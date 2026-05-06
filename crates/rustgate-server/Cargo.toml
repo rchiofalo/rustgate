@@ -71,6 +71,15 @@ arc-swap = { workspace = true }
 rustgate-authz = { workspace = true }
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
+# Closes #847. The server registers EntityCodec implementations for
+# every wire-format crate at startup so the router can surface
+# canonical Entity-kind tags to audit and per-kind metrics. These are
+# always-on (no feature gate) because the registry construction is
+# zero-cost when no traffic of the corresponding protocol arrives, and
+# the codec types themselves are zero-sized.
+rustgate-mavlink = { workspace = true }
+rustgate-asterix = { workspace = true }
+rustgate-stanag4586 = { workspace = true }
 rustgate-transport = { workspace = true }
 rustgate-websocket = { workspace = true, optional = true }
 rustgate-mqtt = { workspace = true, optional = true }

@@ -106,6 +106,7 @@ static MESSAGES_DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
 static MESSAGES_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_REPLAYED: OnceLock<IntCounter> = OnceLock::new();
 static MESSAGES_ROUTED: OnceLock<IntCounterVec> = OnceLock::new();
+static MESSAGES_ROUTED_BY_KIND: OnceLock<IntCounterVec> = OnceLock::new();
 
 static DEDUP_HITS: OnceLock<IntCounter> = OnceLock::new();
 static DEDUP_CACHE_SIZE: OnceLock<IntGauge> = OnceLock::new();
@@ -558,6 +559,26 @@ pub fn init() -> prometheus::Result<()> {
     )?;
     registry.register(Box::new(messages_routed.clone()))?;
     let _ = MESSAGES_ROUTED.set(messages_routed);
+
+    // Closes #847. Per-kind routed-message counter, labelled by the
+    // canonical `EntityKind::as_str()` tag (`aircraft`, `ground`,
+    // `marine`, `sensor`, `track`, `munition`, `unknown`) and the
+    // `metadata.source_protocol` string. Cardinality is bounded by the
+    // closed `EntityKind` vocabulary; the protocol label is also a
+    // small fixed vocabulary in practice (`cot`, `mavlink`, `asterix`,
+    // `stanag4586`, `nats`, `federation`, `tcp`, `websocket`, …) — the
+    // operator who registers a codec for a new protocol is the same
+    // operator who controls the metric label, so this is not an
+    // attacker-controlled axis.
+    let messages_routed_by_kind = IntCounterVec::new(
+        Opts::new(
+            "rustgate_messages_routed_by_kind_total",
+            "Messages routed by canonical EntityKind and source_protocol — populated when an EntityCodecRegistry is installed; \"unknown\" covers unregistered protocols and codec parse failures",
+        ),
+        &["kind", "protocol"],
+    )?;
+    registry.register(Box::new(messages_routed_by_kind.clone()))?;
+    let _ = MESSAGES_ROUTED_BY_KIND.set(messages_routed_by_kind);
 
     let sessions_active = IntGauge::with_opts(Opts::new(
         "rustgate_sessions_active",
@@ -1906,6 +1927,36 @@ pub fn messages_routed() -> &'static IntCounterVec {
             "fallback",
             &["destination", "identity_cn"],
         )
+    })
+}
+
+/// Accessor for the per-kind routed-message counter (closes #847).
+///
+/// Labelled by the canonical [`rustgate_core::entity::EntityKind::as_str`]
+/// tag and the `metadata.source_protocol` string. Use the wired-up
+/// [`router_routed_by_kind_callback`] to emit observations rather than
+/// poking this counter directly — the callback runs inside the router's
+/// dispatch path so a single hot-path observation site stays
+/// authoritative.
+pub fn messages_routed_by_kind() -> &'static IntCounterVec {
+    MESSAGES_ROUTED_BY_KIND.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_messages_routed_by_kind_total",
+            "fallback",
+            &["kind", "protocol"],
+        )
+    })
+}
+
+/// Build the [`rustgate_transport::OnRoutedByKind`] callback that feeds
+/// the `rustgate_messages_routed_by_kind_total{kind, protocol}` counter.
+/// Wired by the server binary at startup so every admitted message
+/// (post-Send-PEP) increments the counter once. Closes #847.
+pub fn router_routed_by_kind_callback() -> rustgate_transport::OnRoutedByKind {
+    Arc::new(|kind: &'static str, protocol: &str| {
+        messages_routed_by_kind()
+            .with_label_values(&[kind, protocol])
+            .inc();
     })
 }
 

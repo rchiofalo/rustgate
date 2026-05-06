@@ -70,10 +70,23 @@ pub struct Position {
 }
 
 /// Errors that can occur when parsing CoT XML.
-#[derive(Debug)]
+///
+/// Closes #847 — the `Display` and `std::error::Error` impls below
+/// satisfy the
+/// [`rustgate_core::entity::DynEntityCodec`] blanket impl bound so the
+/// router-side [`rustgate_core::entity::EntityCodecRegistry`] can hold
+/// a [`crate::entity::CotEntityCodec`] under the heterogeneous codec
+/// type. The thiserror macro generates a `Display` whose output mirrors
+/// the variant payloads — operators relying on the `{}` format of a
+/// `ParseError` see the same human-readable shape they would have
+/// gotten from `Debug` formatting before.
+#[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    Xml(quick_xml::Error),
+    #[error("XML parse error: {0}")]
+    Xml(#[from] quick_xml::Error),
+    #[error("missing required attribute: {0}")]
     MissingAttribute(&'static str),
+    #[error("invalid float for field: {0}")]
     InvalidFloat(&'static str),
     /// A numeric field was out of its spec-defined range.
     ///
@@ -81,16 +94,8 @@ pub enum ParseError {
     /// `lat` and `lon` in WGS-84 decimal degrees: latitude -90..=90,
     /// longitude -180..=180. Values outside these ranges are rejected
     /// rather than propagated to downstream geofilter / multicast logic.
-    OutOfRange {
-        field: &'static str,
-        value: f64,
-    },
-}
-
-impl From<quick_xml::Error> for ParseError {
-    fn from(e: quick_xml::Error) -> Self {
-        ParseError::Xml(e)
-    }
+    #[error("field `{field}` out of range: {value}")]
+    OutOfRange { field: &'static str, value: f64 },
 }
 
 #[cfg(feature = "fuzz")]

@@ -125,9 +125,14 @@ fn audit_delivery_cli_flag_wires_callbacks() {
             // Mirror the `cli.audit_delivery == true` arm of
             // `main.rs`: install the audit-emitting callbacks.
             router.set_on_message_delivered(Some(Arc::new(
-                |source_cn, dest_cn, msg_uid, msg_type, group| {
+                |source_cn, dest_cn, msg_uid, msg_type, group, entity_kind| {
                     rustgate_core::audit::message_delivered(
-                        source_cn, dest_cn, msg_uid, msg_type, group,
+                        source_cn,
+                        dest_cn,
+                        msg_uid,
+                        msg_type,
+                        group,
+                        entity_kind,
                     );
                 },
             )));

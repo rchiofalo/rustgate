@@ -868,12 +868,48 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             None
         };
 
+    // Closes #847. Build the EntityCodecRegistry once at startup with
+    // every protocol crate that ships an EntityCodec — CoT XML
+    // (#1289), MAVLink (#1292), ASTERIX (#1295), STANAG-4586 (#1300).
+    // The registry is held behind `Arc` so the router (and any future
+    // hot-reload story) can share ownership without allocation churn.
+    // Codec instances are zero-sized — the per-protocol `Arc::new(...)`
+    // here is the canonical zero-cost handle.
+    let entity_codec_registry = {
+        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+        registry.register(
+            "cot",
+            std::sync::Arc::new(rustgate_cot::entity::CotEntityCodec),
+        );
+        registry.register(
+            rustgate_core::message::SOURCE_MAVLINK,
+            std::sync::Arc::new(rustgate_mavlink::entity::MavlinkEntityCodec),
+        );
+        registry.register(
+            "asterix",
+            std::sync::Arc::new(rustgate_asterix::entity::AsterixEntityCodec),
+        );
+        registry.register(
+            "stanag4586",
+            std::sync::Arc::new(rustgate_stanag4586::entity::Stanag4586EntityCodec),
+        );
+        Arc::new(registry)
+    };
+
     let router = Arc::new({
         let base = (match group_acl {
             Some(acl) => Router::with_acl(acl),
             None => Router::new(),
         })
         .with_backpressure(Arc::clone(&backpressure_gate))
+        // Closes #847. Install the EntityCodecRegistry so the routing
+        // dispatch path can surface canonical Entity-kind tags to
+        // audit (`message_delivered.entity_kind=…`) and the
+        // `rustgate_messages_routed_by_kind_total` Prometheus counter.
+        // Decode failures and unregistered protocols collapse to
+        // `entity_kind="unknown"` so the metric label cardinality
+        // stays bounded.
+        .with_entity_codec_registry(Arc::clone(&entity_codec_registry))
         // Issue #728: apply the unknown-obligation policy at
         // construction time. Default (`false`) keeps the router in
         // fail-closed mode; operators opt into fail-open via
@@ -965,6 +1001,11 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         // its pre-swap baseline is the all-clear that every
         // evaluation that observed the previous engine has retired.
         router.set_on_authz_in_flight_changed(Some(metrics::router_authz_in_flight_callback()));
+        // Closes #847. Per-kind routed-message observation — feeds
+        // `rustgate_messages_routed_by_kind_total{kind, protocol}`.
+        // Fires once per admitted message (not per recipient), with
+        // `kind` drawn from the closed `EntityKind::as_str` vocabulary.
+        router.set_on_routed_by_kind(Some(metrics::router_routed_by_kind_callback()));
     }
 
     // Closes #854. Per-recipient delivery audit is opt-in because a
@@ -977,9 +1018,14 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // `ArcSwap::load` + `is_none` check per recipient.
     if cli.audit_delivery {
         router.set_on_message_delivered(Some(std::sync::Arc::new(
-            |source_cn, dest_cn, msg_uid, msg_type, group| {
+            |source_cn, dest_cn, msg_uid, msg_type, group, entity_kind| {
                 rustgate_core::audit::message_delivered(
-                    source_cn, dest_cn, msg_uid, msg_type, group,
+                    source_cn,
+                    dest_cn,
+                    msg_uid,
+                    msg_type,
+                    group,
+                    entity_kind,
                 );
             },
         )));

@@ -161,13 +161,18 @@ rustgate_core::on_callback!(
     /// behind `--audit-delivery` (default off, high-volume in busy
     /// deployments) to feed
     /// [`rustgate_core::audit::message_delivered`] for chain-of-custody
-    /// audit trails. The five `&str` arguments are, in order:
+    /// audit trails. The arguments are, in order:
     /// `source_cn`, `dest_cn`, `msg_uid` (CoT `uid="…"` attribute or
     /// empty when not CoT-shaped), `msg_type` (the `Display` form of
-    /// [`rustgate_core::message::MessageType`]), and `group` (the
+    /// [`rustgate_core::message::MessageType`]), `group` (the
     /// destination group name on group / multicast fan-out, or the small
     /// fixed-vocabulary tag `"direct"` / `"broadcast"` for non-group
-    /// destinations).
+    /// destinations), and `entity_kind` — the closed-vocabulary
+    /// [`rustgate_core::entity::EntityKind::as_str`] tag when the router
+    /// successfully decoded the payload via the registered codec for
+    /// `metadata.source_protocol`, or `None` either when no codec is
+    /// registered for the protocol or when the codec rejected the
+    /// payload. Closes #847 (umbrella).
     ///
     /// Hot-reloadable via `ArcSwap` so the audit layer can be installed
     /// after construction without a lock on the routing hot path. The
@@ -180,7 +185,8 @@ rustgate_core::on_callback!(
     &str,
     &str,
     &str,
-    &str
+    &str,
+    Option<&str>
 );
 
 rustgate_core::on_callback!(
@@ -199,6 +205,31 @@ rustgate_core::on_callback!(
     &str,
     &str,
     &str,
+    &str
+);
+
+rustgate_core::on_callback!(
+    /// Callback invoked once per admitted message (not per recipient)
+    /// after the router has classified the payload via the installed
+    /// [`rustgate_core::entity::EntityCodecRegistry`]. The two `&str`
+    /// arguments are, in order: `kind` — the closed-vocabulary
+    /// [`rustgate_core::entity::EntityKind::as_str`] tag (e.g.
+    /// `"aircraft"`, `"ground"`, `"unknown"`); and `protocol` — the
+    /// `metadata.source_protocol` string (e.g. `"cot"`, `"mavlink"`).
+    /// When no codec is registered or when the codec rejected the
+    /// payload, `kind` is `"unknown"` so the metric label cardinality
+    /// stays bounded by the closed `EntityKind` vocabulary.
+    ///
+    /// Wired by the server binary under `#[cfg(feature = "metrics")]`
+    /// to feed `rustgate_messages_routed_by_kind_total{kind, protocol}`.
+    /// Hot-reloadable via `ArcSwap`; default `None` keeps the un-wired
+    /// hot path at a single `ArcSwap::load` + `is_none()` check. The
+    /// callback fires once per admitted message — not per recipient —
+    /// so a broadcast to N subscribers produces a single metric
+    /// increment, matching the existing `messages_routed_total`
+    /// cardinality model. Closes #847.
+    pub OnRoutedByKind,
+    &'static str,
     &str
 );
 
@@ -295,6 +326,7 @@ pub struct AuthzEvent<'a> {
     pub policy_id: &'a str,
 }
 use rustgate_core::audit;
+use rustgate_core::entity::EntityCodecRegistry;
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
@@ -319,6 +351,16 @@ pub const ACCESS_LOG_TARGET: &str = "access";
 /// or oversized payloads: scan cost stays O(1) per message regardless
 /// of total payload size.
 const MAX_UID_SCAN_BYTES: usize = 1024;
+
+/// Closed-vocabulary tag emitted to the per-kind routed-message metric
+/// when the entity codec is absent (no registry installed, no codec
+/// for the protocol, or decode failure). Pinned as a `&'static str` so
+/// the [`rustgate_core::entity::EntityKind::Unknown`] variant's
+/// allocation is avoided on the metric hot path. Mirrors the value
+/// returned by `EntityKind::Unknown(_).as_str()` — kept in sync via the
+/// `unknown_entity_label_matches_entity_kind_unknown_as_str` test
+/// below. Closes #847.
+const UNKNOWN_ENTITY_KIND_LABEL: &str = "unknown";
 
 /// Best-effort extraction of a CoT `uid="..."` attribute from a payload
 /// without doing a full XML parse. Returns an empty string when the
@@ -1103,6 +1145,27 @@ pub struct Router {
     /// via `ArcSwap` so the operator can flip rebroadcast at runtime
     /// without restarting the listener. Default `None`. Closes #861.
     on_multicast_forward: ArcSwap<Option<crate::udp_multicast::OnMulticastForward>>,
+    /// Optional registry mapping `metadata.source_protocol` to the
+    /// `DynEntityCodec` that decodes its wire format into the canonical
+    /// [`rustgate_core::entity::Entity`] shape.
+    ///
+    /// `None` (default) — the routing path skips entity decode entirely;
+    /// `Some(reg)` — at message dispatch the router looks up the codec
+    /// for `msg.metadata.source_protocol` and, on a hit, decodes the
+    /// payload best-effort to surface the canonical kind to audit
+    /// (`message_delivered.entity_kind=…`) and the per-kind metric
+    /// `rustgate_messages_routed_by_kind_total{kind, protocol}`. Decode
+    /// failures are logged at `tracing::debug!` and downgrade the
+    /// surface to `None` — the wire payload still flows. Closes #847
+    /// (router pivot).
+    entity_codec_registry: Option<Arc<EntityCodecRegistry>>,
+    /// Optional per-kind routed-message observation. Wired by the
+    /// server binary to feed
+    /// `rustgate_messages_routed_by_kind_total{kind, protocol}`.
+    /// Hot-reloadable via `ArcSwap`; default `None` keeps the routing
+    /// hot path at a single `ArcSwap::load` + `is_none()` check.
+    /// Closes #847.
+    on_routed_by_kind: ArcSwap<Option<OnRoutedByKind>>,
 }
 
 impl std::fmt::Debug for Router {
@@ -1159,6 +1222,14 @@ impl std::fmt::Debug for Router {
                 "on_multicast_forward_installed",
                 &(**self.on_multicast_forward.load()).is_some(),
             )
+            .field(
+                "entity_codec_registry_installed",
+                &self.entity_codec_registry.is_some(),
+            )
+            .field(
+                "on_routed_by_kind_installed",
+                &(**self.on_routed_by_kind.load()).is_some(),
+            )
             .finish()
     }
 }
@@ -1189,6 +1260,8 @@ impl Default for Router {
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
+            entity_codec_registry: None,
+            on_routed_by_kind: ArcSwap::from_pointee(None),
         }
     }
 }
@@ -1232,6 +1305,8 @@ impl Router {
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
+            entity_codec_registry: None,
+            on_routed_by_kind: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1281,6 +1356,8 @@ impl Router {
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
+            entity_codec_registry: None,
+            on_routed_by_kind: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1333,6 +1410,8 @@ impl Router {
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
+            entity_codec_registry: None,
+            on_routed_by_kind: ArcSwap::from_pointee(None),
         }
     }
 
@@ -1737,6 +1816,61 @@ impl Router {
         self.on_message_dropped.store(Arc::new(cb));
     }
 
+    /// Attach an [`EntityCodecRegistry`] for protocol-agnostic entity
+    /// surfacing on the dispatch path. Closes #847.
+    ///
+    /// When installed, every routed message has its
+    /// `metadata.source_protocol` looked up in the registry; on a hit
+    /// the codec decodes the payload and the resulting
+    /// [`rustgate_core::entity::Entity::kind`] is surfaced to the
+    /// per-recipient delivery audit (`message_delivered.entity_kind=…`)
+    /// and to the `rustgate_messages_routed_by_kind_total` Prometheus
+    /// counter. A miss (unknown protocol) or a decode failure is logged
+    /// at `tracing::debug!` and downgrades the entity surface to `None`
+    /// — the wire payload still flows to subscribers. Builder-style:
+    ///
+    /// ```ignore
+    /// let router = Router::new().with_entity_codec_registry(Arc::new(reg));
+    /// ```
+    #[must_use]
+    pub fn with_entity_codec_registry(mut self, registry: Arc<EntityCodecRegistry>) -> Self {
+        self.entity_codec_registry = Some(registry);
+        self
+    }
+
+    /// Borrow the installed [`EntityCodecRegistry`], if any. Surfaced
+    /// for tests and diagnostics; the routing hot path consumes the
+    /// registry through `self.entity_codec_registry` directly so the
+    /// public accessor's cost is irrelevant.
+    pub fn entity_codec_registry(&self) -> Option<&Arc<EntityCodecRegistry>> {
+        self.entity_codec_registry.as_ref()
+    }
+
+    /// Internal hot-path helper — look up
+    /// `metadata.source_protocol` in the installed registry and return
+    /// the canonical [`rustgate_core::entity::EntityKind::as_str`] tag,
+    /// or `None` either when no registry is installed, no codec is
+    /// registered for the protocol, or the codec rejected the payload.
+    /// Decode failures are logged at `tracing::debug!` so an operator
+    /// can correlate audit `entity_kind=None` lines with the
+    /// per-protocol parse-error rate without surfacing the failure to
+    /// the user-facing routing path. Closes #847.
+    fn classify_entity_kind(&self, msg: &RoutableMessage) -> Option<&'static str> {
+        let registry = self.entity_codec_registry.as_ref()?;
+        let codec = registry.get(&msg.metadata.source_protocol)?;
+        match codec.to_entity_dyn(&msg.payload) {
+            Ok(entity) => Some(entity.kind.as_str()),
+            Err(err) => {
+                debug!(
+                    source_protocol = %msg.metadata.source_protocol,
+                    err = %err,
+                    "entity codec decode failed; entity surface downgraded to None",
+                );
+                None
+            }
+        }
+    }
+
     /// Install (or replace) the multicast-egress forwarding callback.
     ///
     /// When installed, the callback fires once per
@@ -1752,6 +1886,30 @@ impl Router {
     /// restarting the routing pipeline. Closes #861.
     pub fn set_on_multicast_forward(&self, cb: Option<crate::udp_multicast::OnMulticastForward>) {
         self.on_multicast_forward.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the per-kind routed-message observer.
+    ///
+    /// When installed, the callback fires once per admitted message
+    /// (after the Send-PEP allow path) with the canonical
+    /// [`rustgate_core::entity::EntityKind::as_str`] tag and the
+    /// `metadata.source_protocol` string. Wired by the server binary
+    /// under `#[cfg(feature = "metrics")]` to feed
+    /// `rustgate_messages_routed_by_kind_total{kind, protocol}`.
+    /// Hot-reloadable via `ArcSwap`. Default `None`. Closes #847.
+    pub fn set_on_routed_by_kind(&self, cb: Option<OnRoutedByKind>) {
+        self.on_routed_by_kind.store(Arc::new(cb));
+    }
+
+    /// Internal helper — invoke the per-kind routed observation
+    /// callback if installed. The hot path on the un-installed (default)
+    /// build is a single `ArcSwap::load` + `is_none()` check, so the
+    /// per-message cost is bounded when the metric is not wired.
+    fn emit_routed_by_kind(&self, kind: &'static str, protocol: &str) {
+        let guard = self.on_routed_by_kind.load();
+        if let Some(cb) = (**guard).as_ref() {
+            cb(kind, protocol);
+        }
     }
 
     /// Internal helper — invoke the fanout callback if installed.
@@ -1806,6 +1964,14 @@ impl Router {
     /// `--audit-delivery`. The `msg_uid_for` helper does a single
     /// bounded `extract_cot_uid` scan over the payload prefix; that
     /// cost is paid only when the callback is installed. Closes #854.
+    ///
+    /// Closes #847 — when an [`EntityCodecRegistry`] is installed, the
+    /// canonical [`rustgate_core::entity::EntityKind`] tag is computed
+    /// once via [`Self::classify_entity_kind`] and surfaced as the
+    /// callback's sixth argument. The decode cost is paid only when
+    /// the audit callback is installed (the early `is_none` return on
+    /// the un-installed slot short-circuits before the registry
+    /// lookup), so opt-out builds pay nothing.
     fn emit_message_delivered(&self, msg: &RoutableMessage, dest_cn: &str, group_label: &str) {
         let guard = self.on_message_delivered.load();
         let Some(cb) = (**guard).as_ref() else {
@@ -1813,7 +1979,15 @@ impl Router {
         };
         let uid = extract_cot_uid(&msg.payload);
         let msg_type = msg.metadata.message_type.to_string();
-        cb(&msg.source.cn, dest_cn, uid, &msg_type, group_label);
+        let entity_kind = self.classify_entity_kind(msg);
+        cb(
+            &msg.source.cn,
+            dest_cn,
+            uid,
+            &msg_type,
+            group_label,
+            entity_kind,
+        );
     }
 
     /// Internal helper — invoke the per-recipient delivery-drop
@@ -2592,6 +2766,25 @@ impl Router {
         // session channels) are still surfaced via the existing warn!
         // logs and metrics.
         emit_access(&msg, "delivered");
+
+        // Closes #847 — per-kind routed-message observation. Fires once
+        // per admitted message, not per recipient, matching the
+        // cardinality model of `messages_routed_total`. Decode failures
+        // and unregistered protocols collapse into the closed
+        // `EntityKind::as_str` vocabulary's `"unknown"` bucket so the
+        // metric label cardinality stays bounded regardless of which
+        // codec shipping has wired in. The lookup short-circuits to
+        // `UNKNOWN_ENTITY_KIND_LABEL` (no allocation) when the registry
+        // is absent or the codec rejects the payload, so the per-message
+        // cost when the metric is wired but the registry is empty is
+        // one `ArcSwap::load` + `is_none()` check + a constant-string
+        // assignment.
+        {
+            let kind = self
+                .classify_entity_kind(&msg)
+                .unwrap_or(UNKNOWN_ENTITY_KIND_LABEL);
+            self.emit_routed_by_kind(kind, &msg.metadata.source_protocol);
+        }
 
         // Wrap in Arc once so broadcast/group sends share one allocation
         // instead of cloning the full RoutableMessage per recipient. A
@@ -7150,6 +7343,524 @@ mod tests {
             gauge.load(Ordering::SeqCst),
             0,
             "no-callback path must not perturb a foreign gauge"
+        );
+    }
+
+    // ── EntityCodecRegistry router-side dispatch (closes #847) ─────
+
+    /// Trivial entity codec used to exercise the registry hot path
+    /// without pulling in real wire-format crates. `kind` controls
+    /// what `to_entity` returns; `fail_decode` makes the codec
+    /// reject every payload so the "decode failure -> entity surface
+    /// downgrades to None" branch is reachable from a unit test.
+    #[derive(Debug, Clone)]
+    struct StubEntityCodec {
+        kind: rustgate_core::entity::EntityKind,
+        fail_decode: bool,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("stub codec rejected payload")]
+    struct StubCodecError;
+
+    impl rustgate_core::entity::EntityCodec for StubEntityCodec {
+        type Error = StubCodecError;
+
+        fn to_entity(&self, _payload: &[u8]) -> Result<rustgate_core::entity::Entity, Self::Error> {
+            if self.fail_decode {
+                return Err(StubCodecError);
+            }
+            Ok(rustgate_core::entity::Entity {
+                uid: "stub".into(),
+                kind: self.kind.clone(),
+                position: None,
+                velocity: None,
+                timestamp: SystemTime::UNIX_EPOCH,
+                callsign: None,
+                mil_std_2525_sidc: None,
+                attributes: std::collections::BTreeMap::new(),
+            })
+        }
+
+        fn from_entity(
+            &self,
+            _entity: &rustgate_core::entity::Entity,
+        ) -> Result<Bytes, Self::Error> {
+            Ok(Bytes::from_static(b"stub"))
+        }
+    }
+
+    fn make_stub_msg(source_protocol: &str, payload: &'static [u8]) -> RoutableMessage {
+        let id = Identity {
+            cn: "alice".into(),
+            fingerprint: "fp".into(),
+            groups: std::collections::BTreeSet::new(),
+            tenant: None,
+            spiffe_id: None,
+            attributes: Arc::new(std::collections::BTreeMap::new()),
+        };
+        RoutableMessage {
+            source: id,
+            destination: Destination::Broadcast,
+            payload: Bytes::from_static(payload),
+            metadata: Metadata::new(
+                SystemTime::now(),
+                source_protocol.to_string(),
+                MessageType::Other("test".into()),
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_entity_kind_returns_kind_when_codec_registered_and_decodes() {
+        // Pins the happy-path of the router-side classifier: when a
+        // codec is registered for the message's source_protocol AND
+        // it accepts the payload, the canonical kind tag flows out.
+        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+        registry.register(
+            "cot",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Aircraft,
+                fail_decode: false,
+            }),
+        );
+        let router = Router::new().with_entity_codec_registry(Arc::new(registry));
+
+        let msg = make_stub_msg("cot", b"any-bytes");
+        assert_eq!(
+            router.classify_entity_kind(&msg),
+            Some("aircraft"),
+            "codec hit must return canonical EntityKind tag",
+        );
+    }
+
+    #[test]
+    fn classify_entity_kind_returns_none_for_unknown_source_protocol() {
+        // Closes #847 — registry lookup miss must not panic; the
+        // surface degrades to None and the wire payload still flows.
+        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+        registry.register(
+            "cot",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Aircraft,
+                fail_decode: false,
+            }),
+        );
+        let router = Router::new().with_entity_codec_registry(Arc::new(registry));
+
+        let msg = make_stub_msg("never-registered", b"x");
+        assert_eq!(router.classify_entity_kind(&msg), None);
+    }
+
+    #[test]
+    fn classify_entity_kind_returns_none_when_codec_fails_to_decode() {
+        // Closes #847 — codec parse failure must not leak into the
+        // routing path. The classifier returns None so audit and
+        // metrics see `entity_kind=None` / `kind="unknown"` and the
+        // wire payload continues to subscribers unchanged.
+        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+        registry.register(
+            "cot",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Aircraft,
+                fail_decode: true,
+            }),
+        );
+        let router = Router::new().with_entity_codec_registry(Arc::new(registry));
+
+        let msg = make_stub_msg("cot", b"x");
+        assert_eq!(router.classify_entity_kind(&msg), None);
+    }
+
+    #[test]
+    fn classify_entity_kind_returns_none_when_no_registry_installed() {
+        // Closes #847 — backward compat with the no-registry default:
+        // the classifier short-circuits to None so the routing path
+        // matches the pre-PR behaviour byte-for-byte.
+        let router = Router::new();
+        let msg = make_stub_msg("cot", b"x");
+        assert_eq!(router.classify_entity_kind(&msg), None);
+    }
+
+    #[test]
+    fn entity_codec_registry_dispatches_each_protocol_to_its_codec() {
+        // Closes #847 — multi-protocol dispatch matrix. Pins that
+        // each registered source_protocol flows to its registered
+        // codec and that the canonical kind tag is preserved through
+        // the registry boundary, mirroring the four-protocol set the
+        // server binary registers (cot, mavlink, asterix, stanag4586).
+        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+        registry.register(
+            "cot",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Ground,
+                fail_decode: false,
+            }),
+        );
+        registry.register(
+            "mavlink",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Aircraft,
+                fail_decode: false,
+            }),
+        );
+        registry.register(
+            "asterix",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Track,
+                fail_decode: false,
+            }),
+        );
+        registry.register(
+            "stanag4586",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Aircraft,
+                fail_decode: false,
+            }),
+        );
+        let router = Router::new().with_entity_codec_registry(Arc::new(registry));
+
+        for (proto, expected) in [
+            ("cot", "ground"),
+            ("mavlink", "aircraft"),
+            ("asterix", "track"),
+            ("stanag4586", "aircraft"),
+        ] {
+            assert_eq!(
+                router.classify_entity_kind(&make_stub_msg(proto, b"x")),
+                Some(expected),
+                "protocol {proto} must dispatch to its registered codec",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_audit_includes_entity_kind_when_codec_succeeds() {
+        // Closes #847 — end-to-end pin: a registered codec's tag
+        // must flow through `emit_message_delivered` into the
+        // installed audit callback. Use a Direct destination so a
+        // single recipient receives the message and the recorder
+        // captures exactly one event.
+        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+        registry.register(
+            "cot",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Aircraft,
+                fail_decode: false,
+            }),
+        );
+        let router = Router::new().with_entity_codec_registry(Arc::new(registry));
+
+        let recorder: Arc<parking_lot::Mutex<Vec<Option<String>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder_cb = Arc::clone(&recorder);
+        router.set_on_message_delivered(Some(Arc::new(
+            move |_src, _dst, _uid, _mtype, _grp, kind| {
+                recorder_cb.lock().push(kind.map(str::to_owned));
+            },
+        )));
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let msg = RoutableMessage {
+            source: (*bob).clone(),
+            destination: Destination::Direct((*alice).clone()),
+            payload: Bytes::from_static(b"any"),
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        };
+        router.route(msg).await;
+
+        let captured = recorder.lock().clone();
+        assert_eq!(captured.len(), 1, "exactly one delivery event expected");
+        assert_eq!(
+            captured[0].as_deref(),
+            Some("aircraft"),
+            "entity_kind must flow through to the audit callback",
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_audit_omits_entity_kind_when_codec_unregistered() {
+        // Closes #847 — when no codec is registered for the
+        // message's source_protocol, the audit surface is `None`.
+        // Pins the backward-compatible behaviour for protocols the
+        // operator has not opted into.
+        let router = Router::new();
+
+        let recorder: Arc<parking_lot::Mutex<Vec<Option<String>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder_cb = Arc::clone(&recorder);
+        router.set_on_message_delivered(Some(Arc::new(
+            move |_src, _dst, _uid, _mtype, _grp, kind| {
+                recorder_cb.lock().push(kind.map(str::to_owned));
+            },
+        )));
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let msg = RoutableMessage {
+            source: (*bob).clone(),
+            destination: Destination::Direct((*alice).clone()),
+            payload: Bytes::from_static(b"any"),
+            metadata: Metadata::new(SystemTime::now(), "no-codec".to_string(), MessageType::Chat),
+        };
+        router.route(msg).await;
+
+        let captured = recorder.lock().clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0], None,
+            "entity_kind must be None when no codec is registered",
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_audit_omits_entity_kind_when_codec_decode_fails() {
+        // Closes #847 — codec parse failure on a registered
+        // protocol still degrades to `None` (rather than reporting
+        // a misleading `Some(...)`). This is the "best-effort,
+        // never gating" property of the entity surface.
+        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+        registry.register(
+            "cot",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Aircraft,
+                fail_decode: true,
+            }),
+        );
+        let router = Router::new().with_entity_codec_registry(Arc::new(registry));
+
+        let recorder: Arc<parking_lot::Mutex<Vec<Option<String>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder_cb = Arc::clone(&recorder);
+        router.set_on_message_delivered(Some(Arc::new(
+            move |_src, _dst, _uid, _mtype, _grp, kind| {
+                recorder_cb.lock().push(kind.map(str::to_owned));
+            },
+        )));
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let msg = RoutableMessage {
+            source: (*bob).clone(),
+            destination: Destination::Direct((*alice).clone()),
+            payload: Bytes::from_static(b"any"),
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        };
+        router.route(msg).await;
+
+        let captured = recorder.lock().clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0], None,
+            "entity_kind must be None on codec decode failure (best-effort, never gating)",
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_by_kind_callback_fires_with_canonical_kind_for_registered_codec() {
+        // Closes #847 — pin that the per-kind metric callback sees
+        // the canonical EntityKind tag once per admitted message
+        // (not per recipient — broadcast still produces one event).
+        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+        registry.register(
+            "cot",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Aircraft,
+                fail_decode: false,
+            }),
+        );
+        let router = Router::new().with_entity_codec_registry(Arc::new(registry));
+
+        let recorder: Arc<parking_lot::Mutex<Vec<(String, String)>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder_cb = Arc::clone(&recorder);
+        router.set_on_routed_by_kind(Some(Arc::new(move |kind: &'static str, protocol: &str| {
+            recorder_cb
+                .lock()
+                .push((kind.to_string(), protocol.to_string()));
+        })));
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        let (ptx2, ntx2, _prx2, _nrx2) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx2, ntx2))
+            .await;
+
+        let carol = make_identity("carol", &[]);
+        let msg = RoutableMessage {
+            source: (*carol).clone(),
+            destination: Destination::Broadcast,
+            payload: Bytes::from_static(b"any"),
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        };
+        router.route(msg).await;
+
+        let captured = recorder.lock().clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "per-kind metric must fire exactly once per admitted message, not per recipient",
+        );
+        assert_eq!(captured[0].0, "aircraft", "kind label");
+        assert_eq!(captured[0].1, "cot", "protocol label");
+    }
+
+    #[tokio::test]
+    async fn routed_by_kind_callback_uses_unknown_label_when_no_registry() {
+        // Closes #847 — pin that the metric still fires when no
+        // registry is installed: the kind label collapses to
+        // `"unknown"` so dashboards show the per-protocol routed
+        // rate even on builds where the operator has not registered
+        // any codec yet. Cardinality stays bounded by the closed
+        // EntityKind vocabulary.
+        let router = Router::new();
+
+        let recorder: Arc<parking_lot::Mutex<Vec<(String, String)>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder_cb = Arc::clone(&recorder);
+        router.set_on_routed_by_kind(Some(Arc::new(move |kind: &'static str, protocol: &str| {
+            recorder_cb
+                .lock()
+                .push((kind.to_string(), protocol.to_string()));
+        })));
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let msg = RoutableMessage {
+            source: (*bob).clone(),
+            destination: Destination::Direct((*alice).clone()),
+            payload: Bytes::from_static(b"any"),
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        };
+        router.route(msg).await;
+
+        let captured = recorder.lock().clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].0, "unknown",
+            "no-registry kind must collapse to 'unknown'"
+        );
+        assert_eq!(captured[0].1, "cot");
+    }
+
+    #[tokio::test]
+    async fn routed_by_kind_callback_uses_unknown_label_when_codec_decode_fails() {
+        // Closes #847 — registered codec but malformed payload:
+        // metric still fires, kind="unknown", protocol preserved.
+        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+        registry.register(
+            "cot",
+            Arc::new(StubEntityCodec {
+                kind: rustgate_core::entity::EntityKind::Aircraft,
+                fail_decode: true,
+            }),
+        );
+        let router = Router::new().with_entity_codec_registry(Arc::new(registry));
+
+        let recorder: Arc<parking_lot::Mutex<Vec<(String, String)>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorder_cb = Arc::clone(&recorder);
+        router.set_on_routed_by_kind(Some(Arc::new(move |kind: &'static str, protocol: &str| {
+            recorder_cb
+                .lock()
+                .push((kind.to_string(), protocol.to_string()));
+        })));
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let msg = RoutableMessage {
+            source: (*bob).clone(),
+            destination: Destination::Direct((*alice).clone()),
+            payload: Bytes::from_static(b"malformed"),
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        };
+        router.route(msg).await;
+
+        let captured = recorder.lock().clone();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].0, "unknown",
+            "decode failure must collapse to 'unknown'"
+        );
+        assert_eq!(captured[0].1, "cot");
+    }
+
+    #[tokio::test]
+    async fn router_without_registry_continues_to_dispatch_unchanged() {
+        // Closes #847 — backward compat: a router with no
+        // EntityCodecRegistry installed must continue to deliver
+        // messages exactly as before. The receiver sees the wire
+        // payload unchanged. This is the "entity surface is
+        // best-effort, not gating" contract.
+        let router = Router::new();
+
+        let alice = make_identity("alice", &[]);
+        let bob = make_identity("bob", &[]);
+        let (ptx, ntx, _prx, mut nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let payload = Bytes::from_static(b"hello-world");
+        let msg = RoutableMessage {
+            source: (*bob).clone(),
+            destination: Destination::Direct((*alice).clone()),
+            payload: payload.clone(),
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        };
+        router.route(msg).await;
+
+        let received = nrx.try_recv().expect("recipient must see the message");
+        assert_eq!(
+            received.payload, payload,
+            "wire payload must flow unchanged through a no-registry router",
+        );
+    }
+
+    #[test]
+    fn unknown_entity_label_matches_entity_kind_unknown_as_str() {
+        // Closes #847 — pins that the constant used on the
+        // metric hot path agrees with the EntityKind variant's
+        // canonical tag, so a future refactor that renames the
+        // EntityKind::Unknown tag also updates the constant (or
+        // fails this test loudly).
+        let kind_tag = rustgate_core::entity::EntityKind::Unknown(String::new());
+        assert_eq!(
+            UNKNOWN_ENTITY_KIND_LABEL,
+            kind_tag.as_str(),
+            "UNKNOWN_ENTITY_KIND_LABEL constant must match \
+             EntityKind::Unknown::as_str() — keep them in sync",
         );
     }
 }
