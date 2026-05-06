@@ -4101,12 +4101,7 @@ mod tests {
             source: (**source).clone(),
             destination: dest,
             payload: Bytes::from_static(b"<event/>"),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position),
         }
     }
 
@@ -4115,12 +4110,7 @@ mod tests {
             source: (**source).clone(),
             destination: dest,
             payload: Bytes::from_static(b"<alert/>"),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Alert,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Alert),
         }
     }
 
@@ -4129,12 +4119,7 @@ mod tests {
             source: (**source).clone(),
             destination: dest,
             payload: Bytes::from_static(b"<chat/>"),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Chat,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
         }
     }
 
@@ -5199,12 +5184,7 @@ mod tests {
             source: (*alice).clone(),
             destination: Destination::Direct((*bob).clone()),
             payload: Bytes::from_static(b"hello bob"),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "test".to_string(),
-                message_type: MessageType::Chat,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "test".to_string(), MessageType::Chat),
         };
         router.route(chat).await;
 
@@ -5250,12 +5230,11 @@ mod tests {
                     source: (*alice).clone(),
                     destination: Destination::Direct((*bob).clone()),
                     payload,
-                    metadata: Metadata {
-                        received_at: SystemTime::now(),
-                        source_protocol: "test".to_string(),
-                        message_type: MessageType::Chat,
-                        ttl: None,
-                    },
+                    metadata: Metadata::new(
+                        SystemTime::now(),
+                        "test".to_string(),
+                        MessageType::Chat,
+                    ),
                 })
                 .await;
         }
@@ -5288,12 +5267,11 @@ mod tests {
                     source: (*alice).clone(),
                     destination: Destination::Direct((*bob).clone()),
                     payload,
-                    metadata: Metadata {
-                        received_at: SystemTime::now(),
-                        source_protocol: "test".to_string(),
-                        message_type: MessageType::Chat,
-                        ttl: None,
-                    },
+                    metadata: Metadata::new(
+                        SystemTime::now(),
+                        "test".to_string(),
+                        MessageType::Chat,
+                    ),
                 })
                 .await;
         }
@@ -5328,12 +5306,7 @@ mod tests {
             source: (*alice).clone(),
             destination: Destination::Direct((*ghost).clone()),
             payload: Bytes::from_static(b"into the void"),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "test".to_string(),
-                message_type: MessageType::Chat,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "test".to_string(), MessageType::Chat),
         };
         router.route(chat).await;
         assert!(router.client_queue().is_none());
@@ -5348,12 +5321,7 @@ mod tests {
             source: (**source).clone(),
             destination: dest,
             payload: Bytes::from_static(payload),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Chat,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
         }
     }
 

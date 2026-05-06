@@ -60,16 +60,15 @@ fn position_with_received_at(
     received_at: SystemTime,
     ttl: Option<Duration>,
 ) -> RoutableMessage {
+    let mut metadata = Metadata::new(received_at, "cot".to_string(), MessageType::Position);
+    if let Some(t) = ttl {
+        metadata = metadata.with_ttl(t);
+    }
     RoutableMessage {
         source: ident(cn),
         destination: Destination::Broadcast,
         payload: Bytes::from_static(b"<event/>"),
-        metadata: Metadata {
-            received_at,
-            source_protocol: "cot".to_string(),
-            message_type: MessageType::Position,
-            ttl,
-        },
+        metadata,
     }
 }
 

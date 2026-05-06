@@ -808,12 +808,11 @@ mod tests {
             source: id,
             destination: Destination::Broadcast,
             payload: Bytes::copy_from_slice(payload),
-            metadata: Metadata {
+            metadata: Metadata::new(
                 received_at,
-                source_protocol: "tcp".into(),
-                message_type: MessageType::Other("mavlink-heartbeat".into()),
-                ttl: None,
-            },
+                "tcp".into(),
+                MessageType::Other("mavlink-heartbeat".into()),
+            ),
         }
     }
 

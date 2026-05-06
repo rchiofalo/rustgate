@@ -40,12 +40,11 @@ fn build_message(source: &Identity, payload: &[u8], dest: Destination) -> Routab
         source: source.clone(),
         destination: dest,
         payload: Bytes::copy_from_slice(payload),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Other("raw".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            "tcp".into(),
+            MessageType::Other("raw".into()),
+        ),
     }
 }
 
@@ -745,12 +744,7 @@ async fn position_cache_replay() {
         source: (*alice).clone(),
         destination: Destination::Broadcast,
         payload: Bytes::from("<event type='a-f-G'/>"),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "cot".into(),
-            message_type: MessageType::Position,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Position),
     };
     router.route(position_msg).await;
 
@@ -785,12 +779,7 @@ async fn chat_messages_not_cached() {
         source: (*alice).clone(),
         destination: Destination::Broadcast,
         payload: Bytes::from("hello"),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "cot".into(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Chat),
     };
     router.route(chat_msg).await;
 
@@ -814,12 +803,7 @@ async fn position_cache_replaces_old() {
         source: (*alice).clone(),
         destination: Destination::Broadcast,
         payload: Bytes::from("pos1"),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "cot".into(),
-            message_type: MessageType::Position,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Position),
     };
     router.route(pos1).await;
 
@@ -828,12 +812,7 @@ async fn position_cache_replaces_old() {
         source: (*alice).clone(),
         destination: Destination::Broadcast,
         payload: Bytes::from("pos2"),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "cot".into(),
-            message_type: MessageType::Position,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Position),
     };
     router.route(pos2).await;
 
@@ -877,12 +856,12 @@ async fn expired_message_is_dropped() {
         source: (*alice).clone(),
         destination: Destination::Broadcast,
         payload: Bytes::from("stale"),
-        metadata: Metadata {
-            received_at: SystemTime::now() - std::time::Duration::from_secs(10),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Other("raw".into()),
-            ttl: Some(std::time::Duration::from_secs(1)),
-        },
+        metadata: Metadata::new(
+            SystemTime::now() - std::time::Duration::from_secs(10),
+            "tcp".into(),
+            MessageType::Other("raw".into()),
+        )
+        .with_ttl(std::time::Duration::from_secs(1)),
     };
     router.route(expired_msg).await;
 
@@ -920,12 +899,11 @@ async fn message_without_ttl_routes_normally() {
         source: (*alice).clone(),
         destination: Destination::Broadcast,
         payload: Bytes::from("no-ttl"),
-        metadata: Metadata {
-            received_at: SystemTime::now() - std::time::Duration::from_secs(3600),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Other("raw".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now() - std::time::Duration::from_secs(3600),
+            "tcp".into(),
+            MessageType::Other("raw".into()),
+        ),
     };
     router.route(msg).await;
 
@@ -958,12 +936,12 @@ async fn non_expired_ttl_message_routes_normally() {
         source: (*alice).clone(),
         destination: Destination::Broadcast,
         payload: Bytes::from("fresh"),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Other("raw".into()),
-            ttl: Some(std::time::Duration::from_secs(300)),
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            "tcp".into(),
+            MessageType::Other("raw".into()),
+        )
+        .with_ttl(std::time::Duration::from_secs(300)),
     };
     router.route(msg).await;
 

@@ -3921,12 +3921,11 @@ async fn mqtt_publish_does_not_loop_back_to_mqtt_subscriber_via_nats() {
         source: nats_source,
         destination: Destination::Group("alpha".into()),
         payload: Bytes::from_static(b"injected-from-nats"),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "nats".to_string(),
-            message_type: MessageType::Other("nats".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            "nats".to_string(),
+            MessageType::Other("nats".into()),
+        ),
     };
     // `route_for_egress` is the same surface the future NATS-subscriber
     // sub-item of #737 will use. The test exercises the MQTT-side

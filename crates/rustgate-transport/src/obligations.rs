@@ -922,12 +922,7 @@ mod tests {
             source: id,
             destination: Destination::Broadcast,
             payload: Bytes::from_static(payload),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "tcp".into(),
-                message_type,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "tcp".into(), message_type),
         }
     }
 

@@ -79,12 +79,7 @@ fn msg_with_payload(from: &str, to: &str, payload: &'static [u8]) -> RoutableMes
         source,
         destination: Destination::Direct(dest_id),
         payload: Bytes::from_static(payload),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".to_string(),
-            message_type: MessageType::Position,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Position),
     }
 }
 

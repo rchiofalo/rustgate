@@ -194,12 +194,7 @@ proptest! {
             source: identity,
             destination: Destination::Broadcast,
             payload: Bytes::from(xml.clone()),
-            metadata: Metadata {
-                received_at: std::time::SystemTime::now(),
-                source_protocol: SOURCE_FEDERATION.to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(std::time::SystemTime::now(), SOURCE_FEDERATION.to_string(), MessageType::Position),
         };
 
         let event = routable_to_federated_event(&msg, &empty_metadata())

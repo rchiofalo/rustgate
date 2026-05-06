@@ -31,12 +31,11 @@ fn build_message(source: &Identity, payload: &[u8]) -> RoutableMessage {
         source: source.clone(),
         destination: Destination::Broadcast,
         payload: Bytes::copy_from_slice(payload),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Other("raw".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            "tcp".into(),
+            MessageType::Other("raw".into()),
+        ),
     }
 }
 

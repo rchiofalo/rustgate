@@ -133,12 +133,7 @@ fn message_strategy() -> impl Strategy<Value = RoutableMessage> {
             source: id,
             destination: Destination::Broadcast,
             payload: Bytes::from_static(payload),
-            metadata: Metadata {
-                received_at: SystemTime::UNIX_EPOCH,
-                source_protocol: "cot".into(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::UNIX_EPOCH, "cot".into(), MessageType::Position),
         }
     })
 }

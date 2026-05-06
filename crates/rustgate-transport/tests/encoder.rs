@@ -19,12 +19,11 @@ fn make_message(payload: &[u8], source_protocol: &str) -> RoutableMessage {
             .expect("valid identity"),
         destination: Destination::Broadcast,
         payload: Bytes::from(payload.to_vec()),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: source_protocol.into(),
-            message_type: MessageType::Position,
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            source_protocol.into(),
+            MessageType::Position,
+        ),
     }
 }
 

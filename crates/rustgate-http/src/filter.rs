@@ -152,12 +152,7 @@ mod tests {
             },
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event/>"),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: protocol.to_string(),
-                message_type: msg_type,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), protocol.to_string(), msg_type),
         }
     }
 

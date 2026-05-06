@@ -5281,12 +5281,11 @@ mod tests {
                 .expect("valid identity"),
                 destination: rustgate_core::message::Destination::Broadcast,
                 payload: bytes::Bytes::from_static(b"<event/>"),
-                metadata: rustgate_core::message::Metadata {
-                    received_at: std::time::SystemTime::now(),
-                    source_protocol: "cot".to_string(),
-                    message_type: rustgate_core::message::MessageType::Position,
-                    ttl: None,
-                },
+                metadata: rustgate_core::message::Metadata::new(
+                    std::time::SystemTime::now(),
+                    "cot".to_string(),
+                    rustgate_core::message::MessageType::Position,
+                ),
             };
 
             cache.store(msg).await;

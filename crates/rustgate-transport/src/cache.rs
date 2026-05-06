@@ -310,31 +310,32 @@ mod tests {
     }
 
     fn make_position_with_ttl(cn: &str, ttl: Option<Duration>) -> RoutableMessage {
+        let mut metadata =
+            Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position);
+        if let Some(t) = ttl {
+            metadata = metadata.with_ttl(t);
+        }
         RoutableMessage {
             source: make_identity(cn),
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event/>"),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Position,
-                ttl,
-            },
+            metadata,
         }
     }
 
     fn make_expired_position(cn: &str) -> RoutableMessage {
+        // received 10 seconds ago with a 1-second TTL → expired
+        let metadata = Metadata::new(
+            SystemTime::now() - Duration::from_secs(10),
+            "cot".to_string(),
+            MessageType::Position,
+        )
+        .with_ttl(Duration::from_secs(1));
         RoutableMessage {
             source: make_identity(cn),
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event/>"),
-            metadata: Metadata {
-                // received 10 seconds ago with a 1-second TTL → expired
-                received_at: SystemTime::now() - Duration::from_secs(10),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Position,
-                ttl: Some(Duration::from_secs(1)),
-            },
+            metadata,
         }
     }
 

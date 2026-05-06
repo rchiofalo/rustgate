@@ -98,12 +98,11 @@ mod tests {
             source: id,
             destination: Destination::Group("grp".into()),
             payload: Bytes::from_static(b"hi"),
-            metadata: Metadata {
-                received_at: std::time::SystemTime::UNIX_EPOCH,
-                source_protocol: "test".into(),
-                message_type: MessageType::Other("test".into()),
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                std::time::SystemTime::UNIX_EPOCH,
+                "test".into(),
+                MessageType::Other("test".into()),
+            ),
         }
     }
 

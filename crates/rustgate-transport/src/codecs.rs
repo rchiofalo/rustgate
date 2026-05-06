@@ -131,12 +131,11 @@ mod tests {
             .unwrap(),
             destination: Destination::Broadcast,
             payload: Bytes::copy_from_slice(payload),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "test".into(),
-                message_type: MessageType::Other("test".into()),
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::now(),
+                "test".into(),
+                MessageType::Other("test".into()),
+            ),
         }
     }
 

@@ -758,12 +758,11 @@ mod tests {
             },
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event uid='test'/>"),
-            metadata: Metadata {
-                received_at: std::time::SystemTime::now(),
-                source_protocol: "tcp".to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                std::time::SystemTime::now(),
+                "tcp".to_string(),
+                MessageType::Position,
+            ),
         }
     }
 

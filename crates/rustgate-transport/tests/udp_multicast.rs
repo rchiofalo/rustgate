@@ -271,12 +271,11 @@ async fn udp_multicast_rebroadcast_emits_to_configured_group() {
         source: id,
         destination: Destination::Broadcast,
         payload: payload.clone(),
-        metadata: Metadata {
-            received_at: std::time::SystemTime::now(),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            std::time::SystemTime::now(),
+            "tcp".into(),
+            MessageType::Position,
+        ),
     };
     let _ = router.route_for_egress(msg).await;
     // Drain the listener channels so they don't block the router.
@@ -353,12 +352,11 @@ async fn udp_multicast_rate_limit_caps_outbound_bps() {
             source: id,
             destination: Destination::Broadcast,
             payload,
-            metadata: Metadata {
-                received_at: std::time::SystemTime::now(),
-                source_protocol: "tcp".into(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                std::time::SystemTime::now(),
+                "tcp".into(),
+                MessageType::Position,
+            ),
         };
         let _ = router.route_for_egress(msg).await;
         // Drain to avoid back-pressure on the router.

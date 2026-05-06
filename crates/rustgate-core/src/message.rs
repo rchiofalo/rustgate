@@ -5,6 +5,26 @@
 //! Every message entering rustgate — whether from a TLS client, WebSocket,
 //! federation peer, or NATS subscription — is normalized into a
 //! [`RoutableMessage`] before being handed to the router.
+//!
+//! # Builder pattern for [`Metadata`]
+//!
+//! [`Metadata`] is marked `#[non_exhaustive]` and is constructed via the
+//! [`Metadata::new`] constructor plus chainable `with_*` builder methods.
+//! The constructor takes only the always-required fields
+//! (`received_at`, `source_protocol`, `message_type`); every optional
+//! field is set with a dedicated builder method (`with_ttl`, etc.) and
+//! defaults to `None` when not specified.
+//!
+//! ```
+//! use std::time::{Duration, SystemTime};
+//! use rustgate_core::message::{Metadata, MessageType};
+//!
+//! let meta = Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Position)
+//!     .with_ttl(Duration::from_secs(60));
+//! ```
+//!
+//! Future fields land as additive `with_*` methods so that adding a new
+//! optional field never breaks an existing construction site.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -12,6 +32,7 @@ use std::time::{Duration, SystemTime};
 #[cfg(feature = "fuzz")]
 use arbitrary::Arbitrary;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use crate::identity::Identity;
 
@@ -44,7 +65,28 @@ pub struct RoutableMessage {
 }
 
 /// Contextual metadata attached to every routed message.
-#[derive(Debug, Clone)]
+///
+/// Marked `#[non_exhaustive]` so that adding a new optional field is an
+/// additive change for downstream crates: external consumers must construct
+/// values via [`Metadata::new`] (plus `with_*` builder methods) rather than
+/// struct literals. Inside the workspace `cargo` still permits literal
+/// construction, but the [`Metadata::new`] constructor is the canonical
+/// path and the only one used by the routing crates.
+///
+/// # Builder
+///
+/// Use [`Metadata::new`] for the three required fields, then chain
+/// `with_*` methods to set optional fields. Each future optional field
+/// becomes its own `with_<name>` method so construction-site churn stays
+/// near zero when the schema grows.
+//
+// Future field additions: append the new optional field below the
+// existing ones with `#[serde(default, skip_serializing_if = "…")]` so the
+// wire format stays stable, then add a `Metadata::with_<name>` builder
+// method below. Existing call sites continue to compile because every
+// optional field defaults to its empty value inside `Metadata::new`.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
     /// When the message was received by this server.
     pub received_at: SystemTime,
@@ -53,10 +95,47 @@ pub struct Metadata {
     /// Classified message type, used for routing decisions (e.g., caching positions).
     pub message_type: MessageType,
     /// Optional time-to-live; expired messages are evicted from the position cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<Duration>,
+    // Future optional fields land here. Each must:
+    //   1. Be `Option<T>` (or another type with a sensible default).
+    //   2. Carry `#[serde(default, skip_serializing_if = "…")]` so absent
+    //      fields round-trip identically across versions.
+    //   3. Default to its empty value inside `Metadata::new` below.
+    //   4. Have a matching `Metadata::with_<name>` builder method.
 }
 
 impl Metadata {
+    /// Construct a [`Metadata`] with the three always-required fields.
+    ///
+    /// All optional fields (currently `ttl`) default to `None`. Set them
+    /// via the chainable `with_*` builder methods (e.g.
+    /// [`Metadata::with_ttl`]).
+    ///
+    /// `source_protocol` is owned (`String`) to keep call-site type
+    /// inference simple — pass either a literal-built `String` (`"tcp".to_string()`)
+    /// or one of the [`SOURCE_FEDERATION`] / [`SOURCE_MAVLINK`] constants
+    /// converted with `.to_string()`.
+    pub fn new(
+        received_at: SystemTime,
+        source_protocol: String,
+        message_type: MessageType,
+    ) -> Self {
+        Self {
+            received_at,
+            source_protocol,
+            message_type,
+            ttl: None,
+        }
+    }
+
+    /// Builder-style setter for [`Metadata::ttl`]. Returns `self` for chaining.
+    #[must_use]
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
     /// Returns `true` when this message has a TTL and `received_at + ttl`
     /// is in the past.
     ///
@@ -120,7 +199,7 @@ impl Destination {
 /// The router uses this to make routing decisions — for example, only
 /// [`Position`](Self::Position) messages are stored in the position cache
 /// for replay to newly connected sessions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageType {
     /// Situational awareness position report (cached for replay).
     Position,
@@ -205,12 +284,11 @@ impl<'a> Arbitrary<'a> for Metadata {
         let ttl_secs: Option<u64> = u.arbitrary()?;
         let ttl = ttl_secs.map(|s| Duration::from_secs(s % 86400));
 
-        Ok(Self {
-            received_at: SystemTime::now(),
-            source_protocol,
-            message_type: u.arbitrary()?,
-            ttl,
-        })
+        let mut meta = Self::new(SystemTime::now(), source_protocol, u.arbitrary()?);
+        if let Some(t) = ttl {
+            meta = meta.with_ttl(t);
+        }
+        Ok(meta)
     }
 }
 
@@ -388,12 +466,7 @@ mod tests {
         // Messages with no TTL are immortal — required so federated
         // control traffic (which never sets a TTL) doesn't silently
         // drop from the position cache.
-        let meta = Metadata {
-            received_at: SystemTime::UNIX_EPOCH,
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        };
+        let meta = Metadata::new(SystemTime::UNIX_EPOCH, "tcp".into(), MessageType::Chat);
         assert!(
             !meta.is_expired(),
             "Metadata::is_expired must return false when ttl is None"
@@ -403,14 +476,14 @@ mod tests {
     #[test]
     fn metadata_is_expired_past_ttl_is_true() {
         // received_at long in the past, ttl only 1ms -> expired.
-        let meta = Metadata {
-            received_at: SystemTime::now()
+        let meta = Metadata::new(
+            SystemTime::now()
                 .checked_sub(Duration::from_secs(60))
                 .expect("clock arithmetic"),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: Some(Duration::from_millis(1)),
-        };
+            "tcp".into(),
+            MessageType::Position,
+        )
+        .with_ttl(Duration::from_millis(1));
         assert!(
             meta.is_expired(),
             "Metadata::is_expired must return true when now > received_at + ttl"
@@ -420,12 +493,8 @@ mod tests {
     #[test]
     fn metadata_is_expired_within_ttl_is_false() {
         // received_at ~now, generous ttl -> not expired.
-        let meta = Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: Some(Duration::from_secs(3600)),
-        };
+        let meta = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position)
+            .with_ttl(Duration::from_secs(3600));
         assert!(
             !meta.is_expired(),
             "Metadata::is_expired must return false when now < received_at + ttl"
@@ -438,14 +507,14 @@ mod tests {
         // node's clock ran ahead), elapsed() returns Err; the contract
         // is to treat that as "not expired" so we do not silently drop
         // legitimate messages. Pin this to prevent accidental strictness.
-        let meta = Metadata {
-            received_at: SystemTime::now()
+        let meta = Metadata::new(
+            SystemTime::now()
                 .checked_add(Duration::from_secs(3600))
                 .expect("clock arithmetic"),
-            source_protocol: "federation".into(),
-            message_type: MessageType::Alert,
-            ttl: Some(Duration::from_secs(1)),
-        };
+            "federation".into(),
+            MessageType::Alert,
+        )
+        .with_ttl(Duration::from_secs(1));
         assert!(
             !meta.is_expired(),
             "future received_at must not count as expired (clock-skew tolerance)"
@@ -644,14 +713,14 @@ mod tests {
         // when elapsed == Duration::MAX, which can happen in contrived
         // test fixtures but more importantly would silently flip the
         // contract for edge-case config.
-        let meta = Metadata {
-            received_at: SystemTime::now()
+        let meta = Metadata::new(
+            SystemTime::now()
                 .checked_sub(Duration::from_secs(3600))
                 .expect("clock arithmetic"),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: Some(Duration::MAX),
-        };
+            "tcp".into(),
+            MessageType::Position,
+        )
+        .with_ttl(Duration::MAX);
         assert!(
             !meta.is_expired(),
             "Duration::MAX TTL must never expire — got expired"
@@ -665,14 +734,14 @@ mod tests {
         // `elapsed > 0`. A regression that treated zero-TTL as
         // "no expiry" (conflating Some(ZERO) with None) would
         // silently keep expired messages in the position cache.
-        let meta = Metadata {
-            received_at: SystemTime::now()
+        let meta = Metadata::new(
+            SystemTime::now()
                 .checked_sub(Duration::from_millis(10))
                 .expect("clock arithmetic"),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: Some(Duration::ZERO),
-        };
+            "tcp".into(),
+            MessageType::Position,
+        )
+        .with_ttl(Duration::ZERO);
         assert!(
             meta.is_expired(),
             "Some(Duration::ZERO) TTL must expire after any elapsed time"
@@ -757,12 +826,7 @@ mod tests {
             source: id,
             destination: Destination::Broadcast,
             payload,
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "tcp".into(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position),
         };
         let cloned = msg.clone();
         // `Bytes` clone shares the same allocation — the as_ptr values
@@ -795,15 +859,130 @@ mod tests {
         // is_true` (existing test, which uses 60s elapsed vs 1ms ttl)
         // the pair pins that within-ttl is false and past-ttl is true.
         let now = SystemTime::now();
-        let meta = Metadata {
-            received_at: now,
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: Some(Duration::from_secs(3600)),
-        };
+        let meta = Metadata::new(now, "tcp".into(), MessageType::Position)
+            .with_ttl(Duration::from_secs(3600));
         assert!(
             !meta.is_expired(),
             "just-received message with 1h TTL must not be expired"
         );
+    }
+
+    // ── builder-pattern coverage (closes #1298) ─────────────────────
+
+    #[test]
+    fn metadata_new_initializes_optional_fields_to_none() {
+        // The constructor takes only the required fields and must zero
+        // every optional field to `None`. Future field additions must
+        // preserve this invariant — adding an optional field that
+        // defaults to a non-None value is a silent semantic change for
+        // every existing call site.
+        let now = SystemTime::now();
+        let meta = Metadata::new(now, "tcp".into(), MessageType::Position);
+        assert_eq!(meta.received_at, now);
+        assert_eq!(meta.source_protocol, "tcp");
+        assert_eq!(meta.message_type, MessageType::Position);
+        assert!(meta.ttl.is_none(), "ttl must default to None");
+    }
+
+    #[test]
+    fn metadata_with_ttl_sets_ttl_field() {
+        // `with_ttl` is a builder-style chain: it must return `self`
+        // with the field updated and leave every other field
+        // untouched. Pin both that the field is set and that nothing
+        // else is mutated.
+        let now = SystemTime::now();
+        let ttl = Duration::from_secs(60);
+        let meta = Metadata::new(now, "nats".into(), MessageType::Chat).with_ttl(ttl);
+        assert_eq!(meta.ttl, Some(ttl));
+        assert_eq!(meta.received_at, now);
+        assert_eq!(meta.source_protocol, "nats");
+        assert_eq!(meta.message_type, MessageType::Chat);
+    }
+
+    #[test]
+    fn metadata_with_ttl_overwrites_previous_value() {
+        // Builder methods must be idempotent under chained re-application:
+        // calling `with_ttl` twice replaces (not stacks) the value, so a
+        // future re-config flow that recomputes the TTL after extra
+        // policy lookup behaves predictably.
+        let meta = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position)
+            .with_ttl(Duration::from_secs(10))
+            .with_ttl(Duration::from_secs(99));
+        assert_eq!(meta.ttl, Some(Duration::from_secs(99)));
+    }
+
+    #[test]
+    fn metadata_serde_round_trip_preserves_wire_format_for_default_ttl() {
+        // Serialize-then-deserialize must reconstruct the original
+        // value exactly. Pin this so the `#[non_exhaustive]` attribute
+        // (which can subtly affect derived serde behavior on some
+        // future compiler versions) does not silently change the wire
+        // shape for a stock-built `Metadata::new(...)`.
+        let original = Metadata::new(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            "tcp".into(),
+            MessageType::Position,
+        );
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: Metadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+        assert!(parsed.ttl.is_none(), "default ttl must round-trip as None");
+    }
+
+    #[test]
+    fn metadata_serde_round_trip_preserves_wire_format_for_some_ttl() {
+        // Same round-trip pin as above, but for the `Some(ttl)` branch:
+        // the `#[serde(skip_serializing_if = "Option::is_none")]`
+        // attribute must NOT skip a present `Some` value.
+        let original = Metadata::new(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            "federation".into(),
+            MessageType::Alert,
+        )
+        .with_ttl(Duration::from_secs(60));
+        let json = serde_json::to_string(&original).expect("serialize");
+        assert!(
+            json.contains("\"ttl\""),
+            "wire format must include `ttl` field when Some, got {json}"
+        );
+        let parsed: Metadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.ttl, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn metadata_serde_existing_wire_format_still_deserializes() {
+        // Pre-PR serializers (e.g. a future federation peer that built
+        // its own JSON shape mirroring the struct fields) emit either
+        // `"ttl": null` or omit the field entirely. Both shapes must
+        // continue to deserialize cleanly so on-disk store-and-forward
+        // queues written before this PR can be replayed by a binary
+        // built after this PR. Pin both shapes.
+        let with_explicit_null = "{\"received_at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"source_protocol\":\"tcp\",\"message_type\":\"Position\",\"ttl\":null}";
+        let parsed: Metadata = serde_json::from_str(with_explicit_null).expect("explicit null");
+        assert!(parsed.ttl.is_none());
+
+        let with_omitted_field = "{\"received_at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"source_protocol\":\"tcp\",\"message_type\":\"Position\"}";
+        let parsed: Metadata = serde_json::from_str(with_omitted_field).expect("omitted ttl");
+        assert!(parsed.ttl.is_none());
+    }
+
+    #[test]
+    fn metadata_struct_is_non_exhaustive_for_external_crates() {
+        // Documentation pin: the struct is `#[non_exhaustive]`. External
+        // crates cannot construct a `Metadata` via struct literal; they
+        // must go through `Metadata::new(...)`. We cannot drive a
+        // compile-fail test from here without `trybuild`, but we do pin
+        // that the constructor + `with_ttl` builder produce a value
+        // equal to the equivalent inline-built value, which is what
+        // external code MUST rely on. A regression that changed the
+        // builder default for `ttl` would be caught by the `is_none`
+        // assertion in `metadata_new_initializes_optional_fields_to_none`.
+        // This test exists to make the `#[non_exhaustive]` contract
+        // discoverable to future maintainers via test name alone.
+        let via_builder =
+            Metadata::new(SystemTime::UNIX_EPOCH, "tcp".into(), MessageType::Position)
+                .with_ttl(Duration::from_secs(10));
+        assert_eq!(via_builder.ttl, Some(Duration::from_secs(10)));
     }
 }

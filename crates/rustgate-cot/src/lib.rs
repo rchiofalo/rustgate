@@ -832,16 +832,19 @@ impl MessageBuilder {
 
         let enriched_source = self.enrich_source(source, cot.source_group.as_ref());
 
+        let mut metadata = Metadata::new(
+            SystemTime::now(),
+            source_protocol.to_string(),
+            cot.message_type,
+        );
+        if let Some(t) = cot.ttl {
+            metadata = metadata.with_ttl(t);
+        }
         RoutableMessage {
             source: enriched_source,
             destination,
             payload,
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: source_protocol.to_string(),
-                message_type: cot.message_type,
-                ttl: cot.ttl,
-            },
+            metadata,
         }
     }
 
@@ -857,12 +860,11 @@ impl MessageBuilder {
             source: enriched_source,
             destination: Destination::Broadcast,
             payload,
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: source_protocol.to_string(),
-                message_type: MessageType::Other("raw".into()),
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::now(),
+                source_protocol.to_string(),
+                MessageType::Other("raw".into()),
+            ),
         }
     }
 

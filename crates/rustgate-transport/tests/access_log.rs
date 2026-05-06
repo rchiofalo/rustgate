@@ -72,12 +72,7 @@ fn make_msg(source: &Arc<Identity>, dest: Destination, payload: &'static [u8]) -
         source: (**source).clone(),
         destination: dest,
         payload: Bytes::from_static(payload),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Chat),
     }
 }
 

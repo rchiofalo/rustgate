@@ -612,12 +612,11 @@ async fn publish_will_message(
         source: Identity::clone(identity),
         destination: Destination::Group(will.group.clone().into()),
         payload: will.payload.clone(),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "mqtt".into(),
-            message_type: MessageType::Other("mqtt".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            "mqtt".into(),
+            MessageType::Other("mqtt".into()),
+        ),
     };
 
     debug!(
@@ -1617,12 +1616,11 @@ async fn handle_publish_v5_inner(
         source: Identity::clone(identity),
         destination: Destination::Group(group.into_owned().into()),
         payload: publish.payload.clone(),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "mqtt".into(),
-            message_type: MessageType::Other("mqtt".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            "mqtt".into(),
+            MessageType::Other("mqtt".into()),
+        ),
     };
 
     // Capture the post-Send-PEP form so NATS / federation / HTTP egress
@@ -1758,12 +1756,11 @@ async fn handle_pubrel_v5(
         source: Identity::clone(identity),
         destination: Destination::Group(group.into()),
         payload: publish.payload.clone(),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "mqtt".into(),
-            message_type: MessageType::Other("mqtt".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            "mqtt".into(),
+            MessageType::Other("mqtt".into()),
+        ),
     };
 
     if let Some(routed) = router.route_for_egress(msg).await {
@@ -1928,12 +1925,11 @@ async fn handle_publish_v4_inner(
         source: Identity::clone(identity),
         destination: Destination::Group(group.into_owned().into()),
         payload: publish.payload.clone(),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "mqtt".into(),
-            message_type: MessageType::Other("mqtt".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            "mqtt".into(),
+            MessageType::Other("mqtt".into()),
+        ),
     };
 
     // See `handle_publish_v5` for the identical rationale — the egress
@@ -2035,12 +2031,11 @@ async fn handle_pubrel_v4(
         source: Identity::clone(identity),
         destination: Destination::Group(group.into()),
         payload: publish.payload.clone(),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "mqtt".into(),
-            message_type: MessageType::Other("mqtt".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            "mqtt".into(),
+            MessageType::Other("mqtt".into()),
+        ),
     };
 
     if let Some(routed) = router.route_for_egress(msg).await {
@@ -3487,12 +3482,11 @@ mod tests {
             source,
             destination: dest,
             payload: Bytes::from_static(b""),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "test".into(),
-                message_type: MessageType::Other("test".into()),
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::now(),
+                "test".into(),
+                MessageType::Other("test".into()),
+            ),
         }
     }
 

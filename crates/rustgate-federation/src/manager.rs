@@ -2434,12 +2434,12 @@ mod tests {
 
         // Build a metadata header that expired in the past: received_at is
         // 2 seconds ago, ttl is 1 second.
-        let metadata = Metadata {
-            received_at: SystemTime::now() - Duration::from_secs(2),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: Some(Duration::from_secs(1)),
-        };
+        let metadata = Metadata::new(
+            SystemTime::now() - Duration::from_secs(2),
+            "tcp".into(),
+            MessageType::Position,
+        )
+        .with_ttl(Duration::from_secs(1));
         assert!(metadata.is_expired(), "test fixture must be expired");
 
         let sent = manager
@@ -2458,12 +2458,8 @@ mod tests {
 
         let manager = FederationManager::new(test_config());
 
-        let metadata = Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: Some(Duration::from_secs(1)),
-        };
+        let metadata = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position)
+            .with_ttl(Duration::from_secs(1));
 
         // Stall: simulate the message sitting in a federation queue for 2s.
         tokio::time::sleep(Duration::from_millis(1_200)).await;
@@ -2486,12 +2482,7 @@ mod tests {
 
         let manager = FederationManager::new(test_config());
 
-        let metadata = Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".into(),
-            message_type: MessageType::Position,
-            ttl: None,
-        };
+        let metadata = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position);
 
         // No peers, so the call still returns 0 — but it must reach the
         // peer-iteration path rather than short-circuit on TTL.

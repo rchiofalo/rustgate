@@ -61,12 +61,7 @@ fn make_msg(source: &Arc<Identity>, len: usize, uid: &str) -> RoutableMessage {
         source: (**source).clone(),
         destination: Destination::Broadcast,
         payload: Bytes::from(payload),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: "tcp".to_string(),
-            message_type: MessageType::Chat,
-            ttl: None,
-        },
+        metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Chat),
     }
 }
 

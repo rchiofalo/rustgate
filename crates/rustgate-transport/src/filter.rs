@@ -196,12 +196,7 @@ mod tests {
                 .expect("valid identity"),
             destination: Destination::Broadcast,
             payload: Bytes::from(payload.to_string()),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "cot".to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position),
         }
     }
 
@@ -380,12 +375,11 @@ mod tests {
                 .expect("valid identity"),
             destination: Destination::Broadcast,
             payload: Bytes::from_static(&[0x00, 0x01, 0x02, 0x03]),
-            metadata: Metadata {
-                received_at: SystemTime::now(),
-                source_protocol: "protobuf".to_string(),
-                message_type: MessageType::Position,
-                ttl: None,
-            },
+            metadata: Metadata::new(
+                SystemTime::now(),
+                "protobuf".to_string(),
+                MessageType::Position,
+            ),
         };
         assert!(
             filter.matches(&msg),
@@ -411,12 +405,7 @@ mod tests {
                     .expect("valid identity"),
                 destination: Destination::Broadcast,
                 payload: Bytes::from_static(&[0x00]),
-                metadata: Metadata {
-                    received_at: SystemTime::now(),
-                    source_protocol: "binary".to_string(),
-                    message_type: mtype.clone(),
-                    ttl: None,
-                },
+                metadata: Metadata::new(SystemTime::now(), "binary".to_string(), mtype.clone()),
             };
             assert!(
                 !filter.matches(&msg),

@@ -79,12 +79,11 @@ fn build_msg(payload: &'static [u8], source_protocol: &str) -> RoutableMessage {
         source: id,
         destination: Destination::Broadcast,
         payload: Bytes::from_static(payload),
-        metadata: Metadata {
-            received_at: SystemTime::now(),
-            source_protocol: source_protocol.to_string(),
-            message_type: MessageType::Other("xml".into()),
-            ttl: None,
-        },
+        metadata: Metadata::new(
+            SystemTime::now(),
+            source_protocol.to_string(),
+            MessageType::Other("xml".into()),
+        ),
     }
 }
 
