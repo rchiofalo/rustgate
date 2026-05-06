@@ -28,6 +28,12 @@ use std::time::{Duration, SystemTime};
 
 use crate::archive::CotArchiver;
 
+/// Callback invoked after each successful rotation pass with the
+/// resulting [`RotationStats`]. The server binary wires this to its
+/// `rustgate_archive_bytes` Prometheus gauge; library callers without
+/// metrics may leave this `None`.
+pub type OnRotationStats = Arc<dyn Fn(RotationStats) + Send + Sync>;
+
 /// Configuration for the archive rotation task.
 #[derive(Clone)]
 pub struct RotationConfig {
@@ -49,6 +55,29 @@ pub struct RotationConfig {
     /// both size accounting and deletion sweeps so it never races the
     /// writer. Required for `max_active_bytes` to take effect.
     pub archiver: Option<Arc<CotArchiver>>,
+    /// Optional callback fired after every successful rotation pass.
+    /// Used by the server binary to update the per-pass
+    /// `rustgate_archive_bytes` Prometheus gauge without coupling this
+    /// crate to a Prometheus dependency.
+    pub on_stats: Option<OnRotationStats>,
+}
+
+// Manual `Debug` because the `on_stats` callback is `Arc<dyn Fn>` —
+// trait objects do not implement `Debug` by default. We surface the
+// configured durations and caps; the callback is rendered as a presence
+// flag.
+impl std::fmt::Debug for RotationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotationConfig")
+            .field("dir", &self.dir)
+            .field("max_bytes", &self.max_bytes)
+            .field("max_active_bytes", &self.max_active_bytes)
+            .field("max_age", &self.max_age)
+            .field("interval", &self.interval)
+            .field("archiver", &self.archiver.is_some())
+            .field("on_stats", &self.on_stats.is_some())
+            .finish()
+    }
 }
 
 /// Outcome of a single rotation pass.
@@ -213,8 +242,9 @@ pub fn spawn(cfg: RotationConfig) -> tokio::task::JoinHandle<()> {
             .await;
             match join {
                 Ok(Ok(stats)) => {
-                    #[cfg(feature = "metrics")]
-                    crate::metrics::archive_bytes().set(stats.bytes_after as i64);
+                    if let Some(cb) = cfg.on_stats.as_ref() {
+                        cb(stats);
+                    }
                     if stats.files_deleted > 0 {
                         tracing::info!(
                             files_deleted = stats.files_deleted,
@@ -425,6 +455,7 @@ mod tests {
             max_age: Duration::from_secs(86_400),
             interval: Duration::from_secs(60),
             archiver: None,
+            on_stats: None,
         };
         let cloned = cfg.clone();
         assert_eq!(cloned.dir, cfg.dir);
@@ -433,6 +464,7 @@ mod tests {
         assert_eq!(cloned.max_age, cfg.max_age);
         assert_eq!(cloned.interval, cfg.interval);
         assert!(cloned.archiver.is_none());
+        assert!(cloned.on_stats.is_none());
     }
 
     #[test]

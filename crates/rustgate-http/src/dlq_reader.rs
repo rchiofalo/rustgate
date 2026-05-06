@@ -12,8 +12,8 @@
 //! The writer serializes each entry as a single JSON object (no
 //! trailing newline) and encrypts it as one ChaCha20-Poly1305 chunk
 //! via
-//! [`SharedEncryptedWriter::write_line`](rustgate_core::encrypted::SharedEncryptedWriter::write_line).
-//! After decryption with [`rustgate_core::encrypted::decrypt_file`],
+//! [`SharedEncryptedWriter::write_line`](rustgate_archive::encrypted::SharedEncryptedWriter::write_line).
+//! After decryption with [`rustgate_archive::encrypted::decrypt_file`],
 //! all chunks concatenate into a stream of JSON values. A streaming
 //! [`serde_json::Deserializer`] parses them back into
 //! [`OwnedDlqEntry`] records without relying on newline delimiters —
@@ -36,8 +36,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
+use rustgate_archive::encrypted::{EncryptError, KeyRing, decrypt_file};
 use rustgate_core::b64;
-use rustgate_core::encrypted::{EncryptError, KeyRing, decrypt_file};
 use serde::{Deserialize, Serialize};
 
 /// Errors raised while decrypting and parsing a DLQ file.
@@ -325,7 +325,8 @@ mod tests {
         // Create+seal a writer directly (DLQ writer lazy-creates, so
         // dead_letter() with zero entries produces zero files).
         let writer =
-            rustgate_core::encrypted::SharedEncryptedWriter::create(&enc_path, &key_ring).unwrap();
+            rustgate_archive::encrypted::SharedEncryptedWriter::create(&enc_path, &key_ring)
+                .unwrap();
         writer.finish().unwrap();
 
         let entries = read_dlq_file(&enc_path, &key_ring).expect("read_dlq_file on empty");
@@ -367,7 +368,8 @@ mod tests {
         let enc_path = dir.path().join("torn.dlq.enc");
 
         let writer =
-            rustgate_core::encrypted::SharedEncryptedWriter::create(&enc_path, &key_ring).unwrap();
+            rustgate_archive::encrypted::SharedEncryptedWriter::create(&enc_path, &key_ring)
+                .unwrap();
         writer.write_line(b"{\"target\":\"x\"}").unwrap();
         // Intentionally drop without finish() — simulates crash mid-DLQ.
         drop(writer);
@@ -507,7 +509,8 @@ mod tests {
         // Write two JSON objects back-to-back in a single chunk — mirrors
         // what happens if the writer ever batched serialization.
         let writer =
-            rustgate_core::encrypted::SharedEncryptedWriter::create(&enc_path, &key_ring).unwrap();
+            rustgate_archive::encrypted::SharedEncryptedWriter::create(&enc_path, &key_ring)
+                .unwrap();
         let e1 = OwnedDlqEntry {
             timestamp: "2026-04-13T12:00:00Z".to_string(),
             target: "t1".to_string(),

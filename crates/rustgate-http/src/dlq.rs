@@ -3,7 +3,7 @@
 //! Encrypted dead-letter queue for circuit-breaker-shed messages.
 //!
 //! When a target's circuit breaker is open, messages are persisted to
-//! ChaCha20-Poly1305 encrypted files (via [`rustgate_core::encrypted`])
+//! ChaCha20-Poly1305 encrypted files (via [`rustgate_archive::encrypted`])
 //! for later forensic recovery or replay. Each target gets a separate
 //! file per process lifetime, named `{target}_{timestamp}.dlq.enc`.
 //!
@@ -20,7 +20,7 @@
 //! # Recovery
 //!
 //! Dead-lettered messages can be recovered offline using
-//! [`rustgate_core::encrypted::decrypt_file`] with the same key ring.
+//! [`rustgate_archive::encrypted::decrypt_file`] with the same key ring.
 //! Each decrypted chunk is one JSON line containing the message metadata
 //! and base64-encoded payload.
 
@@ -29,8 +29,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use rustgate_archive::encrypted::{KeyRing, SharedEncryptedWriter};
 use rustgate_core::b64;
-use rustgate_core::encrypted::{KeyRing, SharedEncryptedWriter};
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
 use serde::Serialize;

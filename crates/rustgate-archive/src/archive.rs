@@ -23,14 +23,26 @@ use rustgate_core::message::RoutableMessage;
 /// suffix. Plaintext callers continue to use [`CotArchiver::new`].
 pub struct CotArchiver {
     dir: PathBuf,
-    key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>>,
+    key_ring: Option<Arc<crate::encrypted::KeyRing>>,
     inner: Arc<Mutex<ArchiverState>>,
+}
+
+// Custom `Debug` so a `{:?}` print never reveals key material or the
+// inner buffered writer state. Mirrors the redaction pattern documented
+// in the workspace playbook for types that hold a `KeyRing`.
+impl std::fmt::Debug for CotArchiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CotArchiver")
+            .field("dir", &self.dir)
+            .field("encrypted", &self.key_ring.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
 enum ArchiveSink {
     Plain(std::io::BufWriter<std::fs::File>),
-    Encrypted(rustgate_core::encrypted::EncryptedWriter),
+    Encrypted(crate::encrypted::EncryptedWriter),
 }
 
 struct ArchiverState {
@@ -54,10 +66,10 @@ impl CotArchiver {
     }
 
     /// Construct an archiver that encrypts each daily file with the active
-    /// key from the supplied [`KeyRing`](rustgate_core::encrypted::KeyRing).
+    /// key from the supplied [`KeyRing`](crate::encrypted::KeyRing).
     pub fn with_encryption(
         dir: impl Into<PathBuf>,
-        key_ring: Arc<rustgate_core::encrypted::KeyRing>,
+        key_ring: Arc<crate::encrypted::KeyRing>,
     ) -> Self {
         Self {
             dir: dir.into(),
@@ -151,7 +163,7 @@ impl CotArchiver {
     /// size is still under the cap.
     ///
     /// Encrypted files are sealed by dropping the underlying
-    /// [`EncryptedWriter`](rustgate_core::encrypted::EncryptedWriter),
+    /// [`EncryptedWriter`](crate::encrypted::EncryptedWriter),
     /// which writes the terminator chunk in its `Drop` impl. Without
     /// that the rolled `.enc` file would fail decryption.
     pub fn roll_if_over_size(&self, max_bytes: u64) -> Option<PathBuf> {
@@ -244,7 +256,7 @@ fn write_line(
     dir: &std::path::Path,
     today: &str,
     line: &str,
-    key_ring: Option<&rustgate_core::encrypted::KeyRing>,
+    key_ring: Option<&crate::encrypted::KeyRing>,
 ) {
     let mut state = match inner.lock() {
         Ok(s) => s,
@@ -329,12 +341,12 @@ fn rolled_path(active: &std::path::Path) -> PathBuf {
 fn open_sink(
     dir: &std::path::Path,
     date: &str,
-    key_ring: Option<&rustgate_core::encrypted::KeyRing>,
+    key_ring: Option<&crate::encrypted::KeyRing>,
 ) -> Result<ArchiveSink, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     if let Some(ring) = key_ring {
         let path = dir.join(format!("cot-{date}.jsonl.enc"));
-        rustgate_core::encrypted::EncryptedWriter::create(&path, ring)
+        crate::encrypted::EncryptedWriter::create(&path, ring)
             .map(ArchiveSink::Encrypted)
             .map_err(|e| e.to_string())
     } else {
@@ -518,16 +530,15 @@ mod tests {
             "k1".to_string(),
             "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
         );
-        let kf = rustgate_core::encrypted::KeyFile {
+        let kf = crate::encrypted::KeyFile {
             active_key_id: "k1".to_string(),
             keys,
             key_expirations: std::collections::BTreeMap::new(),
             key_derivations: std::collections::BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&kf).expect("serialize");
-        let ring = std::sync::Arc::new(
-            rustgate_core::encrypted::KeyRing::from_bytes(&bytes).expect("ring"),
-        );
+        let ring =
+            std::sync::Arc::new(crate::encrypted::KeyRing::from_bytes(&bytes).expect("ring"));
 
         let archiver = CotArchiver::with_encryption(&dir, std::sync::Arc::clone(&ring));
 
@@ -565,13 +576,13 @@ mod tests {
 
         // Magic header check
         let raw = std::fs::read(&enc_path).expect("read");
-        assert_eq!(&raw[..8], rustgate_core::encrypted::MAGIC);
+        assert_eq!(&raw[..8], crate::encrypted::MAGIC);
         // Plaintext "alice" must NOT appear in ciphertext.
         assert!(!raw.windows(5).any(|w| w == b"alice"));
 
         // Round-trip: decrypt to a sibling file and check the JSONL line.
         let out_path = dir.join("decrypted.jsonl");
-        rustgate_core::encrypted::decrypt_file(&enc_path, &out_path, &ring).expect("decrypt");
+        crate::encrypted::decrypt_file(&enc_path, &out_path, &ring).expect("decrypt");
         let plaintext = std::fs::read_to_string(&out_path).expect("read decrypted");
         assert!(plaintext.contains("\"cn\":\"alice\""));
         assert!(plaintext.ends_with('\n'));
@@ -742,15 +753,14 @@ mod tests {
             "k1".to_string(),
             "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
         );
-        let kf = rustgate_core::encrypted::KeyFile {
+        let kf = crate::encrypted::KeyFile {
             active_key_id: "k1".to_string(),
             keys,
             key_expirations: std::collections::BTreeMap::new(),
             key_derivations: std::collections::BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&kf).unwrap();
-        let ring =
-            std::sync::Arc::new(rustgate_core::encrypted::KeyRing::from_bytes(&bytes).unwrap());
+        let ring = std::sync::Arc::new(crate::encrypted::KeyRing::from_bytes(&bytes).unwrap());
 
         let archiver = CotArchiver::with_encryption(&dir, ring);
         let active = archiver.active_path();
@@ -779,15 +789,14 @@ mod tests {
             "k1".to_string(),
             "2222222222222222222222222222222222222222222222222222222222222222".to_string(),
         );
-        let kf = rustgate_core::encrypted::KeyFile {
+        let kf = crate::encrypted::KeyFile {
             active_key_id: "k1".to_string(),
             keys,
             key_expirations: std::collections::BTreeMap::new(),
             key_derivations: std::collections::BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&kf).unwrap();
-        let ring =
-            std::sync::Arc::new(rustgate_core::encrypted::KeyRing::from_bytes(&bytes).unwrap());
+        let ring = std::sync::Arc::new(crate::encrypted::KeyRing::from_bytes(&bytes).unwrap());
 
         let archiver = CotArchiver::with_encryption(&dir, std::sync::Arc::clone(&ring));
         let msg = make_test_msg();
@@ -816,7 +825,7 @@ mod tests {
         // Round-trip decrypt the rolled file: if sealing failed this
         // returns `MissingTerminator`.
         let out = dir.join("decrypted.jsonl");
-        rustgate_core::encrypted::decrypt_file(&rolled, &out, &ring)
+        crate::encrypted::decrypt_file(&rolled, &out, &ring)
             .expect("rolled .enc should be fully sealed and decrypt cleanly");
         let plaintext = std::fs::read_to_string(&out).unwrap();
         assert!(plaintext.contains("\"cn\":\"alice\""));

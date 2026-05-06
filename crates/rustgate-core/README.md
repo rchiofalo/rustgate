@@ -7,10 +7,13 @@ Foundational types, traits, and utilities shared across the rustgate workspace.
 `rustgate-core` sits at the bottom of the dependency graph — every other crate
 in the workspace depends on it, and it depends on nothing else local. It owns
 the cross-crate vocabulary (`Identity`, `RoutableMessage`, `Codec`, `PeerId`),
-the structured audit-event API, the hash-chained audit-log writer, the
-ChaCha20-Poly1305 streaming archive format, the secret-file reader, the
-cross-platform TCP keepalive helpers, and the timeout/frame-size constants
-every transport in the workspace shares.
+the structured audit-event API, the secret-file reader, the cross-platform
+TCP keepalive helpers, and the timeout/frame-size constants every transport
+in the workspace shares. The archive-side cryptography (ChaCha20-Poly1305
+streaming) and the SHA-256 hash-chained audit-log writer were extracted into
+[rustgate-archive](../rustgate-archive/README.md) by #892 so consumers that
+do not need them — every crate above this one except the server, the HTTP
+egress, and the cross-domain guard — stop paying the transitive compile cost.
 
 ## Public API surface
 
@@ -24,10 +27,6 @@ every transport in the workspace shares.
   aggregator wrapping transport, config, and `io::Error`
 - `audit::*` — 28+ structured audit event helpers (`client_rejected`,
   `tls_handshake_failed`, `authz_denied`, `security_rate_limited`, etc.)
-- `audit_chain::HashChainWriter`, `audit_chain::verify_audit_log` —
-  tamper-evident SHA-256-chained append-only log
-- `encrypted::{EncryptedWriter, KeyRing, decrypt_file}` — AEAD streaming
-  archive format (per-chunk AAD, sealed terminator, key rotation by id)
 - `secrets::{read_secret_file, SecretFileOpts}` — single secret-file reader
   with size cap, Unix permissions gate, owner-uid check, `Zeroizing<String>`
   return type

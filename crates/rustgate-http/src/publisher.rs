@@ -291,7 +291,7 @@ impl HttpPublisher {
         let dlq = match (&config.dlq_dir, &config.dlq_key_file) {
             (Some(dir), Some(key_file)) => {
                 let key_ring =
-                    rustgate_core::encrypted::KeyRing::load(std::path::Path::new(key_file))
+                    rustgate_archive::encrypted::KeyRing::load(std::path::Path::new(key_file))
                         .map_err(|e| HttpError::Dlq {
                             target: "_global".to_string(),
                             message: format!("failed to load DLQ key ring: {e}"),
@@ -2201,14 +2201,14 @@ mod tests {
     }
 
     /// Synthetic key ring for DLQ encryption in tests.
-    fn admission_test_key_ring() -> rustgate_core::encrypted::KeyRing {
+    fn admission_test_key_ring() -> rustgate_archive::encrypted::KeyRing {
         let key_json = r#"{
             "active_key_id": "test-key",
             "keys": {
                 "test-key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }
         }"#;
-        rustgate_core::encrypted::KeyRing::from_bytes(key_json.as_bytes()).unwrap()
+        rustgate_archive::encrypted::KeyRing::from_bytes(key_json.as_bytes()).unwrap()
     }
 
     #[test]

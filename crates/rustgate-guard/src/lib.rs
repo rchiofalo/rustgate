@@ -23,7 +23,7 @@
 //!    so SIEM rules can correlate misconfigured policies with the
 //!    boundary they were evaluated at.
 //! 3. **Dedicated audit envelope.** The guard owns a
-//!    [`rustgate_core::audit_chain::HashChainWriter`] pointed at a
+//!    [`rustgate_archive::audit_chain::HashChainWriter`] pointed at a
 //!    SEPARATE log file from the general audit chain, so cross-domain
 //!    accountability survives rotation of the operational log. Every
 //!    evaluation — admit or deny — emits exactly one record before the
@@ -52,7 +52,7 @@
 //! - `rustgate_cot::cdi` — the three transform helpers (refs #1286).
 //! - `rustgate_core::classification` — CAPCO grammar + lattice (refs
 //!   #1282).
-//! - `rustgate_core::audit_chain::HashChainWriter` — the proven
+//! - `rustgate_archive::audit_chain::HashChainWriter` — the proven
 //!   tamper-evident primitive (refs #1268).
 //! - `rustgate_resilience::token_bucket` — the per-direction byte
 //!   limiter (refs #883).
@@ -64,7 +64,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use bytes::Bytes;
-use rustgate_core::audit_chain::{AuditChainError, GENESIS_PREV, HashChainWriter};
+use rustgate_archive::audit_chain::{AuditChainError, GENESIS_PREV, HashChainWriter};
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_resilience::token_bucket::TokenBucket;
@@ -261,9 +261,9 @@ impl CrossDomainGuard {
     ///
     /// Opens the audit log in append mode (creating it if missing) and
     /// resumes the hash chain from the existing tip via
-    /// [`rustgate_core::audit_chain::read_chain_state`] when the file
+    /// [`rustgate_archive::audit_chain::read_chain_state`] when the file
     /// is non-empty. A brand-new audit log starts at
-    /// [`rustgate_core::audit_chain::GENESIS_PREV`].
+    /// [`rustgate_archive::audit_chain::GENESIS_PREV`].
     ///
     /// # Errors
     ///
@@ -271,7 +271,7 @@ impl CrossDomainGuard {
     /// opened or its chain state cannot be read.
     pub fn new(config: GuardConfig) -> Result<Self> {
         let (prev, next_seq) = if config.audit_log_path.exists() {
-            rustgate_core::audit_chain::read_chain_state(&config.audit_log_path)
+            rustgate_archive::audit_chain::read_chain_state(&config.audit_log_path)
                 .unwrap_or_else(|_| (GENESIS_PREV.to_string(), 1))
         } else {
             (GENESIS_PREV.to_string(), 1)
@@ -868,7 +868,7 @@ mod tests {
         let _ = g.evaluate(&msg2, GuardDirection::LowToHigh).unwrap();
         let _ = g.evaluate(&msg3, GuardDirection::LowToHigh).unwrap();
         drop(g);
-        let report = rustgate_core::audit_chain::verify_audit_log(&path).unwrap();
+        let report = rustgate_archive::audit_chain::verify_audit_log(&path).unwrap();
         assert_eq!(report.records, 3);
         assert_ne!(report.tip, GENESIS_PREV);
         // Tamper with the middle line.
@@ -876,7 +876,7 @@ mod tests {
         let tampered = original.replacen("u-2", "uX2", 1);
         assert_ne!(original, tampered, "tampering must produce different bytes");
         std::fs::write(&path, tampered).unwrap();
-        let res = rustgate_core::audit_chain::verify_audit_log(&path);
+        let res = rustgate_archive::audit_chain::verify_audit_log(&path);
         assert!(res.is_err(), "verify_audit_log must reject tampered chain");
     }
 
@@ -963,7 +963,7 @@ mod tests {
         let msg2 = make_message(cot_with_marking("u-2", "//SECRET//"));
         let _ = g2.evaluate(&msg2, GuardDirection::LowToHigh).unwrap();
         drop(g2);
-        let report = rustgate_core::audit_chain::verify_audit_log(&path).unwrap();
+        let report = rustgate_archive::audit_chain::verify_audit_log(&path).unwrap();
         assert_eq!(
             report.records, 2,
             "chain must continue across restart, got {}",

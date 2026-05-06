@@ -68,6 +68,7 @@ schema = ["dep:schemars"]
 
 [dependencies]
 arc-swap = { workspace = true }
+rustgate-archive = { workspace = true }
 rustgate-authz = { workspace = true }
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }

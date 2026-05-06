@@ -182,6 +182,9 @@ crate = "rustgate-asterix"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-guard"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-archive"
 
 [bans]
 multiple-versions = "warn"

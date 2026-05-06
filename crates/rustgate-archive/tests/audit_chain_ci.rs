@@ -2,7 +2,7 @@
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! End-to-end CI verification of the hash-chained audit log
-//! ([`rustgate_core::audit_chain`], closes #772).
+//! ([`rustgate_archive::audit_chain`], closes #772).
 //!
 //! The audit chain is the forensic trail tactical operators rely on
 //! when a SIEM is unavailable or has been compromised: every record
@@ -13,7 +13,7 @@
 //! truncation produces a strict prefix that still verifies.
 //!
 //! Pre-this-test the chain implementation had inline unit tests in
-//! [`rustgate_core::audit_chain::tests`] but no integration-binary
+//! [`rustgate_archive::audit_chain::tests`] but no integration-binary
 //! test that exercised the full
 //! [`HashChainWriter`] → [`verify_audit_log`] cycle plus tamper
 //! detection in CI. A regression that broke either side of the
@@ -26,7 +26,7 @@
 //! The integration-test binary isolation matters for two reasons:
 //! (1) CI now reports a dedicated `audit_chain_ci` test target so a
 //!     red dot on the dashboard maps directly to "the audit chain
-//!     itself broke" rather than to a generic `rustgate-core` failure;
+//!     itself broke" rather than to a generic `rustgate-archive` failure;
 //! (2) the test process is short-lived, so any future addition that
 //!     installs a global tracing subscriber for chain emissions
 //!     cannot leak its `Interest` cache into other tests in the
@@ -37,13 +37,13 @@
 //!
 //! Closes #772 item 1.
 //!
-//! [`HashChainWriter`]: rustgate_core::audit_chain::HashChainWriter
-//! [`verify_audit_log`]: rustgate_core::audit_chain::verify_audit_log
+//! [`HashChainWriter`]: rustgate_archive::audit_chain::HashChainWriter
+//! [`verify_audit_log`]: rustgate_archive::audit_chain::verify_audit_log
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
 
-use rustgate_core::audit_chain::{GENESIS_PREV, HashChainWriter, VerifyError, verify_audit_log};
+use rustgate_archive::audit_chain::{GENESIS_PREV, HashChainWriter, VerifyError, verify_audit_log};
 use tempfile::NamedTempFile;
 
 /// Number of records exercised by every test in this binary. 100 is the
