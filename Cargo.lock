@@ -3395,6 +3395,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-guard"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "prometheus",
+ "quick-xml",
+ "rustgate-core",
+ "rustgate-cot",
+ "rustgate-resilience",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "rustgate-http"
 version = "0.8.0"
 dependencies = [
