@@ -40,6 +40,13 @@ does.
 | [0008](0008-once-lock-not-once-cell-lazy.md) | `std::sync::OnceLock` over `once_cell::sync::Lazy` | Accepted |
 | [0009](0009-zeroizing-and-subtle-for-secrets.md) | `Zeroizing<T>` + `subtle::ConstantTimeEq` for secrets | Accepted |
 | [0010](0010-spawn-background-and-subsystem-handle.md) | `spawn_background` + `SubsystemHandle` for task lifecycle | Accepted |
+| [0011](0011-tracing-not-log-workspace-wide.md) | `tracing` for structured logging; no `log` facade | Accepted |
+| [0012](0012-bytes-end-to-end-no-vec-on-hot-path.md) | `bytes::Bytes` end-to-end on the routing hot path | Accepted |
+| [0013](0013-tactical-tcp-socket-hardening.md) | `configure_tactical_socket` for every TCP stream | Accepted |
+| [0014](0014-hash-chained-audit-log.md) | SHA-256 hash-chained audit log with sealed terminator | Accepted |
+| [0015](0015-encrypted-archives-chacha20-poly1305.md) | ChaCha20-Poly1305 with per-chunk AAD for archive encryption | Accepted |
+| [0016](0016-on-callback-macro-for-typed-aliases.md) | `on_callback!` macro for `Arc<dyn Fn>` callback aliases | Accepted |
+| [0017](0017-workspace-dependency-inheritance.md) | Workspace dependency inheritance for every crate | Accepted |
 
 ## Authoring a new ADR
 
