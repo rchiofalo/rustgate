@@ -109,9 +109,18 @@ rustgate_core::on_callback!(
     /// or unrelated UID). The CN is converted to `PeerId` at the gRPC
     /// boundary inside [`FederationService`]; the wire format is the
     /// bare string under TLS, exactly as before.
+    ///
+    /// Closes #852 (PR-C): the third argument is the parsed W3C
+    /// [`rustgate_core::TraceContext`] extracted from the inbound
+    /// gRPC `traceparent` metadata header (if present and well-formed),
+    /// so consumers can persist it on `RoutableMessage::metadata` and
+    /// continue the upstream trace across the local routing path. A
+    /// missing or malformed header surfaces as `None` — propagation is
+    /// best-effort by construction.
     pub OnEvent,
     figpb::FederatedEvent,
-    rustgate_core::PeerId
+    rustgate_core::PeerId,
+    Option<rustgate_core::TraceContext>
 );
 
 rustgate_core::on_callback!(
@@ -985,8 +994,10 @@ impl FederatedChannel for FederationService {
         // W3C trace context propagation (PR-B of #852): pull the parent
         // trace from the inbound metadata and link it onto the current
         // span. Best-effort — a missing or malformed header does not
-        // fail the RPC.
-        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
+        // fail the RPC. PR-C also forwards the parsed context to the
+        // OnEvent callback so the consumer can persist it on the
+        // resulting `RoutableMessage::metadata.trace_context`.
+        let trace_ctx = super::traceparent::extract_into_current_span(&request, &peer_id);
         let event = request.into_inner();
 
         if !Self::validate_hop_count(&event, &peer_id, self.max_hops) {
@@ -1037,7 +1048,8 @@ impl FederatedChannel for FederationService {
         // F-113: lift the wire-format CN (`String`) into the typed
         // `PeerId` newtype at the gRPC boundary so the OnEvent callback
         // signature stays type-safe end to end.
-        (self.on_event)(event, rustgate_core::PeerId::new(peer_id));
+        // Closes #852 (PR-C): the parsed TraceContext is the third arg.
+        (self.on_event)(event, rustgate_core::PeerId::new(peer_id), trace_ctx);
         Ok(Response::new(figpb::Empty {}))
     }
 
@@ -1144,7 +1156,12 @@ impl FederatedChannel for FederationService {
         request: Request<Streaming<figpb::FederatedEvent>>,
     ) -> Result<Response<figpb::Subscription>, Status> {
         let peer_id = Self::peer_id_from_request(&request)?;
-        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
+        // PR-C of #852: capture the parsed trace context (best-effort)
+        // once at stream open; every event the peer streams over this
+        // RPC inherits the same parent, which is the gRPC streaming
+        // contract — `traceparent` is set on the stream's HTTP/2
+        // headers, not per-frame.
+        let trace_ctx = super::traceparent::extract_into_current_span(&request, &peer_id);
 
         // Per-RPC observability (closes #1299). For a streaming RPC,
         // "duration" is the lifetime of the open stream (handler entry
@@ -1234,7 +1251,14 @@ impl FederatedChannel for FederationService {
                 // callback edge — `pid` itself stays a `String` because
                 // the surrounding allowlist lookup uses `HashMap<String, _>`
                 // keys for now.
-                on_event(event, rustgate_core::PeerId::new(pid.as_str()));
+                // PR-C of #852: the trace context captured at stream-
+                // open time rides on every event the peer streamed
+                // (clone is cheap — `TraceContext` is a thin struct).
+                on_event(
+                    event,
+                    rustgate_core::PeerId::new(pid.as_str()),
+                    trace_ctx.clone(),
+                );
             }
             info!(peer = %pid, "server_event_stream closed");
 
@@ -1769,13 +1793,13 @@ mod tests {
     }
 
     fn noop_on_event() -> OnEvent {
-        Arc::new(|_event, _peer| {})
+        Arc::new(|_event, _peer, _trace| {})
     }
 
     fn counting_on_event() -> (OnEvent, Arc<AtomicU64>) {
         let count = Arc::new(AtomicU64::new(0));
         let c = Arc::clone(&count);
-        let cb: OnEvent = Arc::new(move |_event, _peer| {
+        let cb: OnEvent = Arc::new(move |_event, _peer, _trace| {
             c.fetch_add(1, Ordering::Relaxed);
         });
         (cb, count)

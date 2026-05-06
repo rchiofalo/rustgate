@@ -2229,17 +2229,18 @@ pub fn message_delivered(
     msg_type: &str,
     group: &str,
     entity_kind: Option<&str>,
+    trace_id: Option<&str>,
 ) {
     let source_cn = s(source_cn);
     let dest_cn = s(dest_cn);
     let msg_uid = s(msg_uid);
     let msg_type = s(msg_type);
     let group = s(group);
-    // `entity_kind` is `Option<&str>` so an absent codec / failed
-    // decode renders explicitly as `None` rather than the empty
-    // string — the latter would be ambiguous with a registered codec
-    // that returned an empty `EntityKind::as_str()`, which the closed
-    // vocabulary precludes today but a future refactor could change.
+    // `entity_kind` is `Option<&str>` so an absent codec / failed decode
+    // renders as `None` rather than empty string. `trace_id` (PR-C of
+    // #852) is the 32-char lowercase hex render of `TraceContext::
+    // trace_id_hex` when the routed message carried a W3C trace context
+    // inbound; `None` otherwise — used for cross-service SIEM joins.
     audit!(
         "message.delivered",
         source = %source_cn,
@@ -2248,6 +2249,7 @@ pub fn message_delivered(
         msg_type = %msg_type,
         group = %group,
         entity_kind = ?entity_kind,
+        trace_id = ?trace_id,
         action = "deliver",
         result = "success"
     );
@@ -3175,13 +3177,13 @@ mod tests {
             // Pin every documented call shape so a future refactor
             // that drops a field or reorders arguments fails the
             // build instead of silently reshaping the audit record.
-            message_delivered("alice", "bob", "UID-1", "position", "team", None);
-            message_delivered("alice", "bob", "", "chat", "direct", None);
-            message_delivered("alice", "bob", "UID-2", "alert", "broadcast", None);
-            message_delivered("", "", "", "", "", None);
-            // Closes #847 — pin the entity_kind=Some(...) shape so
-            // the closed-vocabulary tags continue to render through
-            // the audit boundary without per-call sanitization.
+            // entity_kind is 6th, trace_id is 7th. Pin both Some/None
+            // shapes so a regression that flipped a field name or
+            // skipped sanitization is caught.
+            message_delivered("alice", "bob", "UID-1", "position", "team", None, None);
+            message_delivered("alice", "bob", "", "chat", "direct", None, None);
+            message_delivered("alice", "bob", "UID-2", "alert", "broadcast", None, None);
+            message_delivered("", "", "", "", "", None, None);
             message_delivered(
                 "alice",
                 "bob",
@@ -3189,6 +3191,7 @@ mod tests {
                 "position",
                 "team",
                 Some("aircraft"),
+                None,
             );
             message_delivered(
                 "alice",
@@ -3197,6 +3200,7 @@ mod tests {
                 "position",
                 "direct",
                 Some("ground"),
+                Some("4bf92f3577b34da6a3ce929d0e0e4736"),
             );
             message_delivered(
                 "alice",
@@ -3205,6 +3209,7 @@ mod tests {
                 "position",
                 "broadcast",
                 Some("unknown"),
+                None,
             );
         }
 

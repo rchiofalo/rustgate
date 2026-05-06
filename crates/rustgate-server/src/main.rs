@@ -1018,7 +1018,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // `ArcSwap::load` + `is_none` check per recipient.
     if cli.audit_delivery {
         router.set_on_message_delivered(Some(std::sync::Arc::new(
-            |source_cn, dest_cn, msg_uid, msg_type, group, entity_kind| {
+            |source_cn, dest_cn, msg_uid, msg_type, group, entity_kind, trace_id| {
+                // entity_kind closes #847; trace_id closes #852 PR-C
+                // (cross-service SIEM correlation via W3C traceparent).
                 rustgate_core::audit::message_delivered(
                     source_cn,
                     dest_cn,
@@ -1026,6 +1028,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                     msg_type,
                     group,
                     entity_kind,
+                    trace_id,
                 );
             },
         )));

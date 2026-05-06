@@ -128,13 +128,13 @@ async fn mtls_client(fixtures: &MtlsFixtures) -> FederatedChannelClient<tonic::t
 }
 
 fn noop_on_event() -> OnEvent {
-    Arc::new(|_event, _peer| {})
+    Arc::new(|_event, _peer, _trace| {})
 }
 
 fn counting_on_event() -> (OnEvent, Arc<AtomicU64>) {
     let count = Arc::new(AtomicU64::new(0));
     let c = Arc::clone(&count);
-    let cb: OnEvent = Arc::new(move |_event, _peer| {
+    let cb: OnEvent = Arc::new(move |_event, _peer, _trace| {
         let _ = c.fetch_add(1, Ordering::Relaxed);
     });
     (cb, count)
@@ -143,7 +143,7 @@ fn counting_on_event() -> (OnEvent, Arc<AtomicU64>) {
 fn collecting_on_event() -> (OnEvent, Arc<tokio::sync::Mutex<Vec<figpb::FederatedEvent>>>) {
     let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let e = Arc::clone(&events);
-    let cb: OnEvent = Arc::new(move |event, _peer| {
+    let cb: OnEvent = Arc::new(move |event, _peer, _trace| {
         let e = Arc::clone(&e);
         // Spawn to avoid blocking the callback
         drop(tokio::spawn(async move {

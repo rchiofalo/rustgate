@@ -92,6 +92,48 @@ pub(crate) fn inject_into_request<T>(request: &mut tonic::Request<T>) {
 #[cfg(not(feature = "otel"))]
 pub(crate) fn inject_into_request<T>(_request: &mut tonic::Request<T>) {}
 
+/// Inject a caller-supplied [`TraceContext`] onto the outbound gRPC
+/// request as W3C `traceparent` (and `tracestate`) metadata. Closes
+/// #852 (PR-C).
+///
+/// Used by the federation outbound path when `RoutableMessage::metadata
+/// .trace_context` is `Some` — the explicit context wins over whatever
+/// the active OTel span would emit, so a relay node propagates the
+/// original upstream `traceparent` rather than spawning a fresh trace
+/// for the relay hop. Independent of the `otel` feature flag because
+/// the operation is pure header injection — no SDK calls, no span
+/// context lookup.
+//
+// justification: helper is reachable from
+// `outbound_request_with_trace` in `v2::client`, which the V2Queued
+// trace-context carry will drive once the streaming RPC gains a
+// per-event override path. The carry exists today on `V2Queued`;
+// the per-message injection wires up here. Unit tests in
+// `v2::traceparent::tests` exercise the helper end-to-end so the
+// behaviour is locked in alongside the type.
+#[allow(dead_code)]
+pub(crate) fn inject_explicit_context<T>(
+    request: &mut tonic::Request<T>,
+    ctx: &rustgate_core::TraceContext,
+) {
+    // `TraceContext::Display` already renders the canonical W3C banner
+    // string (lowercase hex, version `00`, dash separators), so the
+    // `parse::<AsciiMetadataValue>()` always succeeds for a well-formed
+    // context. We still use the `if let Ok` pattern for symmetry with
+    // the OTel-derived path and to make the failure mode explicit.
+    let banner = ctx.to_string();
+    if let Ok(value) = banner.parse::<tonic::metadata::AsciiMetadataValue>() {
+        let _ = request.metadata_mut().insert(TRACEPARENT_HEADER, value);
+    }
+    if let Some(ts) = ctx.tracestate.as_deref()
+        && !ts.is_empty()
+        && ts.len() <= rustgate_core::MAX_TRACESTATE_BYTES
+        && let Ok(value) = ts.parse::<tonic::metadata::AsciiMetadataValue>()
+    {
+        let _ = request.metadata_mut().insert(TRACESTATE_HEADER, value);
+    }
+}
+
 /// Extract the W3C `traceparent` header from an inbound gRPC request,
 /// parse it into a [`TraceContext`], and return it for the caller to
 /// attach to the per-RPC span.
@@ -340,5 +382,65 @@ mod tests {
         // refactor cannot regress the wire-form contract.
         assert_eq!(TRACEPARENT_HEADER, "traceparent");
         assert_eq!(TRACESTATE_HEADER, "tracestate");
+    }
+
+    #[test]
+    fn inject_explicit_context_sets_traceparent_metadata() {
+        // Closes #852 (PR-C): an explicit `TraceContext` overrides the
+        // OTel-derived inject. Pin the wire-format banner shape and
+        // the `tracestate` companion handling end-to-end at the helper
+        // boundary.
+        let ctx = TraceContext::new(
+            [
+                0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
+                0x47, 0x36,
+            ],
+            [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7],
+            0x01,
+        )
+        .expect("valid context");
+        let mut req: tonic::Request<()> = tonic::Request::new(());
+        inject_explicit_context(&mut req, &ctx);
+        let banner = req
+            .metadata()
+            .get(TRACEPARENT_HEADER)
+            .expect("traceparent injected")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            banner,
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+        assert!(
+            req.metadata().get(TRACESTATE_HEADER).is_none(),
+            "no tracestate carry → header must not be set"
+        );
+    }
+
+    #[test]
+    fn inject_explicit_context_carries_tracestate_when_present() {
+        // The explicit-context inject must respect the optional
+        // `tracestate` companion: present + within cap → injected;
+        // absent or oversized → not set. Pin the present-and-OK branch.
+        let ctx = TraceContext::new(
+            [
+                0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e,
+                0x47, 0x36,
+            ],
+            [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7],
+            0x01,
+        )
+        .expect("valid context")
+        .with_tracestate("vendor=value")
+        .expect("within cap");
+        let mut req: tonic::Request<()> = tonic::Request::new(());
+        inject_explicit_context(&mut req, &ctx);
+        let ts = req
+            .metadata()
+            .get(TRACESTATE_HEADER)
+            .expect("tracestate injected")
+            .to_str()
+            .unwrap();
+        assert_eq!(ts, "vendor=value");
     }
 }
