@@ -415,6 +415,7 @@ async fn audit_event_fields_are_sanitized() {
         "chat",
         "direct",
         None,
+        None,
     );
 
     let captured = buf.snapshot();

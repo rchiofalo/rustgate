@@ -7567,7 +7567,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder_cb = Arc::clone(&recorder);
         router.set_on_message_delivered(Some(Arc::new(
-            move |_src, _dst, _uid, _mtype, _grp, kind| {
+            move |_src, _dst, _uid, _mtype, _grp, kind, _trace| {
                 recorder_cb.lock().push(kind.map(str::to_owned));
             },
         )));
@@ -7608,7 +7608,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder_cb = Arc::clone(&recorder);
         router.set_on_message_delivered(Some(Arc::new(
-            move |_src, _dst, _uid, _mtype, _grp, kind| {
+            move |_src, _dst, _uid, _mtype, _grp, kind, _trace| {
                 recorder_cb.lock().push(kind.map(str::to_owned));
             },
         )));
@@ -7656,7 +7656,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorder_cb = Arc::clone(&recorder);
         router.set_on_message_delivered(Some(Arc::new(
-            move |_src, _dst, _uid, _mtype, _grp, kind| {
+            move |_src, _dst, _uid, _mtype, _grp, kind, _trace| {
                 recorder_cb.lock().push(kind.map(str::to_owned));
             },
         )));

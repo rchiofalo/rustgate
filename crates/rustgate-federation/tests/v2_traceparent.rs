@@ -439,10 +439,7 @@ type CapturedEvent = (String, Option<String>);
 /// Shared single-slot capture used by the PR-C federation tests below.
 type CaptureSlot = Arc<StdMutex<Option<CapturedEvent>>>;
 
-async fn start_capture_server(
-    federate_id: &str,
-    client_cn: &str,
-) -> (MtlsFixtures, CaptureSlot) {
+async fn start_capture_server(federate_id: &str, client_cn: &str) -> (MtlsFixtures, CaptureSlot) {
     let ca = TestCa::new("federation-trace-capture-ca");
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
     let client_cert = ca.issue_client_cert(client_cn, &[]);

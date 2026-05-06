@@ -4174,7 +4174,15 @@ mod tests {
             // refactor that renames a field fails this test instead of
             // silently breaking downstream rules.
             let snapshot = capture_audit(|| {
-                message_delivered("alice", "bob", "ANDROID-1", "position", "team-blue", None)
+                message_delivered(
+                    "alice",
+                    "bob",
+                    "ANDROID-1",
+                    "position",
+                    "team-blue",
+                    None,
+                    None,
+                )
             });
             let event = parse_event(&snapshot, "message.delivered");
             assert_eq!(
@@ -4235,6 +4243,7 @@ mod tests {
                     "position",
                     "team-blue",
                     Some("aircraft"),
+                    None,
                 )
             });
             let event = parse_event(&snapshot, "message.delivered");
@@ -4258,7 +4267,7 @@ mod tests {
             // rejected the payload. Both cases must render explicitly
             // as `None` in the audit record.
             let snapshot = capture_audit(|| {
-                message_delivered("alice", "bob", "UID-1", "chat", "direct", None)
+                message_delivered("alice", "bob", "UID-1", "chat", "direct", None, None)
             });
             let event = parse_event(&snapshot, "message.delivered");
             let entity_kind = event["fields"]["entity_kind"]
@@ -4277,7 +4286,7 @@ mod tests {
             // responsibility regardless of whether the caller wrapped.
             let malicious_cn = "bob\r\n\x1b[31m[FAKE]\x1b[0m";
             let snapshot = capture_audit(|| {
-                message_delivered("alice", malicious_cn, "UID-1", "chat", "direct", None)
+                message_delivered("alice", malicious_cn, "UID-1", "chat", "direct", None, None)
             });
             let event = parse_event(&snapshot, "message.delivered");
             let dest = event["fields"]["dest"]
