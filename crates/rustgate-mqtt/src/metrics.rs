@@ -29,7 +29,7 @@
 use std::sync::OnceLock;
 
 use prometheus::{HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts};
-use rustgate_core::metrics_util::{
+use rustgate_metrics::{
     fallback_counter, fallback_counter_vec, fallback_gauge, fallback_histogram_vec,
 };
 

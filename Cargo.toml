@@ -21,6 +21,7 @@ members = [
     "crates/rustgate-stanag4586",
     "crates/rustgate-guard",
     "crates/rustgate-archive",
+    "crates/rustgate-metrics",
 ]
 exclude = ["fuzz"]
 
@@ -164,6 +165,7 @@ rustgate-resilience = { path = "crates/rustgate-resilience" }
 rustgate-stanag4586 = { path = "crates/rustgate-stanag4586" }
 rustgate-guard = { path = "crates/rustgate-guard" }
 rustgate-archive = { path = "crates/rustgate-archive" }
+rustgate-metrics = { path = "crates/rustgate-metrics" }
 
 [profile.release]
 lto = true

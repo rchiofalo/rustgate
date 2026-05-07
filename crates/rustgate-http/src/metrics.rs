@@ -30,10 +30,10 @@ static BATCHES_FLUSHED: OnceLock<IntCounterVec> = OnceLock::new();
 //
 // When `init()` has not been called, accessor functions lazily create
 // an unregistered metric via `OnceLock::get_or_init()`. The helpers
-// live in `rustgate_core::metrics_util` so every crate following the
+// live in `rustgate_metrics` so every crate following the
 // `OnceLock` + `init()` + accessor pattern shares one implementation.
 
-use rustgate_core::metrics_util::{
+use rustgate_metrics::{
     fallback_counter_vec, fallback_gauge, fallback_gauge_vec, fallback_histogram,
 };
 

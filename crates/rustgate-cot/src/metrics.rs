@@ -23,7 +23,7 @@
 use std::sync::OnceLock;
 
 use prometheus::{Histogram, HistogramOpts, IntCounterVec, Opts};
-use rustgate_core::metrics_util::{fallback_counter_vec, fallback_histogram};
+use rustgate_metrics::{fallback_counter_vec, fallback_histogram};
 
 // ── Static slots ────────────────────────────────────────────────────
 

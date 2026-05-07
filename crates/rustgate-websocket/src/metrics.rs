@@ -26,7 +26,7 @@
 use std::sync::OnceLock;
 
 use prometheus::{IntCounterVec, IntGauge, Opts};
-use rustgate_core::metrics_util::{fallback_counter_vec, fallback_gauge};
+use rustgate_metrics::{fallback_counter_vec, fallback_gauge};
 
 // ── Static slots ────────────────────────────────────────────────────
 

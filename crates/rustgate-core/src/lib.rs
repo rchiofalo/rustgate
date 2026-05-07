@@ -37,8 +37,6 @@ pub mod error;
 pub mod identity;
 pub mod masking;
 pub mod message;
-#[cfg(feature = "metrics")]
-pub mod metrics_util;
 pub mod net;
 pub mod peer_id;
 #[cfg(feature = "pem")]

@@ -11,11 +11,12 @@ repository.workspace = true
 workspace = true
 
 [features]
-metrics = ["dep:prometheus", "rustgate-core/metrics", "rustgate-resilience/metrics"]
+metrics = ["dep:prometheus", "dep:rustgate-metrics", "rustgate-resilience/metrics"]
 
 [dependencies]
 rustgate-archive = { workspace = true }
 rustgate-core = { workspace = true }
+rustgate-metrics = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
 rustgate-cot = { workspace = true }
 bytes = { workspace = true }

@@ -20,10 +20,11 @@ cedar = ["dep:cedar-policy"]
 # decision-cache size gauge (issue #771). Off by default so the
 # no-features build of `rustgate-authz` does not pull in `prometheus`.
 # Enabled by `rustgate-server` when its own `metrics` feature is on.
-metrics = ["dep:prometheus", "rustgate-core/metrics"]
+metrics = ["dep:prometheus", "dep:rustgate-metrics"]
 
 [dependencies]
 rustgate-core = { workspace = true }
+rustgate-metrics = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

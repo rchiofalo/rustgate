@@ -266,14 +266,14 @@ pub fn init() -> prometheus::Result<()> {
 //
 // When `init()` has not been called, accessor functions lazily create
 // an unregistered metric via `OnceLock::get_or_init()`. The helpers
-// live in `rustgate_core::metrics_util` so every crate following the
+// live in `rustgate_metrics` so every crate following the
 // `OnceLock` + `init()` + accessor pattern shares one implementation.
 
-use rustgate_core::metrics_util::{
+use rustgate_core::sanitize::sanitize_for_log;
+use rustgate_metrics::{
     fallback_counter, fallback_counter_vec, fallback_gauge, fallback_gauge_vec,
     fallback_histogram_vec,
 };
-use rustgate_core::sanitize::sanitize_for_log;
 
 // ── Accessor functions ──────────────────────────────────────────────
 //
@@ -850,7 +850,7 @@ mod tests {
     /// metric on demand. We can't isolate the global `OnceLock` from a
     /// preceding test that already triggered `init()`, but the
     /// fallback constructor's correctness is independently exercised
-    /// by `rustgate_core::metrics_util` unit tests; here we just
+    /// by `rustgate_metrics` unit tests; here we just
     /// confirm the accessor returns a callable handle.
     #[test]
     fn rpc_metrics_accessor_works_without_init() {
