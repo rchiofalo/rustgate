@@ -181,7 +181,7 @@ const GROUP_ID_RULES: &str = "group id must be 1–128 bytes, contain only ASCII
 /// another group).
 ///
 /// The 128-byte cap matches the `MAX_CN_LENGTH` convention in
-/// `rustgate_transport::extract` and bounds the worst-case memory
+/// `rustgate_tls::extract` and bounds the worst-case memory
 /// footprint of the in-memory ACL map.
 ///
 /// ## Reserved-sentinel namespace

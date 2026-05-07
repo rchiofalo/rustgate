@@ -2295,7 +2295,7 @@ async fn reload_all_configs(
     cert_reloader: Option<&Arc<rustgate_tls::CertReloader>>,
     acl_reloader: Option<&Arc<acl_reloader::AclReloader>>,
     crl_path: Option<&str>,
-    #[cfg(feature = "ocsp")] ocsp_stapler: Option<&Arc<rustgate_transport::ocsp::Stapler>>,
+    #[cfg(feature = "ocsp")] ocsp_stapler: Option<&Arc<rustgate_tls::ocsp::Stapler>>,
     #[cfg(feature = "federation")] fed_peer_reloader: Option<
         &Arc<federation_reloader::FederationPeerReloader>,
     >,
@@ -2318,7 +2318,7 @@ async fn reload_all_configs(
                     // waiting for the next inbound handshake to surface the
                     // new leaf. There is still a brief unstapled window
                     // until the fetcher completes its OCSP request.
-                    rustgate_transport::ocsp::preload(stapler, ckey);
+                    rustgate_tls::ocsp::preload(stapler, ckey);
                 }
                 tracing::info!(
                     target: "audit",

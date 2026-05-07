@@ -717,7 +717,7 @@ pub(crate) const CERT_EXPIRING_SOON_DAYS: i64 = 30;
 /// `/api/cert/status` so a missing `commonName` RDN renders as JSON
 /// `null` instead of fabricating an empty string. `serial` and
 /// `fingerprint_sha256` are lowercase hex without separators — same
-/// format that `rustgate_transport::extract::cert_serial` and the
+/// format that `rustgate_tls::extract::cert_serial` and the
 /// `rustgate-server cert-info` CLI subcommand emit, so policy authors,
 /// pinning code, and operator tooling all interpret one canonical
 /// rendering. `days_remaining` is computed as a saturating signed
@@ -821,7 +821,7 @@ pub(crate) fn build_v1_cert_status(der: &[u8]) -> Result<V1CertStatus, String> {
     let subject_cn = first_rdn_value(cert.subject(), &OID_X509_COMMON_NAME);
     let issuer_cn = first_rdn_value(cert.issuer(), &OID_X509_COMMON_NAME);
 
-    // Match `rustgate_transport::extract::cert_serial` so policy rules
+    // Match `rustgate_tls::extract::cert_serial` so policy rules
     // and operator tooling interpret the same hex string.
     let serial = hex::encode(cert.tbs_certificate.serial.to_bytes_be());
 

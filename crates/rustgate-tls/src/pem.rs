@@ -20,7 +20,7 @@ mod tests {
     //! surface: a silent upstream rename or accidental removal of one
     //! of the three helpers must fail this build, not produce a stale
     //! import that breaks downstream crates (`rustgate-client` and
-    //! integration tests still reach for `rustgate_transport::pem::…`).
+    //! integration tests still reach for `rustgate_tls::pem::…`).
     use rustgate_test_utils::certs::TestCa;
     use rustls_pki_types::PrivateKeyDer;
 
