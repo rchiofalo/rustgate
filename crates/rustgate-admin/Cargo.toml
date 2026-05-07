@@ -1,0 +1,44 @@
+[package]
+name = "rustgate-admin"
+description = "HTTP management server: Prometheus exposition, health/readiness probes, federation/mgmt/ACL APIs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+nats = ["dep:rustgate-nats"]
+federation = ["dep:rustgate-federation"]
+http = ["dep:rustgate-http"]
+
+[dependencies]
+rustgate-core = { workspace = true }
+rustgate-tls = { workspace = true }
+rustgate-transport = { workspace = true }
+rustgate-nats = { workspace = true, optional = true }
+rustgate-federation = { workspace = true, optional = true }
+rustgate-http = { workspace = true, optional = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+prometheus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros", "rt-multi-thread"] }
+tracing = { workspace = true }
+x509-parser = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+rustgate-test-utils = { workspace = true }
+http-body = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "time"] }

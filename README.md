@@ -100,6 +100,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-federation`](crates/rustgate-federation/README.md) | Server-to-server federation: V1 (XML), V2 (gRPC), HA, REST API |
 | [`rustgate-client`](crates/rustgate-client/README.md) | Lightweight client library for integration testing |
 | [`rustgate-server`](crates/rustgate-server/README.md) | Binary entry point, CLI, orchestration |
+| [`rustgate-admin`](crates/rustgate-admin/README.md) | HTTP management server: Prometheus exposition, health/readiness probes, federation/mgmt/ACL APIs |
 | [`rustgate-archive`](crates/rustgate-archive/README.md) | Encrypted hash-chained archives (ChaCha20-Poly1305 + SHA-256 chain) |
 | [`rustgate-metrics`](crates/rustgate-metrics/README.md) | Shared Prometheus scaffolding: OnceLock fallbacks, init() orchestration, standard buckets |
 | [`rustgate-test-utils`](crates/rustgate-test-utils/README.md) | Test CA and certificate generation helpers |

@@ -15,7 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [features]
-nats = ["dep:rustgate-nats"]
+nats = ["dep:rustgate-nats", "rustgate-admin/nats"]
 enrollment = ["dep:rustgate-enrollment"]
 est = ["enrollment", "rustgate-enrollment/est"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto", "rustgate-http?/proto"]
@@ -23,7 +23,6 @@ full-detail = ["nats", "rustgate-nats/full-detail"]
 metrics = [
     "dep:prometheus",
     "dep:hyper",
-    "dep:hyper-util",
     "dep:http-body-util",
     "dep:rustgate-metrics",
     "rustgate-authz/metrics",
@@ -33,7 +32,7 @@ metrics = [
     "rustgate-websocket?/metrics",
     "rustgate-http?/metrics",
 ]
-federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api"]
+federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api", "rustgate-admin/federation"]
 federation-ha = ["federation", "rustgate-federation/ha"]
 # Sub-features selecting which dynamic peer-discovery backends the server
 # binary will ship with (issue #571). The `peer-discovery` umbrella enables
@@ -58,7 +57,7 @@ ocsp = ["rustgate-tls/ocsp"]
 spiffe = ["rustgate-tls/spiffe"]
 # Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
 cedar = ["rustgate-authz/cedar"]
-http = ["dep:rustgate-http"]
+http = ["dep:rustgate-http", "rustgate-admin/http"]
 # Emit a JSON Schema for `rustgate.toml` via the `emit-schema` subcommand
 # so operators can wire it into VS Code (Even Better TOML) or any
 # JSON-Schema-aware editor for autocomplete + inline validation. Pulls in
@@ -68,6 +67,7 @@ schema = ["dep:schemars"]
 
 [dependencies]
 arc-swap = { workspace = true }
+rustgate-admin = { workspace = true }
 rustgate-archive = { workspace = true }
 rustgate-authz = { workspace = true }
 rustgate-core = { workspace = true }
@@ -93,7 +93,6 @@ rustgate-federation = { workspace = true, optional = true }
 rustgate-http = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
@@ -142,9 +141,7 @@ rustgate-transport = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
 serial_test = { workspace = true }
-smol_str = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "time"] }
-http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 bytes = { workspace = true }

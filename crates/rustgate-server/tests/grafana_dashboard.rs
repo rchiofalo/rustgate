@@ -107,31 +107,56 @@ fn extract_metric_names(expr: &str) -> BTreeSet<String> {
     out
 }
 
-/// Read every `crates/*/src/metrics.rs` and collect the set of metric
-/// names declared as `"rustgate_..."` string literals. The `Opts::new`
-/// / `HistogramOpts::new` constructors and the `fallback_*` helpers all
-/// take the metric name as the first string argument, so a literal scan
-/// is sufficient and avoids depending on the prometheus crate's runtime
-/// registry.
+/// Read every `crates/*/src/metrics.rs` (plus a small allowlist of
+/// non-`metrics.rs` files for crates whose Prometheus surface lives in
+/// a differently-named module) and collect the set of metric names
+/// declared as `"rustgate_..."` string literals. The `Opts::new` /
+/// `HistogramOpts::new` constructors and the `fallback_*` helpers all
+/// take the metric name as the first string argument, so a literal
+/// scan is sufficient and avoids depending on the prometheus crate's
+/// runtime registry.
+///
+/// `rustgate-admin` (#895) registers `rustgate_cert_expiry_seconds`
+/// from `src/server.rs` because the gauge is updated as a side effect
+/// of `ReadinessState::check`; the test scans that file alongside the
+/// canonical `metrics.rs` modules.
 fn defined_metric_names() -> BTreeSet<String> {
     let crates_dir = workspace_root().join("crates");
     let crate_dirs = std::fs::read_dir(&crates_dir)
         .unwrap_or_else(|e| panic!("read {} failed: {e}", crates_dir.display()))
         .filter_map(Result::ok);
     let mut out = BTreeSet::new();
+    let extra_scans: &[(&str, &str)] = &[("rustgate-admin", "server.rs")];
     for entry in crate_dirs {
+        let mut paths_to_scan = Vec::new();
         let metrics_rs = entry.path().join("src").join("metrics.rs");
-        if !metrics_rs.exists() {
-            continue;
+        if metrics_rs.exists() {
+            paths_to_scan.push(metrics_rs);
         }
-        let raw = std::fs::read_to_string(&metrics_rs)
-            .unwrap_or_else(|e| panic!("read {} failed: {e}", metrics_rs.display()));
-        for hit in raw.split("\"rustgate_").skip(1) {
-            if let Some(end) = hit.find('"') {
-                let name = format!("rustgate_{}", &hit[..end]);
-                // Defensive: identifier characters only.
-                if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                    let _ = out.insert(name);
+        let crate_name = entry
+            .path()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        for (extra_crate, extra_file) in extra_scans {
+            if crate_name == *extra_crate {
+                let extra = entry.path().join("src").join(extra_file);
+                if extra.exists() {
+                    paths_to_scan.push(extra);
+                }
+            }
+        }
+        for path in paths_to_scan {
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()));
+            for hit in raw.split("\"rustgate_").skip(1) {
+                if let Some(end) = hit.find('"') {
+                    let name = format!("rustgate_{}", &hit[..end]);
+                    // Defensive: identifier characters only.
+                    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        let _ = out.insert(name);
+                    }
                 }
             }
         }

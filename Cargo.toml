@@ -20,6 +20,7 @@ members = [
     "crates/rustgate-resilience",
     "crates/rustgate-stanag4586",
     "crates/rustgate-guard",
+    "crates/rustgate-admin",
     "crates/rustgate-archive",
     "crates/rustgate-metrics",
     "crates/rustgate-tls",
@@ -165,6 +166,7 @@ rustgate-asterix = { path = "crates/rustgate-asterix" }
 rustgate-resilience = { path = "crates/rustgate-resilience" }
 rustgate-stanag4586 = { path = "crates/rustgate-stanag4586" }
 rustgate-guard = { path = "crates/rustgate-guard" }
+rustgate-admin = { path = "crates/rustgate-admin" }
 rustgate-archive = { path = "crates/rustgate-archive" }
 rustgate-metrics = { path = "crates/rustgate-metrics" }
 rustgate-tls = { path = "crates/rustgate-tls" }
