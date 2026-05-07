@@ -22,7 +22,7 @@
 use std::sync::OnceLock;
 
 use prometheus::{IntCounterVec, IntGaugeVec, Opts};
-use rustgate_core::metrics_util::{fallback_counter_vec, fallback_gauge_vec};
+use rustgate_metrics::{fallback_counter_vec, fallback_gauge_vec};
 
 static EVALUATIONS: OnceLock<IntCounterVec> = OnceLock::new();
 static THROUGHPUT_BPS: OnceLock<IntGaugeVec> = OnceLock::new();
@@ -82,7 +82,7 @@ pub fn init() -> prometheus::Result<()> {
 ///
 /// Falls back to an unregistered counter if `init()` was never called
 /// — matches the workspace pattern in
-/// [`rustgate_core::metrics_util::fallback_counter_vec`].
+/// [`rustgate_metrics::fallback_counter_vec`].
 pub fn evaluations_total() -> &'static IntCounterVec {
     EVALUATIONS.get_or_init(|| {
         fallback_counter_vec(

@@ -25,7 +25,7 @@ metrics = [
     "dep:hyper",
     "dep:hyper-util",
     "dep:http-body-util",
-    "rustgate-core/metrics",
+    "dep:rustgate-metrics",
     "rustgate-authz/metrics",
     "rustgate-cot/metrics",
     "rustgate-proto?/metrics",
@@ -72,6 +72,7 @@ rustgate-archive = { workspace = true }
 rustgate-authz = { workspace = true }
 rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
+rustgate-metrics = { workspace = true, optional = true }
 # Closes #847. The server registers EntityCodec implementations for
 # every wire-format crate at startup so the router can surface
 # canonical Entity-kind tags to audit and per-kind metrics. These are

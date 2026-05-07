@@ -420,7 +420,7 @@ fn rpc_metrics_init_is_idempotent() {
 /// is "the accessor returns something usable", and that's verified by
 /// successfully creating a label set on the returned vec — the
 /// fallback constructor's correctness is independently exercised by
-/// `rustgate_core::metrics_util` unit tests.
+/// `rustgate_metrics` unit tests.
 #[test]
 fn rpc_metrics_accessor_works_without_init() {
     let _ = rpc_duration().with_label_values(&[

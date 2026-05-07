@@ -21,7 +21,7 @@ ignored = ["prost-types", "prost-build", "tonic-prost-build"]
 default = []
 v2 = ["dep:tonic", "dep:tonic-prost", "dep:tokio-stream", "dep:prost-types", "dep:prost-build", "dep:tonic-prost-build", "dep:rustgate-proto"]
 ha = ["dep:async-nats"]
-api = ["dep:hyper", "dep:http-body-util", "dep:prometheus", "rustgate-core/metrics"]
+api = ["dep:hyper", "dep:http-body-util", "dep:prometheus", "dep:rustgate-metrics"]
 fips = ["rustls/aws_lc_rs", "rustls/fips", "tonic?/tls-aws-lc"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum", "tonic?/tls-aws-lc"]
 # Dynamic peer discovery backends (issue #571). Each backend is independently
@@ -51,6 +51,7 @@ otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }
+rustgate-metrics = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
 rustgate-transport = { workspace = true }

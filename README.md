@@ -100,6 +100,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-client`](crates/rustgate-client/README.md) | Lightweight client library for integration testing |
 | [`rustgate-server`](crates/rustgate-server/README.md) | Binary entry point, CLI, orchestration |
 | [`rustgate-archive`](crates/rustgate-archive/README.md) | Encrypted hash-chained archives (ChaCha20-Poly1305 + SHA-256 chain) |
+| [`rustgate-metrics`](crates/rustgate-metrics/README.md) | Shared Prometheus scaffolding: OnceLock fallbacks, init() orchestration, standard buckets |
 | [`rustgate-test-utils`](crates/rustgate-test-utils/README.md) | Test CA and certificate generation helpers |
 
 For detailed architecture documentation see [docs/architecture.md](docs/architecture.md).

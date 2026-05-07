@@ -940,27 +940,35 @@ pub(crate) async fn start_metrics(
     mgmt_api_slot: &Arc<std::sync::OnceLock<metrics::MgmtApiHandler>>,
     router_slot: &metrics::RouterSlot,
 ) -> anyhow::Result<Arc<metrics::MetricsIdentity>> {
-    metrics::init().context("registering metrics")?;
-
-    #[cfg(feature = "federation")]
-    rustgate_federation::metrics::init().context("registering federation metrics")?;
-
-    #[cfg(all(feature = "http", feature = "metrics"))]
-    rustgate_http::metrics::init().context("registering HTTP egress metrics")?;
-
-    // Per-crate metrics modules added under issue #771. Each registers
+    // Aggregate every domain crate's `init()` callback into a single
+    // ordered registry, then run the sequence with `init_all`. The
+    // first error short-circuits and propagates out of this function
+    // — identical semantics to the historical hardcoded ladder of
+    // `?`-propagating calls, but the bring-up sequence is now data
+    // (closes #894).
+    //
+    // Per-crate metrics modules added under issue #771 register
     // additional metric families on top of the pre-existing
     // `rustgate-server::metrics` surface for that crate; conflicts are
     // avoided by deliberate naming (see the per-crate metrics-module
     // header doc-comments for the boundary discipline).
-    rustgate_authz::metrics::init().context("registering authz metrics")?;
-    rustgate_cot::metrics::init().context("registering cot metrics")?;
+    let mut registry = rustgate_metrics::MetricsRegistry::default();
+    let _ = registry.register(metrics::init);
+    #[cfg(feature = "federation")]
+    let _ = registry.register(rustgate_federation::metrics::init);
+    #[cfg(all(feature = "http", feature = "metrics"))]
+    let _ = registry.register(rustgate_http::metrics::init);
+    let _ = registry.register(rustgate_authz::metrics::init);
+    let _ = registry.register(rustgate_cot::metrics::init);
     #[cfg(feature = "proto")]
-    rustgate_proto::metrics::init().context("registering proto metrics")?;
+    let _ = registry.register(rustgate_proto::metrics::init);
     #[cfg(feature = "mqtt")]
-    rustgate_mqtt::metrics::init().context("registering mqtt metrics")?;
+    let _ = registry.register(rustgate_mqtt::metrics::init);
     #[cfg(feature = "websocket")]
-    rustgate_websocket::metrics::init().context("registering websocket metrics")?;
+    let _ = registry.register(rustgate_websocket::metrics::init);
+    registry
+        .init_all()
+        .context("registering workspace metrics")?;
 
     // Load the optional CN allowlist for per-identity metric label
     // bucketing. When unset, all CNs collapse to the literal "other"

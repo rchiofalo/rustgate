@@ -16,11 +16,12 @@ fuzz = ["dep:arbitrary", "rustgate-core/fuzz"]
 # Off by default so the no-features build of `rustgate-cot` does not pull
 # in `prometheus`. Enabled by `rustgate-server` when its own `metrics`
 # feature is on.
-metrics = ["dep:prometheus", "rustgate-core/metrics"]
+metrics = ["dep:prometheus", "dep:rustgate-metrics"]
 
 [dependencies]
 arbitrary = { workspace = true, optional = true }
 rustgate-core = { workspace = true }
+rustgate-metrics = { workspace = true, optional = true }
 bytes = { workspace = true }
 quick-xml = { workspace = true }
 lru = { workspace = true }

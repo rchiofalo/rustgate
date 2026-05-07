@@ -1,0 +1,14 @@
+[package]
+name = "rustgate-metrics"
+description = "Shared Prometheus scaffolding for rustgate: OnceLock fallbacks, init() orchestration, standard buckets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+prometheus = { workspace = true }

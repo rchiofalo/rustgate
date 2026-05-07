@@ -16,10 +16,11 @@ default = []
 # gauge / will-message counter (issue #771). Off by default so the
 # no-features build of `rustgate-mqtt` does not pull in `prometheus`.
 # Enabled by `rustgate-server` when its own `metrics` feature is on.
-metrics = ["dep:prometheus", "rustgate-core/metrics"]
+metrics = ["dep:prometheus", "dep:rustgate-metrics"]
 
 [dependencies]
 rustgate-core = { workspace = true }
+rustgate-metrics = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
 rustgate-transport = { workspace = true }
 bytes = { workspace = true }

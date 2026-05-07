@@ -3250,6 +3250,7 @@ dependencies = [
  "prometheus",
  "proptest",
  "rustgate-core",
+ "rustgate-metrics",
  "serde",
  "serde_json",
  "sha2",
@@ -3289,7 +3290,6 @@ dependencies = [
  "base64",
  "bytes",
  "hmac",
- "prometheus",
  "proptest",
  "rcgen",
  "rustls",
@@ -3320,6 +3320,7 @@ dependencies = [
  "proptest",
  "quick-xml",
  "rustgate-core",
+ "rustgate-metrics",
  "thiserror 2.0.18",
 ]
 
@@ -3385,6 +3386,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rustgate-core",
+ "rustgate-metrics",
  "rustgate-proto",
  "rustgate-resilience",
  "rustgate-test-utils",
@@ -3423,6 +3425,7 @@ dependencies = [
  "rustgate-archive",
  "rustgate-core",
  "rustgate-cot",
+ "rustgate-metrics",
  "rustgate-resilience",
  "serde_json",
  "sha2",
@@ -3449,6 +3452,7 @@ dependencies = [
  "reqwest",
  "rustgate-archive",
  "rustgate-core",
+ "rustgate-metrics",
  "rustgate-proto",
  "rustgate-resilience",
  "rustgate-test-utils",
@@ -3484,6 +3488,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-metrics"
+version = "0.8.0"
+dependencies = [
+ "prometheus",
+]
+
+[[package]]
 name = "rustgate-mqtt"
 version = "0.8.0"
 dependencies = [
@@ -3492,6 +3503,7 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "rustgate-core",
+ "rustgate-metrics",
  "rustgate-resilience",
  "rustgate-test-utils",
  "rustgate-transport",
@@ -3538,6 +3550,7 @@ dependencies = [
  "prost-build",
  "quick-xml",
  "rustgate-core",
+ "rustgate-metrics",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -3584,6 +3597,7 @@ dependencies = [
  "rustgate-federation",
  "rustgate-http",
  "rustgate-mavlink",
+ "rustgate-metrics",
  "rustgate-mqtt",
  "rustgate-nats",
  "rustgate-proto",
@@ -3695,6 +3709,7 @@ dependencies = [
  "prometheus",
  "rustgate-core",
  "rustgate-cot",
+ "rustgate-metrics",
  "rustgate-resilience",
  "rustgate-test-utils",
  "rustgate-transport",
