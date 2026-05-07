@@ -3796,6 +3796,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-vmf"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "rustgate-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rustgate-websocket"
 version = "0.8.0"
 dependencies = [
