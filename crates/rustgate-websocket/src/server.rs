@@ -23,7 +23,9 @@ use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::tasks::spawn_background;
 use rustgate_cot::MessageBuilder;
-use rustgate_router::{ClientThrottle, ReplayFilter, Router, SessionHandle, ThrottleConfig};
+use rustgate_router::{
+    ClientThrottle, RecipientClass, ReplayFilter, Router, SessionHandle, ThrottleConfig,
+};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::{Interval, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
@@ -531,15 +533,38 @@ async fn ws_read_loop(
             continue;
         };
 
-        if let Some(cb) = nats_publish {
-            cb((*routed).clone());
+        // Closes #746: each external sink renders its own envelope with
+        // its sink-class as resource so per-sink Send-PEP rules
+        // (e.g. `MaskPayload` on an HTTP webhook bound to a SIEM) are
+        // applied before the publisher callback observes the payload.
+        if let Some(cb) = nats_publish
+            && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+                Arc::clone(&routed),
+                RecipientClass::NatsSink(String::new()),
+            )
+        {
+            cb((*envelope.message).clone());
         }
-        if let Some(fwd) = fed_forward {
-            let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
-            fwd(routed.payload.clone(), groups, routed.metadata.clone());
+        if let Some(fwd) = fed_forward
+            && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+                Arc::clone(&routed),
+                RecipientClass::FederationPeer(rustgate_core::PeerId::new(String::new())),
+            )
+        {
+            let groups: Vec<String> = envelope.message.source.groups.iter().cloned().collect();
+            fwd(
+                envelope.message.payload.clone(),
+                groups,
+                envelope.message.metadata.clone(),
+            );
         }
-        if let Some(fwd) = http_forward {
-            fwd((*routed).clone());
+        if let Some(fwd) = http_forward
+            && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+                Arc::clone(&routed),
+                RecipientClass::HttpSink(String::new()),
+            )
+        {
+            fwd((*envelope.message).clone());
         }
     }
 }

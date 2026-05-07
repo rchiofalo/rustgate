@@ -1384,14 +1384,15 @@ pub(crate) fn build_federation_inbound_handler(
             // local fanout.
             let routed = router.route_for_egress(msg).await;
             if let Some(routed) = routed.as_ref() {
-                fire_federation_inbound_forwarding(&hooks, routed);
+                fire_federation_inbound_forwarding(&router, &hooks, routed);
             }
         });
     })
 }
 
 /// Fan out the post-Send-PEP routed message from the federation
-/// `on_inbound` path to NATS and HTTP egress sinks (refs #737).
+/// `on_inbound` path to NATS and HTTP egress sinks (refs #737, closes
+/// #746).
 ///
 /// Mirrors the helper in `rustgate_nats::subscriber` so a
 /// federation-inbound message that survives the router's
@@ -1399,21 +1400,40 @@ pub(crate) fn build_federation_inbound_handler(
 /// same way an MQTT publish or NATS subscribe would be. Each sink
 /// is independent — a `None` field is a no-op and never allocates.
 ///
+/// **Per-sink envelope rendering** (closes #746). Each wired sink
+/// renders its own [`rustgate_router::EgressEnvelope`] via
+/// [`Router::prepare_egress_envelope_for_sink`] with its own
+/// [`rustgate_router::RecipientClass`] before invoking the publisher
+/// callback. Send-PEP rules addressed to a sink class are applied per
+/// envelope; an envelope-level deny suppresses dispatch to that sink
+/// only.
+///
 /// `nats_publish` is fired without a short-circuit because the
 /// NATS publisher's echo guard matches `source_protocol == "nats"`
 /// only (case-insensitive, see #1192) — federation→NATS fan-out is
 /// the intended behaviour.
 #[cfg(feature = "federation")]
 fn fire_federation_inbound_forwarding(
+    router: &Router,
     hooks: &FedInboundForwardingHooks,
     routed: &Arc<RoutableMessage>,
 ) {
-    if let Some(cb) = hooks.nats_publish.as_ref() {
-        cb(routed.as_ref().clone());
+    if let Some(cb) = hooks.nats_publish.as_ref()
+        && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+            Arc::clone(routed),
+            rustgate_router::RecipientClass::NatsSink(String::new()),
+        )
+    {
+        cb(envelope.message.as_ref().clone());
     }
     #[cfg(feature = "http")]
-    if let Some(fwd) = hooks.http_forward.as_ref() {
-        fwd(routed.as_ref().clone());
+    if let Some(fwd) = hooks.http_forward.as_ref()
+        && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+            Arc::clone(routed),
+            rustgate_router::RecipientClass::HttpSink(String::new()),
+        )
+    {
+        fwd(envelope.message.as_ref().clone());
     }
 }
 

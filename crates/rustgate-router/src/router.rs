@@ -52,7 +52,8 @@ use rustgate_authz::{
 use smol_str::SmolStr;
 
 use crate::egress::{
-    EgressContext, EgressError, EnvelopeEvaluator, RecipientClass, prepare_egress_envelope,
+    EgressContext, EgressEnvelope, EgressError, EnvelopeEvaluator, RecipientClass,
+    prepare_egress_envelope,
 };
 use crate::obligations::{
     ObligationRateLimiter, UnknownObligationPolicy, apply_obligations_with_limiter,
@@ -2542,6 +2543,72 @@ impl Router {
         }
 
         routed
+    }
+
+    /// Render the per-sink egress envelope for an already-routed message.
+    ///
+    /// External-sink fan-out (NATS publisher, federation peer client, HTTP
+    /// webhook publisher, MQTT publisher) calls this method with the
+    /// [`Arc<RoutableMessage>`] returned by [`Self::route_for_egress`] and
+    /// the sink's own [`RecipientClass`]. The returned [`EgressEnvelope`]
+    /// carries the post-Send-PEP `Arc<RoutableMessage>` that the sink
+    /// MUST dispatch — never the input arc — so any Send obligations
+    /// addressed to the sink class (e.g. `MaskPayload` against an
+    /// HTTP webhook bound to a SIEM) are applied before the payload
+    /// leaves the process.
+    ///
+    /// Why this is the architectural fix for #746:
+    ///
+    /// `route_for_egress` returns one [`Arc`] sized for the *highest*
+    /// privilege recipient class on the local-fanout path (multicast
+    /// folds the union across addressed groups; Direct/Group/Broadcast
+    /// short-circuit to the unmodified inbound arc). For external sinks
+    /// addressed by *their own* `AuthzResource` — a NATS subject, an
+    /// HTTP endpoint, a federation peer — the policy engine may have
+    /// distinct Send rules. Without a per-sink envelope rendering step,
+    /// every external sink would observe the same arc and per-sink
+    /// obligations would never run on the egress path. This method is
+    /// the "external sinks call the helper with the egress class as
+    /// resource" half of #746.
+    ///
+    /// # Performance contract
+    ///
+    /// The rendered `Arc<RoutableMessage>` is paid for exactly once per
+    /// call. When the input message is the same `Arc` as the output
+    /// envelope's [`EgressEnvelope::message`] (no payload-mutating
+    /// obligations) the method is allocation-free; the input arc is
+    /// simply rewrapped. The audit cadence of
+    /// [`rustgate_core::audit::egress_obligation_applied`] is
+    /// per-envelope, per-applied-obligation — exactly one event per
+    /// envelope per obligation, never duplicated across recipients of a
+    /// single envelope.
+    ///
+    /// # Errors
+    ///
+    /// - [`EgressError::Denied`] when the Send PEP for the sink class
+    ///   denies the message. Sinks MUST suppress the dispatch so no
+    ///   external observer sees a denied envelope.
+    /// - [`EgressError::ObligationFailed`] when obligation actuation
+    ///   fails under the configured
+    ///   [`UnknownObligationPolicy::FailClosed`]. Sinks MUST suppress
+    ///   the dispatch so no leaked unmasked payload reaches an external
+    ///   sink.
+    ///
+    /// [`UnknownObligationPolicy::FailClosed`]:
+    ///     crate::obligations::UnknownObligationPolicy::FailClosed
+    pub fn prepare_egress_envelope_for_sink(
+        &self,
+        arc_msg: Arc<RoutableMessage>,
+        class: RecipientClass,
+    ) -> Result<EgressEnvelope, EgressError> {
+        let authz_guard = self.authz.load();
+        let engine_ref = (**authz_guard).as_ref();
+        let ctx = EgressContext {
+            engine: engine_ref,
+            unknown_policy: self.unknown_obligation_policy,
+            rate_limiter: &self.obligation_rate_limiter,
+        };
+        prepare_egress_envelope(arc_msg, class, &ctx, self)
     }
 
     /// Inner routing logic, separated so [`Self::route_for_egress`] can

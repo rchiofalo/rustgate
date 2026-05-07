@@ -21,7 +21,7 @@ use rustgate_core::message::Destination;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
 use rustgate_cot::delta::{DeltaEncoder, DeltaOutput};
-use rustgate_router::{ReplayFilter, Router, SessionHandle, ThrottleConfig};
+use rustgate_router::{RecipientClass, ReplayFilter, Router, SessionHandle, ThrottleConfig};
 use rustgate_tls::AuthenticatedSession;
 use rustgate_transport::FramedCodec;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -582,23 +582,47 @@ async fn read_loop(
             continue;
         };
 
+        // Closes #746: each external sink renders its own envelope so
+        // per-sink Send-PEP rules (e.g. `MaskPayload` on an HTTP webhook
+        // bound to a SIEM) are applied before the publisher callback
+        // observes the payload.
+
         // Publish to NATS after local routing (fire-and-forget)
-        if let Some(publisher) = ctx.nats_publisher {
+        if let Some(publisher) = ctx.nats_publisher
+            && let Ok(envelope) = ctx.router.prepare_egress_envelope_for_sink(
+                Arc::clone(&routed),
+                RecipientClass::NatsSink(String::new()),
+            )
+        {
             #[cfg(feature = "metrics")]
             metrics::nats_publishes().inc();
-            publisher.publish(&routed).await;
+            publisher.publish(&envelope.message).await;
         }
 
         // Forward to federation peers (fire-and-forget)
-        if let Some(fwd) = ctx.fed_forward {
-            let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
-            fwd(routed.payload.clone(), groups, routed.metadata.clone());
+        if let Some(fwd) = ctx.fed_forward
+            && let Ok(envelope) = ctx.router.prepare_egress_envelope_for_sink(
+                Arc::clone(&routed),
+                RecipientClass::FederationPeer(rustgate_core::PeerId::new(String::new())),
+            )
+        {
+            let groups: Vec<String> = envelope.message.source.groups.iter().cloned().collect();
+            fwd(
+                envelope.message.payload.clone(),
+                groups,
+                envelope.message.metadata.clone(),
+            );
         }
 
         // Forward to HTTP targets (fire-and-forget)
         #[cfg(feature = "http")]
-        if let Some(fwd) = ctx.http_forward {
-            fwd((*routed).clone());
+        if let Some(fwd) = ctx.http_forward
+            && let Ok(envelope) = ctx.router.prepare_egress_envelope_for_sink(
+                Arc::clone(&routed),
+                RecipientClass::HttpSink(String::new()),
+            )
+        {
+            fwd((*envelope.message).clone());
         }
     }
 
@@ -1043,18 +1067,42 @@ async fn run_plaintext_session_loops<P: NatsPublish>(
                     continue;
                 };
 
-                if let Some(publisher) = nats_publisher {
-                    publisher.publish(&routed).await;
+                // Closes #746: each external sink renders its own
+                // envelope so per-sink Send-PEP rules (e.g.
+                // `MaskPayload` on a federation peer) are applied
+                // before the publisher callback observes the payload.
+                if let Some(publisher) = nats_publisher
+                    && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+                        Arc::clone(&routed),
+                        RecipientClass::NatsSink(String::new()),
+                    )
+                {
+                    publisher.publish(&envelope.message).await;
                 }
 
-                if let Some(fwd) = fed_forward {
-                    let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
-                    fwd(routed.payload.clone(), groups, routed.metadata.clone());
+                if let Some(fwd) = fed_forward
+                    && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+                        Arc::clone(&routed),
+                        RecipientClass::FederationPeer(rustgate_core::PeerId::new(String::new())),
+                    )
+                {
+                    let groups: Vec<String> =
+                        envelope.message.source.groups.iter().cloned().collect();
+                    fwd(
+                        envelope.message.payload.clone(),
+                        groups,
+                        envelope.message.metadata.clone(),
+                    );
                 }
 
                 #[cfg(feature = "http")]
-                if let Some(fwd) = http_forward {
-                    fwd((*routed).clone());
+                if let Some(fwd) = http_forward
+                    && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+                        Arc::clone(&routed),
+                        RecipientClass::HttpSink(String::new()),
+                    )
+                {
+                    fwd((*envelope.message).clone());
                 }
             }
             Ok(())
