@@ -10,7 +10,7 @@
 //! configuration changed are reconnected with the new settings. Peers that
 //! are unchanged are left alone — existing connections are preserved.
 //!
-//! Mirrors the polling pattern used by [`crate::acl_reloader::AclReloader`].
+//! Mirrors the polling pattern used by [`rustgate_admin::AclReloader`].
 //!
 //! The watcher is intended to be **single-instance** per server process: a
 //! single `FederationPeerReloader` is constructed at startup and shared

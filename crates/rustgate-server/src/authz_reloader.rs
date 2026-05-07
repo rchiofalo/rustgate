@@ -2,7 +2,7 @@
 
 //! Authz policy file hot-reload via polling.
 //!
-//! Mirrors [`crate::acl_reloader::AclReloader`]: compute a SHA-256 digest
+//! Mirrors [`rustgate_admin::AclReloader`]: compute a SHA-256 digest
 //! of the on-disk JSON policy file, compare against the last successfully
 //! loaded digest, and when the file content changes parse + compile the
 //! new policy **before** swapping it onto the router. Parse or compile

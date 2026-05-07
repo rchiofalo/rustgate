@@ -25,10 +25,6 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-#[cfg(feature = "metrics")]
-mod acl_api;
-mod acl_config;
-mod acl_reloader;
 mod audit;
 mod authz_reloader;
 mod cli;
@@ -652,11 +648,11 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
 
     // Differentiated health probe state for K8s liveness/readiness/startup.
-    // `live` flips on inside `metrics::serve` when the metrics server binds.
+    // `live` flips on inside `rustgate_admin::serve` when the metrics server binds.
     // `ready` is set after listener + ACL + (optional) federation init.
     // `started` is a one-shot, flipped after the accept loop is reached.
     #[cfg(feature = "metrics")]
-    let health = Arc::new(metrics::HealthState::new());
+    let health = Arc::new(rustgate_admin::HealthState::new());
     // Legacy compatibility shim: a number of code paths still use a bare
     // `ready` AtomicBool to gate accept-loop behaviour. Keep it for now —
     // it shadows the readiness portion of `HealthState`.
@@ -665,27 +661,31 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // Readiness dependency state — holds handles to subsystems so the
     // `/readyz` endpoint can inspect their health.
     #[cfg(feature = "metrics")]
-    let readiness = Arc::new(metrics::ReadinessState {
-        cert_reloader: cert_reloader.as_ref().map(Arc::clone),
-        #[cfg(feature = "nats")]
-        nats_publisher: std::sync::Mutex::new(None),
-        #[cfg(feature = "federation")]
-        federation_manager: std::sync::Mutex::new(None),
-        #[cfg(feature = "http")]
-        http_publisher: std::sync::Mutex::new(None),
-    });
+    let readiness = {
+        let mut state = rustgate_admin::ReadinessState::new();
+        state.cert_reloader = cert_reloader.as_ref().map(Arc::clone);
+        // Wire jemalloc refresh as a pre-scrape hook so /metrics
+        // returns current values rather than whatever was cached at
+        // last gather. The hook is target-gated to non-Windows
+        // mirroring the Cargo.toml gate on the allocator dep.
+        #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
+        {
+            state.pre_scrape = Some(Arc::new(metrics::refresh_jemalloc_stats));
+        }
+        Arc::new(state)
+    };
 
     // ── Metrics ─────────────────────────────────────────────────────
     #[cfg(all(feature = "metrics", feature = "federation"))]
-    let fed_api_slot: Arc<std::sync::OnceLock<metrics::FedApiHandler>> =
+    let fed_api_slot: Arc<std::sync::OnceLock<rustgate_admin::FedApiHandler>> =
         Arc::new(std::sync::OnceLock::new());
 
     #[cfg(feature = "metrics")]
-    let acl_api_slot: Arc<std::sync::OnceLock<metrics::AclApiHandler>> =
+    let acl_api_slot: Arc<std::sync::OnceLock<rustgate_admin::AclApiHandler>> =
         Arc::new(std::sync::OnceLock::new());
 
     #[cfg(feature = "metrics")]
-    let mgmt_api_slot: Arc<std::sync::OnceLock<metrics::MgmtApiHandler>> =
+    let mgmt_api_slot: Arc<std::sync::OnceLock<rustgate_admin::MgmtApiHandler>> =
         Arc::new(std::sync::OnceLock::new());
 
     // Shared shutdown notifier driven by either SIGTERM/Ctrl-C
@@ -697,7 +697,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let drain_notify = Arc::new(tokio::sync::Notify::new());
 
     #[cfg(feature = "metrics")]
-    let router_slot: metrics::RouterSlot = Arc::new(std::sync::OnceLock::new());
+    let router_slot: rustgate_admin::RouterSlot = Arc::new(std::sync::OnceLock::new());
 
     #[cfg(feature = "metrics")]
     let metrics_identity = setup::start_metrics(
@@ -1110,12 +1110,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // (even if the polling interval is zero) so that SIGHUP-driven reloads
     // can use the same code path. The polling watcher is only spawned when
     // `acl_reload_interval > 0`.
-    let mut acl_reloader_handle: Option<Arc<acl_reloader::AclReloader>> = None;
+    let mut acl_reloader_handle: Option<Arc<rustgate_admin::AclReloader>> = None;
     if let Some(ref acl_file) = cli.group_acl_file {
         let initial_hash =
-            acl_file_hash.unwrap_or_else(|| acl_reloader::AclReloader::compute_hash(b""));
+            acl_file_hash.unwrap_or_else(|| rustgate_admin::AclReloader::compute_hash(b""));
         let reloader =
-            acl_reloader::AclReloader::new(acl_file.clone(), Arc::clone(&router), initial_hash);
+            rustgate_admin::AclReloader::new(acl_file.clone(), Arc::clone(&router), initial_hash);
         if cli.acl_reload_interval > 0 {
             let interval = Duration::from_secs(cli.acl_reload_interval);
             reloader.spawn_watcher(interval);
@@ -1128,7 +1128,8 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         acl_reloader_handle = Some(reloader);
     }
     #[cfg(feature = "metrics")]
-    let acl_reloader_for_api: Option<Arc<acl_reloader::AclReloader>> = acl_reloader_handle.clone();
+    let acl_reloader_for_api: Option<Arc<rustgate_admin::AclReloader>> =
+        acl_reloader_handle.clone();
 
     // ── Authz (RBAC/ABAC) policy + hot-reload ──────────────────────
     //
@@ -1355,19 +1356,22 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                     anyhow::anyhow!("failed to read ACL API token file {token_file}: {e}")
                 })?;
                 let token = token_str.as_bytes().to_vec();
-                acl_api::validate_bearer_token_length(&token, "ACL API")
+                rustgate_admin::validate_bearer_token_length(&token, "ACL API")
                     .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
                 let initial_file = acl_file_parsed.unwrap_or_default();
-                let api_state = Arc::new(acl_api::AclApiState {
+                let api_state = Arc::new(rustgate_admin::AclApiState {
                     current: Arc::new(std::sync::RwLock::new(initial_file)),
                     router: Arc::clone(&router),
                     reloader: acl_reloader_for_api,
                     file_path: std::path::PathBuf::from(acl_file),
                     auth_token: zeroize::Zeroizing::new(token),
                 });
-                let handler: metrics::AclApiHandler = Arc::new(move |method, path, auth, body| {
-                    acl_api::handle_request(method, path, auth, body, &api_state)
-                });
+                let handler: rustgate_admin::AclApiHandler =
+                    Arc::new(move |method, path, auth, body| {
+                        rustgate_admin::acl_api::handle_request(
+                            method, path, auth, body, &api_state,
+                        )
+                    });
                 let _ = acl_api_slot.set(handler);
                 tracing::warn!(
                     "ACL REST API enabled at /api/acl/ — exposes mutation of routing policy; \
@@ -1796,7 +1800,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 anyhow::anyhow!("failed to read management API token file {token_file}: {e}")
             })?;
             let token = token_str.as_bytes().to_vec();
-            acl_api::validate_bearer_token_length(&token, "management API")
+            rustgate_admin::validate_bearer_token_length(&token, "management API")
                 .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
 
             // Capture the same handles the SIGHUP reloader uses so the
@@ -1862,17 +1866,18 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 drain_notify: Arc::clone(&drain_notify),
                 auth_token: zeroize::Zeroizing::new(token),
             });
-            let handler: metrics::MgmtApiHandler = Arc::new(move |method, path, auth, body| {
-                let api_state = Arc::clone(&api_state);
-                let method = method.clone();
-                let path = path.to_string();
-                let auth = auth.map(|s| s.to_string());
-                let body = body.to_vec();
-                Box::pin(async move {
-                    mgmt_api::handle_request(&method, &path, auth.as_deref(), &body, &api_state)
-                        .await
-                })
-            });
+            let handler: rustgate_admin::MgmtApiHandler =
+                Arc::new(move |method, path, auth, body| {
+                    let api_state = Arc::clone(&api_state);
+                    let method = method.clone();
+                    let path = path.to_string();
+                    let auth = auth.map(|s| s.to_string());
+                    let body = body.to_vec();
+                    Box::pin(async move {
+                        mgmt_api::handle_request(&method, &path, auth.as_deref(), &body, &api_state)
+                            .await
+                    })
+                });
             let _ = mgmt_api_slot.set(handler);
             tracing::info!(
                 "management REST API enabled at /api/cert/, /api/crl/, /api/dedup/, \
@@ -2293,7 +2298,7 @@ pub(crate) struct ReloadReport {
 /// errors before the next restart.
 async fn reload_all_configs(
     cert_reloader: Option<&Arc<rustgate_tls::CertReloader>>,
-    acl_reloader: Option<&Arc<acl_reloader::AclReloader>>,
+    acl_reloader: Option<&Arc<rustgate_admin::AclReloader>>,
     crl_path: Option<&str>,
     #[cfg(feature = "ocsp")] ocsp_stapler: Option<&Arc<rustgate_tls::ocsp::Stapler>>,
     #[cfg(feature = "federation")] fed_peer_reloader: Option<
@@ -2678,12 +2683,13 @@ mod tests {
         let acl_path = dir.path().join("acl.json");
         let initial = r#"{"groups":{}}"#;
         std::fs::write(&acl_path, initial).unwrap();
-        let initial_hash = acl_reloader::AclReloader::compute_hash(initial.as_bytes());
+        let initial_hash = rustgate_admin::AclReloader::compute_hash(initial.as_bytes());
 
         let router = Arc::new(rustgate_transport::Router::with_acl(
             rustgate_transport::GroupAclPolicy::new(HashMap::new()),
         ));
-        let reloader = acl_reloader::AclReloader::new(&acl_path, Arc::clone(&router), initial_hash);
+        let reloader =
+            rustgate_admin::AclReloader::new(&acl_path, Arc::clone(&router), initial_hash);
 
         // Sanity-check pre-reload state: empty policy collapses to open mode (None).
         {

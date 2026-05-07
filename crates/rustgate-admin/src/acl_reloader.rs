@@ -25,7 +25,8 @@ use tracing::{debug, info, warn};
 ///
 /// Construct with [`AclReloader::new`], then call
 /// [`spawn_watcher`](Self::spawn_watcher) to start the background polling task.
-pub(crate) struct AclReloader {
+#[derive(Debug)]
+pub struct AclReloader {
     acl_path: PathBuf,
     router: Arc<Router>,
     /// SHA-256 digest of the last successfully loaded file contents.
@@ -37,7 +38,7 @@ impl AclReloader {
     ///
     /// The file must already exist and be valid JSON; the initial ACL should
     /// have been loaded before constructing this reloader.
-    pub(crate) fn new(
+    pub fn new(
         acl_path: impl Into<PathBuf>,
         router: Arc<Router>,
         initial_hash: [u8; 32],
@@ -53,7 +54,7 @@ impl AclReloader {
     /// file content has changed.
     ///
     /// Returns `Ok(true)` if the policy was swapped, `Ok(false)` if unchanged.
-    pub(crate) fn reload(&self) -> anyhow::Result<bool> {
+    pub fn reload(&self) -> anyhow::Result<bool> {
         let data = std::fs::read_to_string(&self.acl_path).map_err(|e| {
             anyhow::anyhow!("failed to read ACL file {}: {e}", self.acl_path.display())
         })?;
@@ -157,7 +158,7 @@ impl AclReloader {
     ///
     /// File I/O is offloaded to a blocking thread via
     /// [`tokio::task::spawn_blocking`] to avoid stalling the async runtime.
-    pub(crate) fn spawn_watcher(self: &Arc<Self>, interval: Duration) {
+    pub fn spawn_watcher(self: &Arc<Self>, interval: Duration) {
         let reloader = Arc::clone(self);
         spawn_background("acl-reloader", async move {
             let mut tick = tokio::time::interval(interval);
@@ -201,15 +202,14 @@ impl AclReloader {
     ///
     /// Called by the REST API after it has persisted a mutation so the
     /// next poll does not re-detect the same change as a pending reload.
-    #[cfg(feature = "metrics")]
-    pub(crate) fn set_hash(&self, hash: [u8; 32]) {
+    pub fn set_hash(&self, hash: [u8; 32]) {
         if let Ok(mut guard) = self.last_hash.lock() {
             *guard = hash;
         }
     }
 
     /// SHA-256 digest of the file bytes.
-    pub(crate) fn compute_hash(data: &[u8]) -> [u8; 32] {
+    pub fn compute_hash(data: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(data);
         hasher.finalize().into()
@@ -824,7 +824,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    #[cfg(feature = "metrics")]
     #[test]
     fn set_hash_updates_stored_hash_observable_via_subsequent_reload() {
         // The `set_hash` metrics-feature hook is called by the REST

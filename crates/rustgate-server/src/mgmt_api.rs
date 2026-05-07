@@ -38,7 +38,7 @@
 //! The API is only registered when `--mgmt-api-token-file` is supplied,
 //! and the token length is validated at startup with the same bounds as
 //! the ACL API (`32..=256` bytes via
-//! [`crate::acl_api::validate_bearer_token_length`]).
+//! [`rustgate_admin::validate_bearer_token_length`]).
 
 use std::future::Future;
 use std::path::PathBuf;

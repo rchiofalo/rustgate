@@ -1,0 +1,38 @@
+// Copyright © 2026 Roberto Chiofalo.
+
+//! HTTP management server: Prometheus exposition, health/readiness probes,
+//! and federation/mgmt/ACL APIs.
+//!
+//! Extracted from `rustgate-server` (#895) so the long-running HTTP
+//! microservice that fronts `/metrics`, the Kubernetes liveness/readiness
+//! probes, and the operator REST APIs can evolve independently from the
+//! Prometheus metric definitions themselves. The metric statics still
+//! live with their owning domain crates; this crate is the
+//! exposition/management surface.
+//!
+//! Modules:
+//!
+//! * [`server`] — HTTP listener, request dispatcher, health/readiness
+//!   types, dependency checks, and the moved `cert_expiry_seconds`
+//!   gauge that the readiness probe maintains as a side effect.
+//! * [`acl_config`] — JSON deserialization for the group ACL policy file.
+//! * [`acl_reloader`] — Polling-driven hot-reload for the on-disk ACL file.
+//! * [`acl_api`] — REST API for runtime ACL CRUD mounted under `/api/acl/`.
+
+#![forbid(unsafe_code)]
+
+pub mod acl_api;
+pub mod acl_config;
+pub mod acl_reloader;
+pub mod server;
+
+pub use acl_api::{AclApiState, validate_bearer_token_length};
+pub use acl_config::{GroupAclEntry, GroupAclFile};
+pub use acl_reloader::AclReloader;
+#[cfg(feature = "federation")]
+pub use server::FedApiHandler;
+pub use server::{
+    AclApiHandler, CheckStatus, DEFAULT_MAX_HTTP_CONNECTIONS, DependencyCheck, HealthState,
+    MgmtApiHandler, ReadinessReport, ReadinessState, RouterSlot, cert_expiry_seconds, init,
+    register_metrics, serve,
+};

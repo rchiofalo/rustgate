@@ -58,7 +58,7 @@ pub(crate) async fn load_group_acl(
 ) -> anyhow::Result<(
     Option<rustgate_transport::GroupAclPolicy>,
     Option<[u8; 32]>,
-    Option<crate::acl_config::GroupAclFile>,
+    Option<rustgate_admin::GroupAclFile>,
 )> {
     let Some(ref acl_file) = cli.group_acl_file else {
         return Ok((None, None, None));
@@ -68,9 +68,9 @@ pub(crate) async fn load_group_acl(
         .await
         .context("reading group ACL file")?;
 
-    let hash = crate::acl_reloader::AclReloader::compute_hash(data.as_bytes());
+    let hash = rustgate_admin::AclReloader::compute_hash(data.as_bytes());
 
-    let config: crate::acl_config::GroupAclFile =
+    let config: rustgate_admin::GroupAclFile =
         serde_json::from_str(&data).context("parsing group ACL file")?;
 
     // Reject reserved-sentinel group ids (`__*__`) before the policy
@@ -928,12 +928,14 @@ pub(crate) fn warn_enrollment_disabled(cli: &Cli) {
 #[cfg(feature = "metrics")]
 pub(crate) async fn start_metrics(
     cli: &Cli,
-    health: &Arc<metrics::HealthState>,
-    readiness: &Arc<metrics::ReadinessState>,
-    #[cfg(feature = "federation")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
-    acl_api_slot: &Arc<std::sync::OnceLock<metrics::AclApiHandler>>,
-    mgmt_api_slot: &Arc<std::sync::OnceLock<metrics::MgmtApiHandler>>,
-    router_slot: &metrics::RouterSlot,
+    health: &Arc<rustgate_admin::HealthState>,
+    readiness: &Arc<rustgate_admin::ReadinessState>,
+    #[cfg(feature = "federation")] fed_api_slot: &Arc<
+        std::sync::OnceLock<rustgate_admin::FedApiHandler>,
+    >,
+    acl_api_slot: &Arc<std::sync::OnceLock<rustgate_admin::AclApiHandler>>,
+    mgmt_api_slot: &Arc<std::sync::OnceLock<rustgate_admin::MgmtApiHandler>>,
+    router_slot: &rustgate_admin::RouterSlot,
 ) -> anyhow::Result<Arc<metrics::MetricsIdentity>> {
     // Aggregate every domain crate's `init()` callback into a single
     // ordered registry, then run the sequence with `init_all`. The
@@ -949,6 +951,7 @@ pub(crate) async fn start_metrics(
     // header doc-comments for the boundary discipline).
     let mut registry = rustgate_metrics::MetricsRegistry::default();
     let _ = registry.register(metrics::init);
+    let _ = registry.register(rustgate_admin::init);
     #[cfg(feature = "federation")]
     let _ = registry.register(rustgate_federation::metrics::init);
     #[cfg(all(feature = "http", feature = "metrics"))]
@@ -1010,7 +1013,7 @@ pub(crate) async fn start_metrics(
         .map_err(|e| anyhow::anyhow!("blocking task panic: {e}"))?
         .map_err(|e| anyhow::anyhow!("failed to read metrics token file {token_file}: {e}"))?;
         let token = token_str.as_bytes().to_vec();
-        crate::acl_api::validate_bearer_token_length(&token, "metrics bearer")
+        rustgate_admin::validate_bearer_token_length(&token, "metrics bearer")
             .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
         tracing::info!("metrics endpoint authentication enabled via --metrics-token-file");
         Some(Arc::new(zeroize::Zeroizing::new(token)))
@@ -1033,7 +1036,7 @@ pub(crate) async fn start_metrics(
         let router_for_metrics = Arc::clone(router_slot);
         let max_http_connections = cli.metrics_max_connections;
         spawn_background("metrics-server", async move {
-            if let Err(e) = metrics::serve(
+            if let Err(e) = rustgate_admin::serve(
                 bind_addr,
                 health_for_metrics,
                 readiness_for_metrics,
@@ -1152,7 +1155,7 @@ async fn build_federation_config(
 fn wire_federation_api(
     cli: &Cli,
     rwlock: &Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>,
-    fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
+    fed_api_slot: &Arc<std::sync::OnceLock<rustgate_admin::FedApiHandler>>,
 ) -> anyhow::Result<()> {
     use rustgate_federation::api::{ApiState, PeerStatusFn};
     use rustgate_federation::store::file::FileStore;
@@ -1202,7 +1205,7 @@ fn wire_federation_api(
         jwks_fn: Arc::new(|| None),
     });
 
-    let handler: metrics::FedApiHandler = Arc::new(move |method, path, body| {
+    let handler: rustgate_admin::FedApiHandler = Arc::new(move |method, path, body| {
         rustgate_federation::api::handle_request(method, path, body, &api_state)
     });
 
@@ -1427,7 +1430,9 @@ pub(crate) async fn start_federation(
     cli: &Cli,
     router: &Arc<Router>,
     hooks: FedInboundForwardingHooks,
-    #[cfg(feature = "metrics")] fed_api_slot: &Arc<std::sync::OnceLock<metrics::FedApiHandler>>,
+    #[cfg(feature = "metrics")] fed_api_slot: &Arc<
+        std::sync::OnceLock<rustgate_admin::FedApiHandler>,
+    >,
 ) -> anyhow::Result<(
     Option<FedForwardFn>,
     Option<Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>>,

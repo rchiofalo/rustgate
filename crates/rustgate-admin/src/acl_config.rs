@@ -17,9 +17,9 @@ use serde::{Deserialize, Serialize};
 /// deserialization error rather than silently ignored.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GroupAclFile {
+pub struct GroupAclFile {
     /// Per-group access control rules.
-    pub(crate) groups: HashMap<String, GroupAclEntry>,
+    pub groups: HashMap<String, GroupAclEntry>,
 }
 
 impl GroupAclFile {
@@ -45,7 +45,7 @@ impl GroupAclFile {
     /// dispatch path. The matching rule is also enforced at the REST
     /// ACL API (`rustgate_server::acl_api::valid_group_id`) so a live
     /// PUT cannot sneak a reserved name past the same guardrail.
-    pub(crate) fn validate_operator_policy(&self) -> Result<(), String> {
+    pub fn validate_operator_policy(&self) -> Result<(), String> {
         if let Some(name) = self
             .groups
             .keys()
@@ -72,19 +72,19 @@ impl GroupAclFile {
 /// properties — a typo like `"recieve"` produces a clear error.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GroupAclEntry {
+pub struct GroupAclEntry {
     /// Certificate CNs permitted to send messages to this group.
     #[serde(default)]
-    pub(crate) send: HashSet<String>,
+    pub send: HashSet<String>,
     /// Certificate CNs permitted to receive messages from this group.
     #[serde(default)]
-    pub(crate) receive: HashSet<String>,
+    pub receive: HashSet<String>,
     /// Certificate CNs explicitly denied from sending; overrides `send`.
     #[serde(default)]
-    pub(crate) deny_send: HashSet<String>,
+    pub deny_send: HashSet<String>,
     /// Certificate CNs explicitly denied from receiving; overrides `receive`.
     #[serde(default)]
-    pub(crate) deny_receive: HashSet<String>,
+    pub deny_receive: HashSet<String>,
 }
 
 #[cfg(test)]
