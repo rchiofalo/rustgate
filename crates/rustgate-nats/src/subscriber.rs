@@ -16,7 +16,7 @@ use async_nats::jetstream::stream::RetentionPolicy;
 use futures::StreamExt;
 use rustgate_core::egress::{OnFederationForward, OnHttpForward, OnNatsPublish};
 use rustgate_core::message::RoutableMessage;
-use rustgate_transport::Router;
+use rustgate_router::Router;
 use tracing::Instrument;
 
 use crate::config::NatsConfig;
@@ -69,7 +69,7 @@ rustgate_core::on_callback!(
 /// The subscriber drives every inbound message through
 /// [`Router::route_for_egress`] (not `Router::route`) so any Send-PEP
 /// obligations (e.g.
-/// [`MaskPoint`](rustgate_transport::rustgate_authz::Obligation::MaskPoint))
+/// `MaskPoint` — see `rustgate_authz::Obligation::MaskPoint`)
 /// are applied to the dispatched envelope before the optional
 /// federation / HTTP / NATS-publish fan-out callbacks observe it. This
 /// closes the second sub-item of #737: a NATS-bridged message arriving

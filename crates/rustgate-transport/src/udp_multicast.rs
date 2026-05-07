@@ -39,10 +39,9 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
 use rustgate_resilience::token_bucket::TokenBucket;
+use rustgate_router::{RoutedMessage, Router, SessionHandle};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
-
-use crate::router::{Router, SessionHandle};
 
 /// Source-protocol tag for messages received via UDP multicast.
 ///
@@ -179,17 +178,12 @@ impl MulticastConfig {
     }
 }
 
-/// Callback invoked by the router (or any post-routing site) once per
-/// routed [`RoutableMessage`] for which the operator has opted in to
-/// multicast rebroadcast. The callback is responsible for token-bucket
-/// gating, datagram splitting, and any per-group fan-out — the call
-/// site only knows it routed a message and that the operator wants it
-/// re-emitted.
-///
-/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
-/// as of Rust 1.93. Async work is dispatched via `spawn_background()`
-/// inside the closure body.
-pub type OnMulticastForward = Arc<dyn Fn(Arc<RoutableMessage>) + Send + Sync>;
+// `OnMulticastForward` was relocated to `rustgate_router` so the router
+// crate (which owns the hot-swap slot) can declare the callback type
+// without taking a dep on `rustgate-transport`. Re-exported below for
+// source-level compatibility with callers that imported it from
+// `rustgate_router::OnMulticastForward`.
+pub use rustgate_router::OnMulticastForward;
 
 // ---------------------------------------------------------------------------
 // Inbound listener
@@ -253,8 +247,8 @@ async fn run_one_group(
             return;
         }
     };
-    let (ptx, _prx) = mpsc::channel::<crate::RoutedMessage>(1);
-    let (ntx, _nrx) = mpsc::channel::<crate::RoutedMessage>(1);
+    let (ptx, _prx) = mpsc::channel::<RoutedMessage>(1);
+    let (ntx, _nrx) = mpsc::channel::<RoutedMessage>(1);
     let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
     let session_id = handle.id;
     let _ = router.register(handle).await;
@@ -439,7 +433,7 @@ fn extract_uid(payload: &[u8]) -> String {
 ///
 /// Returns a tuple `(callback, join_handle)`:
 ///   * `callback`: install on the router via
-///     [`crate::router::Router::set_on_multicast_forward`]. Each call
+///     `rustgate_router::Router::set_on_multicast_forward`. Each call
 ///     enqueues the message into a bounded mpsc channel.
 ///   * `join_handle`: the background egress task that drains the
 ///     channel and writes datagrams to the multicast socket. Held by

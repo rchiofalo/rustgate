@@ -19,7 +19,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::{ACCESS_LOG_TARGET, Router, SessionHandle};
+use rustgate_router::{ACCESS_LOG_TARGET, Router, SessionHandle};
 use tokio::sync::mpsc;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Targets;

@@ -18,7 +18,7 @@ rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
-rustgate-transport = { workspace = true }
+rustgate-router = { workspace = true }
 async-nats = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
@@ -34,4 +34,5 @@ unicode-normalization = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
 rustgate-test-utils = { workspace = true, features = ["nats"] }
+rustgate-authz = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -44,7 +44,8 @@ mod setup;
 
 use cli::{Cli, Command};
 use rustgate_core::tasks::{spawn_background, stop_subsystem};
-use rustgate_transport::{BackpressureGate, Router};
+use rustgate_router::Router;
+use rustgate_transport::BackpressureGate;
 use session::{FedForwardFn, SessionDeps};
 
 /// Adapter that buffers `Write` calls and emits a single AEAD-sealed chunk
@@ -509,7 +510,7 @@ fn main() -> anyhow::Result<()> {
             std::sync::Mutex::new(Box::new(file))
         };
         let filter = tracing_subscriber::filter::Targets::new()
-            .with_target(rustgate_transport::ACCESS_LOG_TARGET, tracing::Level::INFO);
+            .with_target(rustgate_router::ACCESS_LOG_TARGET, tracing::Level::INFO);
         Some(
             tracing_subscriber::fmt::layer()
                 .json()
@@ -801,7 +802,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         "admission control enabled"
     );
 
-    let client_queue: Option<Arc<rustgate_transport::ClientQueue>> =
+    let client_queue: Option<Arc<rustgate_router::ClientQueue>> =
         if let Some(ref dir) = cli.client_queue_dir {
             // Choose the open mode: persistent-key > explicit-wipe > plain.
             // The plain `open` now fails closed if the on-disk queue has
@@ -809,15 +810,15 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             let open_result = if let Some(ref key_path) = cli.client_queue_key_file {
                 let key = read_queue_key_file(key_path)
                     .map_err(|e| anyhow::anyhow!("--client-queue-key-file: {e}"))?;
-                rustgate_transport::ClientQueue::open_with_hmac_key(
+                rustgate_router::ClientQueue::open_with_hmac_key(
                     dir,
                     cli.client_queue_max_bytes,
                     Some(key),
                 )
             } else if cli.client_queue_wipe_on_start {
-                rustgate_transport::ClientQueue::open_with_wipe(dir, cli.client_queue_max_bytes)
+                rustgate_router::ClientQueue::open_with_wipe(dir, cli.client_queue_max_bytes)
             } else {
-                rustgate_transport::ClientQueue::open(dir, cli.client_queue_max_bytes)
+                rustgate_router::ClientQueue::open(dir, cli.client_queue_max_bytes)
             };
 
             let q = open_result.map_err(|e| {
@@ -840,11 +841,11 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             None
         };
     // ── Per-tenant quota tracker ────────────────────────────────────
-    let quota_tracker: Option<Arc<rustgate_transport::TenantQuotaTracker>> =
+    let quota_tracker: Option<Arc<rustgate_router::TenantQuotaTracker>> =
         if let Some(ref path) = cli.tenant_quota_file {
-            match rustgate_transport::TenantQuotaTracker::load_config(path) {
+            match rustgate_router::TenantQuotaTracker::load_config(path) {
                 Ok(config) => {
-                    let tracker = Arc::new(rustgate_transport::TenantQuotaTracker::new(config));
+                    let tracker = Arc::new(rustgate_router::TenantQuotaTracker::new(config));
                     // Issue #883 sub-item 4: wire the per-tenant
                     // throughput rejection / consumption callbacks to
                     // Prometheus so an operator can see drops and
@@ -937,7 +938,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         // TokenBucket so a flap-looping client cannot drive the
         // authz engine at an uncapped rate. Defaults
         // (rate=100/sec, burst=200) are operator-safe.
-        .with_position_replay_limit(rustgate_transport::PositionReplayLimitConfig::new(
+        .with_position_replay_limit(rustgate_router::PositionReplayLimitConfig::new(
             cli.position_replay_rate_per_sec,
             cli.position_replay_burst,
         ));
@@ -949,7 +950,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         // callback) still applies the audit-rate cap.
         #[cfg(feature = "metrics")]
         let base = {
-            let limiter = rustgate_transport::obligations::ObligationRateLimiter::default()
+            let limiter = rustgate_router::obligations::ObligationRateLimiter::default()
                 .with_on_unknown(std::sync::Arc::new(|variant: &str| {
                     metrics::authz_obligation_unknown()
                         .with_label_values(&[variant])
@@ -1072,7 +1073,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // ── Cross-path deduplication ───────────────────────────────────
     #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
     if let Some(mut dedup) =
-        rustgate_transport::DedupCache::from_secs(cli.dedup_window_secs, cli.dedup_cache_size)
+        rustgate_router::DedupCache::from_secs(cli.dedup_window_secs, cli.dedup_cache_size)
             .map(|d| d.with_cross_tenant(cli.dedup_cross_tenant))
     {
         #[cfg(feature = "metrics")]
@@ -1618,8 +1619,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         };
 
     // ── Anti-replay filter ─────────────────────────────────────────
-    let replay_filter =
-        rustgate_transport::ReplayFilter::from_secs(cli.replay_window).map(Arc::new);
+    let replay_filter = rustgate_router::ReplayFilter::from_secs(cli.replay_window).map(Arc::new);
     if replay_filter.is_some() {
         tracing::info!(
             window_secs = cli.replay_window,
@@ -2685,8 +2685,8 @@ mod tests {
         std::fs::write(&acl_path, initial).unwrap();
         let initial_hash = rustgate_admin::AclReloader::compute_hash(initial.as_bytes());
 
-        let router = Arc::new(rustgate_transport::Router::with_acl(
-            rustgate_transport::GroupAclPolicy::new(HashMap::new()),
+        let router = Arc::new(rustgate_router::Router::with_acl(
+            rustgate_router::GroupAclPolicy::new(HashMap::new()),
         ));
         let reloader =
             rustgate_admin::AclReloader::new(&acl_path, Arc::clone(&router), initial_hash);

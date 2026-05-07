@@ -20,8 +20,8 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::quota::{QuotaConfig, TenantQuota, TenantQuotaTracker};
-use rustgate_transport::{
+use rustgate_router::quota::{QuotaConfig, TenantQuota, TenantQuotaTracker};
+use rustgate_router::{
     NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, RoutedMessage, Router, SessionHandle,
 };
 use tokio::sync::mpsc;
@@ -406,14 +406,14 @@ async fn tenant_token_bucket_handles_unknown_tenant_with_default() {
 ///
 /// We pin the composition at the API level: the tenant bucket lives
 /// in `TenantQuotaTracker`, the per-session bucket lives in
-/// `rustgate_transport::ClientThrottle` — they are independent
+/// `rustgate_router::ClientThrottle` — they are independent
 /// counters with no shared state. Charging one must not affect the
 /// other. A regression that wired the tenant bucket as a subset of
 /// the per-session counter would make `ClientThrottle::available`
 /// jump on a tenant-side acquire.
 #[tokio::test(flavor = "current_thread")]
 async fn tenant_token_bucket_does_not_double_account_with_per_session_bucket() {
-    use rustgate_transport::ClientThrottle;
+    use rustgate_router::ClientThrottle;
 
     // Per-session throttle: 5 messages burst, no refill. We charge it
     // once and expect 4 to remain.

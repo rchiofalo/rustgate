@@ -14,10 +14,11 @@ use futures::{SinkExt, StreamExt};
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::protocol::HeaderSize;
+use rustgate_router::{Router, SessionHandle};
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_tls::{AuthenticatedSession, TlsConfig, TlsListener};
-use rustgate_transport::{LengthPrefixedCodec, Router, SessionHandle};
+use rustgate_transport::LengthPrefixedCodec;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -53,8 +54,8 @@ fn spawn_session(session: AuthenticatedSession, router: Arc<Router>) {
         let identity = session.identity_arc();
         let cn = identity.cn.clone();
 
-        let (ptx, priority_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
-        let (ntx, normal_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(64);
+        let (ptx, priority_rx) = mpsc::channel::<rustgate_router::RoutedMessage>(16);
+        let (ntx, normal_rx) = mpsc::channel::<rustgate_router::RoutedMessage>(64);
         let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
         let session_id = handle.id;
         let _ = router.register(handle).await;
@@ -91,8 +92,8 @@ async fn server_read(
 
 async fn server_write(
     writer: rustgate_tls::SessionWriter,
-    mut priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    mut normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mut priority_rx: mpsc::Receiver<rustgate_router::RoutedMessage>,
+    mut normal_rx: mpsc::Receiver<rustgate_router::RoutedMessage>,
 ) -> std::io::Result<()> {
     let mut framed = FramedWrite::new(writer, LengthPrefixedCodec::new(HeaderSize::Four));
     loop {
@@ -509,18 +510,18 @@ async fn route_to_group() {
     let charlie = Arc::new(make_identity("charlie", &["medics"]));
 
     let (alice_ptx, alice_ntx, _alice_prx, mut alice_nrx) = {
-        let (p, pr) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
-        let (n, nr) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
+        let (p, pr) = mpsc::channel::<rustgate_router::RoutedMessage>(16);
+        let (n, nr) = mpsc::channel::<rustgate_router::RoutedMessage>(16);
         (p, n, pr, nr)
     };
     let (bob_ptx, bob_ntx, _bob_prx, mut bob_nrx) = {
-        let (p, pr) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
-        let (n, nr) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
+        let (p, pr) = mpsc::channel::<rustgate_router::RoutedMessage>(16);
+        let (n, nr) = mpsc::channel::<rustgate_router::RoutedMessage>(16);
         (p, n, pr, nr)
     };
     let (charlie_ptx, charlie_ntx, _charlie_prx, mut charlie_nrx) = {
-        let (p, pr) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
-        let (n, nr) = mpsc::channel::<rustgate_transport::RoutedMessage>(16);
+        let (p, pr) = mpsc::channel::<rustgate_router::RoutedMessage>(16);
+        let (n, nr) = mpsc::channel::<rustgate_router::RoutedMessage>(16);
         (p, n, pr, nr)
     };
 
@@ -564,10 +565,10 @@ async fn route_to_group() {
 fn make_channels(
     cap: usize,
 ) -> (
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
 ) {
     let (ptx, prx) = mpsc::channel(cap);
     let (ntx, nrx) = mpsc::channel(cap);

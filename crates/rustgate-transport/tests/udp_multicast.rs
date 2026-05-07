@@ -21,9 +21,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::{
-    MulticastConfig, MulticastGroup, RoutedMessage, Router, SessionHandle, udp_multicast,
-};
+use rustgate_router::{RoutedMessage, Router, SessionHandle};
+use rustgate_transport::{MulticastConfig, MulticastGroup, udp_multicast};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 

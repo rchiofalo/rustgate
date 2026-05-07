@@ -15,7 +15,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::{RoutedMessage, Router, SessionHandle};
+use rustgate_router::{RoutedMessage, Router, SessionHandle};
 use tokio::sync::mpsc;
 
 fn identity(cn: &str, groups: &[&str]) -> Arc<Identity> {

@@ -5,7 +5,7 @@
 //! invariants (refs #787, F-22).
 //!
 //! The data-plane obligation actuator
-//! [`rustgate_transport::obligations::apply_obligations`] is documented
+//! [`rustgate_router::obligations::apply_obligations`] is documented
 //! to satisfy three load-bearing invariants over the set of known
 //! [`rustgate_authz::Obligation`] variants:
 //!
@@ -53,7 +53,7 @@ use proptest::prelude::*;
 use rustgate_authz::Obligation;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::obligations::{UnknownObligationPolicy, apply_obligations};
+use rustgate_router::obligations::{UnknownObligationPolicy, apply_obligations};
 
 // ── Payload corpus ──────────────────────────────────────────────────────
 //

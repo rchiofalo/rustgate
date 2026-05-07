@@ -60,12 +60,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use rustgate_authz::{Action, DecisionOutcome, PolicyEngine, Resource, Subject};
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::rustgate_authz::{
-    Action, DecisionOutcome, PolicyEngine, Resource, Subject,
-};
-use rustgate_transport::{OnAuthzInFlightChanged, Router, SessionHandle};
+use rustgate_router::{OnAuthzInFlightChanged, Router, SessionHandle};
 use tokio::sync::mpsc;
 
 fn identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
@@ -93,10 +91,10 @@ fn chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
 
 #[allow(clippy::type_complexity)]
 fn channels() -> (
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
 ) {
     let (ptx, prx) = mpsc::channel(16);
     let (ntx, nrx) = mpsc::channel(16);

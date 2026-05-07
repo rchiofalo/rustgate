@@ -14,7 +14,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
-use rustgate_transport::{BackpressureGate, Router, SessionHandle};
+use rustgate_router::{Router, SessionHandle};
+use rustgate_transport::BackpressureGate;
 use tokio::sync::mpsc;
 
 fn make_identity(cn: &str) -> Identity {

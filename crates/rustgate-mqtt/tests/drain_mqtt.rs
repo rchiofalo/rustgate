@@ -28,10 +28,10 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use rustgate_mqtt::{MqttListener, MqttServer, MqttServerConfig, WildcardPolicy};
+use rustgate_router::Router;
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_tls::TlsConfig;
-use rustgate_transport::Router;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore};
 

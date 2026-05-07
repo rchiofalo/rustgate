@@ -242,7 +242,7 @@ async fn group_send_backpressure_drops_without_panic() {
     use bytes::Bytes;
     use rustgate_core::identity::Identity;
     use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-    use rustgate_transport::{Router, SessionHandle};
+    use rustgate_router::{Router, SessionHandle};
     use tokio::sync::mpsc;
 
     let router = Router::new();
@@ -303,7 +303,7 @@ async fn disconnected_receiver_drops_gracefully() {
     use bytes::Bytes;
     use rustgate_core::identity::Identity;
     use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-    use rustgate_transport::{Router, SessionHandle};
+    use rustgate_router::{Router, SessionHandle};
     use tokio::sync::mpsc;
 
     let router = Router::new();

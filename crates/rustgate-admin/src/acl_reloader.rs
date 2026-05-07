@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustgate_core::tasks::spawn_background;
-use rustgate_transport::Router;
+use rustgate_router::Router;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
@@ -97,7 +97,7 @@ impl AclReloader {
         for (group_id, entry) in config.groups {
             let _ = groups.insert(
                 group_id,
-                rustgate_transport::GroupAcl::with_deny(
+                rustgate_router::GroupAcl::with_deny(
                     entry
                         .send
                         .into_iter()
@@ -122,7 +122,7 @@ impl AclReloader {
             );
         }
 
-        let policy = rustgate_transport::GroupAclPolicy::new(groups);
+        let policy = rustgate_router::GroupAclPolicy::new(groups);
         let group_count = policy.len();
 
         let new_acl = if policy.is_empty() {
@@ -306,14 +306,14 @@ mod tests {
         let (ptx_b2, _ntx_b2) = tokio::sync::mpsc::channel(16);
 
         let _ = router
-            .register(rustgate_transport::SessionHandle::new(
+            .register(rustgate_router::SessionHandle::new(
                 alice_id.clone(),
                 ptx_a,
                 ptx_a2,
             ))
             .await;
         let _ = router
-            .register(rustgate_transport::SessionHandle::new(
+            .register(rustgate_router::SessionHandle::new(
                 bob_id.clone(),
                 ptx_b,
                 ptx_b2,

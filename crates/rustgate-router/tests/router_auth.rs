@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::{Router, SessionHandle};
+use rustgate_router::{Router, SessionHandle};
 use tokio::sync::mpsc;
 
 fn make_identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
@@ -44,10 +44,10 @@ fn make_chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
 fn make_channels(
     cap: usize,
 ) -> (
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
 ) {
     let (ptx, prx) = mpsc::channel(cap);
     let (ntx, nrx) = mpsc::channel(cap);

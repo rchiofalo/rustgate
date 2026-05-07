@@ -694,9 +694,7 @@ fn handle_request(
 ///     "compile_warnings": []
 /// }
 /// ```
-fn authz_health_response(
-    router: Option<&Arc<rustgate_transport::Router>>,
-) -> Response<Full<Bytes>> {
+fn authz_health_response(router: Option<&Arc<rustgate_router::Router>>) -> Response<Full<Bytes>> {
     /// Typed response for `/health/authz` — serialized via `serde_json`
     /// to guarantee RFC 8259-compliant escaping of all string values.
     #[derive(serde::Serialize)]
@@ -740,7 +738,7 @@ fn authz_health_response(
 /// Populated via `OnceLock` after the router is constructed (which happens
 /// after `start_metrics` spawns the HTTP server). Requests that arrive
 /// before the slot is filled return an empty warnings list.
-pub type RouterSlot = Arc<OnceLock<Arc<rustgate_transport::Router>>>;
+pub type RouterSlot = Arc<OnceLock<Arc<rustgate_router::Router>>>;
 
 /// Serve Prometheus metrics and health endpoints at the given address.
 ///

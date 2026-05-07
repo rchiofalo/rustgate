@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use rustgate_core::egress::{OnFederationForward, OnHttpForward, OnNatsPublish};
-use rustgate_transport::Router;
+use rustgate_router::Router;
 use tokio::sync::{Notify, Semaphore};
 
 use crate::listener::MqttListener;

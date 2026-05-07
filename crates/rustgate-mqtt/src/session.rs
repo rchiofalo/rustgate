@@ -4,7 +4,7 @@
 //!
 //! Handles the CONNECT handshake, PUBLISH/SUBSCRIBE/PINGREQ/DISCONNECT
 //! packet processing, and read/write loops. Each session registers with
-//! the [`Router`](rustgate_transport::Router) and receives routed messages
+//! the [`Router`](rustgate_router::Router) and receives routed messages
 //! for delivery to the MQTT client.
 
 use std::collections::HashMap;
@@ -18,9 +18,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::sanitize::sanitize_for_log;
-use rustgate_transport::{
-    NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle,
-};
+use rustgate_router::{NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle};
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tracing::{debug, info, warn};
 
@@ -226,9 +224,9 @@ pub(crate) async fn handle_mqtt_session(
 
     // --- Channel setup and router registration ---
     let (priority_tx, mut priority_rx) =
-        mpsc::channel::<rustgate_transport::RoutedMessage>(PRIORITY_CHANNEL_CAPACITY);
+        mpsc::channel::<rustgate_router::RoutedMessage>(PRIORITY_CHANNEL_CAPACITY);
     let (normal_tx, mut normal_rx) =
-        mpsc::channel::<rustgate_transport::RoutedMessage>(NORMAL_CHANNEL_CAPACITY);
+        mpsc::channel::<rustgate_router::RoutedMessage>(NORMAL_CHANNEL_CAPACITY);
     let handle = SessionHandle::new(Arc::clone(&identity), priority_tx, normal_tx);
     let session_id = handle.id;
 
@@ -2777,8 +2775,8 @@ async fn mqtt_write_loop(
     writer: &mut PacketWriter,
     protocol: ProtocolLevel,
     prefix: &str,
-    priority_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    priority_rx: &mut mpsc::Receiver<rustgate_router::RoutedMessage>,
+    normal_rx: &mut mpsc::Receiver<rustgate_router::RoutedMessage>,
     resp_rx: &mut mpsc::Receiver<ResponsePacket>,
     subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
 ) -> Result<(), MqttError> {
@@ -2906,8 +2904,8 @@ async fn flush_pending(
     protocol: ProtocolLevel,
     prefix: &str,
     resp_rx: &mut mpsc::Receiver<ResponsePacket>,
-    priority_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    priority_rx: &mut mpsc::Receiver<rustgate_router::RoutedMessage>,
+    normal_rx: &mut mpsc::Receiver<rustgate_router::RoutedMessage>,
     subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
 ) {
     let mut flushed = 0u32;

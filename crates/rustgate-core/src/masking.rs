@@ -454,7 +454,7 @@ mod tests {
     //
     // The following four tests pin the *public* hash-correlation contract
     // expected by other crates that have migrated from the formerly-private
-    // `rustgate_transport::router::hash_cn` to the shared
+    // `rustgate_router::router::hash_cn` to the shared
     // `rustgate_core::masking::hash_cn`. They are deliberately named with the
     // F-94 spelling so a future reorg / rename catches the migration
     // breakage at the test level (the names are quoted in the issue body).

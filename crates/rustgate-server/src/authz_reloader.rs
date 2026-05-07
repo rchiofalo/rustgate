@@ -21,7 +21,7 @@ use std::time::Duration;
 use rustgate_authz::{NativeEngine, PolicyEngine, parser};
 use rustgate_core::audit;
 use rustgate_core::tasks::spawn_background;
-use rustgate_transport::Router;
+use rustgate_router::Router;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 

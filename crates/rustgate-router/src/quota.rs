@@ -40,7 +40,7 @@ pub struct TenantQuota {
     /// paths (router broadcast, HTTP publisher, NATS bridge, federation
     /// outbound) for this tenant. 0 = unlimited. Used by
     /// [`TenantQuotaTracker::try_reserve_bytes`] to prevent a single noisy
-    /// tenant from exhausting the global [`crate::backpressure::BackpressureGate`].
+    /// tenant from exhausting the global `rustgate_resilience::backpressure::BackpressureGate`.
     #[serde(default)]
     pub max_queued_bytes: u64,
     /// Per-tenant aggregate-throughput cap, in bytes per second

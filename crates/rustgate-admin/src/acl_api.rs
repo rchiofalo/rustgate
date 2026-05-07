@@ -14,7 +14,7 @@
 //! - `DELETE /api/acl/groups/{group}` — remove a single group entry
 //! - `POST   /api/acl/reload`         — re-read the on-disk ACL file
 //!
-//! Mutations rebuild the full [`rustgate_transport::GroupAclPolicy`] from the in-memory
+//! Mutations rebuild the full [`rustgate_router::GroupAclPolicy`] from the in-memory
 //! source-of-truth and atomically install it on the [`Router`] via
 //! [`Router::swap_acl`]. Calling `POST /api/acl/reload` re-reads the
 //! configured ACL file and replaces both the in-memory state and the
@@ -28,7 +28,7 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Method, Response, StatusCode};
-use rustgate_transport::Router;
+use rustgate_router::Router;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -96,16 +96,16 @@ fn json_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         .unwrap_or_else(|_| internal_error_response())
 }
 
-/// Convert an in-memory [`GroupAclFile`] into a runtime [`rustgate_transport::GroupAclPolicy`].
+/// Convert an in-memory [`GroupAclFile`] into a runtime [`rustgate_router::GroupAclPolicy`].
 ///
 /// CN strings are normalized to ASCII lowercase for case-insensitive
 /// matching per RFC 5280 §7.1.
-fn build_policy(file: &GroupAclFile) -> rustgate_transport::GroupAclPolicy {
+fn build_policy(file: &GroupAclFile) -> rustgate_router::GroupAclPolicy {
     let mut groups = HashMap::with_capacity(file.groups.len());
     for (group_id, entry) in &file.groups {
         let _ = groups.insert(
             group_id.clone(),
-            rustgate_transport::GroupAcl::with_deny(
+            rustgate_router::GroupAcl::with_deny(
                 entry.send.iter().map(|s| s.to_ascii_lowercase()).collect(),
                 entry
                     .receive
@@ -125,7 +125,7 @@ fn build_policy(file: &GroupAclFile) -> rustgate_transport::GroupAclPolicy {
             ),
         );
     }
-    rustgate_transport::GroupAclPolicy::new(groups)
+    rustgate_router::GroupAclPolicy::new(groups)
 }
 
 /// Atomically install the current in-memory file as the router policy.
@@ -164,7 +164,7 @@ const GROUP_ID_RULES: &str = "group id must be 1–128 bytes, contain only ASCII
 /// arbitrary simplification. ACL group names flow through several
 /// downstream consumers that each assume an ASCII byte representation:
 ///
-/// * Router ACL lookup in [`rustgate_transport::GroupAclPolicy`] is a
+/// * Router ACL lookup in [`rustgate_router::GroupAclPolicy`] is a
 ///   case-insensitive ASCII comparison.
 /// * Client-certificate OU extraction parses comma-separated ASCII
 ///   strings out of X.509 RDNs.

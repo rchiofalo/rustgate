@@ -23,7 +23,7 @@ rustgate-core = { workspace = true }
 rustgate-metrics = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
 rustgate-tls = { workspace = true }
-rustgate-transport = { workspace = true }
+rustgate-router = { workspace = true }
 bytes = { workspace = true }
 mqttbytes = { version = "0.6", features = ["v5"] }
 tokio = { workspace = true, features = ["net", "time", "sync", "rt", "macros", "io-util"] }
@@ -36,7 +36,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
-rustgate-transport = { workspace = true }
+rustgate-authz = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tokio-rustls = { workspace = true }

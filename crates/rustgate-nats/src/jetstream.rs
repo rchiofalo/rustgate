@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_nats::jetstream;
 use futures::StreamExt;
-use rustgate_transport::Router;
+use rustgate_router::Router;
 
 use crate::config::NatsConfig;
 use crate::serde_compat::WireEvent;

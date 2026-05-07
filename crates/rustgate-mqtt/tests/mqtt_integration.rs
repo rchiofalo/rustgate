@@ -15,10 +15,10 @@ use bytes::BytesMut;
 use rustgate_mqtt::{
     MqttForwardingHooks, MqttListener, MqttServer, MqttServerConfig, WildcardPolicy,
 };
+use rustgate_router::Router;
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_tls::TlsConfig;
-use rustgate_transport::Router;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore};
 
@@ -3678,10 +3678,10 @@ async fn mqtt_publish_with_send_pep_obligation_applies_obligation_before_fanout(
     use std::time::SystemTime;
 
     use bytes::Bytes;
-    use rustgate_core::message::RoutableMessage;
-    use rustgate_transport::rustgate_authz::{
+    use rustgate_authz::{
         Action, Decision, DecisionOutcome, Obligation, PolicyEngine, Resource, Subject,
     };
+    use rustgate_core::message::RoutableMessage;
 
     /// Engine that allows everything but attaches `MaskPoint` on the
     /// Send PEP. Mirrors the `AllowWithObligationEngine` pattern from

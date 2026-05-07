@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::{SinkExt, StreamExt};
 use rustgate_core::codec::Codec;
+use rustgate_router::{Router, ThrottleConfig};
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_tls::TlsConfig;
-use rustgate_transport::{Router, TakXmlCodec, ThrottleConfig};
+use rustgate_transport::TakXmlCodec;
 use rustgate_websocket::{WebSocketServer, WsListener, WsServerConfig};
 use tokio::sync::{Notify, Semaphore};
 use tokio_tungstenite::tungstenite::Message;

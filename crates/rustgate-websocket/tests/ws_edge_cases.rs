@@ -9,10 +9,11 @@
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
+use rustgate_router::Router;
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_tls::TlsConfig;
-use rustgate_transport::{Router, TakXmlCodec};
+use rustgate_transport::TakXmlCodec;
 use rustgate_websocket::{WebSocketServer, WsListener, WsServerConfig};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;

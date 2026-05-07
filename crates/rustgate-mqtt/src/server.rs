@@ -186,9 +186,9 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
+    use rustgate_router::Router;
     use rustgate_test_utils::certs::TestCa;
     use rustgate_tls::TlsConfig;
-    use rustgate_transport::Router;
     use tokio::sync::{Notify, Semaphore};
 
     use super::*;
