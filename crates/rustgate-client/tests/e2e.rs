@@ -20,9 +20,8 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::protocol::HeaderSize;
 use rustgate_test_utils::certs::TestCa;
-use rustgate_transport::{
-    AuthenticatedSession, LengthPrefixedCodec, Router, SessionHandle, TlsConfig, TlsListener,
-};
+use rustgate_tls::{AuthenticatedSession, TlsConfig, TlsListener};
+use rustgate_transport::{LengthPrefixedCodec, Router, SessionHandle};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite};
 

@@ -188,6 +188,9 @@ crate = "rustgate-archive"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-metrics"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-tls"
 
 [bans]
 multiple-versions = "warn"

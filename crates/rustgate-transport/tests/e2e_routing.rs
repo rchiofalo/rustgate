@@ -16,9 +16,8 @@ use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage
 use rustgate_core::protocol::HeaderSize;
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{
-    AuthenticatedSession, LengthPrefixedCodec, Router, SessionHandle, TlsConfig, TlsListener,
-};
+use rustgate_tls::{AuthenticatedSession, TlsConfig, TlsListener};
+use rustgate_transport::{LengthPrefixedCodec, Router, SessionHandle};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -76,7 +75,7 @@ fn spawn_session(session: AuthenticatedSession, router: Arc<Router>) {
 }
 
 async fn server_read(
-    reader: rustgate_transport::SessionReader,
+    reader: rustgate_tls::SessionReader,
     identity: &Identity,
     router: &Router,
 ) -> std::io::Result<()> {
@@ -91,7 +90,7 @@ async fn server_read(
 }
 
 async fn server_write(
-    writer: rustgate_transport::SessionWriter,
+    writer: rustgate_tls::SessionWriter,
     mut priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     mut normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
 ) -> std::io::Result<()> {

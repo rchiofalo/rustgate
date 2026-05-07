@@ -24,6 +24,7 @@ rustgate-core = { workspace = true }
 rustgate-cot = { workspace = true }
 rustgate-metrics = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
+rustgate-tls = { workspace = true }
 rustgate-transport = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }

@@ -48,7 +48,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Method, Response, StatusCode};
-use rustgate_transport::{CertReloader, Router};
+use rustgate_tls::CertReloader;
+use rustgate_transport::Router;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -91,7 +92,7 @@ pub struct MgmtApiState {
     pub cert_reloader: Option<Arc<CertReloader>>,
     /// On-disk CRL path when one was configured via `--crl`. The
     /// [`crl_status`] handler re-parses this file on every request via
-    /// [`rustgate_transport::TlsConfig::validate_crl_file`] so the
+    /// [`rustgate_tls::TlsConfig::validate_crl_file`] so the
     /// response reflects what the next SIGHUP would load — there is no
     /// separate in-memory CRL cache to go stale.
     pub crl_path: Option<PathBuf>,
@@ -538,7 +539,7 @@ fn crl_status(state: &MgmtApiState) -> Response<Full<Bytes>> {
         });
     };
     let display = path.display().to_string();
-    match rustgate_transport::TlsConfig::validate_crl_file(&display) {
+    match rustgate_tls::TlsConfig::validate_crl_file(&display) {
         Ok(summary) => json_ok(&CrlStatus {
             configured: true,
             path: Some(display),

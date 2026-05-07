@@ -49,7 +49,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::net::configure_tactical_socket;
 use rustgate_resilience::SlidingWindowLimiter;
-use rustgate_transport::{TlsConfig, extract_identity};
+use rustgate_tls::{TlsConfig, extract_identity};
 pub use server::{
     DEFAULT_MAX_WRITE_BUFFER_BYTES, OnFederationForward, OnHttpForward, OnNatsPublish,
     OnWsAcceptFn, OnWsRejectFn, WebSocketServer, WsServerConfig, WsSessionHooks,
@@ -166,7 +166,7 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// WebSocket listener with mandatory mTLS.
 ///
-/// Mirrors [`TlsListener`](rustgate_transport::TlsListener) but adds the
+/// Mirrors [`TlsListener`](rustgate_tls::TlsListener) but adds the
 /// WebSocket upgrade handshake after TLS completes. The accept loop handles
 /// TCP, TLS, identity extraction, and WS upgrade — callers receive a fully
 /// authenticated [`WsSession`] ready for message exchange.

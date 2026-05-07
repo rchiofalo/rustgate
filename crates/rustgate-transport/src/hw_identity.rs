@@ -57,10 +57,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
-use rustls_pki_types::pem::PemObject;
 use tracing::warn;
 use zeroize::Zeroizing;
 

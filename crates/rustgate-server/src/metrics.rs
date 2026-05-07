@@ -2900,7 +2900,7 @@ pub struct ReadinessReport {
 /// included in the report.
 pub struct ReadinessState {
     /// TLS certificate reloader — checked for cert existence and expiry.
-    pub cert_reloader: Option<Arc<rustgate_transport::CertReloader>>,
+    pub cert_reloader: Option<Arc<rustgate_tls::CertReloader>>,
 
     /// NATS publisher — checked for connection state via
     /// `NatsPublisher::is_connected`.
@@ -3018,7 +3018,7 @@ impl Default for ReadinessState {
 
 /// Check TLS certificate validity by parsing the end-entity cert and
 /// comparing its `notBefore`/`notAfter` fields against the current time.
-fn check_tls_cert(reloader: &rustgate_transport::CertReloader) -> DependencyCheck {
+fn check_tls_cert(reloader: &rustgate_tls::CertReloader) -> DependencyCheck {
     let Some(certified_key) = reloader.certified_key() else {
         return DependencyCheck::unhealthy("certificate not loaded");
     };
@@ -5143,8 +5143,7 @@ mod tests {
         std::fs::write(&cert_path, &server.cert_pem).expect("write cert");
         std::fs::write(&key_path, &server.key_pem).expect("write key");
 
-        let reloader =
-            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         let check = check_tls_cert(&reloader);
         assert_eq!(check.status, CheckStatus::Ok);
     }
@@ -5162,8 +5161,7 @@ mod tests {
         std::fs::write(&cert_path, &expired.cert_pem).expect("write cert");
         std::fs::write(&key_path, &expired.key_pem).expect("write key");
 
-        let reloader =
-            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         let check = check_tls_cert(&reloader);
         assert_eq!(check.status, CheckStatus::Unhealthy);
         assert!(check.message.as_deref().unwrap_or("").contains("expired"));
@@ -5183,8 +5181,7 @@ mod tests {
         std::fs::write(&cert_path, &near_expiry.cert_pem).expect("write cert");
         std::fs::write(&key_path, &near_expiry.key_pem).expect("write key");
 
-        let reloader =
-            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         let check = check_tls_cert(&reloader);
         assert_eq!(
             check.status,
@@ -5255,12 +5252,9 @@ mod tests {
         // read the age from the convenience method, then push it into
         // the gauge. This is exactly the sequence setup.rs runs at
         // startup.
-        let tls_config = rustgate_transport::TlsConfig::from_pem(
-            &server.cert_pem,
-            &server.key_pem,
-            &ca.cert_pem,
-        )
-        .expect("TlsConfig::from_pem");
+        let tls_config =
+            rustgate_tls::TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+                .expect("TlsConfig::from_pem");
         let tls_config = tls_config.with_crls(&crl_pem).expect("with_crls");
         let age = tls_config
             .crl_max_age_seconds()
@@ -5428,8 +5422,7 @@ mod tests {
         std::fs::write(&cert_path, &server.cert_pem).expect("write cert");
         std::fs::write(&key_path, &server.key_pem).expect("write key");
 
-        let reloader =
-            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         // check_tls_cert updates the gauge as a side effect; invoke it and
         // read the gauge back.
         let _ = check_tls_cert(&reloader);
@@ -5453,8 +5446,7 @@ mod tests {
         std::fs::write(&cert_path, &expired.cert_pem).expect("write cert");
         std::fs::write(&key_path, &expired.key_pem).expect("write key");
 
-        let reloader =
-            rustgate_transport::CertReloader::new(&cert_path, &key_path).expect("reloader");
+        let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         let _ = check_tls_cert(&reloader);
         assert!(
             cert_expiry_seconds().get() < 0,

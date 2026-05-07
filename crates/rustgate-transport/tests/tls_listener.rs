@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::{build_client_tls_config, parse_certs, parse_key};
-use rustgate_transport::{
+use rustgate_tls::{
     ExpectedKeyUsage, TlsConfig, TlsListener, TlsMinVersion, extract_identity, validate_key_usage,
 };
 use rustls::RootCertStore;

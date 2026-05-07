@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use rustgate_test_utils::certs::TestCa;
-use rustgate_transport::TlsConfig;
+use rustgate_tls::TlsConfig;
 use rustgate_websocket::{WsListener, WsListenerConfig};
 use rustls::RootCertStore;
 use rustls_pki_types::pem::PemObject;

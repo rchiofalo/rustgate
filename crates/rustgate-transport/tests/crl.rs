@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{TlsConfig, TlsListener};
+use rustgate_tls::{TlsConfig, TlsListener};
 use rustls::pki_types::CertificateRevocationListDer;
-use rustls_pki_types::pem::PemObject;
+use rustls::pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn try_connect(
@@ -215,7 +215,7 @@ fn stale_crl_detected_by_freshness_check() {
             .collect::<Result<Vec<_>, _>>()
             .expect("parse CRL PEM");
 
-    let stale_count = rustgate_transport::check_crl_freshness(&crls);
+    let stale_count = rustgate_tls::check_crl_freshness(&crls);
     assert_eq!(stale_count, 1, "expired CRL should be detected as stale");
 }
 
@@ -232,7 +232,7 @@ fn fresh_crl_passes_freshness_check() {
             .collect::<Result<Vec<_>, _>>()
             .expect("parse CRL PEM");
 
-    let stale_count = rustgate_transport::check_crl_freshness(&crls);
+    let stale_count = rustgate_tls::check_crl_freshness(&crls);
     assert_eq!(stale_count, 0, "fresh CRL should not be flagged as stale");
 }
 

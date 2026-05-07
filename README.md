@@ -87,7 +87,8 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 |-------|---------|
 | [`rustgate-core`](crates/rustgate-core/README.md) | Codec trait, shared types: Identity, RoutableMessage, Destination, framing strategies |
 | [`rustgate-cot`](crates/rustgate-cot/README.md) | Cursor on Target XML parsing and message building |
-| [`rustgate-transport`](crates/rustgate-transport/README.md) | mTLS listener, codec, session management, CRL, FIPS provider, routing engine |
+| [`rustgate-tls`](crates/rustgate-tls/README.md) | TLS/mTLS configuration, X.509 identity extraction, OCSP, SPIFFE, TCP listeners |
+| [`rustgate-transport`](crates/rustgate-transport/README.md) | Routing, sessions, codecs, store-and-forward, throttling, UDP — pure post-handshake |
 | [`rustgate-websocket`](crates/rustgate-websocket/README.md) | WebSocket (wss://) listener with mTLS client authentication |
 | [`rustgate-mqtt`](crates/rustgate-mqtt/README.md) | MQTT 5.0/3.1.1 transport adapter with mTLS and dynamic subscriptions |
 | [`rustgate-mavlink`](crates/rustgate-mavlink/README.md) | MAVLink v1/v2 wire-frame codec (listeners and signing land in follow-up PRs) |

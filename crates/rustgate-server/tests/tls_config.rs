@@ -9,7 +9,7 @@
 //! APIs from `rustgate-transport`.
 
 use rustgate_test_utils::certs::TestCa;
-use rustgate_transport::{TlsConfig, TlsListener, TlsMinVersion};
+use rustgate_tls::{TlsConfig, TlsListener, TlsMinVersion};
 
 // ── TlsConfig::from_pem ─────────────────────────────────────────────
 

@@ -560,15 +560,15 @@ fn main() -> anyhow::Result<()> {
     // includes FIPS validation (same aws-lc-rs backend) plus PQ KX groups.
     #[cfg(feature = "post-quantum")]
     if let Some(ref groups) = cli.kx_groups {
-        rustgate_transport::install_provider_with_kx_groups(groups)?;
+        rustgate_tls::install_provider_with_kx_groups(groups)?;
     } else {
-        rustgate_transport::install_pq_provider()?;
+        rustgate_tls::install_pq_provider()?;
     }
 
     #[cfg(all(feature = "fips", not(feature = "post-quantum")))]
-    rustgate_transport::install_fips_provider()?;
+    rustgate_tls::install_fips_provider()?;
 
-    if cli.fips_required && !rustgate_transport::is_fips_provider_active() {
+    if cli.fips_required && !rustgate_tls::is_fips_provider_active() {
         anyhow::bail!(
             "--fips-required is set but FIPS crypto provider is not active. \
              Build with --features fips to enable FIPS 140-3 mode."
@@ -576,7 +576,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "post-quantum")]
-    if rustgate_transport::is_pq_provider_active() {
+    if rustgate_tls::is_pq_provider_active() {
         tracing::info!("post-quantum key exchange available (X25519MLKEM768)");
     } else {
         tracing::warn!("post-quantum feature enabled but X25519MLKEM768 not found in provider");
@@ -2292,7 +2292,7 @@ pub(crate) struct ReloadReport {
 /// requires a server restart. Re-parsing on SIGHUP catches operator
 /// errors before the next restart.
 async fn reload_all_configs(
-    cert_reloader: Option<&Arc<rustgate_transport::CertReloader>>,
+    cert_reloader: Option<&Arc<rustgate_tls::CertReloader>>,
     acl_reloader: Option<&Arc<acl_reloader::AclReloader>>,
     crl_path: Option<&str>,
     #[cfg(feature = "ocsp")] ocsp_stapler: Option<&Arc<rustgate_transport::ocsp::Stapler>>,
@@ -2503,8 +2503,8 @@ async fn reload_all_configs(
 /// Used by [`reload_all_configs`] to validate CRL files on SIGHUP without
 /// touching the live TLS listener. The returned age is fed into the
 /// `rustgate_crl_age_seconds` gauge so operators alert on stale CRLs.
-fn reload_crl_file(path: &str) -> anyhow::Result<rustgate_transport::CrlFileSummary> {
-    rustgate_transport::TlsConfig::validate_crl_file(path).map_err(|e| anyhow::anyhow!("{e}"))
+fn reload_crl_file(path: &str) -> anyhow::Result<rustgate_tls::CrlFileSummary> {
+    rustgate_tls::TlsConfig::validate_crl_file(path).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Maximum size of a client-queue HMAC key file (128 bytes — well above

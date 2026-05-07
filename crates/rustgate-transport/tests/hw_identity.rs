@@ -20,9 +20,8 @@ use std::sync::Arc;
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{
-    HardwareIdentity, HardwareIdentityResolver, Pkcs11StubBackend, TlsConfig, TlsListener,
-};
+use rustgate_tls::{TlsConfig, TlsListener};
+use rustgate_transport::{HardwareIdentity, HardwareIdentityResolver, Pkcs11StubBackend};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn install_provider() {

@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use rustgate_federation::v1::server::{OnMessage, V1Server};
 use rustgate_test_utils::certs::TestCa;
-use rustgate_transport::TlsConfig;
+use rustgate_tls::TlsConfig;
 
 const DRAIN_BUDGET: Duration = Duration::from_secs(5);
 

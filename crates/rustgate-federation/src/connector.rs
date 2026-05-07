@@ -15,7 +15,7 @@ use rustgate_core::masking::hash_cn;
 use rustgate_core::net::configure_tactical_socket;
 use rustgate_core::pem::{parse_ca_store, parse_certs, parse_key};
 use rustgate_core::secrets::{SecretFileOpts, read_secret_file};
-use rustgate_transport::extract_identity;
+use rustgate_tls::extract_identity;
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
@@ -512,7 +512,7 @@ mod tests {
     use std::time::Duration;
 
     use rustgate_test_utils::certs::TestCa;
-    use rustgate_transport::{TlsConfig, TlsListener};
+    use rustgate_tls::{TlsConfig, TlsListener};
 
     use super::*;
 

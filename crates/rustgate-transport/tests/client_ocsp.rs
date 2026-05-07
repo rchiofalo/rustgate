@@ -8,6 +8,7 @@
 //! cached `Revoked` status causes the next handshake to be rejected.
 
 #![allow(clippy::panic, clippy::unwrap_used)]
+#![cfg(feature = "ocsp")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -15,7 +16,7 @@ use std::time::Duration;
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{
+use rustgate_tls::{
     ClientOcspVerifier, DEFAULT_MAX_HANDSHAKES, FetchFuture, OcspFetcher, TlsConfig, TlsListener,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

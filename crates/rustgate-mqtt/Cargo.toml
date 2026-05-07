@@ -22,6 +22,7 @@ metrics = ["dep:prometheus", "dep:rustgate-metrics"]
 rustgate-core = { workspace = true }
 rustgate-metrics = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
+rustgate-tls = { workspace = true }
 rustgate-transport = { workspace = true }
 bytes = { workspace = true }
 mqttbytes = { version = "0.6", features = ["v5"] }

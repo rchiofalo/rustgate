@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::TlsConfig;
+use rustgate_tls::TlsConfig;
 use rustgate_websocket::{
     CompressionConfig, Deflater, Inflater, PermessageDeflateConfig, WsListener, WsListenerConfig,
 };

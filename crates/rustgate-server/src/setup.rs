@@ -37,9 +37,8 @@ use rustgate_core::tasks::SubsystemHandle;
     feature = "federation-ha",
 ))]
 use rustgate_core::tasks::spawn_background;
-use rustgate_transport::{
-    CertReloader, Router, ThrottleConfig, TlsConfig, TlsListener, TlsMinVersion,
-};
+use rustgate_tls::{CertReloader, TlsConfig, TlsListener, TlsMinVersion};
+use rustgate_transport::{Router, ThrottleConfig};
 use tokio::sync::Semaphore;
 
 use crate::cli::{Cli, Encoding, Framing};
@@ -318,10 +317,10 @@ pub(crate) async fn bind_tls_listener(
         #[cfg(not(feature = "metrics"))]
         let on_miss: Option<rustgate_transport::client_ocsp::OnCacheMiss> = None;
 
-        let fetcher: std::sync::Arc<dyn rustgate_transport::OcspFetcher> =
-            std::sync::Arc::new(rustgate_transport::OcspStaplerFetcher::default());
+        let fetcher: std::sync::Arc<dyn rustgate_tls::OcspFetcher> =
+            std::sync::Arc::new(rustgate_tls::OcspStaplerFetcher::default());
         let wrapped =
-            rustgate_transport::ClientOcspVerifier::new(inner_verifier, fetcher, on_hit, on_miss);
+            rustgate_tls::ClientOcspVerifier::new(inner_verifier, fetcher, on_hit, on_miss);
         tracing::info!(
             "client certificate OCSP verification enabled (Tier 1, fail-open, SKI cache)"
         );
@@ -2016,12 +2015,12 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 
     tracing::warn!(addr = %addr, "plaintext TCP input enabled — traffic is NOT encrypted");
 
-    let identity_config = rustgate_transport::PlaintextIdentityConfig {
+    let identity_config = rustgate_tls::PlaintextIdentityConfig {
         cn: cli.plaintext_cn.clone(),
         default_group: cli.plaintext_group.clone(),
     };
 
-    let pt_listener = rustgate_transport::PlaintextListener::bind(addr, identity_config)
+    let pt_listener = rustgate_tls::PlaintextListener::bind(addr, identity_config)
         .await
         .context("binding plaintext TCP listener")?;
 

@@ -1,6 +1,6 @@
 [package]
 name = "rustgate-transport"
-description = "TLS/mTLS listener and connection management"
+description = "Routing, sessions, codecs, store-and-forward, throttling, and UDP I/O"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,10 +13,14 @@ workspace = true
 [features]
 proto = ["dep:rustgate-proto"]
 mavlink = ["dep:rustgate-mavlink"]
-fips = ["rustls/aws_lc_rs", "rustls/fips"]
-post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
-ocsp = ["dep:ocsp-stapler"]
-spiffe = ["dep:spiffe"]
+# Passthrough features so existing transport-test gates (`#![cfg(feature = "fips")]`,
+# `#![cfg(feature = "post-quantum")]`, `#![cfg(feature = "ocsp")]`, `#![cfg(feature = "spiffe")]`)
+# continue to compile after the TLS extraction (#890). The actual implementation lives
+# in `rustgate-tls`; transport just forwards the flag.
+fips = ["rustgate-tls/fips"]
+post-quantum = ["rustgate-tls/post-quantum"]
+ocsp = ["rustgate-tls/ocsp"]
+spiffe = ["rustgate-tls/spiffe"]
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }
@@ -30,10 +34,7 @@ bytes = { workspace = true }
 dashmap = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }
 tokio-util = { workspace = true }
-tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
-x509-parser = { workspace = true }
 sha2 = { workspace = true }
 ring = { workspace = true }
 parking_lot = { workspace = true }
@@ -42,8 +43,6 @@ serde_json = { workspace = true }
 lru = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
-ocsp-stapler = { workspace = true, optional = true }
-spiffe = { workspace = true, optional = true }
 redb = { workspace = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
@@ -54,8 +53,11 @@ thiserror = { workspace = true }
 socket2 = { workspace = true }
 
 [dev-dependencies]
+rustgate-tls = { workspace = true }
 rustgate-test-utils = { workspace = true }
+x509-parser = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tokio-rustls = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }

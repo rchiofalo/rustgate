@@ -8,7 +8,7 @@
 //! updates without restarting the server.
 //!
 //! Follows the same polling pattern as
-//! [`CertReloader`](rustgate_transport::CertReloader): compute a hash of the
+//! [`CertReloader`](rustgate_tls::CertReloader): compute a hash of the
 //! file contents, compare against the previously stored hash, and swap only
 //! when the hash changes.
 

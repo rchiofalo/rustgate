@@ -22,7 +22,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::net::configure_tactical_socket;
 use rustgate_resilience::SlidingWindowLimiter;
-use rustgate_transport::{TlsConfig, extract_identity};
+use rustgate_tls::{TlsConfig, extract_identity};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};

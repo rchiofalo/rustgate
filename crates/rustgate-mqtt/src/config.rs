@@ -619,12 +619,9 @@ mod tests {
         // and fail) is caught here.
         let ca = rustgate_test_utils::certs::TestCa::new("debug-none-test");
         let server = ca.issue_server_cert("localhost", &["localhost"]);
-        let tls = rustgate_transport::TlsConfig::from_pem(
-            &server.cert_pem,
-            &server.key_pem,
-            &ca.cert_pem,
-        )
-        .expect("TlsConfig from fresh test certs");
+        let tls =
+            rustgate_tls::TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+                .expect("TlsConfig from fresh test certs");
         let listener = MqttListener::bind("127.0.0.1:0".parse().unwrap(), &tls).expect("bind");
         let config = MqttServerConfig {
             listener,
@@ -671,12 +668,9 @@ mod tests {
         // unable to tell whether observers are wired at all.
         let ca = rustgate_test_utils::certs::TestCa::new("debug-some-test");
         let server = ca.issue_server_cert("localhost", &["localhost"]);
-        let tls = rustgate_transport::TlsConfig::from_pem(
-            &server.cert_pem,
-            &server.key_pem,
-            &ca.cert_pem,
-        )
-        .expect("TlsConfig from fresh test certs");
+        let tls =
+            rustgate_tls::TlsConfig::from_pem(&server.cert_pem, &server.key_pem, &ca.cert_pem)
+                .expect("TlsConfig from fresh test certs");
         let listener = MqttListener::bind("127.0.0.1:0".parse().unwrap(), &tls).expect("bind");
         let config = MqttServerConfig {
             listener,

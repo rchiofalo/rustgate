@@ -1,0 +1,40 @@
+[package]
+name = "rustgate-tls"
+description = "TLS/mTLS configuration, certificate handling, OCSP, SPIFFE, and TCP listeners"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+fips = ["rustls/aws_lc_rs", "rustls/fips"]
+post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+ocsp = ["dep:ocsp-stapler"]
+spiffe = ["dep:spiffe"]
+
+[dependencies]
+rustgate-core = { workspace = true, features = ["pem"] }
+arc-swap = { workspace = true }
+parking_lot = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+x509-parser = { workspace = true }
+zeroize = { workspace = true }
+ocsp-stapler = { workspace = true, optional = true }
+spiffe = { workspace = true, optional = true }
+
+[dev-dependencies]
+rustgate-test-utils = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tempfile = { workspace = true }
+futures = { workspace = true }
+socket2 = { workspace = true }

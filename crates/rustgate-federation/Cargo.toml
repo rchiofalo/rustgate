@@ -54,6 +54,7 @@ rustgate-core = { workspace = true, features = ["pem"] }
 rustgate-metrics = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
+rustgate-tls = { workspace = true }
 rustgate-transport = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros", "io-util"] }
 tokio-rustls = { workspace = true }
