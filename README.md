@@ -93,6 +93,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-websocket`](crates/rustgate-websocket/README.md) | WebSocket (wss://) listener with mTLS client authentication |
 | [`rustgate-mqtt`](crates/rustgate-mqtt/README.md) | MQTT 5.0/3.1.1 transport adapter with mTLS and dynamic subscriptions |
 | [`rustgate-mavlink`](crates/rustgate-mavlink/README.md) | MAVLink v1/v2 wire-frame codec (listeners and signing land in follow-up PRs) |
+| [`rustgate-meshtastic`](crates/rustgate-meshtastic/README.md) | Meshtastic / LoRa TAKPacket compact-protobuf codec (237-byte cap; transport binding in follow-up PRs) |
 | [`rustgate-nats`](crates/rustgate-nats/README.md) | NATS/JetStream bridge for cross-instance message delivery |
 | [`rustgate-enrollment`](crates/rustgate-enrollment/README.md) | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | [`rustgate-proto`](crates/rustgate-proto/README.md) | Protobuf message translation (XML ↔ proto) |

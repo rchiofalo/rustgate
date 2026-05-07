@@ -58,6 +58,14 @@ spiffe = ["rustgate-tls/spiffe"]
 # Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
 cedar = ["rustgate-authz/cedar"]
 http = ["dep:rustgate-http", "rustgate-admin/http"]
+# Documentary feature for the Meshtastic / LoRa TAKPacket codec
+# (`rustgate-meshtastic`). The codec crate is always linked alongside
+# the other always-on wire-format crates (CoT, MAVLink, ASTERIX,
+# STANAG-4586) — the registry construction is zero-cost when no
+# Meshtastic traffic arrives — so this feature is a no-op selector
+# kept so operators and CI can express intent in a `--features` list
+# without breaking other always-on conventions. Refs #865.
+meshtastic = []
 # Emit a JSON Schema for `rustgate.toml` via the `emit-schema` subcommand
 # so operators can wire it into VS Code (Even Better TOML) or any
 # JSON-Schema-aware editor for autocomplete + inline validation. Pulls in
@@ -82,6 +90,7 @@ rustgate-metrics = { workspace = true, optional = true }
 rustgate-mavlink = { workspace = true }
 rustgate-asterix = { workspace = true }
 rustgate-stanag4586 = { workspace = true }
+rustgate-meshtastic = { workspace = true }
 rustgate-tls = { workspace = true }
 rustgate-transport = { workspace = true }
 rustgate-router = { workspace = true }
