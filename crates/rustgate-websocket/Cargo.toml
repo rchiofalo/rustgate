@@ -25,7 +25,7 @@ rustgate-cot = { workspace = true }
 rustgate-metrics = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
 rustgate-tls = { workspace = true }
-rustgate-transport = { workspace = true }
+rustgate-router = { workspace = true }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
@@ -39,6 +39,7 @@ socket2 = { workspace = true }
 
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
+rustgate-transport = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 tokio-tungstenite = { workspace = true }
 tokio-rustls = { workspace = true }

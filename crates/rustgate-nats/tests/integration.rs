@@ -22,8 +22,8 @@ use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage
 use rustgate_nats::{
     NatsAdapter, NatsConfig, NatsRequestHandler, NatsRequestResponder, RequestError, WireEvent,
 };
+use rustgate_router::Router;
 use rustgate_test_utils::require_nats;
-use rustgate_transport::Router;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -73,13 +73,13 @@ async fn register_session(
     router: &Router,
     cn: &str,
     group: &str,
-) -> mpsc::Receiver<rustgate_transport::RoutedMessage> {
+) -> mpsc::Receiver<rustgate_router::RoutedMessage> {
     let (ptx, prx) = mpsc::channel(16);
     let (ntx, _nrx) = mpsc::channel(64);
     let mut groups = BTreeSet::new();
     let _ = groups.insert(group.to_string());
     let identity = Arc::new(Identity::plaintext(cn.to_string(), groups).expect("valid identity"));
-    let handle = rustgate_transport::SessionHandle::new(identity, ptx, ntx);
+    let handle = rustgate_router::SessionHandle::new(identity, ptx, ntx);
     let _ = router.register(handle).await;
     // Return priority receiver — NATS-bridged messages are typically
     // positions which route to the priority channel.
@@ -96,15 +96,15 @@ async fn register_session_dual(
     cn: &str,
     group: &str,
 ) -> (
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
 ) {
     let (ptx, prx) = mpsc::channel(16);
     let (ntx, nrx) = mpsc::channel(64);
     let mut groups = BTreeSet::new();
     let _ = groups.insert(group.to_string());
     let identity = Arc::new(Identity::plaintext(cn.to_string(), groups).expect("valid identity"));
-    let handle = rustgate_transport::SessionHandle::new(identity, ptx, ntx);
+    let handle = rustgate_router::SessionHandle::new(identity, ptx, ntx);
     let _ = router.register(handle).await;
     (prx, nrx)
 }
@@ -1498,7 +1498,7 @@ async fn nats_subscriber_publish_fans_out_to_http() {
 async fn nats_subscriber_with_send_pep_obligation_applies_obligation_before_fanout() {
     use std::sync::Mutex as StdMutex;
 
-    use rustgate_transport::rustgate_authz::{
+    use rustgate_authz::{
         Action, Decision, DecisionOutcome, Obligation, PolicyEngine, Resource, Subject,
     };
 

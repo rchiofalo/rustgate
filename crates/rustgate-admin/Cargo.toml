@@ -18,7 +18,7 @@ http = ["dep:rustgate-http"]
 [dependencies]
 rustgate-core = { workspace = true }
 rustgate-tls = { workspace = true }
-rustgate-transport = { workspace = true }
+rustgate-router = { workspace = true }
 rustgate-nats = { workspace = true, optional = true }
 rustgate-federation = { workspace = true, optional = true }
 rustgate-http = { workspace = true, optional = true }

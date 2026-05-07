@@ -48,8 +48,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Method, Response, StatusCode};
+use rustgate_router::Router;
 use rustgate_tls::CertReloader;
-use rustgate_transport::Router;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -873,7 +873,7 @@ pub(crate) fn build_v1_cert_status(der: &[u8]) -> Result<V1CertStatus, String> {
 /// OK` because "no live session for this CN" is a normal,
 /// not-exceptional state for the endpoint.
 ///
-/// [`SessionHandle`]: rustgate_transport::SessionHandle
+/// [`SessionHandle`]: rustgate_router::SessionHandle
 #[derive(Debug, Serialize)]
 struct V1DisconnectResult {
     /// Number of session writer channels signalled to drain.
@@ -1303,15 +1303,15 @@ mod tests {
     /// Three sends of two distinct payloads → 2 misses + 1 hit, with
     /// `entries == 2` and `evictions == 0` because the cache capacity
     /// is far above the working set.
-    fn router_with_primed_dedup() -> Arc<rustgate_transport::Router> {
+    fn router_with_primed_dedup() -> Arc<rustgate_router::Router> {
         use std::time::Duration;
-        let dedup = rustgate_transport::DedupCache::new(Duration::from_secs(60), 16);
+        let dedup = rustgate_router::DedupCache::new(Duration::from_secs(60), 16);
         // Drive the cache directly — we only need the counters bumped,
         // not a full router fan-out.
         assert!(!dedup.check_payload("", b"alpha"));
         assert!(!dedup.check_payload("", b"bravo"));
         assert!(dedup.check_payload("", b"alpha"));
-        let router = rustgate_transport::Router::new();
+        let router = rustgate_router::Router::new();
         router.set_dedup(Some(dedup));
         Arc::new(router)
     }
@@ -1910,7 +1910,7 @@ mod tests {
         use std::sync::Arc as StdArc;
 
         use rustgate_core::identity::Identity;
-        use rustgate_transport::SessionHandle;
+        use rustgate_router::SessionHandle;
         use tokio::sync::mpsc;
 
         let identity = StdArc::new(

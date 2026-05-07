@@ -23,7 +23,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::tasks::spawn_background;
 use rustgate_cot::MessageBuilder;
-use rustgate_transport::{ClientThrottle, ReplayFilter, Router, SessionHandle, ThrottleConfig};
+use rustgate_router::{ClientThrottle, ReplayFilter, Router, SessionHandle, ThrottleConfig};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::{Interval, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
@@ -302,12 +302,10 @@ async fn handle_ws_session(
         "WebSocket session started"
     );
 
-    let (priority_tx, mut priority_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
-        rustgate_transport::PRIORITY_CHANNEL_CAPACITY,
-    );
-    let (normal_tx, mut normal_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
-        rustgate_transport::NORMAL_CHANNEL_CAPACITY,
-    );
+    let (priority_tx, mut priority_rx) =
+        mpsc::channel::<rustgate_router::RoutedMessage>(rustgate_router::PRIORITY_CHANNEL_CAPACITY);
+    let (normal_tx, mut normal_rx) =
+        mpsc::channel::<rustgate_router::RoutedMessage>(rustgate_router::NORMAL_CHANNEL_CAPACITY);
     let handle = if circuit_breaker_threshold > 0 {
         SessionHandle::with_drop_threshold(
             Arc::clone(&identity),
@@ -549,7 +547,7 @@ async fn ws_read_loop(
 /// Action chosen on each iteration of the write loop.
 enum WriteAction {
     /// A routed message is ready to be encoded and sent.
-    Send(rustgate_transport::RoutedMessage),
+    Send(rustgate_router::RoutedMessage),
     /// The ping interval elapsed; emit a Ping frame after a staleness check.
     Ping,
 }
@@ -586,8 +584,8 @@ async fn tick_or_never(ticker: Option<&mut Interval>) -> Instant {
 #[allow(clippy::too_many_arguments)]
 async fn ws_write_loop(
     mut ws_write: SplitSink<WsStream, Message>,
-    priority_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    normal_rx: &mut mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    priority_rx: &mut mpsc::Receiver<rustgate_router::RoutedMessage>,
+    normal_rx: &mut mpsc::Receiver<rustgate_router::RoutedMessage>,
     codec: &dyn Codec,
     max_write_buffer_bytes: usize,
     health_check: HealthCheckConfig,
@@ -712,9 +710,9 @@ mod tests {
 
     use rustgate_core::codec::Codec;
     use rustgate_core::message::RoutableMessage;
+    use rustgate_router::Router;
     use rustgate_test_utils::certs::TestCa;
     use rustgate_tls::TlsConfig;
-    use rustgate_transport::Router;
     use tokio::sync::{Notify, Semaphore};
 
     use super::*;

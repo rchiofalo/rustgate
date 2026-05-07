@@ -1658,7 +1658,7 @@ dependencies = [
  "rustgate-core",
  "rustgate-cot",
  "rustgate-resilience",
- "rustgate-transport",
+ "rustgate-router",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1695,6 +1695,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-router"
+version = "0.8.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "dashmap",
+ "lru",
+ "parking_lot",
+ "redb",
+ "ring",
+ "rustgate-authz",
+ "rustgate-core",
+ "rustgate-cot",
+ "rustgate-resilience",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smol_str",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "rustgate-stanag4586"
 version = "0.8.0"
 dependencies = [
@@ -1725,22 +1750,15 @@ dependencies = [
 name = "rustgate-transport"
 version = "0.8.0"
 dependencies = [
- "arc-swap",
  "bytes",
- "dashmap",
  "lru",
  "parking_lot",
- "redb",
- "ring",
- "rustgate-authz",
  "rustgate-core",
  "rustgate-cot",
  "rustgate-resilience",
+ "rustgate-router",
  "rustls",
- "serde",
- "serde_json",
  "sha2",
- "smol_str",
  "socket2",
  "thiserror 2.0.18",
  "tokio",

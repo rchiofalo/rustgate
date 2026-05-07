@@ -35,7 +35,7 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::{
+use rustgate_router::{
     NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, RoutedMessage, Router, SessionHandle,
 };
 use tokio::runtime::Runtime;

@@ -37,8 +37,8 @@ use rustgate_core::tasks::SubsystemHandle;
     feature = "federation-ha",
 ))]
 use rustgate_core::tasks::spawn_background;
+use rustgate_router::{Router, ThrottleConfig};
 use rustgate_tls::{CertReloader, TlsConfig, TlsListener, TlsMinVersion};
-use rustgate_transport::{Router, ThrottleConfig};
 use tokio::sync::Semaphore;
 
 use crate::cli::{Cli, Encoding, Framing};
@@ -56,7 +56,7 @@ use crate::session::{FedForwardFn, NatsPublish, PlaintextTcpConfig};
 pub(crate) async fn load_group_acl(
     cli: &Cli,
 ) -> anyhow::Result<(
-    Option<rustgate_transport::GroupAclPolicy>,
+    Option<rustgate_router::GroupAclPolicy>,
     Option<[u8; 32]>,
     Option<rustgate_admin::GroupAclFile>,
 )> {
@@ -85,7 +85,7 @@ pub(crate) async fn load_group_acl(
     for (group_id, entry) in &config.groups {
         let _ = groups.insert(
             group_id.clone(),
-            rustgate_transport::GroupAcl::with_deny(
+            rustgate_router::GroupAcl::with_deny(
                 entry.send.iter().map(|s| s.to_ascii_lowercase()).collect(),
                 entry
                     .receive
@@ -106,7 +106,7 @@ pub(crate) async fn load_group_acl(
         );
     }
 
-    let policy = rustgate_transport::GroupAclPolicy::new(groups);
+    let policy = rustgate_router::GroupAclPolicy::new(groups);
     tracing::info!(groups = policy.len(), "loaded group access control policy");
     Ok((Some(policy), Some(hash), Some(config)))
 }
@@ -1684,7 +1684,7 @@ pub(crate) struct WebSocketSetup<'a, P: NatsPublish> {
     #[cfg(feature = "http")]
     pub(crate) http_forward: &'a Option<HttpForwardFn>,
     pub(crate) throttle_config: Option<ThrottleConfig>,
-    pub(crate) replay_filter: &'a Option<Arc<rustgate_transport::ReplayFilter>>,
+    pub(crate) replay_filter: &'a Option<Arc<rustgate_router::ReplayFilter>>,
 }
 
 /// Start the WebSocket listener and return its subsystem handle.
@@ -2004,7 +2004,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     #[cfg(feature = "http")] http_forward: &Option<HttpForwardFn>,
     throttle_config: Option<ThrottleConfig>,
     archiver: &Option<Arc<rustgate_archive::CotArchiver>>,
-    replay_filter: &Option<Arc<rustgate_transport::ReplayFilter>>,
+    replay_filter: &Option<Arc<rustgate_router::ReplayFilter>>,
     #[cfg(feature = "metrics")] metrics_identity: &Arc<metrics::MetricsIdentity>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
     let tcp_bind = match cli.tcp_bind.as_ref() {
@@ -2087,7 +2087,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
     router: &Arc<Router>,
     nats_publisher: &Option<P>,
     fed_forward: &Option<FedForwardFn>,
-    replay_filter: &Option<Arc<rustgate_transport::ReplayFilter>>,
+    replay_filter: &Option<Arc<rustgate_router::ReplayFilter>>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
     let udp_bind = match cli.udp_bind.as_ref() {
         Some(b) => b,
@@ -2487,7 +2487,7 @@ mod tests {
         use bytes::Bytes;
         use rustgate_core::PeerId;
         use rustgate_core::message::{MessageType, RoutableMessage};
-        use rustgate_transport::Router;
+        use rustgate_router::Router;
 
         use super::super::{FedInboundForwardingHooks, build_federation_inbound_handler};
 
@@ -2641,7 +2641,7 @@ mod tests {
         /// targets while the in-process delivery looked compliant.
         #[tokio::test]
         async fn federation_inbound_with_send_pep_obligation_applies_obligation_before_fanout() {
-            use rustgate_transport::rustgate_authz::{
+            use rustgate_authz::{
                 Action, Decision, DecisionOutcome, Obligation, PolicyEngine, Resource, Subject,
             };
 

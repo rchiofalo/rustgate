@@ -13,12 +13,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use rustgate_core::identity::Identity;
-use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::rustgate_authz::{
+use rustgate_authz::{
     Action, DecisionOutcome, Effect, NativeEngine, PolicyEngine, Resource, RuleSet, Subject,
 };
-use rustgate_transport::{ClientQueue, Router, SessionHandle};
+use rustgate_core::identity::Identity;
+use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_router::{ClientQueue, Router, SessionHandle};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 

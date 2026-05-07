@@ -6,7 +6,7 @@
 //!
 //! Two of the production code paths that depend on time are tested here:
 //!
-//! 1. **Position cache TTL** (`rustgate_transport::cache::PositionCache`)
+//! 1. **Position cache TTL** (`rustgate_router::cache::PositionCache`)
 //!    expires entries when `received_at + ttl < SystemTime::now()`.
 //!    Because the cache uses `SystemTime` (not `tokio::time::Instant`),
 //!    `tokio::time::pause` does not affect it — instead we drive
@@ -45,7 +45,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::PositionCache;
+use rustgate_router::PositionCache;
 
 fn ident(cn: &str) -> Identity {
     Identity::new(cn.to_string(), format!("{cn}-fp"), BTreeSet::new()).unwrap()

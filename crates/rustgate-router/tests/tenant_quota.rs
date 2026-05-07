@@ -7,10 +7,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use rustgate_core::identity::Identity;
-use rustgate_transport::quota::{QuotaConfig, TenantQuota, TenantQuotaTracker};
-use rustgate_transport::{
-    NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle,
-};
+use rustgate_router::quota::{QuotaConfig, TenantQuota, TenantQuotaTracker};
+use rustgate_router::{NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle};
 use tokio::sync::mpsc;
 
 /// Build an identity with the given CN and tenant.

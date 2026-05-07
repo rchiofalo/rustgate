@@ -38,7 +38,7 @@ use bytes::Bytes;
 use rustgate_authz::Obligation;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::obligations::{UnknownObligationPolicy, apply_obligations};
+use rustgate_router::obligations::{UnknownObligationPolicy, apply_obligations};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::MakeWriter;

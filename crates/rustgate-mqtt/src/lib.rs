@@ -18,7 +18,7 @@
 //! The adapter follows rustgate's transport-crate pattern: a [`MqttListener`]
 //! accepts TLS connections, a [`MqttServer`] manages the accept loop and
 //! session lifecycle, and each session registers with the shared
-//! [`Router`](rustgate_transport::Router) for message delivery.
+//! [`Router`](rustgate_router::Router) for message delivery.
 //!
 //! MQTT topics map to rustgate groups (1:1 by default, with optional prefix
 //! stripping). Authorization is enforced by the router's authz PEP on every

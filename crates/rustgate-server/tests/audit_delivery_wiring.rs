@@ -22,7 +22,7 @@
 //!   router visits.
 //!
 //! `rustgate-server` is a binary-only crate, so this test exercises
-//! the `rustgate_transport::Router::set_on_message_delivered` /
+//! the `rustgate_router::Router::set_on_message_delivered` /
 //! `set_on_message_dropped` boundary directly rather than driving
 //! the binary via `std::process::Command`. The CLI parsing contract
 //! itself is pinned by `cli_audit_delivery_*` in `cli.rs`.
@@ -43,7 +43,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::{Router, SessionHandle};
+use rustgate_router::{Router, SessionHandle};
 use tokio::sync::mpsc;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Targets;

@@ -19,7 +19,7 @@
 //! - **CoT XML** —
 //!   `SHA-256(b"cot" || 0x00 || tenant || 0x00 || uid || 0x00 || payload)`.
 //!   The `uid` is extracted from the XML attribute scanner (see
-//!   [`crate::replay::extract_xml_attr`]); the full payload is folded in
+//!   `crate::replay::extract_xml_attr`); the full payload is folded in
 //!   so messages sharing a `uid` but with different bytes do not
 //!   collide.
 //! - **non-CoT** —

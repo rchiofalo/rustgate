@@ -16,9 +16,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::{
-    NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle,
-};
+use rustgate_router::{NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle};
 use tokio::sync::mpsc;
 
 fn make_identity(cn: &str) -> Arc<Identity> {
@@ -66,7 +64,7 @@ async fn drain_flushes_queued_messages_before_eof() {
     for i in 0..n {
         let msg = Arc::new(make_chat(&alice, Destination::Direct((*bob).clone()), i));
         bob_handle
-            .send(rustgate_transport::RoutedMessage::new(msg))
+            .send(rustgate_router::RoutedMessage::new(msg))
             .await
             .expect("send must succeed before drain");
     }

@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::ClientQueue;
+use rustgate_router::ClientQueue;
 use tempfile::TempDir;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Targets;

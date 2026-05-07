@@ -115,7 +115,7 @@ async fn start_test_server(token: Option<&[u8]>) -> SocketAddr {
 
     let metrics_token = token.map(|t| Arc::new(zeroize::Zeroizing::new(t.to_vec())));
     let router_slot: RouterSlot = Arc::new(OnceLock::new());
-    let _ = router_slot.set(Arc::new(rustgate_transport::Router::new()));
+    let _ = router_slot.set(Arc::new(rustgate_router::Router::new()));
 
     let server_health = Arc::clone(&health);
     let server_readiness = Arc::clone(&readiness);
@@ -152,7 +152,7 @@ async fn serve_health_and_metrics_endpoints() {
     drop(listener);
 
     let router_slot: RouterSlot = Arc::new(OnceLock::new());
-    let _ = router_slot.set(Arc::new(rustgate_transport::Router::new()));
+    let _ = router_slot.set(Arc::new(rustgate_router::Router::new()));
 
     let server_health = Arc::clone(&health);
     let server_router_slot = Arc::clone(&router_slot);

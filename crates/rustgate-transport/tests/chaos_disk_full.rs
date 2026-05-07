@@ -56,7 +56,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::store_forward::ClientQueue;
+use rustgate_router::store_forward::ClientQueue;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 

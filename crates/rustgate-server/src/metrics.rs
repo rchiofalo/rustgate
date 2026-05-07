@@ -1353,7 +1353,7 @@ pub fn init() -> prometheus::Result<()> {
 /// in future releases without making this a breaking change, and we
 /// degrade to a neutral `"unknown"` label rather than failing the
 /// metric update so the decision counter never drops events.
-pub fn observe_authz_event(ev: &rustgate_transport::AuthzEvent<'_>) {
+pub fn observe_authz_event(ev: &rustgate_router::AuthzEvent<'_>) {
     let action = match ev.action {
         rustgate_authz::Action::Send => "send",
         rustgate_authz::Action::Receive => "receive",
@@ -1433,12 +1433,12 @@ pub fn reload_rollback() -> &'static IntCounterVec {
 /// Unknown-obligation encounter counter (issue #769, F-3b).
 ///
 /// Incremented once per encounter at the
-/// [`rustgate_transport::obligations::ObligationRateLimiter`] callback
+/// [`rustgate_router::obligations::ObligationRateLimiter`] callback
 /// boundary, **before** the per-`(policy_id, variant)` audit-rate-limit
 /// gate. The counter therefore reflects every unknown-variant
 /// encounter, not just the audit emissions that survived rate-limiting.
 /// Wired into the transport via
-/// [`rustgate_transport::obligations::ObligationRateLimiter::with_on_unknown`]
+/// [`rustgate_router::obligations::ObligationRateLimiter::with_on_unknown`]
 /// at server startup.
 pub fn authz_obligation_unknown() -> &'static IntCounterVec {
     AUTHZ_OBLIGATION_UNKNOWN.get_or_init(|| {
@@ -1453,7 +1453,7 @@ pub fn authz_obligation_unknown() -> &'static IntCounterVec {
 // ── Router fanout / PEP / obligation accessors (issue #768) ─────────
 
 /// Per-destination router-fanout counter. Wired by the server binary
-/// at startup via [`rustgate_transport::Router::set_on_fanout`] under
+/// at startup via [`rustgate_router::Router::set_on_fanout`] under
 /// `#[cfg(feature = "metrics")]`. Closes #768.
 pub fn router_fanout_total() -> &'static IntCounterVec {
     ROUTER_FANOUT_TOTAL.get_or_init(|| {
@@ -1468,7 +1468,7 @@ pub fn router_fanout_subscribers() -> &'static Histogram {
 }
 
 /// Per-reason router-drop counter. Wired by the server binary at
-/// startup via [`rustgate_transport::Router::set_on_dropped`] under
+/// startup via [`rustgate_router::Router::set_on_dropped`] under
 /// `#[cfg(feature = "metrics")]`. Closes #768.
 pub fn router_dropped_total() -> &'static IntCounterVec {
     ROUTER_DROPPED_TOTAL.get_or_init(|| {
@@ -1522,7 +1522,7 @@ pub fn obligation_applied_total() -> &'static IntCounterVec {
 /// vocabulary mirrors the `reason` field emitted by
 /// [`rustgate_core::audit::authz_obligation_failed`]. Wired by the
 /// server binary at startup via
-/// [`rustgate_transport::obligations::ObligationRateLimiter::with_on_failure`]
+/// [`rustgate_router::obligations::ObligationRateLimiter::with_on_failure`]
 /// under `#[cfg(feature = "metrics")]`. Closes #768.
 pub fn obligation_failures_total() -> &'static IntCounterVec {
     OBLIGATION_FAILURES_TOTAL.get_or_init(|| {
@@ -1534,12 +1534,12 @@ pub fn obligation_failures_total() -> &'static IntCounterVec {
     })
 }
 
-/// Build the [`rustgate_transport::OnFanout`] callback that feeds the
+/// Build the [`rustgate_router::OnFanout`] callback that feeds the
 /// `rustgate_router_fanout_total{destination}` counter and the
 /// `rustgate_router_fanout_subscribers` histogram. Wired by the server
 /// binary once at startup so every fan-out observed by the router
 /// funnels into the same metrics. Closes #768.
-pub fn router_fanout_callback() -> rustgate_transport::OnFanout {
+pub fn router_fanout_callback() -> rustgate_router::OnFanout {
     Arc::new(|destination: &'static str, subscribers: u64| {
         router_fanout_total()
             .with_label_values(&[destination])
@@ -1551,22 +1551,22 @@ pub fn router_fanout_callback() -> rustgate_transport::OnFanout {
     })
 }
 
-/// Build the [`rustgate_transport::OnDropped`] callback that feeds the
+/// Build the [`rustgate_router::OnDropped`] callback that feeds the
 /// `rustgate_router_dropped_total{reason}` counter. Closes #768.
-pub fn router_dropped_callback() -> rustgate_transport::OnDropped {
+pub fn router_dropped_callback() -> rustgate_router::OnDropped {
     Arc::new(|reason: &'static str| {
         router_dropped_total().with_label_values(&[reason]).inc();
     })
 }
 
-/// Build the [`rustgate_transport::OnPepDecision`] callback that feeds
+/// Build the [`rustgate_router::OnPepDecision`] callback that feeds
 /// the Send/Receive PEP counters and the per-direction evaluation
 /// latency histogram. The router emits direction labels `"send"`,
 /// `"receive"`, or `"other"`; the callback maps the first two to the
 /// dedicated counter and bins everything else under the histogram so
 /// future `AuthzAction` variants stay observable without extra
 /// counters. Closes #768.
-pub fn router_pep_decision_callback() -> rustgate_transport::OnPepDecision {
+pub fn router_pep_decision_callback() -> rustgate_router::OnPepDecision {
     Arc::new(
         |direction: &'static str, decision: &'static str, eval_secs: f64| {
             match direction {
@@ -1581,10 +1581,10 @@ pub fn router_pep_decision_callback() -> rustgate_transport::OnPepDecision {
     )
 }
 
-/// Build the [`rustgate_transport::OnObligationApplied`] callback that
+/// Build the [`rustgate_router::OnObligationApplied`] callback that
 /// feeds the `rustgate_obligation_applied_total{kind}` counter. Closes
 /// #768.
-pub fn router_obligation_applied_callback() -> rustgate_transport::OnObligationApplied {
+pub fn router_obligation_applied_callback() -> rustgate_router::OnObligationApplied {
     Arc::new(|kind: &'static str| {
         obligation_applied_total().with_label_values(&[kind]).inc();
     })
@@ -1596,14 +1596,14 @@ pub fn authz_evaluations_in_flight() -> &'static IntGauge {
         .get_or_init(|| fallback_gauge("rustgate_authz_evaluations_in_flight", "fallback"))
 }
 
-/// Build the [`rustgate_transport::OnAuthzInFlightChanged`] callback
+/// Build the [`rustgate_router::OnAuthzInFlightChanged`] callback
 /// that feeds the `rustgate_authz_evaluations_in_flight` gauge with
 /// the signed `+1` / `-1` deltas emitted by the router's RAII
 /// `AuthzEvalGuard`. Wired by the server binary once at startup so
 /// every authz evaluation observed by the router contributes to the
 /// gauge — and so the gauge is a faithful drain signal across an
 /// `Router::swap_authz` policy reload. Closes #721.
-pub fn router_authz_in_flight_callback() -> rustgate_transport::OnAuthzInFlightChanged {
+pub fn router_authz_in_flight_callback() -> rustgate_router::OnAuthzInFlightChanged {
     Arc::new(|delta: i64| {
         authz_evaluations_in_flight().add(delta);
     })
@@ -1858,11 +1858,11 @@ pub fn messages_routed_by_kind() -> &'static IntCounterVec {
     })
 }
 
-/// Build the [`rustgate_transport::OnRoutedByKind`] callback that feeds
+/// Build the [`rustgate_router::OnRoutedByKind`] callback that feeds
 /// the `rustgate_messages_routed_by_kind_total{kind, protocol}` counter.
 /// Wired by the server binary at startup so every admitted message
 /// (post-Send-PEP) increments the counter once. Closes #847.
-pub fn router_routed_by_kind_callback() -> rustgate_transport::OnRoutedByKind {
+pub fn router_routed_by_kind_callback() -> rustgate_router::OnRoutedByKind {
     Arc::new(|kind: &'static str, protocol: &str| {
         messages_routed_by_kind()
             .with_label_values(&[kind, protocol])
@@ -2032,7 +2032,7 @@ pub fn mavlink_heartbeats() -> &'static IntCounterVec {
 
 /// Counter for multicast messages dropped because the destination
 /// group list exceeded the router's `MAX_MULTICAST_GROUPS` cap. Wired
-/// to the router via `rustgate_transport::Router::set_on_multicast_oversize_dropped`
+/// to the router via `rustgate_router::Router::set_on_multicast_oversize_dropped`
 /// at server startup under `#[cfg(feature = "metrics")]`. Closes #741.
 pub fn multicast_oversize_dropped() -> &'static IntCounter {
     MULTICAST_OVERSIZE_DROPPED
@@ -2357,7 +2357,7 @@ pub fn store_forward_dwell_seconds() -> &'static Histogram {
 ///
 /// The task exits when the queue's last `Arc` reference is dropped.
 pub fn spawn_client_queue_metrics_task(
-    queue: Arc<rustgate_transport::ClientQueue>,
+    queue: Arc<rustgate_router::ClientQueue>,
     identity: Arc<MetricsIdentity>,
 ) {
     use std::collections::HashMap;
@@ -3676,7 +3676,7 @@ mod tests {
     mod position_cache_size_gauge {
         use std::sync::Arc;
 
-        use rustgate_transport::PositionCache;
+        use rustgate_router::PositionCache;
 
         use super::*;
 

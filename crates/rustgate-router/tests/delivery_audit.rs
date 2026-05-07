@@ -33,7 +33,7 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::{Router, SessionHandle};
+use rustgate_router::{Router, SessionHandle};
 use tokio::sync::mpsc;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Targets;
@@ -91,7 +91,7 @@ impl DeliveredRecorder {
         self.0.lock().unwrap().clone()
     }
 
-    fn callback(&self) -> rustgate_transport::OnMessageDelivered {
+    fn callback(&self) -> rustgate_router::OnMessageDelivered {
         let inner = Arc::clone(&self.0);
         Arc::new(
             move |source_cn, dest_cn, msg_uid, msg_type, group, entity_kind, trace_id| {
@@ -125,7 +125,7 @@ impl DroppedRecorder {
         self.0.lock().unwrap().clone()
     }
 
-    fn callback(&self) -> rustgate_transport::OnMessageDropped {
+    fn callback(&self) -> rustgate_router::OnMessageDropped {
         let inner = Arc::clone(&self.0);
         Arc::new(move |source_cn, dest_cn, msg_uid, reason| {
             inner.lock().unwrap().push(DroppedRecord {

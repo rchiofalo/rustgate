@@ -21,13 +21,13 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use rustgate_core::identity::Identity;
-use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::rustgate_authz::{
+use rustgate_authz::{
     Action, Decision, DecisionOutcome, Effect, NativeEngine, Obligation, PolicyEngine, Resource,
     ResourceMatcher, Rule, RuleSet, Subject, SubjectMatcher,
 };
-use rustgate_transport::{Router, SessionHandle};
+use rustgate_core::identity::Identity;
+use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_router::{Router, SessionHandle};
 use tokio::sync::mpsc;
 
 fn identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
@@ -46,10 +46,10 @@ fn identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
 
 #[allow(clippy::type_complexity)]
 fn channels() -> (
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
 ) {
     let (ptx, prx) = mpsc::channel(16);
     let (ntx, nrx) = mpsc::channel(16);
@@ -346,7 +346,7 @@ async fn deny_receive_blocks_broadcast_per_recipient() {
 /// engine, not the one in effect at storage time.
 #[tokio::test]
 async fn store_forward_drain_re_evaluates_authz_after_policy_change() {
-    use rustgate_transport::ClientQueue;
+    use rustgate_router::ClientQueue;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let queue = std::sync::Arc::new(ClientQueue::open(tmp.path(), 1_000_000).unwrap());
@@ -392,7 +392,7 @@ async fn store_forward_drain_re_evaluates_authz_after_policy_change() {
 /// engine snapshot, not a stale one.
 #[tokio::test]
 async fn store_forward_drain_allows_delivery_when_policy_permits() {
-    use rustgate_transport::ClientQueue;
+    use rustgate_router::ClientQueue;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let queue = std::sync::Arc::new(ClientQueue::open(tmp.path(), 1_000_000).unwrap());
@@ -631,7 +631,7 @@ async fn position_replay_applies_mask_point_obligation() {
 /// drain, not just on live fan-out.
 #[tokio::test]
 async fn store_forward_drain_applies_mask_payload_obligation() {
-    use rustgate_transport::ClientQueue;
+    use rustgate_router::ClientQueue;
 
     let tmp = tempfile::TempDir::new().unwrap();
     let queue = std::sync::Arc::new(ClientQueue::open(tmp.path(), 1_000_000).unwrap());
@@ -816,14 +816,14 @@ async fn classified_delivery_audit_skipped_when_try_send_fails() {
         let (ntx, nrx) = mpsc::channel(1);
         // Saturate the normal channel. Chat is non-priority, so
         // `send_to_session` routes into this one.
-        ntx.try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+        ntx.try_send(rustgate_router::RoutedMessage::from(Arc::new(chat(
             &alice,
             Destination::Direct((*bob).clone()),
         ))))
         .expect("pre-fill should succeed");
         // Also saturate the priority channel so the classification path
         // cannot fall back to it for any message variant.
-        ptx.try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+        ptx.try_send(rustgate_router::RoutedMessage::from(Arc::new(chat(
             &alice,
             Destination::Direct((*bob).clone()),
         ))))
@@ -1014,13 +1014,13 @@ async fn group_send_classified_delivery_audit_skipped_when_try_send_fails() {
     let (ptx_b, prx_b) = mpsc::channel(1);
     let (ntx_b, nrx_b) = mpsc::channel(1);
     ntx_b
-        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+        .try_send(rustgate_router::RoutedMessage::from(Arc::new(chat(
             &alice,
             Destination::Group("alpha".into()),
         ))))
         .expect("pre-fill normal");
     ptx_b
-        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+        .try_send(rustgate_router::RoutedMessage::from(Arc::new(chat(
             &alice,
             Destination::Group("alpha".into()),
         ))))
@@ -1063,13 +1063,13 @@ async fn broadcast_classified_delivery_audit_skipped_when_try_send_fails() {
     let (ptx_b, prx_b) = mpsc::channel(1);
     let (ntx_b, nrx_b) = mpsc::channel(1);
     ntx_b
-        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+        .try_send(rustgate_router::RoutedMessage::from(Arc::new(chat(
             &alice,
             Destination::Broadcast,
         ))))
         .expect("pre-fill normal");
     ptx_b
-        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+        .try_send(rustgate_router::RoutedMessage::from(Arc::new(chat(
             &alice,
             Destination::Broadcast,
         ))))
@@ -1113,13 +1113,13 @@ async fn multicast_classified_delivery_audit_skipped_when_try_send_fails() {
     let (ptx_b, prx_b) = mpsc::channel(1);
     let (ntx_b, nrx_b) = mpsc::channel(1);
     ntx_b
-        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+        .try_send(rustgate_router::RoutedMessage::from(Arc::new(chat(
             &alice,
             Destination::Multicast(vec!["alpha".into(), "bravo".into()]),
         ))))
         .expect("pre-fill normal");
     ptx_b
-        .try_send(rustgate_transport::RoutedMessage::from(Arc::new(chat(
+        .try_send(rustgate_router::RoutedMessage::from(Arc::new(chat(
             &alice,
             Destination::Multicast(vec!["alpha".into(), "bravo".into()]),
         ))))
@@ -1156,7 +1156,7 @@ async fn multicast_classified_delivery_audit_skipped_when_try_send_fails() {
 /// audit record lands in the buffer.
 #[tokio::test(flavor = "current_thread")]
 async fn drain_classified_delivery_audit_driven_by_emit_on_delivered() {
-    use rustgate_transport::ClientQueue;
+    use rustgate_router::ClientQueue;
 
     let (buf, _guard) = audit_capture::install();
 

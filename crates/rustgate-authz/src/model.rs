@@ -223,7 +223,7 @@ impl Obligation {
     /// the policy author added, and forcing it last lets every known
     /// redactor and tagger run first. The
     /// [`crate::Obligation`]-actuation site
-    /// (`rustgate_transport::obligations::apply_obligations`) still
+    /// (`rustgate_router::obligations::apply_obligations`) still
     /// fail-closes on unknown variants under the default
     /// `UnknownObligationPolicy::FailClosed` after the sort runs, so
     /// the priority assignment matters only when the operator opted

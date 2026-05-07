@@ -22,7 +22,7 @@
 //!
 //! ## Sweep Task
 //!
-//! [`start_sweep_task`] spawns a background `tokio` task that calls
+//! [`PositionCache::start_sweep_task`] spawns a background `tokio` task that calls
 //! [`PositionCache::sweep`] at a fixed interval (default: **15 seconds**).
 //! The sweep removes all entries whose TTL has elapsed. Entries without a
 //! TTL are never removed by the sweep — they persist until explicitly

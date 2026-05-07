@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bytes::Bytes;
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::{BackpressureGate, Router, SessionHandle};
+use rustgate_router::{Router, SessionHandle};
+use rustgate_transport::BackpressureGate;
 use tokio::sync::mpsc;
 
 fn ident(cn: &str) -> Identity {

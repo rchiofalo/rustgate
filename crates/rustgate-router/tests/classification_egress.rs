@@ -24,14 +24,14 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use rustgate_core::classification::{Classification, ClassificationMarking};
-use rustgate_core::identity::Identity;
-use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::rustgate_authz::{
+use rustgate_authz::{
     Action, AuthzContext, DecisionOutcome, Effect, NativeEngine, Obligation, PolicyEngine,
     Resource, ResourceMatcher, Rule, RuleSet, Subject, SubjectMatcher,
 };
-use rustgate_transport::{Router, SessionHandle};
+use rustgate_core::classification::{Classification, ClassificationMarking};
+use rustgate_core::identity::Identity;
+use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_router::{Router, SessionHandle};
 use tokio::sync::mpsc;
 
 fn identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
@@ -50,10 +50,10 @@ fn identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
 
 #[allow(clippy::type_complexity)]
 fn channels() -> (
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
 ) {
     let (ptx, prx) = mpsc::channel(16);
     let (ntx, nrx) = mpsc::channel(16);

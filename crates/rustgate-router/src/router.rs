@@ -13,7 +13,7 @@
 //!    For multicast, the Send PEP runs per-group inside
 //!    `send_to_group_excluding` so that per-group policy granularity is
 //!    preserved on the local fanout, AND a second per-group Send pass runs
-//!    on the egress path inside [`crate::egress::prepare_egress_envelope`]
+//!    on the egress path inside `crate::egress::prepare_egress_envelope`
 //!    so external sinks (NATS, federation, HTTP, MQTT) receive a single
 //!    rendered copy with the union of allow-side Send obligations
 //!    applied (closes #738, refactored under #746). The subject is the
@@ -235,6 +235,23 @@ rustgate_core::on_callback!(
     &'static str,
     &str
 );
+
+/// Callback invoked by the router once per routed [`RoutableMessage`]
+/// for which the operator has opted in to multicast rebroadcast. The
+/// callback is responsible for token-bucket gating, datagram splitting,
+/// and any per-group fan-out — the call site only knows it routed a
+/// message and that the operator wants it re-emitted.
+///
+/// Defined here (not in the `udp_multicast` module of `rustgate-transport`)
+/// because the router owns the [`ArcSwap`] hot-swap slot. The transport
+/// crate re-exports this from `rustgate_transport::udp_multicast` for
+/// source-level compatibility with callers that imported it from there.
+///
+/// Uses `Fn` (not `AsyncFn`) because `dyn AsyncFn` is not object-safe
+/// as of Rust 1.93. Async work is dispatched via `spawn_background()`
+/// inside the closure body.
+pub type OnMulticastForward =
+    Arc<dyn Fn(Arc<rustgate_core::message::RoutableMessage>) + Send + Sync>;
 
 /// RAII handle that bumps the in-flight authz-evaluation gauge on
 /// construction and decrements it on `Drop`. Constructed at the entry
@@ -1147,7 +1164,7 @@ pub struct Router {
     /// `rustgate_transport::udp_multicast` egress task. Hot-reloadable
     /// via `ArcSwap` so the operator can flip rebroadcast at runtime
     /// without restarting the listener. Default `None`. Closes #861.
-    on_multicast_forward: ArcSwap<Option<crate::udp_multicast::OnMulticastForward>>,
+    on_multicast_forward: ArcSwap<Option<OnMulticastForward>>,
     /// Optional registry mapping `metadata.source_protocol` to the
     /// `DynEntityCodec` that decodes its wire format into the canonical
     /// [`rustgate_core::entity::Entity`] shape.
@@ -1947,7 +1964,7 @@ impl Router {
     ///
     /// Pass `None` (the default) to disable rebroadcast without
     /// restarting the routing pipeline. Closes #861.
-    pub fn set_on_multicast_forward(&self, cb: Option<crate::udp_multicast::OnMulticastForward>) {
+    pub fn set_on_multicast_forward(&self, cb: Option<OnMulticastForward>) {
         self.on_multicast_forward.store(Arc::new(cb));
     }
 

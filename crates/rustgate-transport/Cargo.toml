@@ -1,6 +1,6 @@
 [package]
 name = "rustgate-transport"
-description = "Routing, sessions, codecs, store-and-forward, throttling, and UDP I/O"
+description = "Codec, framing, hardware-identity, and UDP transports for rustgate"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -25,26 +25,19 @@ spiffe = ["rustgate-tls/spiffe"]
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }
 rustgate-cot = { workspace = true }
-rustgate-authz = { workspace = true }
 rustgate-resilience = { workspace = true }
+rustgate-router = { workspace = true }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-mavlink = { workspace = true, optional = true }
-arc-swap = { workspace = true }
 bytes = { workspace = true }
-dashmap = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }
 tokio-util = { workspace = true }
 rustls = { workspace = true }
-sha2 = { workspace = true }
-ring = { workspace = true }
 parking_lot = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 lru = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
-redb = { workspace = true }
-smol_str = { workspace = true }
 thiserror = { workspace = true }
 # socket2 is used by `udp_multicast` to set SO_REUSEADDR on the inbound
 # multicast bind so the tactical-radio test rig (and CI on Linux) can
@@ -63,25 +56,13 @@ bytes = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 tempfile = { workspace = true }
 proptest = { workspace = true }
+serde_json = { workspace = true }
 # Used by `tests/udp_multicast.rs` for SO_REUSEADDR on sniffer sockets
 # that need to co-bind the same multicast port the inbound listener
 # also binds. Same workspace pin as the production dep above.
 socket2 = { workspace = true }
 tracing-subscriber = { workspace = true }
-# Used by the byte-for-byte compute_hmac regression test in
-# `store_forward::tests` to pin the helper output against the previous
-# inlined construction. Not needed for production builds — the
-# migrated code path goes through `rustgate_core::crypto::hmac_sha256_tag`.
-hmac = { workspace = true }
 
 [[bench]]
 name = "codec"
-harness = false
-
-[[bench]]
-name = "router_fanout"
-harness = false
-
-[[bench]]
-name = "dedup_contention"
 harness = false

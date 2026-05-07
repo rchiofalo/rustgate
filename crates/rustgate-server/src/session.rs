@@ -21,8 +21,9 @@ use rustgate_core::message::Destination;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
 use rustgate_cot::delta::{DeltaEncoder, DeltaOutput};
+use rustgate_router::{ReplayFilter, Router, SessionHandle, ThrottleConfig};
 use rustgate_tls::AuthenticatedSession;
-use rustgate_transport::{FramedCodec, ReplayFilter, Router, SessionHandle, ThrottleConfig};
+use rustgate_transport::FramedCodec;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -130,7 +131,7 @@ struct SessionContext<'a, P: NatsPublish> {
     fed_forward: &'a Option<FedForwardFn>,
     #[cfg(feature = "http")]
     http_forward: &'a Option<HttpForwardFn>,
-    throttle: Option<rustgate_transport::ClientThrottle>,
+    throttle: Option<rustgate_router::ClientThrottle>,
     archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
     delta_config: DeltaConfig,
@@ -173,12 +174,10 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     #[cfg(feature = "metrics")]
     metrics::sessions_active().inc();
 
-    let (priority_tx, priority_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
-        rustgate_transport::PRIORITY_CHANNEL_CAPACITY,
-    );
-    let (normal_tx, normal_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
-        rustgate_transport::NORMAL_CHANNEL_CAPACITY,
-    );
+    let (priority_tx, priority_rx) =
+        mpsc::channel::<rustgate_router::RoutedMessage>(rustgate_router::PRIORITY_CHANNEL_CAPACITY);
+    let (normal_tx, normal_rx) =
+        mpsc::channel::<rustgate_router::RoutedMessage>(rustgate_router::NORMAL_CHANNEL_CAPACITY);
     let handle = if deps.circuit_breaker_threshold > 0 {
         SessionHandle::with_drop_threshold(
             Arc::clone(&identity),
@@ -430,8 +429,8 @@ async fn negotiate_tak_protocol(
 async fn run_session_loops(
     reader: rustgate_tls::SessionReader,
     writer: rustgate_tls::SessionWriter,
-    priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    priority_rx: mpsc::Receiver<rustgate_router::RoutedMessage>,
+    normal_rx: mpsc::Receiver<rustgate_router::RoutedMessage>,
     ctx: &SessionContext<'_, impl NatsPublish>,
     read_buf: tokio_util::bytes::BytesMut,
     #[cfg(feature = "metrics")] cn: &str,
@@ -612,8 +611,8 @@ async fn read_loop(
 /// (Position and Alert messages) before processing normal messages.
 async fn write_loop(
     writer: rustgate_tls::SessionWriter,
-    mut priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    mut normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mut priority_rx: mpsc::Receiver<rustgate_router::RoutedMessage>,
+    mut normal_rx: mpsc::Receiver<rustgate_router::RoutedMessage>,
     codec: &dyn Codec,
     mut delta_encoder: Option<DeltaEncoder>,
     #[cfg(feature = "metrics")] bucket: String,
@@ -803,11 +802,11 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 
                         tracing::info!(cn = %hash_cn(&cn), peer = %peer_addr, "plaintext TCP connected");
 
-                        let (priority_tx, priority_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
-                            rustgate_transport::PRIORITY_CHANNEL_CAPACITY,
+                        let (priority_tx, priority_rx) = mpsc::channel::<rustgate_router::RoutedMessage>(
+                            rustgate_router::PRIORITY_CHANNEL_CAPACITY,
                         );
-                        let (normal_tx, normal_rx) = mpsc::channel::<rustgate_transport::RoutedMessage>(
-                            rustgate_transport::NORMAL_CHANNEL_CAPACITY,
+                        let (normal_tx, normal_rx) = mpsc::channel::<rustgate_router::RoutedMessage>(
+                            rustgate_router::NORMAL_CHANNEL_CAPACITY,
                         );
                         let handle = if circuit_breaker_threshold > 0 {
                             SessionHandle::with_drop_threshold(Arc::clone(&identity), priority_tx, normal_tx, circuit_breaker_threshold)
@@ -919,8 +918,8 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 struct PlaintextSessionContext<'a, P: NatsPublish> {
     reader: tokio::io::ReadHalf<tokio::net::TcpStream>,
     writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
-    priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    priority_rx: mpsc::Receiver<rustgate_router::RoutedMessage>,
+    normal_rx: mpsc::Receiver<rustgate_router::RoutedMessage>,
     identity: &'a Identity,
     router: &'a Router,
     codec: &'a dyn Codec,
@@ -928,7 +927,7 @@ struct PlaintextSessionContext<'a, P: NatsPublish> {
     fed_forward: &'a Option<FedForwardFn>,
     #[cfg(feature = "http")]
     http_forward: &'a Option<HttpForwardFn>,
-    throttle: Option<rustgate_transport::ClientThrottle>,
+    throttle: Option<rustgate_router::ClientThrottle>,
     archiver: &'a Option<Arc<archive::CotArchiver>>,
     replay_filter: &'a Option<Arc<ReplayFilter>>,
     delta_config: DeltaConfig,

@@ -35,12 +35,10 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::{MessageBuilder, OnSaAutoUpgraded};
 use rustgate_resilience::SlidingWindowLimiter;
-use rustgate_transport_types::{Router, SessionHandle};
+use rustgate_router::{ReplayFilter, RoutedMessage, Router, SessionHandle};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 use tracing::warn;
-
-use crate::replay::ReplayFilter;
 
 /// Maximum UDP datagram size. CoT messages are typically well under 64 KB.
 const MAX_DATAGRAM_SIZE: usize = 65_535;
@@ -344,8 +342,8 @@ impl UdpInput {
                 return;
             }
         };
-        let (ptx, _prx) = mpsc::channel::<crate::RoutedMessage>(1);
-        let (ntx, _nrx) = mpsc::channel::<crate::RoutedMessage>(1);
+        let (ptx, _prx) = mpsc::channel::<RoutedMessage>(1);
+        let (ntx, _nrx) = mpsc::channel::<RoutedMessage>(1);
         let handle = SessionHandle::new(Arc::clone(&identity), ptx, ntx);
         let session_id = handle.id;
         let _ = router.register(handle).await;
@@ -473,12 +471,6 @@ impl UdpInput {
 
         router.unregister(&config.cn, session_id).await;
     }
-}
-
-/// Internal module alias — the types are re-exported from the crate root
-/// but within this file we reference them via the router module.
-mod rustgate_transport_types {
-    pub use crate::router::{Router, SessionHandle};
 }
 
 #[cfg(test)]
@@ -615,8 +607,8 @@ mod tests {
         let listener_identity = Arc::new(
             Identity::plaintext("test-listener".to_string(), groups).expect("valid identity"),
         );
-        let (listener_ptx, mut listener_prx) = mpsc::channel::<crate::RoutedMessage>(16);
-        let (listener_ntx, mut listener_nrx) = mpsc::channel::<crate::RoutedMessage>(16);
+        let (listener_ptx, mut listener_prx) = mpsc::channel::<RoutedMessage>(16);
+        let (listener_ntx, mut listener_nrx) = mpsc::channel::<RoutedMessage>(16);
         let listener_handle = SessionHandle::new(listener_identity, listener_ptx, listener_ntx);
         let _ = router.register(listener_handle).await;
 
@@ -710,8 +702,8 @@ mod tests {
         let listener_identity = Arc::new(
             Identity::plaintext("test-no-restrict".to_string(), groups).expect("valid identity"),
         );
-        let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(64);
-        let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(64);
+        let (ptx, mut prx) = mpsc::channel::<RoutedMessage>(64);
+        let (ntx, mut nrx) = mpsc::channel::<RoutedMessage>(64);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
         let _ = router.register(handle).await;
 
@@ -766,8 +758,8 @@ mod tests {
         let listener_identity = Arc::new(
             Identity::plaintext("test-rl-listener".to_string(), groups).expect("valid identity"),
         );
-        let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(64);
-        let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(64);
+        let (ptx, mut prx) = mpsc::channel::<RoutedMessage>(64);
+        let (ntx, mut nrx) = mpsc::channel::<RoutedMessage>(64);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
         let _ = router.register(handle).await;
 
@@ -842,8 +834,8 @@ mod tests {
             Identity::plaintext("test-allowlist-reject".to_string(), groups)
                 .expect("valid identity"),
         );
-        let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(16);
-        let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(16);
+        let (ptx, mut prx) = mpsc::channel::<RoutedMessage>(16);
+        let (ntx, mut nrx) = mpsc::channel::<RoutedMessage>(16);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
         let _ = router.register(handle).await;
 
@@ -903,8 +895,8 @@ mod tests {
             Identity::plaintext("test-allowlist-accept".to_string(), groups)
                 .expect("valid identity"),
         );
-        let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(16);
-        let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(16);
+        let (ptx, mut prx) = mpsc::channel::<RoutedMessage>(16);
+        let (ntx, mut nrx) = mpsc::channel::<RoutedMessage>(16);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
         let _ = router.register(handle).await;
 
@@ -962,8 +954,8 @@ mod tests {
         let _ = groups.insert("__plaintext__".to_string());
         let listener_identity =
             Arc::new(Identity::plaintext("test-cap".to_string(), groups).expect("valid identity"));
-        let (ptx, mut prx) = mpsc::channel::<crate::RoutedMessage>(64);
-        let (ntx, mut nrx) = mpsc::channel::<crate::RoutedMessage>(64);
+        let (ptx, mut prx) = mpsc::channel::<RoutedMessage>(64);
+        let (ntx, mut nrx) = mpsc::channel::<RoutedMessage>(64);
         let handle = SessionHandle::new(listener_identity, ptx, ntx);
         let _ = router.register(handle).await;
 

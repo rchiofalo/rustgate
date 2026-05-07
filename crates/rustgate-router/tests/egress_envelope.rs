@@ -22,19 +22,19 @@
 //!    vocabulary (`sink`, `obligation_type`, `recipient_class`).
 //!
 //! [`prepare_egress_envelope`]:
-//!     rustgate_transport::egress::prepare_egress_envelope
+//!     rustgate_router::egress::prepare_egress_envelope
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use rustgate_core::identity::Identity;
-use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_transport::rustgate_authz::{
+use rustgate_authz::{
     Action, Decision, DecisionOutcome, Obligation, PolicyEngine, Resource, Subject,
 };
-use rustgate_transport::{Router, SessionHandle};
+use rustgate_core::identity::Identity;
+use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_router::{Router, SessionHandle};
 use tokio::sync::mpsc;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -59,10 +59,10 @@ fn identity(cn: &str, groups: &[&str]) -> Arc<Identity> {
 
 #[allow(clippy::type_complexity)]
 fn channels() -> (
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Sender<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
-    mpsc::Receiver<rustgate_transport::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Sender<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
+    mpsc::Receiver<rustgate_router::RoutedMessage>,
 ) {
     let (ptx, prx) = mpsc::channel(16);
     let (ntx, nrx) = mpsc::channel(16);

@@ -84,6 +84,7 @@ rustgate-asterix = { workspace = true }
 rustgate-stanag4586 = { workspace = true }
 rustgate-tls = { workspace = true }
 rustgate-transport = { workspace = true }
+rustgate-router = { workspace = true }
 rustgate-websocket = { workspace = true, optional = true }
 rustgate-mqtt = { workspace = true, optional = true }
 rustgate-nats = { workspace = true, optional = true }
