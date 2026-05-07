@@ -21,8 +21,8 @@
 //!
 //! Optional modules behind feature flags:
 //!
-//! * [`ocsp`] / [`client_ocsp`] — OCSP stapling and verification (`ocsp`).
-//! * [`spiffe`] — SPIFFE Workload API integration (`spiffe`).
+//! * `ocsp` / `client_ocsp` — OCSP stapling and verification (feature `ocsp`).
+//! * `spiffe` — SPIFFE Workload API integration (feature `spiffe`).
 
 #![forbid(unsafe_code)]
 

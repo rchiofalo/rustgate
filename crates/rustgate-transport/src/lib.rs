@@ -4,7 +4,7 @@
 //! throttling, replay filtering, and UDP / multicast I/O for rustgate.
 //!
 //! TLS, certificate handling, OCSP, SPIFFE, and the TCP listeners
-//! (`TlsListener`, `PlaintextListener`) live in [`rustgate_tls`] as of
+//! (`TlsListener`, `PlaintextListener`) live in `rustgate-tls` as of
 //! #890. This crate consumes those primitives but no longer owns them.
 //!
 //! # Error handling
