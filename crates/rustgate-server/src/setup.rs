@@ -270,11 +270,7 @@ pub(crate) async fn bind_tls_listener(
         #[cfg(not(feature = "metrics"))]
         let hooks: Option<rustgate_tls::spiffe::SpiffeHooks> = None;
 
-        rustgate_tls::spiffe::spawn_refresh_task(
-            Arc::downgrade(&reloader),
-            spiffe_cfg,
-            hooks,
-        );
+        rustgate_tls::spiffe::spawn_refresh_task(Arc::downgrade(&reloader), spiffe_cfg, hooks);
         tracing::info!(
             spiffe_id = %identity.spiffe_id,
             trust_domain = %identity.trust_domain,
