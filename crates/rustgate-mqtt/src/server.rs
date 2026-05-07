@@ -187,7 +187,8 @@ mod tests {
     use std::time::Duration;
 
     use rustgate_test_utils::certs::TestCa;
-    use rustgate_transport::{Router, TlsConfig};
+    use rustgate_tls::TlsConfig;
+    use rustgate_transport::Router;
     use tokio::sync::{Notify, Semaphore};
 
     use super::*;

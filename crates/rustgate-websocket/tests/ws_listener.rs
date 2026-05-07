@@ -9,7 +9,7 @@ use futures::SinkExt;
 use futures::stream::StreamExt;
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::TlsConfig;
+use rustgate_tls::TlsConfig;
 use rustgate_websocket::WsListener;
 use tokio_tungstenite::tungstenite::Message;
 

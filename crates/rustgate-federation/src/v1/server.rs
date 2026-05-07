@@ -12,7 +12,8 @@ use bytes::Bytes;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::protocol::HeaderSize;
 use rustgate_core::tasks::spawn_background;
-use rustgate_transport::{LengthPrefixedCodec, TlsConfig, TlsListener};
+use rustgate_tls::{TlsConfig, TlsListener};
+use rustgate_transport::LengthPrefixedCodec;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::bytes::BytesMut;
@@ -180,7 +181,7 @@ async fn accept_loop(
 /// Runs a read loop that decodes length-prefixed XML frames and a
 /// heartbeat sender that sends CoT heartbeats at the configured interval.
 async fn handle_inbound_peer(
-    session: rustgate_transport::AuthenticatedSession,
+    session: rustgate_tls::AuthenticatedSession,
     server_uid: String,
     heartbeat_interval: Duration,
     heartbeat_timeout: Duration,

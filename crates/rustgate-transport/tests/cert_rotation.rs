@@ -39,9 +39,8 @@ use std::sync::{Arc, Mutex};
 
 use rustgate_test_utils::certs::{TestCa, TestCert};
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{
-    BackpressureGate, CertReloader, DynamicCertVerifier, TlsConfig, TlsListener,
-};
+use rustgate_tls::{CertReloader, DynamicCertVerifier, TlsConfig, TlsListener};
+use rustgate_transport::BackpressureGate;
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls::server::danger::ClientCertVerifier;
@@ -589,7 +588,7 @@ async fn reload_corrupted_cert_returns_error() {
 // directly; the unit suite inside `backpressure.rs` exercises the
 // `Arc::get_mut` setter contract directly. These integration tests pin
 // the same invariants from outside the modules — through the same
-// public re-exports (`rustgate_transport::DynamicCertVerifier`,
+// public re-exports (`rustgate_tls::DynamicCertVerifier`,
 // `rustgate_transport::BackpressureGate`) that downstream binaries
 // consume — so a refactor that broke the boundary contract would be
 // caught here even if the inline tests were tweaked alongside it.
@@ -602,7 +601,7 @@ fn root_store_from_cas(cas: &[&TestCa]) -> RootCertStore {
     let mut store = RootCertStore::empty();
     for ca in cas {
         let certs: Vec<CertificateDer<'static>> =
-            rustls_pki_types::pem::PemObject::pem_slice_iter(ca.cert_pem.as_bytes())
+            rustls::pki_types::pem::PemObject::pem_slice_iter(ca.cert_pem.as_bytes())
                 .collect::<Result<Vec<_>, _>>()
                 .expect("parse CA PEM");
         for cert in certs {
@@ -622,7 +621,7 @@ fn root_store_from_cas(cas: &[&TestCa]) -> RootCertStore {
 /// decline to send a chain anchored on it.
 ///
 /// This integration test goes through the same public re-export path
-/// the listener wires up (`rustgate_transport::DynamicCertVerifier` →
+/// the listener wires up (`rustgate_tls::DynamicCertVerifier` →
 /// `Arc<dyn ClientCertVerifier>`), bumps the provider generation, and
 /// asserts the hint count grows from one to two.
 #[test]

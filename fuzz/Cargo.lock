@@ -1593,6 +1593,7 @@ dependencies = [
  "rustgate-core",
  "rustgate-proto",
  "rustgate-resilience",
+ "rustgate-tls",
  "rustgate-transport",
  "rustls",
  "rustls-pki-types",
@@ -1703,6 +1704,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-tls"
+version = "0.8.0"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "parking_lot",
+ "ring",
+ "rustgate-core",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "rustgate-transport"
 version = "0.8.0"
 dependencies = [
@@ -1718,7 +1741,6 @@ dependencies = [
  "rustgate-cot",
  "rustgate-resilience",
  "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
@@ -1726,10 +1748,8 @@ dependencies = [
  "socket2",
  "thiserror 2.0.18",
  "tokio",
- "tokio-rustls",
  "tokio-util",
  "tracing",
- "x509-parser",
  "zeroize",
 ]
 

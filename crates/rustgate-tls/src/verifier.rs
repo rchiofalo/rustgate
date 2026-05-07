@@ -103,7 +103,7 @@ impl DynamicCertVerifier {
     /// ```no_run
     /// use std::sync::Arc;
     /// use rustls::RootCertStore;
-    /// use rustgate_transport::DynamicCertVerifier;
+    /// use rustgate_tls::DynamicCertVerifier;
     ///
     /// // The provider closure is invoked lock-free on every TLS handshake;
     /// // keep it cheap. A typical implementation snapshots an in-memory

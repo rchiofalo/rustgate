@@ -21,9 +21,8 @@ use rustgate_core::message::Destination;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::MessageBuilder;
 use rustgate_cot::delta::{DeltaEncoder, DeltaOutput};
-use rustgate_transport::{
-    AuthenticatedSession, FramedCodec, ReplayFilter, Router, SessionHandle, ThrottleConfig,
-};
+use rustgate_tls::AuthenticatedSession;
+use rustgate_transport::{FramedCodec, ReplayFilter, Router, SessionHandle, ThrottleConfig};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -350,8 +349,8 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
 /// Returns the negotiated codec and any buffered read bytes.
 #[cfg(feature = "proto")]
 async fn negotiate_tak_protocol(
-    reader: &mut rustgate_transport::SessionReader,
-    writer: &mut rustgate_transport::SessionWriter,
+    reader: &mut rustgate_tls::SessionReader,
+    writer: &mut rustgate_tls::SessionWriter,
     cn: &str,
     negotiation_timeout: std::time::Duration,
 ) -> std::io::Result<(Arc<dyn Codec>, tokio_util::bytes::BytesMut)> {
@@ -429,8 +428,8 @@ async fn negotiate_tak_protocol(
 ///
 /// Returns when either loop finishes (EOF, timeout, or error).
 async fn run_session_loops(
-    reader: rustgate_transport::SessionReader,
-    writer: rustgate_transport::SessionWriter,
+    reader: rustgate_tls::SessionReader,
+    writer: rustgate_tls::SessionWriter,
     priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     ctx: &SessionContext<'_, impl NatsPublish>,
@@ -468,7 +467,7 @@ fn codec_is_xml(codec: &dyn Codec) -> bool {
 /// Decode inbound frames, apply rate limiting, and route to local clients,
 /// NATS, federation peers, and the event archiver.
 async fn read_loop(
-    reader: rustgate_transport::SessionReader,
+    reader: rustgate_tls::SessionReader,
     ctx: &SessionContext<'_, impl NatsPublish>,
     prefix: tokio_util::bytes::BytesMut,
 ) -> std::io::Result<()> {
@@ -612,7 +611,7 @@ async fn read_loop(
 /// Uses biased `tokio::select!` to always drain the priority channel
 /// (Position and Alert messages) before processing normal messages.
 async fn write_loop(
-    writer: rustgate_transport::SessionWriter,
+    writer: rustgate_tls::SessionWriter,
     mut priority_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     mut normal_rx: mpsc::Receiver<rustgate_transport::RoutedMessage>,
     codec: &dyn Codec,
@@ -731,7 +730,7 @@ fn apply_delta(enc: &mut DeltaEncoder, encoded: &Bytes) -> DeltaDispatch {
 /// Configuration for the plaintext TCP accept loop, bundling arguments that
 /// would otherwise require `#[allow(clippy::too_many_arguments)]`.
 pub(crate) struct PlaintextTcpConfig<P: NatsPublish> {
-    pub(crate) listener: rustgate_transport::PlaintextListener,
+    pub(crate) listener: rustgate_tls::PlaintextListener,
     pub(crate) router: Arc<Router>,
     pub(crate) connection_limit: Arc<Semaphore>,
     pub(crate) codec: Arc<dyn Codec>,

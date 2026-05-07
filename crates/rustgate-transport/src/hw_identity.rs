@@ -20,7 +20,7 @@
 //!   the [`ResolvesServerCert`] adapter can be exercised by the
 //!   workspace's integration test rig **without hardware**.
 //! - [`HardwareIdentityResolver`] — a [`ResolvesServerCert`] adapter
-//!   that the existing [`crate::TlsConfig::build_reloadable_server_config`]
+//!   that the existing `rustgate_tls::TlsConfig::build_reloadable_server_config`
 //!   entry point already consumes, so a hardware-rooted listener
 //!   composes the same way as a file- or SPIFFE-backed one.
 //!
@@ -57,10 +57,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
-use rustls_pki_types::pem::PemObject;
 use tracing::warn;
 use zeroize::Zeroizing;
 
@@ -362,7 +362,7 @@ impl HardwareIdentity for Pkcs11StubBackend {
 
 /// [`ResolvesServerCert`] adapter that lets a [`HardwareIdentity`]
 /// drive the existing rustls server-side resolver path. Plug into
-/// [`crate::TlsConfig::build_reloadable_server_config`] in place of a
+/// `rustgate_tls::TlsConfig::build_reloadable_server_config` in place of a
 /// `CertReloader` to switch a listener from file-based to
 /// hardware-rooted identity without touching the listener itself.
 ///

@@ -51,11 +51,11 @@ peer-discovery-etcd = ["federation", "rustgate-federation/peer-discovery-etcd"]
 websocket = ["dep:rustgate-websocket"]
 mqtt = ["dep:rustgate-mqtt"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "rustgate-http?/otel"]
-fips = ["rustgate-transport/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips", "rustgate-http?/fips"]
-post-quantum = ["rustgate-transport/post-quantum", "rustgate-federation?/post-quantum", "rustgate-http?/post-quantum"]
+fips = ["rustgate-tls/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips", "rustgate-http?/fips"]
+post-quantum = ["rustgate-tls/post-quantum", "rustgate-federation?/post-quantum", "rustgate-http?/post-quantum"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
-ocsp = ["rustgate-transport/ocsp"]
-spiffe = ["rustgate-transport/spiffe"]
+ocsp = ["rustgate-tls/ocsp"]
+spiffe = ["rustgate-tls/spiffe"]
 # Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
 cedar = ["rustgate-authz/cedar"]
 http = ["dep:rustgate-http"]
@@ -82,6 +82,7 @@ rustgate-metrics = { workspace = true, optional = true }
 rustgate-mavlink = { workspace = true }
 rustgate-asterix = { workspace = true }
 rustgate-stanag4586 = { workspace = true }
+rustgate-tls = { workspace = true }
 rustgate-transport = { workspace = true }
 rustgate-websocket = { workspace = true, optional = true }
 rustgate-mqtt = { workspace = true, optional = true }

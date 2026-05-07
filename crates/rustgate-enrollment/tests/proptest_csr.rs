@@ -26,7 +26,7 @@
 //!    to the supplied CN.
 //! 3. **Random SAN counts** up to the per-category cap of `32`
 //!    (`MAX_SAN_ENTRIES_PER_CATEGORY` in
-//!    `rustgate_transport::extract`). The CSR's caller-supplied SANs
+//!    `rustgate_tls::extract`). The CSR's caller-supplied SANs
 //!    are stripped by `sign_csr`'s allowlist policy — the round-trip
 //!    therefore asserts the *output* certificate carries no SAN
 //!    entries regardless of how many the CSR claimed. That is the
@@ -44,7 +44,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 const MAX_CN_LENGTH: usize = 256;
 
 /// Workspace-wide per-category SAN cap from
-/// `rustgate_transport::extract`. Mirrored locally because the constant
+/// `rustgate_tls::extract`. Mirrored locally because the constant
 /// is crate-private.
 const MAX_SAN_ENTRIES_PER_CATEGORY: usize = 32;
 

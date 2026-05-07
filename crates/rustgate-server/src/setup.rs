@@ -37,9 +37,8 @@ use rustgate_core::tasks::SubsystemHandle;
     feature = "federation-ha",
 ))]
 use rustgate_core::tasks::spawn_background;
-use rustgate_transport::{
-    CertReloader, Router, ThrottleConfig, TlsConfig, TlsListener, TlsMinVersion,
-};
+use rustgate_tls::{CertReloader, TlsConfig, TlsListener, TlsMinVersion};
+use rustgate_transport::{Router, ThrottleConfig};
 use tokio::sync::Semaphore;
 
 use crate::cli::{Cli, Encoding, Framing};
@@ -121,12 +120,12 @@ pub(crate) async fn load_group_acl(
 pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild> {
     #[cfg(feature = "spiffe")]
     if cli.spiffe {
-        let spiffe_cfg = rustgate_transport::spiffe::SpiffeConfig {
+        let spiffe_cfg = rustgate_tls::spiffe::SpiffeConfig {
             workload_api_socket: cli.spiffe_workload_api_socket.clone(),
             expected_trust_domain: cli.spiffe_trust_domain.clone(),
             refresh_interval: std::time::Duration::from_secs(cli.spiffe_refresh_interval),
         };
-        let identity = rustgate_transport::spiffe::fetch_initial_identity(&spiffe_cfg)
+        let identity = rustgate_tls::spiffe::fetch_initial_identity(&spiffe_cfg)
             .await
             .context("fetching initial SPIFFE X.509-SVID")?;
 
@@ -226,7 +225,7 @@ pub(crate) struct TlsConfigBuild {
     pub(crate) key_pem: zeroize::Zeroizing<String>,
     pub(crate) ca_pem: String,
     #[cfg(feature = "spiffe")]
-    pub(crate) spiffe_identity: Option<rustgate_transport::spiffe::SpiffeIdentity>,
+    pub(crate) spiffe_identity: Option<rustgate_tls::spiffe::SpiffeIdentity>,
 }
 
 /// Bind the TLS listener with a handshake concurrency limit.
@@ -237,7 +236,7 @@ pub(crate) struct TlsConfigBuild {
 pub(crate) async fn bind_tls_listener(
     cli: &Cli,
     tls_config: &TlsConfig,
-    #[cfg(feature = "spiffe")] spiffe_identity: Option<rustgate_transport::spiffe::SpiffeIdentity>,
+    #[cfg(feature = "spiffe")] spiffe_identity: Option<rustgate_tls::spiffe::SpiffeIdentity>,
 ) -> anyhow::Result<TlsListenerHandle> {
     // When SPIFFE is enabled, reuse the `SpiffeIdentity` already fetched by
     // `build_tls_config` so we do not double-fetch from the Workload API at
@@ -247,7 +246,7 @@ pub(crate) async fn bind_tls_listener(
     let reloader = if cli.spiffe {
         let identity = spiffe_identity
             .ok_or_else(|| anyhow::anyhow!("SPIFFE enabled but no preloaded identity passed"))?;
-        let spiffe_cfg = rustgate_transport::spiffe::SpiffeConfig {
+        let spiffe_cfg = rustgate_tls::spiffe::SpiffeConfig {
             workload_api_socket: cli.spiffe_workload_api_socket.clone(),
             expected_trust_domain: cli.spiffe_trust_domain.clone(),
             refresh_interval: std::time::Duration::from_secs(cli.spiffe_refresh_interval),
@@ -255,7 +254,7 @@ pub(crate) async fn bind_tls_listener(
         let reloader = identity.cert_reloader.clone();
 
         #[cfg(feature = "metrics")]
-        let hooks = Some(rustgate_transport::spiffe::SpiffeHooks {
+        let hooks = Some(rustgate_tls::spiffe::SpiffeHooks {
             on_success: Arc::new(|expiry| {
                 metrics::spiffe_refresh_total()
                     .with_label_values(&["success"])
@@ -269,13 +268,9 @@ pub(crate) async fn bind_tls_listener(
             }),
         });
         #[cfg(not(feature = "metrics"))]
-        let hooks: Option<rustgate_transport::spiffe::SpiffeHooks> = None;
+        let hooks: Option<rustgate_tls::spiffe::SpiffeHooks> = None;
 
-        rustgate_transport::spiffe::spawn_refresh_task(
-            Arc::downgrade(&reloader),
-            spiffe_cfg,
-            hooks,
-        );
+        rustgate_tls::spiffe::spawn_refresh_task(Arc::downgrade(&reloader), spiffe_cfg, hooks);
         tracing::info!(
             spiffe_id = %identity.spiffe_id,
             trust_domain = %identity.trust_domain,
@@ -300,28 +295,28 @@ pub(crate) async fn bind_tls_listener(
     #[cfg(feature = "ocsp")]
     let verifier: std::sync::Arc<dyn rustgate_transport::ClientCertVerifier> = if cli.client_ocsp {
         #[cfg(feature = "metrics")]
-        let on_hit: Option<rustgate_transport::client_ocsp::OnCacheHit> =
+        let on_hit: Option<rustgate_tls::client_ocsp::OnCacheHit> =
             Some(std::sync::Arc::new(|| {
                 if let Some(c) = metrics::client_ocsp_cache_hits() {
                     c.inc();
                 }
             }));
         #[cfg(feature = "metrics")]
-        let on_miss: Option<rustgate_transport::client_ocsp::OnCacheMiss> =
+        let on_miss: Option<rustgate_tls::client_ocsp::OnCacheMiss> =
             Some(std::sync::Arc::new(|| {
                 if let Some(c) = metrics::client_ocsp_cache_misses() {
                     c.inc();
                 }
             }));
         #[cfg(not(feature = "metrics"))]
-        let on_hit: Option<rustgate_transport::client_ocsp::OnCacheHit> = None;
+        let on_hit: Option<rustgate_tls::client_ocsp::OnCacheHit> = None;
         #[cfg(not(feature = "metrics"))]
-        let on_miss: Option<rustgate_transport::client_ocsp::OnCacheMiss> = None;
+        let on_miss: Option<rustgate_tls::client_ocsp::OnCacheMiss> = None;
 
-        let fetcher: std::sync::Arc<dyn rustgate_transport::OcspFetcher> =
-            std::sync::Arc::new(rustgate_transport::OcspStaplerFetcher::default());
+        let fetcher: std::sync::Arc<dyn rustgate_tls::OcspFetcher> =
+            std::sync::Arc::new(rustgate_tls::OcspStaplerFetcher::default());
         let wrapped =
-            rustgate_transport::ClientOcspVerifier::new(inner_verifier, fetcher, on_hit, on_miss);
+            rustgate_tls::ClientOcspVerifier::new(inner_verifier, fetcher, on_hit, on_miss);
         tracing::info!(
             "client certificate OCSP verification enabled (Tier 1, fail-open, SKI cache)"
         );
@@ -346,16 +341,16 @@ pub(crate) async fn bind_tls_listener(
     #[cfg(feature = "ocsp")]
     let (resolver, ocsp_stapler): (
         std::sync::Arc<dyn rustgate_transport::ResolvesServerCert>,
-        Option<std::sync::Arc<rustgate_transport::ocsp::Stapler>>,
+        Option<std::sync::Arc<rustgate_tls::ocsp::Stapler>>,
     ) = if cli.ocsp_stapling {
-        let stapler = rustgate_transport::ocsp::wrap_resolver(reloader.clone());
+        let stapler = rustgate_tls::ocsp::wrap_resolver(reloader.clone());
         // Preload the active certificate so the stapler queues its first
         // OCSP fetch immediately rather than waiting for the inaugural
         // handshake to surface it. This shrinks (but does not eliminate)
         // the unstapled window at startup; the background fetcher still
         // needs one cycle (up to ~60s) to actually populate the cache.
         if let Some(ckey) = reloader.certified_key() {
-            rustgate_transport::ocsp::preload(&stapler, ckey);
+            rustgate_tls::ocsp::preload(&stapler, ckey);
         }
         tracing::info!("OCSP stapling enabled for server certificate");
         (stapler.clone(), Some(stapler))
@@ -442,7 +437,7 @@ pub(crate) struct TlsListenerHandle {
     pub(crate) listener: TlsListener,
     pub(crate) cert_reloader: Option<Arc<CertReloader>>,
     #[cfg(feature = "ocsp")]
-    pub(crate) ocsp_stapler: Option<Arc<rustgate_transport::ocsp::Stapler>>,
+    pub(crate) ocsp_stapler: Option<Arc<rustgate_tls::ocsp::Stapler>>,
 }
 
 /// Validate framing/encoding feature requirements and consistency at startup.
@@ -2016,12 +2011,12 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
 
     tracing::warn!(addr = %addr, "plaintext TCP input enabled — traffic is NOT encrypted");
 
-    let identity_config = rustgate_transport::PlaintextIdentityConfig {
+    let identity_config = rustgate_tls::PlaintextIdentityConfig {
         cn: cli.plaintext_cn.clone(),
         default_group: cli.plaintext_group.clone(),
     };
 
-    let pt_listener = rustgate_transport::PlaintextListener::bind(addr, identity_config)
+    let pt_listener = rustgate_tls::PlaintextListener::bind(addr, identity_config)
         .await
         .context("binding plaintext TCP listener")?;
 

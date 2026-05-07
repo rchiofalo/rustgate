@@ -34,6 +34,7 @@ COPY crates/rustgate-websocket/Cargo.toml   crates/rustgate-websocket/Cargo.toml
 COPY crates/rustgate-server/Cargo.toml      crates/rustgate-server/Cargo.toml
 COPY crates/rustgate-stanag4586/Cargo.toml  crates/rustgate-stanag4586/Cargo.toml
 COPY crates/rustgate-test-utils/Cargo.toml  crates/rustgate-test-utils/Cargo.toml
+COPY crates/rustgate-tls/Cargo.toml         crates/rustgate-tls/Cargo.toml
 
 # Stub lib.rs / main.rs so cargo can resolve and fetch deps.
 RUN for d in crates/*/; do mkdir -p "$d/src" && echo "" > "$d/src/lib.rs"; done \

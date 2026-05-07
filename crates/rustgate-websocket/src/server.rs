@@ -713,7 +713,8 @@ mod tests {
     use rustgate_core::codec::Codec;
     use rustgate_core::message::RoutableMessage;
     use rustgate_test_utils::certs::TestCa;
-    use rustgate_transport::{Router, TlsConfig};
+    use rustgate_tls::TlsConfig;
+    use rustgate_transport::Router;
     use tokio::sync::{Notify, Semaphore};
 
     use super::*;

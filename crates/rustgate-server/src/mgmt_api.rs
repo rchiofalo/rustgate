@@ -48,7 +48,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Method, Response, StatusCode};
-use rustgate_transport::{CertReloader, Router};
+use rustgate_tls::CertReloader;
+use rustgate_transport::Router;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -91,7 +92,7 @@ pub struct MgmtApiState {
     pub cert_reloader: Option<Arc<CertReloader>>,
     /// On-disk CRL path when one was configured via `--crl`. The
     /// [`crl_status`] handler re-parses this file on every request via
-    /// [`rustgate_transport::TlsConfig::validate_crl_file`] so the
+    /// [`rustgate_tls::TlsConfig::validate_crl_file`] so the
     /// response reflects what the next SIGHUP would load — there is no
     /// separate in-memory CRL cache to go stale.
     pub crl_path: Option<PathBuf>,
@@ -538,7 +539,7 @@ fn crl_status(state: &MgmtApiState) -> Response<Full<Bytes>> {
         });
     };
     let display = path.display().to_string();
-    match rustgate_transport::TlsConfig::validate_crl_file(&display) {
+    match rustgate_tls::TlsConfig::validate_crl_file(&display) {
         Ok(summary) => json_ok(&CrlStatus {
             configured: true,
             path: Some(display),
@@ -716,7 +717,7 @@ pub(crate) const CERT_EXPIRING_SOON_DAYS: i64 = 30;
 /// `/api/cert/status` so a missing `commonName` RDN renders as JSON
 /// `null` instead of fabricating an empty string. `serial` and
 /// `fingerprint_sha256` are lowercase hex without separators — same
-/// format that `rustgate_transport::extract::cert_serial` and the
+/// format that `rustgate_tls::extract::cert_serial` and the
 /// `rustgate-server cert-info` CLI subcommand emit, so policy authors,
 /// pinning code, and operator tooling all interpret one canonical
 /// rendering. `days_remaining` is computed as a saturating signed
@@ -820,7 +821,7 @@ pub(crate) fn build_v1_cert_status(der: &[u8]) -> Result<V1CertStatus, String> {
     let subject_cn = first_rdn_value(cert.subject(), &OID_X509_COMMON_NAME);
     let issuer_cn = first_rdn_value(cert.issuer(), &OID_X509_COMMON_NAME);
 
-    // Match `rustgate_transport::extract::cert_serial` so policy rules
+    // Match `rustgate_tls::extract::cert_serial` so policy rules
     // and operator tooling interpret the same hex string.
     let serial = hex::encode(cert.tbs_certificate.serial.to_bytes_be());
 

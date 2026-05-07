@@ -17,7 +17,8 @@ use rustgate_mqtt::{
 };
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{Router, TlsConfig};
+use rustgate_tls::TlsConfig;
+use rustgate_transport::Router;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore};
 

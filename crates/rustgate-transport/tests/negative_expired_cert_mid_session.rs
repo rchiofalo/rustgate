@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{TlsConfig, TlsListener};
+use rustgate_tls::{TlsConfig, TlsListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The cert is issued with 5 seconds of remaining validity. The test

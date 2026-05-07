@@ -419,7 +419,7 @@ impl FederationManager {
 
         // Start V1 inbound server if enabled
         if self.config.v1_enabled {
-            let tls_config = rustgate_transport::TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
+            let tls_config = rustgate_tls::TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem)?;
 
             let on_v1_server =
                 Self::create_v1_dedup_callback(&v1_dedup, &on_inbound, "inbound server");
@@ -432,7 +432,7 @@ impl FederationManager {
                 let base_ca = ca_pem.clone().into_bytes();
                 let crls = tls_config.crls().to_vec();
 
-                let dynamic_verifier = rustgate_transport::DynamicCertVerifier::new(
+                let dynamic_verifier = rustgate_tls::DynamicCertVerifier::new(
                     Box::new(move || {
                         let current_gen = ts_clone.generation();
                         let store = ts_clone
@@ -464,10 +464,10 @@ impl FederationManager {
 
                 let server_config =
                     tls_config.build_server_config_with_verifier(dynamic_verifier)?;
-                let listener = rustgate_transport::TlsListener::bind_with_server_config(
+                let listener = rustgate_tls::TlsListener::bind_with_server_config(
                     self.config.v1_listen_addr,
                     Arc::new(server_config),
-                    rustgate_transport::DEFAULT_MAX_HANDSHAKES,
+                    rustgate_tls::DEFAULT_MAX_HANDSHAKES,
                 )
                 .await?;
 
@@ -2380,7 +2380,7 @@ mod tests {
     #[tokio::test]
     async fn trust_store_certs_used_in_tls_verification() {
         use rustgate_test_utils::certs::TestCa;
-        use rustgate_transport::{TlsConfig, TlsListener};
+        use rustgate_tls::{TlsConfig, TlsListener};
 
         // Two separate CAs — base and extra
         let base_ca = TestCa::new("Base CA");

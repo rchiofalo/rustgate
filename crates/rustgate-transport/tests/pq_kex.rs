@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_transport::{TlsConfig, TlsListener, install_pq_provider, is_pq_provider_active};
+use rustgate_tls::{TlsConfig, TlsListener, install_pq_provider, is_pq_provider_active};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── setup ────────────────────────────────────────────────────────────────

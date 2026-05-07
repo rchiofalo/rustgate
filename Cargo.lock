@@ -3269,6 +3269,7 @@ dependencies = [
  "futures",
  "rustgate-core",
  "rustgate-test-utils",
+ "rustgate-tls",
  "rustgate-transport",
  "rustls",
  "rustls-pki-types",
@@ -3390,6 +3391,7 @@ dependencies = [
  "rustgate-proto",
  "rustgate-resilience",
  "rustgate-test-utils",
+ "rustgate-tls",
  "rustgate-transport",
  "rustls",
  "rustls-pki-types",
@@ -3506,6 +3508,7 @@ dependencies = [
  "rustgate-metrics",
  "rustgate-resilience",
  "rustgate-test-utils",
+ "rustgate-tls",
  "rustgate-transport",
  "rustls",
  "socket2",
@@ -3603,6 +3606,7 @@ dependencies = [
  "rustgate-proto",
  "rustgate-stanag4586",
  "rustgate-test-utils",
+ "rustgate-tls",
  "rustgate-transport",
  "rustgate-websocket",
  "rustix",
@@ -3657,6 +3661,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-tls"
+version = "0.8.0"
+dependencies = [
+ "arc-swap",
+ "futures",
+ "ocsp-stapler",
+ "parking_lot",
+ "rustgate-core",
+ "rustgate-test-utils",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "spiffe",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "rustgate-transport"
 version = "0.8.0"
 dependencies = [
@@ -3667,7 +3695,6 @@ dependencies = [
  "futures",
  "hmac",
  "lru",
- "ocsp-stapler",
  "parking_lot",
  "proptest",
  "redb",
@@ -3679,14 +3706,13 @@ dependencies = [
  "rustgate-proto",
  "rustgate-resilience",
  "rustgate-test-utils",
+ "rustgate-tls",
  "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "smol_str",
  "socket2",
- "spiffe",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3712,6 +3738,7 @@ dependencies = [
  "rustgate-metrics",
  "rustgate-resilience",
  "rustgate-test-utils",
+ "rustgate-tls",
  "rustgate-transport",
  "rustls",
  "rustls-pki-types",
