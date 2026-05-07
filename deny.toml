@@ -180,6 +180,9 @@ allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-stanag4586"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-meshtastic"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-asterix"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
