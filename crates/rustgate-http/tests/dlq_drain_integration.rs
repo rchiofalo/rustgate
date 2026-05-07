@@ -312,7 +312,7 @@ async fn drain_preserves_delivery_id_across_replay() {
 /// which is only possible if `dead_letter_with_id` did its job.
 #[tokio::test]
 async fn drain_requeues_failed_entries_and_preserves_id() {
-    use rustgate_core::encrypted::KeyRing;
+    use rustgate_archive::encrypted::KeyRing;
 
     let server = MockServer::start().await;
 

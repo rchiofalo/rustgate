@@ -24,7 +24,6 @@
 //! through `anyhow::Error` at the orchestration layer.
 
 pub mod audit;
-pub mod audit_chain;
 pub mod b64;
 pub mod callbacks;
 pub mod classification;
@@ -33,7 +32,6 @@ pub mod config;
 pub mod constants;
 pub mod crypto;
 pub mod egress;
-pub mod encrypted;
 pub mod entity;
 pub mod error;
 pub mod identity;

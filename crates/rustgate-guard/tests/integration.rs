@@ -78,7 +78,7 @@ fn audit_log_grows_one_record_per_evaluate_regardless_of_outcome() {
     let msg = make_message(plain);
     let _ = g.evaluate(&msg, GuardDirection::LowToHigh);
     drop(g);
-    let report = rustgate_core::audit_chain::verify_audit_log(&path).unwrap();
+    let report = rustgate_archive::audit_chain::verify_audit_log(&path).unwrap();
     assert_eq!(report.records, 5);
     let contents = std::fs::read_to_string(&path).unwrap();
     let line_count = contents.lines().count();

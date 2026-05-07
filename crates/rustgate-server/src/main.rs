@@ -29,8 +29,6 @@ use tracing_subscriber::{EnvFilter, Layer};
 mod acl_api;
 mod acl_config;
 mod acl_reloader;
-mod archive;
-mod archive_rotation;
 mod audit;
 mod authz_reloader;
 mod cli;
@@ -57,12 +55,12 @@ use session::{FedForwardFn, SessionDeps};
 /// per `flush`. Used by the audit log layer so each tracing event becomes
 /// one encrypted record on disk.
 struct EncryptedLineWriter {
-    inner: Arc<rustgate_core::encrypted::SharedEncryptedWriter>,
+    inner: Arc<rustgate_archive::encrypted::SharedEncryptedWriter>,
     buf: Vec<u8>,
 }
 
 impl EncryptedLineWriter {
-    fn new(inner: Arc<rustgate_core::encrypted::SharedEncryptedWriter>) -> Self {
+    fn new(inner: Arc<rustgate_archive::encrypted::SharedEncryptedWriter>) -> Self {
         Self {
             inner,
             buf: Vec::with_capacity(1024),
@@ -163,15 +161,15 @@ fn main() -> anyhow::Result<()> {
             ref output,
             ref key_file,
         }) => {
-            let ring = rustgate_core::encrypted::KeyRing::load(key_file)
+            let ring = rustgate_archive::encrypted::KeyRing::load(key_file)
                 .map_err(|e| anyhow::anyhow!("failed to load key file: {e}"))?;
-            rustgate_core::encrypted::decrypt_file(input, output, &ring)
+            rustgate_archive::encrypted::decrypt_file(input, output, &ring)
                 .map_err(|e| anyhow::anyhow!("decrypt failed: {e}"))?;
             println!("decrypted {} -> {}", input.display(), output.display());
             return Ok(());
         }
         Some(Command::VerifyAudit { ref file }) => {
-            match rustgate_core::audit_chain::verify_audit_log(std::path::Path::new(file)) {
+            match rustgate_archive::audit_chain::verify_audit_log(std::path::Path::new(file)) {
                 Ok(report) => {
                     println!(
                         "audit log OK: {} records verified, tip={}, tip_seq={}",
@@ -362,9 +360,9 @@ fn main() -> anyhow::Result<()> {
     let fmt_layer = tracing_subscriber::fmt::layer().json();
 
     // Optional encryption key ring shared by the audit log and CoT archive.
-    let archive_key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>> =
+    let archive_key_ring: Option<Arc<rustgate_archive::encrypted::KeyRing>> =
         if let Some(ref kp) = cli.archive_key_file {
-            let ring = rustgate_core::encrypted::KeyRing::load(kp).map_err(|e| {
+            let ring = rustgate_archive::encrypted::KeyRing::load(kp).map_err(|e| {
                 anyhow::anyhow!("failed to load --archive-key-file {}: {e}", kp.display())
             })?;
             tracing::debug!(active_key_id = %ring.active_key_id(), "loaded archive key ring");
@@ -388,9 +386,9 @@ fn main() -> anyhow::Result<()> {
         let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if audit_path == "-" {
             // Stdout sinks start each process with a genesis chain since
             // there is no persistent file to resume from.
-            let chain = rustgate_core::audit_chain::HashChainWriter::new(
+            let chain = rustgate_archive::audit_chain::HashChainWriter::new(
                 std::io::stdout(),
-                rustgate_core::audit_chain::GENESIS_PREV.to_string(),
+                rustgate_archive::audit_chain::GENESIS_PREV.to_string(),
             );
             std::sync::Mutex::new(Box::new(chain))
         } else if let Some(ref ring) = archive_key_ring {
@@ -398,14 +396,14 @@ fn main() -> anyhow::Result<()> {
             // hash chain so each line is hash-chained, then encrypted.
             // The chain restarts at genesis because the on-disk format is
             // opaque without the key; tip recovery is not supported here.
-            let enc = rustgate_core::encrypted::SharedEncryptedWriter::create(
+            let enc = rustgate_archive::encrypted::SharedEncryptedWriter::create(
                 std::path::Path::new(audit_path),
                 ring,
             )
             .map_err(|e| anyhow::anyhow!("failed to open encrypted audit log {audit_path}: {e}"))?;
-            let chain = rustgate_core::audit_chain::HashChainWriter::new(
+            let chain = rustgate_archive::audit_chain::HashChainWriter::new(
                 EncryptedLineWriter::new(Arc::new(enc)),
-                rustgate_core::audit_chain::GENESIS_PREV.to_string(),
+                rustgate_archive::audit_chain::GENESIS_PREV.to_string(),
             );
             std::sync::Mutex::new(Box::new(chain))
         } else {
@@ -418,15 +416,15 @@ fn main() -> anyhow::Result<()> {
             // cases warrant operator attention. The audit.chain_discontinuity
             // event below is emitted *after* tracing init so it lands in the
             // audit log, not in the early stderr stream. Issue #718.
-            match rustgate_core::audit_chain::check_chain_continuity(path) {
-                Ok(rustgate_core::audit_chain::ChainContinuity::NoAnchor) => {
+            match rustgate_archive::audit_chain::check_chain_continuity(path) {
+                Ok(rustgate_archive::audit_chain::ChainContinuity::NoAnchor) => {
                     // First run after enabling the audit log; benign. The
                     // anchor is persisted on the next clean shutdown.
                 }
-                Ok(rustgate_core::audit_chain::ChainContinuity::Match { .. }) => {
+                Ok(rustgate_archive::audit_chain::ChainContinuity::Match { .. }) => {
                     // Chain continuous across the last shutdown; all good.
                 }
-                Ok(rustgate_core::audit_chain::ChainContinuity::Mismatch {
+                Ok(rustgate_archive::audit_chain::ChainContinuity::Mismatch {
                     anchor_tip,
                     live_tip,
                 }) => {
@@ -457,7 +455,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let (prev, next_seq) =
-                rustgate_core::audit_chain::read_chain_state(path).map_err(|e| {
+                rustgate_archive::audit_chain::read_chain_state(path).map_err(|e| {
                     anyhow::anyhow!("failed to read audit log chain state {audit_path}: {e}")
                 })?;
             let file = std::fs::OpenOptions::new()
@@ -466,7 +464,7 @@ fn main() -> anyhow::Result<()> {
                 .open(audit_path)
                 .map_err(|e| anyhow::anyhow!("failed to open audit log {audit_path}: {e}"))?;
             let tip_observer = Arc::new(arc_swap::ArcSwap::from_pointee(prev.clone()));
-            let chain = rustgate_core::audit_chain::HashChainWriter::new(file, prev)
+            let chain = rustgate_archive::audit_chain::HashChainWriter::new(file, prev)
                 .with_next_seq(next_seq)
                 .with_tip_observer(Arc::clone(&tip_observer));
             // Upgrade the handle (or create one) so shutdown knows which
@@ -1661,10 +1659,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     setup::warn_mqtt_disabled(&cli);
 
     // ── CoT event archival ──────────────────────────────────────────
-    let archive_key_ring: Option<Arc<rustgate_core::encrypted::KeyRing>> =
+    let archive_key_ring: Option<Arc<rustgate_archive::encrypted::KeyRing>> =
         if let Some(ref kp) = cli.archive_key_file {
             Some(Arc::new(
-                rustgate_core::encrypted::KeyRing::load(kp)
+                rustgate_archive::encrypted::KeyRing::load(kp)
                     .map_err(|e| anyhow::anyhow!("failed to load archive key file: {e}"))?,
             ))
         } else {
@@ -1678,13 +1676,13 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 active_key_id = %ring.active_key_id(),
                 "CoT event archival enabled (encrypted)"
             );
-            Some(Arc::new(archive::CotArchiver::with_encryption(
+            Some(Arc::new(rustgate_archive::CotArchiver::with_encryption(
                 dir,
                 Arc::clone(ring),
             )))
         } else {
             tracing::info!(dir = %dir, "CoT event archival enabled");
-            Some(Arc::new(archive::CotArchiver::new(dir)))
+            Some(Arc::new(rustgate_archive::CotArchiver::new(dir)))
         }
     } else {
         None
@@ -1694,7 +1692,19 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let archive_rotation_handle = if let Some(ref dir) = cli.archive_dir
         && (cli.archive_max_size > 0 || cli.archive_max_age > 0 || cli.archive_max_active_bytes > 0)
     {
-        let cfg = archive_rotation::RotationConfig {
+        // Surface the per-pass `bytes_after` count to the existing
+        // `rustgate_archive_bytes` Prometheus gauge via the
+        // `OnRotationStats` callback. The metric registration stays in
+        // the server binary so `rustgate-archive` does not need a
+        // Prometheus dep — see #892.
+        #[cfg(feature = "metrics")]
+        let on_stats: Option<rustgate_archive::OnRotationStats> = Some(Arc::new(|stats| {
+            metrics::archive_bytes().set(stats.bytes_after as i64);
+        }));
+        #[cfg(not(feature = "metrics"))]
+        let on_stats: Option<rustgate_archive::OnRotationStats> = None;
+
+        let cfg = rustgate_archive::RotationConfig {
             dir: std::path::PathBuf::from(dir),
             max_bytes: cli.archive_max_size,
             max_active_bytes: cli.archive_max_active_bytes,
@@ -1704,6 +1714,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             // redundant — the value is already safe at this point.
             interval: std::time::Duration::from_secs(cli.archive_rotate_interval),
             archiver: archiver.clone(),
+            on_stats,
         };
         tracing::info!(
             dir = %dir,
@@ -1713,7 +1724,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             interval_secs = cli.archive_rotate_interval,
             "CoT archive rotation enabled",
         );
-        Some(archive_rotation::spawn(cfg))
+        Some(rustgate_archive::spawn(cfg))
     } else {
         None
     };
@@ -2121,7 +2132,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         // `tip_seq = 0` (the high-water of records *already* on disk),
         // which the next startup interprets as "fall back to scanning
         // the log" via the read_anchor_with_seq backward-compat path.
-        let tip_seq = match rustgate_core::audit_chain::read_chain_state(path) {
+        let tip_seq = match rustgate_archive::audit_chain::read_chain_state(path) {
             Ok((_, next_seq)) => next_seq.saturating_sub(1),
             Err(e) => {
                 tracing::warn!(
@@ -2132,7 +2143,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 0
             }
         };
-        match rustgate_core::audit_chain::write_anchor_with_seq(path, &tip, tip_seq) {
+        match rustgate_archive::audit_chain::write_anchor_with_seq(path, &tip, tip_seq) {
             Ok(()) => {
                 rustgate_core::audit::chain_anchor_persisted(&path.display().to_string(), &tip);
             }

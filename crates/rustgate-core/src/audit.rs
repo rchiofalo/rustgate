@@ -650,7 +650,7 @@ pub fn authz_denied(
 /// same material. Concretely:
 ///
 /// - Prefer a dedicated hash-chained audit file
-///   ([`crate::audit_chain::HashChainWriter`]) on an encrypted
+///   (`rustgate_archive::audit_chain::HashChainWriter`) on an encrypted
 ///   volume over a shared syslog/journald stream.
 /// - If using a SIEM, confirm its ingest channel and retention store
 ///   both satisfy the handling caveat that applies to the classified
@@ -1242,7 +1242,7 @@ pub fn chain_anchor_persisted(audit_path: &str, tip: &str) {
 /// The error text is emitted verbatim so operators can distinguish disk-full,
 /// permission-denied, and read-only-filesystem failures without chasing the
 /// correlated ERROR-level tracing record. On the next startup a missing
-/// anchor presents as [`ChainContinuity::NoAnchor`] which is benign, so the
+/// anchor presents as `ChainContinuity::NoAnchor` which is benign, so the
 /// audit chain itself is not broken by this failure — but the operator
 /// loses the tamper-detection signal for the window it took to retry.
 ///
@@ -1251,7 +1251,6 @@ pub fn chain_anchor_persisted(audit_path: &str, tip: &str) {
 /// (e.g. a path with embedded newlines) are neutralised; the body of the
 /// rendered error otherwise passes through verbatim.
 ///
-/// [`ChainContinuity::NoAnchor`]: crate::audit_chain::ChainContinuity::NoAnchor
 pub fn chain_anchor_persist_failed(audit_path: &str, error: &str) {
     let audit_path = s(audit_path);
     let error = s(error);
@@ -1827,7 +1826,7 @@ pub fn nats_poison_message_dlq(subject: &str, msg_id: &str, reason: &str, attemp
     );
 }
 
-/// Record that an encrypted-archive [`crate::encrypted::KeyRing`] was loaded
+/// Record that an encrypted-archive `rustgate_archive::encrypted::KeyRing` was loaded
 /// with an active key whose configured `not_after` is within the rotation
 /// window — the operator must rotate before the key expires or new-write
 /// admission will fail closed.
@@ -1849,8 +1848,8 @@ pub fn nats_poison_message_dlq(subject: &str, msg_id: &str, reason: &str, attemp
 /// `kid` is the active key id; `days_remaining` is `(not_after - now) /
 /// 86_400`, rounded down. A key whose `not_after` is already in the past
 /// is reported with `days_remaining = 0` — but in that case the actual
-/// admission gate ([`crate::encrypted::KeyRing::active_key_expired_at`])
-/// will refuse new writes with [`crate::encrypted::EncryptError::ActiveKeyExpired`]
+/// admission gate (`rustgate_archive::encrypted::KeyRing::active_key_expired_at`)
+/// will refuse new writes with `rustgate_archive::encrypted::EncryptError::ActiveKeyExpired`
 /// regardless of whether anyone listens for this audit event.
 ///
 /// Sanitization: `kid` is sanitized at the audit boundary.

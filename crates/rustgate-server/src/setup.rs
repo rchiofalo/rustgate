@@ -1995,7 +1995,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     fed_forward: &Option<FedForwardFn>,
     #[cfg(feature = "http")] http_forward: &Option<HttpForwardFn>,
     throttle_config: Option<ThrottleConfig>,
-    archiver: &Option<Arc<crate::archive::CotArchiver>>,
+    archiver: &Option<Arc<rustgate_archive::CotArchiver>>,
     replay_filter: &Option<Arc<rustgate_transport::ReplayFilter>>,
     #[cfg(feature = "metrics")] metrics_identity: &Arc<metrics::MetricsIdentity>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {

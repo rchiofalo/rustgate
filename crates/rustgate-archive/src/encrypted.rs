@@ -41,7 +41,7 @@
 //!   for production secrets that should not live in a config-management blob),
 //! - reading the named environment variable (`ikm_from_env`), or
 //! - reading from a file (`ikm_from_file`) — the file is loaded via
-//!   [`crate::secrets::read_secret_file`], so it inherits the workspace's
+//!   [`rustgate_core::secrets::read_secret_file`], so it inherits the workspace's
 //!   strict permission gate (`mode 0o077` rejected on Unix), size cap
 //!   (16 KiB), and ownership-UID check.
 //!
@@ -57,7 +57,7 @@
 //! open a new file with [`EncryptError::ActiveKeyExpired`] — historical
 //! data encrypted under the expired key is still readable, only new-write
 //! admission is gated. Loading a key file whose active key expires within
-//! 14 days emits an [`crate::audit::archive_key_rotation_due`] audit event;
+//! 14 days emits an [`rustgate_core::audit::archive_key_rotation_due`] audit event;
 //! loading a key file with no expirations declared at all emits a
 //! `tracing::warn!` so operators are nudged toward setting rotation policy.
 //!
@@ -295,7 +295,7 @@ pub enum Derivation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ikm_from_env: Option<String>,
         /// Resolve IKM by reading the named file via
-        /// [`crate::secrets::read_secret_file`]. The file inherits the
+        /// [`rustgate_core::secrets::read_secret_file`]. The file inherits the
         /// workspace's strict permission gate (`mode 0o077` rejected on
         /// Unix), size cap (16 KiB), and ownership-UID check.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -559,7 +559,7 @@ impl KeyRing {
     ///    rotation.
     /// 2. If the active key has a configured `not_after` within the
     ///    next 14 days (inclusive of "in the past"), emit
-    ///    [`crate::audit::archive_key_rotation_due`] with `kid` and
+    ///    [`rustgate_core::audit::archive_key_rotation_due`] with `kid` and
     ///    `days_remaining`. SIEMs key on this event to drive rotation
     ///    runbooks.
     ///
@@ -572,7 +572,7 @@ impl KeyRing {
 
         if self.not_after.is_empty() {
             tracing::warn!(
-                target: "rustgate_core::encrypted",
+                target: "rustgate_archive::encrypted",
                 active_key_id = %self.active_key_id,
                 "encrypted-archive key file has no `key_expirations` set; \
                  set `not_after` per key to enable rotation hygiene checks"
@@ -590,7 +590,7 @@ impl KeyRing {
                 // case at write time — this audit event is purely
                 // observational.
                 let days_remaining = (remaining / SECONDS_PER_DAY).max(0);
-                crate::audit::archive_key_rotation_due(&self.active_key_id, days_remaining);
+                rustgate_core::audit::archive_key_rotation_due(&self.active_key_id, days_remaining);
             }
         }
     }
@@ -824,8 +824,8 @@ fn resolve_ikm(
         // inherits the same permission / ownership / size policy
         // already applied to enrollment passwords and federation HMAC
         // secrets.
-        let opts = crate::secrets::SecretFileOpts::default();
-        let value = crate::secrets::read_secret_file(path, &opts).map_err(|e| {
+        let opts = rustgate_core::secrets::SecretFileOpts::default();
+        let value = rustgate_core::secrets::read_secret_file(path, &opts).map_err(|e| {
             EncryptError::KeyDerivation {
                 id: id.to_string(),
                 reason: format!("ikm file: {e}"),
@@ -2551,7 +2551,7 @@ mod tests {
         //    a tracing warn so operators are nudged toward setting
         //    rotation. The warn-emission is observed via the
         //    `EventCapture` layer above filtering on
-        //    `target = "rustgate_core::encrypted"`.
+        //    `target = "rustgate_archive::encrypted"`.
         #[test]
         fn key_without_not_after_loads_and_emits_rotation_hygiene_warn() {
             use tracing_subscriber::layer::SubscriberExt;
@@ -2561,7 +2561,7 @@ mod tests {
             // blanket impl. Test-only — short-lived process means
             // the leak is benign.
             let layer_ref: &'static EventCapture = Box::leak(Box::new(EventCapture::new(
-                "rustgate_core::encrypted",
+                "rustgate_archive::encrypted",
                 Some(tracing::Level::WARN),
                 None,
             )));

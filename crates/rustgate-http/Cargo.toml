@@ -18,6 +18,7 @@ fips = ["rustls/aws_lc_rs", "rustls/fips"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 
 [dependencies]
+rustgate-archive = { workspace = true }
 rustgate-core = { workspace = true }
 rustgate-resilience = { workspace = true }
 reqwest = { workspace = true }

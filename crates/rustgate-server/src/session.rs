@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use rustgate_archive as archive;
 use rustgate_core::codec::Codec;
 use rustgate_core::constants::{READ_TIMEOUT, WRITE_TIMEOUT};
 use rustgate_core::identity::Identity;
@@ -26,7 +27,6 @@ use rustgate_transport::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use crate::archive;
 use crate::cli::Framing;
 #[cfg(feature = "metrics")]
 use crate::metrics;
