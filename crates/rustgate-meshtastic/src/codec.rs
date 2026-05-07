@@ -364,9 +364,8 @@ fn build_pli(entity: &Entity, position: Position) -> Pli {
         return Pli {
             latitude_i: lat,
             longitude_i: lon,
-            altitude: alt_attr.unwrap_or_else(|| {
-                position.hae_meters.map(clamp_to_i32).unwrap_or_default()
-            }),
+            altitude: alt_attr
+                .unwrap_or_else(|| position.hae_meters.map(clamp_to_i32).unwrap_or_default()),
             speed: speed_attr.unwrap_or_else(|| {
                 entity
                     .velocity
