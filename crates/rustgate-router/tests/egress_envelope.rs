@@ -34,7 +34,7 @@ use rustgate_authz::{
 };
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
-use rustgate_router::{Router, SessionHandle};
+use rustgate_router::{RecipientClass, Router, SessionHandle};
 use tokio::sync::mpsc;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -328,5 +328,146 @@ async fn egress_obligation_applied_audit_event_fires_with_expected_fields() {
         fields.get("result").copied(),
         Some("success"),
         "result field must be success, got fields={fields:?}"
+    );
+}
+
+/// Engine that allows everything and attaches `MaskPoint` only to the
+/// HTTP sink class (Broadcast resource). Used to pin the per-sink fold
+/// behaviour of [`Router::prepare_egress_envelope_for_sink`] — different
+/// sinks observe different obligation outcomes for the same inbound
+/// message.
+struct MaskHttpOnly;
+impl PolicyEngine for MaskHttpOnly {
+    fn evaluate(&self, _s: &Subject<'_>, _r: &Resource<'_>, a: Action) -> DecisionOutcome {
+        // Every send obligates `MaskPoint`; non-Send actions pass
+        // through unmodified. The single-recipient sinks (NATS, HTTP,
+        // federation) all evaluate against `Resource::Broadcast` — they
+        // are not group-aware — so this engine emits `MaskPoint` for
+        // every wired sink, exercising the audit-event-per-sink fold
+        // that `prepare_egress_envelope_for_sink` is documented to
+        // produce.
+        let obligations = if a == Action::Send {
+            vec![Obligation::MaskPoint]
+        } else {
+            Vec::new()
+        };
+        DecisionOutcome {
+            decision: Decision::Allow,
+            rule_id: None,
+            obligations,
+        }
+    }
+    fn policy_id(&self) -> &str {
+        "test-746-mask-http-only"
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn per_sink_envelope_renders_mask_point_for_each_sink_class() {
+    // Pin the public-API contract of
+    // `Router::prepare_egress_envelope_for_sink` — closes #746. For a
+    // single inbound message the helper must produce one envelope per
+    // sink class, each carrying its own audit-event emission. With
+    // every sink-side rule attaching `MaskPoint`, three wired sinks
+    // (NATS, HTTP, federation) MUST surface three independent
+    // `egress.obligation.applied` events with distinct `sink` labels.
+    let capture = AuditCapture::default();
+    let sink = capture.handle();
+    let subscriber = tracing_subscriber::registry().with(AuditLayer { sink });
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let router = Router::new().with_authz(Arc::new(MaskHttpOnly));
+    let alice = identity("alice", &["alpha"]);
+
+    let nats_envelope = router
+        .prepare_egress_envelope_for_sink(
+            Arc::new(position(&alice, Destination::Group("alpha".into()))),
+            RecipientClass::NatsSink("rg.alpha".to_string()),
+        )
+        .expect("nats sink envelope must render under an allow-with-MaskPoint policy");
+    let http_envelope = router
+        .prepare_egress_envelope_for_sink(
+            Arc::new(position(&alice, Destination::Group("alpha".into()))),
+            RecipientClass::HttpSink("siem".to_string()),
+        )
+        .expect("http sink envelope must render under an allow-with-MaskPoint policy");
+    let fed_envelope = router
+        .prepare_egress_envelope_for_sink(
+            Arc::new(position(&alice, Destination::Group("alpha".into()))),
+            RecipientClass::FederationPeer(rustgate_core::PeerId::new("peer-1".to_string())),
+        )
+        .expect("federation envelope must render under an allow-with-MaskPoint policy");
+
+    // Every sink envelope is masked — `MaskPoint` ran once per
+    // envelope, not per recipient.
+    for envelope in [&nats_envelope, &http_envelope, &fed_envelope] {
+        let s =
+            std::str::from_utf8(&envelope.message.payload).expect("rendered payload must be UTF-8");
+        assert!(
+            s.contains(r#"lat="0.0""#),
+            "envelope must have MaskPoint applied: {s}"
+        );
+        assert_eq!(
+            envelope.applied_obligations.len(),
+            1,
+            "exactly one obligation per sink envelope: {:?}",
+            envelope.applied_obligations
+        );
+    }
+
+    // Audit log carries one `egress.obligation.applied` per sink
+    // class. The `sink` field renders the small fixed-vocabulary
+    // label so SIEM correlation can group by sink without parsing the
+    // recipient label.
+    let records = capture.snapshot();
+    let by_sink: Vec<&str> = records
+        .iter()
+        .filter(|r| r.event_type == "egress.obligation.applied")
+        .filter_map(|r| {
+            r.fields
+                .iter()
+                .find(|(k, _)| k == "sink")
+                .map(|(_, v)| v.as_str())
+        })
+        .collect();
+    assert!(
+        by_sink.contains(&"nats"),
+        "expected nats sink event in {by_sink:?}"
+    );
+    assert!(
+        by_sink.contains(&"http"),
+        "expected http sink event in {by_sink:?}"
+    );
+    assert!(
+        by_sink.contains(&"federation"),
+        "expected federation sink event in {by_sink:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn per_sink_envelope_passthrough_when_no_engine_installed() {
+    // No authz engine means no Send-PEP, so the helper hands back the
+    // input arc verbatim — same allocation, same payload, no audit
+    // events. The `applied_obligations` vector is empty so callers can
+    // detect the no-op path without inspecting the message body.
+    let router = Router::new();
+    let alice = identity("alice", &["alpha"]);
+    let inbound = Arc::new(position(&alice, Destination::Group("alpha".into())));
+
+    let envelope = router
+        .prepare_egress_envelope_for_sink(
+            Arc::clone(&inbound),
+            RecipientClass::NatsSink("rg.alpha".to_string()),
+        )
+        .expect("no-engine path must always succeed");
+
+    assert!(
+        Arc::ptr_eq(&envelope.message, &inbound),
+        "no-engine path must return the input arc verbatim (no clone)"
+    );
+    assert!(
+        envelope.applied_obligations.is_empty(),
+        "no-engine path must report empty applied obligations: {:?}",
+        envelope.applied_obligations
     );
 }

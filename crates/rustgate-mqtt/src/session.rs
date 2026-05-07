@@ -18,7 +18,9 @@ use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::sanitize::sanitize_for_log;
-use rustgate_router::{NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, Router, SessionHandle};
+use rustgate_router::{
+    NORMAL_CHANNEL_CAPACITY, PRIORITY_CHANNEL_CAPACITY, RecipientClass, Router, SessionHandle,
+};
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tracing::{debug, info, warn};
 
@@ -1070,7 +1072,7 @@ fn fire_retain_outcome(hooks: Option<&crate::config::MqttSessionHooks>, outcome:
 }
 
 /// Fan out the post-Send-PEP routed message to NATS / federation / HTTP
-/// egress sinks.
+/// egress sinks (closes #746).
 ///
 /// Mirrors the WebSocket write-loop's fan-out block verbatim so that an
 /// MQTT PUBLISH that survives the router's obligations (dedup, TTL,
@@ -1078,19 +1080,52 @@ fn fire_retain_outcome(hooks: Option<&crate::config::MqttSessionHooks>, outcome:
 /// sink in exactly the same way a WebSocket inbound message would be.
 /// Each sink is independent — a `None` field is a no-op and never
 /// allocates.
-fn fire_forwarding(hooks: Option<&crate::config::MqttForwardingHooks>, routed: &RoutableMessage) {
+///
+/// **Per-sink envelope rendering** (closes #746). Each wired sink
+/// renders its own [`rustgate_router::EgressEnvelope`] via
+/// [`Router::prepare_egress_envelope_for_sink`] with its own
+/// [`RecipientClass`] before invoking the publisher callback. Send-PEP
+/// rules addressed to a sink class are applied per envelope; an
+/// envelope-level deny suppresses dispatch to that sink only — peer
+/// sinks still receive their own envelope. Obligation actuation runs
+/// once per sink per inbound message (not once per recipient): the
+/// audit-event cadence stays per-envelope.
+fn fire_forwarding(
+    router: &Router,
+    hooks: Option<&crate::config::MqttForwardingHooks>,
+    routed: &Arc<RoutableMessage>,
+) {
     let Some(h) = hooks else {
         return;
     };
-    if let Some(cb) = &h.nats_publish {
-        cb(routed.clone());
+    if let Some(cb) = &h.nats_publish
+        && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+            Arc::clone(routed),
+            RecipientClass::NatsSink(String::new()),
+        )
+    {
+        cb(envelope.message.as_ref().clone());
     }
-    if let Some(fwd) = &h.federation_forward {
-        let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
-        fwd(routed.payload.clone(), groups, routed.metadata.clone());
+    if let Some(fwd) = &h.federation_forward
+        && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+            Arc::clone(routed),
+            RecipientClass::FederationPeer(rustgate_core::PeerId::new(String::new())),
+        )
+    {
+        let groups: Vec<String> = envelope.message.source.groups.iter().cloned().collect();
+        fwd(
+            envelope.message.payload.clone(),
+            groups,
+            envelope.message.metadata.clone(),
+        );
     }
-    if let Some(fwd) = &h.http_forward {
-        fwd(routed.clone());
+    if let Some(fwd) = &h.http_forward
+        && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+            Arc::clone(routed),
+            RecipientClass::HttpSink(String::new()),
+        )
+    {
+        fwd(envelope.message.as_ref().clone());
     }
 }
 
@@ -1632,7 +1667,7 @@ async fn handle_publish_v5_inner(
         return ack_publish_v5(resp_tx, &publish).await;
     };
 
-    fire_forwarding(forwarding_hooks, &routed);
+    fire_forwarding(router, forwarding_hooks, &routed);
     fire_publish_accept(session_hooks);
 
     ack_publish_v5(resp_tx, &publish).await
@@ -1762,7 +1797,7 @@ async fn handle_pubrel_v5(
     };
 
     if let Some(routed) = router.route_for_egress(msg).await {
-        fire_forwarding(forwarding_hooks, &routed);
+        fire_forwarding(router, forwarding_hooks, &routed);
     }
     fire_publish_accept(session_hooks);
 
@@ -1937,7 +1972,7 @@ async fn handle_publish_v4_inner(
         return ack_publish_v4(resp_tx, &publish).await;
     };
 
-    fire_forwarding(forwarding_hooks, &routed);
+    fire_forwarding(router, forwarding_hooks, &routed);
     fire_publish_accept(session_hooks);
 
     ack_publish_v4(resp_tx, &publish).await
@@ -2037,7 +2072,7 @@ async fn handle_pubrel_v4(
     };
 
     if let Some(routed) = router.route_for_egress(msg).await {
-        fire_forwarding(forwarding_hooks, &routed);
+        fire_forwarding(router, forwarding_hooks, &routed);
     }
     fire_publish_accept(session_hooks);
 

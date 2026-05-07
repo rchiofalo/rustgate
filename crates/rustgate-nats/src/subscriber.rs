@@ -16,7 +16,7 @@ use async_nats::jetstream::stream::RetentionPolicy;
 use futures::StreamExt;
 use rustgate_core::egress::{OnFederationForward, OnHttpForward, OnNatsPublish};
 use rustgate_core::message::RoutableMessage;
-use rustgate_router::Router;
+use rustgate_router::{RecipientClass, Router};
 use tracing::Instrument;
 
 use crate::config::NatsConfig;
@@ -495,13 +495,16 @@ impl NatsSubscriber {
             // the message (dedup, TTL expiry, Send-PEP deny, oversize
             // multicast) and every fan-out MUST be skipped to keep the
             // external sinks consistent with the local fanout.
+            let nats_subject = msg.subject.to_string();
             let routed = router.route_for_egress(routable).instrument(span).await;
             if let Some(routed) = routed.as_ref() {
                 fire_forwarding(
+                    router.as_ref(),
                     self.nats_publish.as_ref(),
                     self.federation_forward.as_ref(),
                     self.http_forward.as_ref(),
                     routed,
+                    &nats_subject,
                 );
             }
             processed += 1;
@@ -556,13 +559,24 @@ fn poison_metadata(msg: &async_nats::jetstream::Message) -> (String, u32) {
 }
 
 /// Fan out the post-Send-PEP routed message to NATS / federation /
-/// HTTP egress sinks (refs #737).
+/// HTTP egress sinks (refs #737, closes #746).
 ///
 /// Mirrors the MQTT fan-out helper in `rustgate_mqtt::session` so an
 /// inbound NATS message that survives the router's obligations is
 /// visible to every external sink in exactly the same way an MQTT
 /// PUBLISH would be. Each sink is independent — a `None` field is a
 /// no-op and never allocates.
+///
+/// **Per-sink envelope rendering** (closes #746). Each wired sink
+/// renders its own [`rustgate_router::EgressEnvelope`] via
+/// [`Router::prepare_egress_envelope_for_sink`] with its own
+/// [`RecipientClass`] before invoking the publisher callback. Send-PEP
+/// rules addressed to a sink class (e.g. `MaskPayload` against the
+/// HTTP webhook bound to a SIEM) are applied per envelope; an
+/// envelope-level deny suppresses dispatch to that sink only — peer
+/// sinks still receive their own envelope. Obligation actuation runs
+/// once per sink per inbound message (not once per recipient): the
+/// audit-event cadence stays per-envelope, never per-recipient.
 ///
 /// The publisher's case-insensitive `source_protocol == "nats"` echo
 /// guard catches the `nats_publish` callback because every envelope
@@ -572,24 +586,47 @@ fn poison_metadata(msg: &async_nats::jetstream::Message) -> (String, u32) {
 /// `nats_publish` field is therefore safe to wire even though it
 /// short-circuits in this transport.
 fn fire_forwarding(
+    router: &Router,
     nats_publish: Option<&OnNatsPublish>,
     federation_forward: Option<&OnFederationForward>,
     http_forward: Option<&OnHttpForward>,
     routed: &Arc<RoutableMessage>,
+    nats_subject: &str,
 ) {
-    if let Some(cb) = nats_publish {
-        // Echo guard inside the NATS publisher itself short-circuits
-        // these calls; we still fire so the wiring shape matches MQTT
-        // and a future change to the echo discipline only needs one
-        // edit at the publisher.
-        cb(routed.as_ref().clone());
+    // Echo guard inside the NATS publisher itself short-circuits the
+    // NATS-publish call; we still render an envelope so the wiring
+    // shape matches MQTT and a future change to the echo discipline
+    // only needs one edit at the publisher. EgressError::Denied /
+    // ObligationFailed on any sink suppresses that sink only — peer
+    // sinks still get their own envelope-rendering chance.
+    if let Some(cb) = nats_publish
+        && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+            Arc::clone(routed),
+            RecipientClass::NatsSink(nats_subject.to_string()),
+        )
+    {
+        cb(envelope.message.as_ref().clone());
     }
-    if let Some(fwd) = federation_forward {
-        let groups: Vec<String> = routed.source.groups.iter().cloned().collect();
-        fwd(routed.payload.clone(), groups, routed.metadata.clone());
+    if let Some(fwd) = federation_forward
+        && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+            Arc::clone(routed),
+            RecipientClass::FederationPeer(rustgate_core::PeerId::new(String::new())),
+        )
+    {
+        let groups: Vec<String> = envelope.message.source.groups.iter().cloned().collect();
+        fwd(
+            envelope.message.payload.clone(),
+            groups,
+            envelope.message.metadata.clone(),
+        );
     }
-    if let Some(fwd) = http_forward {
-        fwd(routed.as_ref().clone());
+    if let Some(fwd) = http_forward
+        && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+            Arc::clone(routed),
+            RecipientClass::HttpSink(String::new()),
+        )
+    {
+        fwd(envelope.message.as_ref().clone());
     }
 }
 

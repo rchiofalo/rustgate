@@ -35,7 +35,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::RoutableMessage;
 use rustgate_cot::{MessageBuilder, OnSaAutoUpgraded};
 use rustgate_resilience::SlidingWindowLimiter;
-use rustgate_router::{ReplayFilter, RoutedMessage, Router, SessionHandle};
+use rustgate_router::{RecipientClass, ReplayFilter, RoutedMessage, Router, SessionHandle};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc};
 use tracing::warn;
@@ -447,14 +447,35 @@ impl UdpInput {
                                 continue;
                             };
 
-                            if let Some(nats_cb) = &nats_publish {
-                                nats_cb((*routed).clone());
+                            // Closes #746: each external sink renders its
+                            // own envelope so per-sink Send-PEP rules
+                            // (e.g. `MaskPayload` on a federation peer)
+                            // are applied before the publisher callback
+                            // observes the payload.
+                            if let Some(nats_cb) = &nats_publish
+                                && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+                                    Arc::clone(&routed),
+                                    RecipientClass::NatsSink(String::new()),
+                                )
+                            {
+                                nats_cb((*envelope.message).clone());
                             }
 
-                            if let Some(fwd) = &fed_forward {
+                            if let Some(fwd) = &fed_forward
+                                && let Ok(envelope) = router.prepare_egress_envelope_for_sink(
+                                    Arc::clone(&routed),
+                                    RecipientClass::FederationPeer(rustgate_core::PeerId::new(
+                                        String::new(),
+                                    )),
+                                )
+                            {
                                 let groups: Vec<String> =
-                                    routed.source.groups.iter().cloned().collect();
-                                fwd(routed.payload.clone(), groups, routed.metadata.clone());
+                                    envelope.message.source.groups.iter().cloned().collect();
+                                fwd(
+                                    envelope.message.payload.clone(),
+                                    groups,
+                                    envelope.message.metadata.clone(),
+                                );
                             }
                         }
                         Err(e) => {
