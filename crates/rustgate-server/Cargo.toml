@@ -42,6 +42,14 @@ metrics = [
 ]
 federation = ["dep:rustgate-federation", "rustgate-federation/v2", "rustgate-federation/api", "rustgate-admin/federation"]
 federation-ha = ["federation", "rustgate-federation/ha"]
+# Mesh-native peer-to-peer multi-hop routing (issue #855). Adds the
+# `rustgate_federation::mesh` module and wires direct-neighbor
+# bookkeeping into the `FederationManager` lifecycle. The MVP exposes
+# the routing surface as a public crate API; downstream binary wiring
+# (route advertisement broadcast over the federation transport, hot
+# reload of the mesh router, admin endpoints) lands in follow-up
+# issues.
+mesh-routing = ["federation", "rustgate-federation/mesh-routing"]
 # Sub-features selecting which dynamic peer-discovery backends the server
 # binary will ship with (issue #571). The `peer-discovery` umbrella enables
 # all three; each sub-feature may be enabled independently.

@@ -39,6 +39,8 @@ pub mod jwks_client;
 pub mod jwks_rotation;
 pub mod jwt;
 pub mod manager;
+#[cfg(feature = "mesh-routing")]
+pub mod mesh;
 pub mod peer;
 pub mod provenance;
 pub mod replay_buffer;

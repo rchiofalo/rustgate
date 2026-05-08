@@ -2430,6 +2430,104 @@ pub fn missing_classification_marking(source_cn: &str, msg_uid: &str, source_pro
     );
 }
 
+/// Record a mesh routing entry being added.
+///
+/// Emitted when a new route to a destination is learned via a neighbor's
+/// route advertisement. `metric` is the distance-vector cost (hop count
+/// from this node).
+pub fn mesh_route_added(destination: &PeerId, next_hop: &PeerId, metric: u32) {
+    audit!(
+        "mesh.route_added",
+        destination = %destination,
+        next_hop = %next_hop,
+        metric = metric,
+        action = "route_update",
+        result = "added"
+    );
+}
+
+/// Record a mesh routing entry being removed.
+///
+/// Emitted when a route is withdrawn (neighbor disappears, peer removed,
+/// or stale route is pruned).
+///
+/// Sanitization: `reason` is sanitized at the audit boundary.
+pub fn mesh_route_removed(destination: &PeerId, reason: &str) {
+    let reason = s(reason);
+    audit!(
+        "mesh.route_removed",
+        destination = %destination,
+        reason = %reason,
+        action = "route_update",
+        result = "removed"
+    );
+}
+
+/// Record a mesh routing entry being updated to a better next hop or metric.
+pub fn mesh_route_updated(
+    destination: &PeerId,
+    next_hop: &PeerId,
+    old_metric: u32,
+    new_metric: u32,
+) {
+    audit!(
+        "mesh.route_updated",
+        destination = %destination,
+        next_hop = %next_hop,
+        old_metric = old_metric,
+        new_metric = new_metric,
+        action = "route_update",
+        result = "updated"
+    );
+}
+
+/// Record a successful mesh forward to the next hop.
+pub fn mesh_forwarded(destination: &PeerId, next_hop: &PeerId, hops: u32) {
+    audit!(
+        "mesh.forwarded",
+        destination = %destination,
+        next_hop = %next_hop,
+        hops = hops,
+        action = "forward",
+        result = "success"
+    );
+}
+
+/// Record a mesh loop detection event — message dropped because our peer
+/// id was already present in the provenance chain.
+pub fn mesh_loop_detected(destination: &PeerId, hops: u32) {
+    audit!(
+        "mesh.loop_detected",
+        destination = %destination,
+        hops = hops,
+        action = "forward",
+        result = "dropped"
+    );
+}
+
+/// Record a mesh TTL exhaustion event — message dropped because hop
+/// count exceeded the configured maximum.
+pub fn mesh_ttl_expired(destination: &PeerId, hops: u32, max_hops: u32) {
+    audit!(
+        "mesh.ttl_expired",
+        destination = %destination,
+        hops = hops,
+        max_hops = max_hops,
+        action = "forward",
+        result = "dropped"
+    );
+}
+
+/// Record a mesh forwarding drop because no route exists to the destination.
+pub fn mesh_no_route_to_destination(destination: &PeerId) {
+    audit!(
+        "mesh.no_route_to_destination",
+        destination = %destination,
+        action = "forward",
+        result = "dropped"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2532,6 +2630,47 @@ mod tests {
             federation_traceparent_invalid("", "non-hex character");
             federation_traceparent_invalid("peer\r\nINJECT", "field has wrong length");
             federation_traceparent_invalid("peer-2", "tracestate exceeds 512-byte cap");
+        }
+    }
+
+    mod mesh {
+        use super::*;
+
+        #[test]
+        fn test_route_added() {
+            mesh_route_added(&PeerId::new("dest-1"), &PeerId::new("hop-1"), 1);
+            mesh_route_added(&PeerId::new("dest-2"), &PeerId::new("hop-2"), 5);
+        }
+
+        #[test]
+        fn test_route_removed() {
+            mesh_route_removed(&PeerId::new("dest-1"), "neighbor disconnected");
+            mesh_route_removed(&PeerId::new("dest-2"), "");
+        }
+
+        #[test]
+        fn test_route_updated() {
+            mesh_route_updated(&PeerId::new("dest-1"), &PeerId::new("hop-1"), 5, 2);
+        }
+
+        #[test]
+        fn test_forwarded() {
+            mesh_forwarded(&PeerId::new("dest-1"), &PeerId::new("hop-1"), 2);
+        }
+
+        #[test]
+        fn test_loop_detected() {
+            mesh_loop_detected(&PeerId::new("dest-1"), 3);
+        }
+
+        #[test]
+        fn test_ttl_expired() {
+            mesh_ttl_expired(&PeerId::new("dest-1"), 8, 8);
+        }
+
+        #[test]
+        fn test_no_route_to_destination() {
+            mesh_no_route_to_destination(&PeerId::new("dest-1"));
         }
     }
 
