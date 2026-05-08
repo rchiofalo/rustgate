@@ -90,6 +90,13 @@ video = ["rustgate-admin/video"]
 lattice = ["dep:rustgate-lattice"]
 lattice-mock = ["lattice", "rustgate-lattice/lattice-mock"]
 lattice-real = ["lattice", "rustgate-lattice/lattice-real"]
+# Bridge between rustgate entities and Palantir Foundry / Gotham
+# ontology objects. The `foundry` feature pulls in the trait + config +
+# wiring scaffold; `foundry-mock` activates the in-memory test bridge
+# (the only implementation today — the partner-gated REST/WebSocket
+# SDK adapter ships behind a future `foundry-real` flag). Refs #851.
+foundry = ["dep:rustgate-foundry"]
+foundry-mock = ["foundry", "rustgate-foundry/foundry-mock"]
 # Documentary feature for the Meshtastic / LoRa TAKPacket codec
 # (`rustgate-meshtastic`). The codec crate is always linked alongside
 # the other always-on wire-format crates (CoT, MAVLink, ASTERIX,
@@ -144,6 +151,7 @@ rustgate-proto = { workspace = true, optional = true }
 rustgate-federation = { workspace = true, optional = true }
 rustgate-http = { workspace = true, optional = true }
 rustgate-lattice = { workspace = true, optional = true }
+rustgate-foundry = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
