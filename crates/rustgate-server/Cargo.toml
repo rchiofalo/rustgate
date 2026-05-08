@@ -15,20 +15,14 @@ path = "src/main.rs"
 workspace = true
 
 [package.metadata.cargo-machete]
-# `rustgate-meshtastic` and `rustgate-sapient` are always-linked but the
-# codecs are dispatched via the runtime `EntityCodecRegistry` (added in
-# #1304) rather than imported by name in this crate's source — a follow-up
-# wire-up PR will add the explicit `register(MeshtasticCodec)` /
-# `register(SapientCodec)` calls. The crates ship in the binary regardless
-# so the codecs are available the moment the registration lands. Refs #865,
-# #869.
-ignored = ["rustgate-meshtastic", "rustgate-sapient"]
-# `rustgate-meshtastic` is always-linked but the codec is dispatched via the
-# runtime `EntityCodecRegistry` (added in #1304) rather than imported by name
-# in this crate's source — a follow-up wire-up PR will add the explicit
-# `register(MeshtasticCodec)` call. The crate ships in the binary regardless
-# so the codec is available the moment the registration lands. Refs #865.
-ignored = ["rustgate-meshtastic", "rustgate-foundry"]
+# `rustgate-meshtastic`, `rustgate-sapient`, and `rustgate-foundry` are
+# always-linked but dispatched via runtime registration (`EntityCodecRegistry`
+# from #1304 for codecs; `FoundryBridge` runtime impl for the Foundry adapter)
+# rather than imported by name in this crate's source. Follow-up wire-up PRs
+# will add the explicit `register(...)` calls. The crates ship in the binary
+# regardless so the integrations are available the moment the registrations
+# land. Refs #865, #869, #851.
+ignored = ["rustgate-meshtastic", "rustgate-sapient", "rustgate-foundry"]
 
 [features]
 nats = ["dep:rustgate-nats", "rustgate-admin/nats"]
