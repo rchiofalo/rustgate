@@ -100,6 +100,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-link16`](crates/rustgate-link16/README.md) | Link 16 / JREAP-C (STANAG 5518) frame codec — J2.2 Air Track today, other J-series via `JseriesMessage::Other` placeholder |
 | [`rustgate-lattice`](crates/rustgate-lattice/README.md) | Anduril Lattice bidirectional adapter — bridge trait, mock backend, and router wiring (real Lattice gRPC SDK is partner-NDA-gated; deferred behind the `lattice-real` feature) |
 | [`rustgate-foundry`](crates/rustgate-foundry/README.md) | Bidirectional REST/WebSocket bridge between rustgate entities and Palantir Foundry / Gotham ontology objects (trait + mock + wiring; partner-gated SDK behind `foundry-real`) |
+| [`rustgate-dds`](crates/rustgate-dds/README.md) | DDS Pub/Sub bridge for NGVA (NATO STANAG 4754) / VICTORY in-vehicle data buses — bridge trait, in-memory mock, NGVA Land Data Model topic mapping; real DDS SDK behind `dds-real` (closes #870 alongside the GeoJSON output that landed in #1326) |
 | [`rustgate-nats`](crates/rustgate-nats/README.md) | NATS/JetStream bridge for cross-instance message delivery |
 | [`rustgate-enrollment`](crates/rustgate-enrollment/README.md) | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | [`rustgate-proto`](crates/rustgate-proto/README.md) | Protobuf message translation (XML ↔ proto) |

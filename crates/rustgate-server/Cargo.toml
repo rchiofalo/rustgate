@@ -15,14 +15,15 @@ path = "src/main.rs"
 workspace = true
 
 [package.metadata.cargo-machete]
-# `rustgate-meshtastic`, `rustgate-sapient`, and `rustgate-foundry` are
-# always-linked but dispatched via runtime registration (`EntityCodecRegistry`
-# from #1304 for codecs; `FoundryBridge` runtime impl for the Foundry adapter)
+# `rustgate-meshtastic`, `rustgate-sapient`, `rustgate-foundry`, and
+# `rustgate-dds` are always-linked (when their feature is on) but dispatched
+# via runtime registration (`EntityCodecRegistry` from #1304 for codecs;
+# `FoundryBridge` / `DdsBridge` runtime impls for the partner-gated bridges)
 # rather than imported by name in this crate's source. Follow-up wire-up PRs
 # will add the explicit `register(...)` calls. The crates ship in the binary
 # regardless so the integrations are available the moment the registrations
-# land. Refs #865, #869, #851.
-ignored = ["rustgate-meshtastic", "rustgate-sapient", "rustgate-foundry"]
+# land. Refs #865, #869, #851, #870.
+ignored = ["rustgate-meshtastic", "rustgate-sapient", "rustgate-foundry", "rustgate-dds"]
 
 [features]
 nats = ["dep:rustgate-nats", "rustgate-admin/nats"]
@@ -97,6 +98,15 @@ lattice-real = ["lattice", "rustgate-lattice/lattice-real"]
 # SDK adapter ships behind a future `foundry-real` flag). Refs #851.
 foundry = ["dep:rustgate-foundry"]
 foundry-mock = ["foundry", "rustgate-foundry/foundry-mock"]
+# DDS Pub/Sub bridge for NGVA (NATO STANAG 4754) / VICTORY in-vehicle
+# data buses (`rustgate-dds`). The `dds` feature pulls in the trait +
+# config + wiring scaffold; `dds-mock` activates the in-memory test
+# bridge (the only implementation today — pinning a real DDS SDK
+# adapter, e.g. `cyclonedds-rs` or `dust-dds`, ships behind a future
+# `dds-real` flag). Closes #870 alongside the GeoJSON output that
+# landed in #1326.
+dds = ["dep:rustgate-dds"]
+dds-mock = ["dds", "rustgate-dds/dds-mock"]
 # Documentary feature for the Meshtastic / LoRa TAKPacket codec
 # (`rustgate-meshtastic`). The codec crate is always linked alongside
 # the other always-on wire-format crates (CoT, MAVLink, ASTERIX,
@@ -152,6 +162,7 @@ rustgate-federation = { workspace = true, optional = true }
 rustgate-http = { workspace = true, optional = true }
 rustgate-lattice = { workspace = true, optional = true }
 rustgate-foundry = { workspace = true, optional = true }
+rustgate-dds = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }

@@ -1511,6 +1511,17 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(feature = "foundry")]
     setup::init_foundry_scaffold();
 
+    // ── DDS bridge (issue #870) ─────────────────────────────────────
+    //
+    // The DDS bridge is partner / SDK-gated; today the wiring is a
+    // scaffold (trait + config + mock + wiring tasks) and the real
+    // SDK adapter lands behind a future `dds-real` feature flag.
+    // Calling `init_dds_scaffold` here gives operators who built with
+    // `--features dds` a one-line confirmation that the scaffold is
+    // linked.
+    #[cfg(feature = "dds")]
+    setup::init_dds_scaffold();
+
     // ── Federation ──────────────────────────────────────────────────
     //
     // The `FedInboundForwardingHooks` carry the optional NATS-publish

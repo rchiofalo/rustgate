@@ -223,6 +223,9 @@ crate = "rustgate-lattice"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-foundry"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-dds"
 
 [bans]
 multiple-versions = "warn"
