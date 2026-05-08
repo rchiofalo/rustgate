@@ -18,14 +18,11 @@
 //! * [`acl_config`] — JSON deserialization for the group ACL policy file.
 //! * [`acl_reloader`] — Polling-driven hot-reload for the on-disk ACL file.
 //! * [`acl_api`] — REST API for runtime ACL CRUD mounted under `/api/acl/`.
-<<<<<<< HEAD
 //! * `missions_api` — REST API for the lightweight TAK Data Packages
 //!   endpoint (Feature 17 of #860) mounted under `/api/packages/`.
 //!   Compiled only with the `missions` feature.
-=======
-//! * [`video`] — In-memory CoT `b-i-v` video stream catalog (feature-gated
-//!   on `video`) exposed at `GET /api/video/streams`. Closes #862.
->>>>>>> d502496 (feat(admin): video stream catalog with /api/video/streams endpoint (closes #862))
+//! * `video` — In-memory CoT `b-i-v` video stream catalog (feature-gated
+//!   on the `video` feature) exposed at `GET /api/video/streams`. Closes #862.
 
 #![forbid(unsafe_code)]
 
