@@ -96,6 +96,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-meshtastic`](crates/rustgate-meshtastic/README.md) | Meshtastic / LoRa TAKPacket compact-protobuf codec (237-byte cap; transport binding in follow-up PRs) |
 | [`rustgate-vmf`](crates/rustgate-vmf/README.md) | VMF (Variable Message Format, MIL-STD-6017) bit-level codec — K05.1 Position Reports today, other K-series via `VmfMessage::Unknown` placeholder |
 | [`rustgate-dis`](crates/rustgate-dis/README.md) | DIS (IEEE 1278.1) Entity State PDU codec for LVC training simulators (other PDU types land in follow-up PRs) |
+| [`rustgate-link16`](crates/rustgate-link16/README.md) | Link 16 / JREAP-C (STANAG 5518) frame codec — J2.2 Air Track today, other J-series via `JseriesMessage::Other` placeholder |
 | [`rustgate-nats`](crates/rustgate-nats/README.md) | NATS/JetStream bridge for cross-instance message delivery |
 | [`rustgate-enrollment`](crates/rustgate-enrollment/README.md) | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | [`rustgate-proto`](crates/rustgate-proto/README.md) | Protobuf message translation (XML ↔ proto) |
