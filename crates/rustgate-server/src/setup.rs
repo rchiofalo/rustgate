@@ -871,7 +871,6 @@ pub(crate) fn init_foundry_scaffold() {
 }
 
 // ---------------------------------------------------------------------------
-<<<<<<< HEAD
 // DDS bridge (issue #870)
 // ---------------------------------------------------------------------------
 //
@@ -907,7 +906,9 @@ pub(crate) fn init_dds_scaffold() {
         target: "rustgate.dds",
         "DDS bridge scaffold linked (trait + config + wiring); awaiting real DDS SDK adapter behind future dds-real feature flag"
     );
-=======
+}
+
+// ---------------------------------------------------------------------------
 // OGC SensorThings v1.0 polling client (issue #869)
 // ---------------------------------------------------------------------------
 
@@ -1006,7 +1007,6 @@ pub(crate) fn warn_ogc_sensorthings_disabled(cli: &Cli) {
     if cli.ogc_sensorthings_config_file.is_some() {
         tracing::warn!("--ogc-sensorthings-config requires --features ogc-sensorthings; ignoring");
     }
->>>>>>> fe1add8 (feat(ogc-sensorthings): rustgate-ogc-sensorthings crate for OGC SensorThings v1.0 client (closes #869))
 }
 
 // ---------------------------------------------------------------------------

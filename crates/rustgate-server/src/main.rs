@@ -1511,7 +1511,6 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(feature = "foundry")]
     setup::init_foundry_scaffold();
 
-<<<<<<< HEAD
     // ── DDS bridge (issue #870) ─────────────────────────────────────
     //
     // The DDS bridge is partner / SDK-gated; today the wiring is a
@@ -1522,7 +1521,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // linked.
     #[cfg(feature = "dds")]
     setup::init_dds_scaffold();
-=======
+
     // ── OGC SensorThings v1.0 polling client (issue #869) ───────────
     //
     // When `--features ogc-sensorthings` is enabled and the operator
@@ -1536,7 +1535,6 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
     #[cfg(not(feature = "ogc-sensorthings"))]
     setup::warn_ogc_sensorthings_disabled(&cli);
->>>>>>> fe1add8 (feat(ogc-sensorthings): rustgate-ogc-sensorthings crate for OGC SensorThings v1.0 client (closes #869))
 
     // ── Federation ──────────────────────────────────────────────────
     //
