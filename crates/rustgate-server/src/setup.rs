@@ -721,7 +721,6 @@ pub(crate) fn warn_http_disabled(cli: &Cli) {
 }
 
 // ---------------------------------------------------------------------------
-<<<<<<< HEAD
 // Lattice (Anduril)
 // ---------------------------------------------------------------------------
 
@@ -834,7 +833,9 @@ pub(crate) fn warn_lattice_disabled(cli: &Cli) {
     if cli.lattice_config_file.is_some() {
         tracing::warn!("--lattice-config requires --features lattice; ignoring");
     }
-=======
+}
+
+// ---------------------------------------------------------------------------
 // Foundry bridge (issue #851)
 // ---------------------------------------------------------------------------
 //
@@ -867,7 +868,6 @@ pub(crate) fn init_foundry_scaffold() {
         target: "rustgate.foundry",
         "Foundry bridge scaffold linked (trait + config + wiring); awaiting partner SDK adapter behind future foundry-real feature flag"
     );
->>>>>>> b7735a7 (feat(foundry): rustgate-foundry crate — bridge trait + MockFoundryBridge for Palantir Foundry integration (closes #851))
 }
 
 // ---------------------------------------------------------------------------

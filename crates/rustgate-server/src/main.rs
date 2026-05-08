@@ -1484,7 +1484,6 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(not(feature = "http"))]
     setup::warn_http_disabled(&cli);
 
-<<<<<<< HEAD
     // ── Lattice (Anduril) ──────────────────────────────────────────
     //
     // Brings up the Lattice bidirectional adapter when `--features
@@ -1500,7 +1499,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
     #[cfg(not(feature = "lattice"))]
     setup::warn_lattice_disabled(&cli);
-=======
+
     // ── Foundry bridge (issue #851) ─────────────────────────────────
     //
     // The Foundry / Gotham bridge is partner-gated; today the wiring
@@ -1511,7 +1510,6 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // scaffold is linked.
     #[cfg(feature = "foundry")]
     setup::init_foundry_scaffold();
->>>>>>> b7735a7 (feat(foundry): rustgate-foundry crate — bridge trait + MockFoundryBridge for Palantir Foundry integration (closes #851))
 
     // ── Federation ──────────────────────────────────────────────────
     //
