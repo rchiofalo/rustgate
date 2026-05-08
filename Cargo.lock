@@ -3494,6 +3494,7 @@ dependencies = [
  "reqwest",
  "rustgate-archive",
  "rustgate-core",
+ "rustgate-cot",
  "rustgate-metrics",
  "rustgate-proto",
  "rustgate-resilience",

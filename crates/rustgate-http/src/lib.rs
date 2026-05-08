@@ -55,6 +55,7 @@ pub(crate) mod dlq;
 pub mod dlq_reader;
 pub mod error;
 pub(crate) mod filter;
+pub(crate) mod geojson;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub(crate) mod payload;

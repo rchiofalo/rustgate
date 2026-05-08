@@ -1213,7 +1213,8 @@ async fn dispatch_to_target(
             .with_label_values(&[target.name.as_str(), flush.reason.as_str()])
             .inc();
         let bodies = flush.bodies();
-        let (batch_body, batch_ct) = payload::render_batch(&bodies, target.batch_format);
+        let (batch_body, batch_ct) =
+            payload::render_batch(&bodies, target.format, target.batch_format);
         publish_with_retry(target, batch_body, batch_ct, Some(flush.len())).await;
         return;
     }
@@ -1802,7 +1803,8 @@ async fn drain_batchers(targets: &[TargetState]) {
             .with_label_values(&[target.name.as_str(), flush.reason.as_str()])
             .inc();
         let bodies = flush.bodies();
-        let (batch_body, batch_ct) = payload::render_batch(&bodies, target.batch_format);
+        let (batch_body, batch_ct) =
+            payload::render_batch(&bodies, target.format, target.batch_format);
         tracing::info!(
             target = %target.name,
             batch_size = flush.len(),

@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::config::{BatchFormat, PayloadFormat};
 use crate::error::HttpError;
+use crate::geojson;
 
 /// JSON wire format for an HTTP-forwarded message.
 ///
@@ -49,6 +50,7 @@ pub(crate) fn serialize(
         PayloadFormat::Json => serialize_json(msg, instance_id),
         PayloadFormat::RawXml => Ok((msg.payload.clone(), "application/xml")),
         PayloadFormat::Protobuf => serialize_protobuf(msg),
+        PayloadFormat::GeoJson => geojson::serialize_feature(msg, instance_id),
     }
 }
 
@@ -132,6 +134,17 @@ pub(crate) fn format_destination(dest: &Destination) -> String {
 ///
 /// # Framing
 ///
+/// `payload_format` is consulted first: when it is
+/// [`PayloadFormat::GeoJson`] the bodies (which are already serialized
+/// `Feature` objects) are wrapped in a `FeatureCollection` envelope —
+/// the only batch shape every GIS tool accepts (Leaflet, Mapbox,
+/// Kepler.gl, QGIS, ArcGIS). Content-Type:
+/// `application/geo+json`. The `batch_format` argument is ignored in
+/// this branch — JSON-array vs NDJSON is not meaningful for GeoJSON.
+///
+/// For every other [`PayloadFormat`] the `batch_format` argument
+/// drives the framing:
+///
 /// - [`BatchFormat::JsonArray`] — wraps bodies in `[…, …, …]` with a
 ///   single `,` separator between entries. Each `body` element MUST
 ///   already be a valid JSON document (typically from
@@ -146,13 +159,20 @@ pub(crate) fn format_destination(dest: &Destination) -> String {
 ///
 /// # Empty input
 ///
-/// An empty body slice produces `[]` for `JsonArray` and `""` for
-/// `Ndjson`. Callers should avoid flushing an empty batch in practice
-/// — the [`Batcher`](crate::batch::Batcher) only yields flush payloads
-/// when at least one message is buffered — but the helper itself is
-/// total.
-pub(crate) fn render_batch(bodies: &[Bytes], format: BatchFormat) -> (Bytes, &'static str) {
-    match format {
+/// An empty body slice produces `[]` for `JsonArray`, `""` for
+/// `Ndjson`, and a well-formed empty `FeatureCollection` for GeoJSON.
+/// Callers should avoid flushing an empty batch in practice — the
+/// [`Batcher`](crate::batch::Batcher) only yields flush payloads when
+/// at least one message is buffered — but the helper itself is total.
+pub(crate) fn render_batch(
+    bodies: &[Bytes],
+    payload_format: PayloadFormat,
+    batch_format: BatchFormat,
+) -> (Bytes, &'static str) {
+    if matches!(payload_format, PayloadFormat::GeoJson) {
+        return geojson::render_feature_collection(bodies);
+    }
+    match batch_format {
         BatchFormat::JsonArray => render_json_array(bodies),
         BatchFormat::Ndjson => render_ndjson(bodies),
     }
@@ -591,7 +611,7 @@ mod tests {
     #[test]
     fn render_batch_json_array_single_message_wraps_in_brackets() {
         let bodies = vec![Bytes::from_static(br#"{"a":1}"#)];
-        let (body, ct) = render_batch(&bodies, BatchFormat::JsonArray);
+        let (body, ct) = render_batch(&bodies, PayloadFormat::Json, BatchFormat::JsonArray);
         assert_eq!(ct, "application/json");
         assert_eq!(&body[..], br#"[{"a":1}]"#);
     }
@@ -603,7 +623,7 @@ mod tests {
             Bytes::from_static(br#"{"b":2}"#),
             Bytes::from_static(br#"{"c":3}"#),
         ];
-        let (body, ct) = render_batch(&bodies, BatchFormat::JsonArray);
+        let (body, ct) = render_batch(&bodies, PayloadFormat::Json, BatchFormat::JsonArray);
         assert_eq!(ct, "application/json");
         assert_eq!(&body[..], br#"[{"a":1},{"b":2},{"c":3}]"#);
         // Roundtrip: the result parses as a JSON array of three objects.
@@ -613,7 +633,7 @@ mod tests {
 
     #[test]
     fn render_batch_json_array_empty_input_emits_bare_brackets() {
-        let (body, ct) = render_batch(&[], BatchFormat::JsonArray);
+        let (body, ct) = render_batch(&[], PayloadFormat::Json, BatchFormat::JsonArray);
         assert_eq!(ct, "application/json");
         assert_eq!(&body[..], b"[]");
     }
@@ -621,7 +641,7 @@ mod tests {
     #[test]
     fn render_batch_ndjson_single_message_appends_newline() {
         let bodies = vec![Bytes::from_static(br#"{"a":1}"#)];
-        let (body, ct) = render_batch(&bodies, BatchFormat::Ndjson);
+        let (body, ct) = render_batch(&bodies, PayloadFormat::Json, BatchFormat::Ndjson);
         assert_eq!(ct, "application/x-ndjson");
         assert_eq!(&body[..], b"{\"a\":1}\n");
     }
@@ -633,7 +653,7 @@ mod tests {
             Bytes::from_static(br#"{"b":2}"#),
             Bytes::from_static(br#"{"c":3}"#),
         ];
-        let (body, ct) = render_batch(&bodies, BatchFormat::Ndjson);
+        let (body, ct) = render_batch(&bodies, PayloadFormat::Json, BatchFormat::Ndjson);
         assert_eq!(ct, "application/x-ndjson");
         assert_eq!(&body[..], b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n");
         // Every NDJSON line is independently parseable.
@@ -649,7 +669,7 @@ mod tests {
 
     #[test]
     fn render_batch_ndjson_empty_input_emits_empty_body() {
-        let (body, ct) = render_batch(&[], BatchFormat::Ndjson);
+        let (body, ct) = render_batch(&[], PayloadFormat::Json, BatchFormat::Ndjson);
         assert_eq!(ct, "application/x-ndjson");
         assert!(body.is_empty());
     }
@@ -662,9 +682,31 @@ mod tests {
         // render step itself must not mutate input bytes).
         let a = Bytes::from_static(b"hello");
         let b = Bytes::from_static(b"world");
-        let (ndjson, _) = render_batch(&[a.clone(), b.clone()], BatchFormat::Ndjson);
+        let (ndjson, _) = render_batch(
+            &[a.clone(), b.clone()],
+            PayloadFormat::Json,
+            BatchFormat::Ndjson,
+        );
         assert_eq!(&ndjson[..], b"hello\nworld\n");
-        let (arr, _) = render_batch(&[a, b], BatchFormat::JsonArray);
+        let (arr, _) = render_batch(&[a, b], PayloadFormat::Json, BatchFormat::JsonArray);
         assert_eq!(&arr[..], b"[hello,world]");
+    }
+
+    #[test]
+    fn render_batch_geojson_dispatches_to_feature_collection_regardless_of_batch_format() {
+        // When `payload_format = GeoJson` the `batch_format` argument is
+        // ignored — JSON-array vs NDJSON is not meaningful for GeoJSON.
+        // Pin that both BatchFormat values produce the same envelope so
+        // an operator who left `batch-format = json-array` (the default)
+        // and switched to `format = geo_json` does not get a malformed
+        // body or a content-type mismatch.
+        let f = Bytes::from_static(br#"{"type":"Feature","geometry":null,"properties":{}}"#);
+        for batch_format in [BatchFormat::JsonArray, BatchFormat::Ndjson] {
+            let (body, ct) =
+                render_batch(std::slice::from_ref(&f), PayloadFormat::GeoJson, batch_format);
+            assert_eq!(ct, "application/geo+json");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["type"], "FeatureCollection");
+        }
     }
 }
