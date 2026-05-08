@@ -3521,6 +3521,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-lattice"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "rustgate-core",
+ "rustgate-router",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "rustgate-link16"
 version = "0.8.0"
 dependencies = [
@@ -3724,6 +3741,7 @@ dependencies = [
  "rustgate-enrollment",
  "rustgate-federation",
  "rustgate-http",
+ "rustgate-lattice",
  "rustgate-mavlink",
  "rustgate-meshtastic",
  "rustgate-metrics",

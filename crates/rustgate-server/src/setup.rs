@@ -721,6 +721,117 @@ pub(crate) fn warn_http_disabled(cli: &Cli) {
 }
 
 // ---------------------------------------------------------------------------
+// Lattice (Anduril)
+// ---------------------------------------------------------------------------
+
+/// Start the Anduril Lattice bridge.
+///
+/// Reads the TOML config file under `cli.lattice_config_file`,
+/// validates the `[lattice]` block, and spawns the inbound
+/// (subscribe-and-route) and outbound (publish-on-event) tasks
+/// against the configured backend. Returns the
+/// `mpsc::Sender<RoutableMessage>` that the caller plumbs into the
+/// router via a fanout / message-delivered hook so admitted
+/// position-and-track messages get pushed to Lattice.
+///
+/// **Backend selection.** This MVP wires the in-memory
+/// `MockLatticeBridge` when the `lattice-mock` feature is enabled.
+/// The real-SDK backend lands behind the `lattice-real` feature in
+/// a follow-up partner PR. With only the umbrella `lattice` feature
+/// enabled and no backend, this helper warns and returns `None` —
+/// the rest of the server keeps running unchanged.
+///
+/// Returns `None` when no config block is present, when the file
+/// cannot be read or parsed, or when no backend is selected.
+#[cfg(feature = "lattice")]
+pub(crate) async fn start_lattice(
+    cli: &Cli,
+    router: &Arc<rustgate_router::Router>,
+) -> Option<(
+    tokio::sync::mpsc::Sender<rustgate_core::message::RoutableMessage>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let config_path = cli.lattice_config_file.as_ref()?;
+    let config_str = match tokio::fs::read_to_string(config_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(path = %config_path, error = %e, "failed to read lattice config");
+            return None;
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        lattice: rustgate_lattice::LatticeConfig,
+    }
+
+    let cfg: rustgate_lattice::LatticeConfig = match toml::from_str::<Wrapper>(&config_str) {
+        Ok(w) => w.lattice,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse [lattice] config");
+            return None;
+        }
+    };
+
+    if let Err(e) = cfg.validate() {
+        tracing::warn!(error = %e, "[lattice] config validation failed");
+        return None;
+    }
+
+    // Backend selection. The MVP only ships the mock backend behind
+    // `lattice-mock`. The real-SDK backend will land behind
+    // `lattice-real` and join this `cfg!(feature = ...)` cascade
+    // without churning the call site.
+    #[cfg(feature = "lattice-mock")]
+    let bridge: rustgate_lattice::bridge::SharedBridge = rustgate_lattice::MockLatticeBridge::new();
+
+    #[cfg(not(feature = "lattice-mock"))]
+    {
+        tracing::warn!(
+            "[lattice] config block present but no backend feature is enabled; \
+             enable --features lattice-mock for testing or --features lattice-real \
+             for the partner SDK (when available)"
+        );
+        return None;
+    }
+
+    #[cfg(feature = "lattice-mock")]
+    {
+        // Outbound channel — the server feeds this from a router
+        // hook (typically `set_on_message_delivered`). The bound is
+        // sized so a slow Lattice endpoint cannot back-pressure the
+        // router; the outbound task drops on receiver-full at the
+        // hook site, not here.
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+
+        let outbound =
+            rustgate_lattice::spawn_outbound_task(std::sync::Arc::clone(&bridge), cfg.clone(), rx);
+        let inbound = rustgate_lattice::spawn_inbound_task(
+            std::sync::Arc::clone(&bridge),
+            cfg.clone(),
+            std::sync::Arc::clone(router),
+        );
+
+        tracing::info!(
+            endpoint = %cfg.endpoint,
+            backend = bridge.backend_name(),
+            "lattice bridge started"
+        );
+
+        Some((tx, outbound, inbound))
+    }
+}
+
+/// Warn when --lattice-config is set but the `lattice` feature is disabled.
+#[cfg(not(feature = "lattice"))]
+pub(crate) fn warn_lattice_disabled(cli: &Cli) {
+    if cli.lattice_config_file.is_some() {
+        tracing::warn!("--lattice-config requires --features lattice; ignoring");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Enrollment
 // ---------------------------------------------------------------------------
 

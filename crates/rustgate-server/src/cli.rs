@@ -381,6 +381,15 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_HTTP_CONFIG")]
     pub(crate) http_config_file: Option<String>,
 
+    /// Path to TOML file configuring the Anduril Lattice bridge.
+    /// The file's `[lattice]` block is parsed by `rustgate-lattice`.
+    /// Requires --features lattice (plus a backend feature like
+    /// --features lattice-mock for the in-memory mock or
+    /// --features lattice-real once the partner SDK is available).
+    /// Refs #850.
+    #[arg(long, env = "RUSTGATE_LATTICE_CONFIG")]
+    pub(crate) lattice_config_file: Option<String>,
+
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
     #[arg(long, env = "RUSTGATE_ENROLLMENT_BIND", value_parser = parse_socket_addr)]
@@ -2120,6 +2129,7 @@ define_config_file! {
     nats_dead_letter_subject: Option<String>,
     nats_checkpoint_path: Option<String>,
     http_config_file: Option<String>,
+    lattice_config_file: Option<String>,
     enrollment_bind: Option<String>,
     ca_key: Option<String>,
     enrollment_user: Option<String>,
