@@ -702,8 +702,11 @@ mod tests {
         // body or a content-type mismatch.
         let f = Bytes::from_static(br#"{"type":"Feature","geometry":null,"properties":{}}"#);
         for batch_format in [BatchFormat::JsonArray, BatchFormat::Ndjson] {
-            let (body, ct) =
-                render_batch(std::slice::from_ref(&f), PayloadFormat::GeoJson, batch_format);
+            let (body, ct) = render_batch(
+                std::slice::from_ref(&f),
+                PayloadFormat::GeoJson,
+                batch_format,
+            );
             assert_eq!(ct, "application/geo+json");
             let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(parsed["type"], "FeatureCollection");
