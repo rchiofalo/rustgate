@@ -220,6 +220,8 @@ crate = "rustgate-missions"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-lattice"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-foundry"
 
 [bans]
