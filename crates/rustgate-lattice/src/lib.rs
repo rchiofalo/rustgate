@@ -30,7 +30,7 @@
 //!   [`bridge::HealthStatus`] — the shared types every backend
 //!   round-trips. Designed to map cleanly to Lattice's `Entity` /
 //!   `EntityFilter` proto when those bindings land.
-//! - [`mock::MockLatticeBridge`] (feature `lattice-mock`) — an
+//! - `mock::MockLatticeBridge` (feature `lattice-mock`) — an
 //!   in-memory, channel-backed implementation that is sufficient for
 //!   integration testing the router → bridge → router round trip
 //!   without an actual Lattice endpoint.
