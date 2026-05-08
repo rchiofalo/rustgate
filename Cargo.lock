@@ -3518,6 +3518,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-link16"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "rustgate-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rustgate-mavlink"
 version = "0.8.0"
 dependencies = [

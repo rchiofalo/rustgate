@@ -208,6 +208,9 @@ crate = "rustgate-router"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-vmf"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-link16"
 
 [bans]
 multiple-versions = "warn"
