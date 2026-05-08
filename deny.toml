@@ -207,6 +207,9 @@ allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-router"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-sapient"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-vmf"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]

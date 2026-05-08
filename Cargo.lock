@@ -3671,6 +3671,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-sapient"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "rustgate-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rustgate-server"
 version = "0.8.0"
 dependencies = [
@@ -3704,6 +3714,7 @@ dependencies = [
  "rustgate-nats",
  "rustgate-proto",
  "rustgate-router",
+ "rustgate-sapient",
  "rustgate-stanag4586",
  "rustgate-test-utils",
  "rustgate-tls",
