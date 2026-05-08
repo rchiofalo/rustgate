@@ -17,6 +17,7 @@ members = [
     "crates/rustgate-http",
     "crates/rustgate-mavlink",
     "crates/rustgate-asterix",
+    "crates/rustgate-dis",
     "crates/rustgate-resilience",
     "crates/rustgate-stanag4586",
     "crates/rustgate-meshtastic",
@@ -166,6 +167,7 @@ rustgate-mqtt = { path = "crates/rustgate-mqtt" }
 rustgate-http = { path = "crates/rustgate-http" }
 rustgate-mavlink = { path = "crates/rustgate-mavlink" }
 rustgate-asterix = { path = "crates/rustgate-asterix" }
+rustgate-dis = { path = "crates/rustgate-dis" }
 rustgate-resilience = { path = "crates/rustgate-resilience" }
 rustgate-stanag4586 = { path = "crates/rustgate-stanag4586" }
 rustgate-meshtastic = { path = "crates/rustgate-meshtastic" }

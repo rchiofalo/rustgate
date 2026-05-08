@@ -883,11 +883,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
     // Closes #847. Build the EntityCodecRegistry once at startup with
     // every protocol crate that ships an EntityCodec — CoT XML
-    // (#1289), MAVLink (#1292), ASTERIX (#1295), STANAG-4586 (#1300).
-    // The registry is held behind `Arc` so the router (and any future
-    // hot-reload story) can share ownership without allocation churn.
-    // Codec instances are zero-sized — the per-protocol `Arc::new(...)`
-    // here is the canonical zero-cost handle.
+    // (#1289), MAVLink (#1292), ASTERIX (#1295), STANAG-4586 (#1300),
+    // DIS (#867). The registry is held behind `Arc` so the router
+    // (and any future hot-reload story) can share ownership without
+    // allocation churn. Codec instances are zero-sized — the
+    // per-protocol `Arc::new(...)` here is the canonical zero-cost
+    // handle.
     let entity_codec_registry = {
         let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
         registry.register(
@@ -906,6 +907,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             "stanag4586",
             std::sync::Arc::new(rustgate_stanag4586::entity::Stanag4586EntityCodec),
         );
+        registry.register("dis", std::sync::Arc::new(rustgate_dis::DisCodec));
         Arc::new(registry)
     };
 

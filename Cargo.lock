@@ -3356,6 +3356,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-dis"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "rustgate-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rustgate-enrollment"
 version = "0.8.0"
 dependencies = [
@@ -3673,6 +3683,7 @@ dependencies = [
  "rustgate-authz",
  "rustgate-core",
  "rustgate-cot",
+ "rustgate-dis",
  "rustgate-enrollment",
  "rustgate-federation",
  "rustgate-http",
