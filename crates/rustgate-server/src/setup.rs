@@ -788,6 +788,10 @@ pub(crate) async fn start_lattice(
 
     #[cfg(not(feature = "lattice-mock"))]
     {
+        // justification: with no backend feature enabled the router is never wired,
+        // but the parameter is part of the public function shape for the
+        // `lattice-mock` / future `lattice-real` paths below.
+        let _ = router;
         tracing::warn!(
             "[lattice] config block present but no backend feature is enabled; \
              enable --features lattice-mock for testing or --features lattice-real \
