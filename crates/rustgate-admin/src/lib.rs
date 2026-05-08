@@ -18,17 +18,24 @@
 //! * [`acl_config`] — JSON deserialization for the group ACL policy file.
 //! * [`acl_reloader`] — Polling-driven hot-reload for the on-disk ACL file.
 //! * [`acl_api`] — REST API for runtime ACL CRUD mounted under `/api/acl/`.
+//! * `missions_api` — REST API for the lightweight TAK Data Packages
+//!   endpoint (Feature 17 of #860) mounted under `/api/packages/`.
+//!   Compiled only with the `missions` feature.
 
 #![forbid(unsafe_code)]
 
 pub mod acl_api;
 pub mod acl_config;
 pub mod acl_reloader;
+#[cfg(feature = "missions")]
+pub mod missions_api;
 pub mod server;
 
 pub use acl_api::{AclApiState, validate_bearer_token_length};
 pub use acl_config::{GroupAclEntry, GroupAclFile};
 pub use acl_reloader::AclReloader;
+#[cfg(feature = "missions")]
+pub use missions_api::{MissionsApiHandler, MissionsApiState};
 #[cfg(feature = "federation")]
 pub use server::FedApiHandler;
 pub use server::{

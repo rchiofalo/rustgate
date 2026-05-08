@@ -14,6 +14,10 @@ workspace = true
 nats = ["dep:rustgate-nats"]
 federation = ["dep:rustgate-federation"]
 http = ["dep:rustgate-http"]
+# Mounts the lightweight Data Packages REST API (Feature 17 of #860)
+# under `/api/packages/`. Pulls in the `rustgate-missions` crate, the
+# package store, and the HMAC-tagged sidecar handler.
+missions = ["dep:rustgate-missions"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -22,6 +26,7 @@ rustgate-router = { workspace = true }
 rustgate-nats = { workspace = true, optional = true }
 rustgate-federation = { workspace = true, optional = true }
 rustgate-http = { workspace = true, optional = true }
+rustgate-missions = { workspace = true, optional = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }

@@ -3222,6 +3222,7 @@ dependencies = [
  "rustgate-core",
  "rustgate-federation",
  "rustgate-http",
+ "rustgate-missions",
  "rustgate-nats",
  "rustgate-router",
  "rustgate-test-utils",
@@ -3554,6 +3555,21 @@ name = "rustgate-metrics"
 version = "0.8.0"
 dependencies = [
  "prometheus",
+]
+
+[[package]]
+name = "rustgate-missions"
+version = "0.8.0"
+dependencies = [
+ "quick-xml",
+ "rustgate-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
