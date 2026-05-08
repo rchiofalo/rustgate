@@ -136,6 +136,18 @@ pub struct FederationManager {
     ha_adopt_rx: Option<tokio::sync::mpsc::Receiver<PeerId>>,
     #[cfg(feature = "ha")]
     ha_lost_rx: Option<tokio::sync::mpsc::Receiver<PeerId>>,
+
+    // ── Mesh routing (issue #855) ────────────────────────────────────
+    /// Optional mesh router for multi-hop forwarding between peers.
+    ///
+    /// `None` (default) preserves the historical hub-and-spoke
+    /// behavior; callers that opt into mesh routing install a router
+    /// via [`FederationManager::install_mesh_router`] before `start()`.
+    /// Direct-neighbor routes are installed/withdrawn when peers
+    /// connect or disconnect; multi-hop forwarding decisions live on
+    /// [`crate::mesh::MeshRouter::should_forward`].
+    #[cfg(feature = "mesh-routing")]
+    mesh: Option<Arc<crate::mesh::MeshRouter>>,
 }
 
 /// Aggregated status snapshot of the federation subsystem.
@@ -243,6 +255,43 @@ impl FederationManager {
             ha_adopt_rx: None,
             #[cfg(feature = "ha")]
             ha_lost_rx: None,
+            #[cfg(feature = "mesh-routing")]
+            mesh: None,
+        }
+    }
+
+    /// Install a mesh router. Must be called before [`Self::start`] so
+    /// that connect/disconnect events seen during startup are mirrored
+    /// into the routing table.
+    ///
+    /// Replaces any previously-installed router; when `None`, the
+    /// manager reverts to hub-and-spoke behavior.
+    #[cfg(feature = "mesh-routing")]
+    pub fn install_mesh_router(&mut self, router: Option<Arc<crate::mesh::MeshRouter>>) {
+        self.mesh = router;
+    }
+
+    /// Borrow the installed mesh router, if any.
+    #[cfg(feature = "mesh-routing")]
+    pub fn mesh_router(&self) -> Option<Arc<crate::mesh::MeshRouter>> {
+        self.mesh.as_ref().map(Arc::clone)
+    }
+
+    /// Internal helper: notify the mesh router that a peer became a
+    /// direct neighbor. No-op when no router is installed.
+    #[cfg(feature = "mesh-routing")]
+    fn mesh_notify_neighbor_up(&self, peer_id: &PeerId) {
+        if let Some(ref mesh) = self.mesh {
+            mesh.add_direct_neighbor(peer_id);
+        }
+    }
+
+    /// Internal helper: notify the mesh router that a peer is no longer
+    /// reachable. No-op when no router is installed.
+    #[cfg(feature = "mesh-routing")]
+    fn mesh_notify_neighbor_down(&self, peer_id: &PeerId) {
+        if let Some(ref mesh) = self.mesh {
+            let _ = mesh.withdraw_neighbor(peer_id);
         }
     }
 
@@ -701,6 +750,8 @@ impl FederationManager {
                         "started V1 federation client"
                     );
 
+                    #[cfg(feature = "mesh-routing")]
+                    self.mesh_notify_neighbor_up(&peer_config.id);
                     let _ = self.peers.insert(peer_config.id.clone(), peer);
                     let _ = self.clients.insert(
                         peer_config.id.clone(),
@@ -739,6 +790,8 @@ impl FederationManager {
                         "started V2 gRPC federation client"
                     );
 
+                    #[cfg(feature = "mesh-routing")]
+                    self.mesh_notify_neighbor_up(&peer_config.id);
                     let _ = self.peers.insert(peer_config.id.clone(), peer);
                     let _ = self.clients.insert(
                         peer_config.id.clone(),
@@ -1605,6 +1658,8 @@ impl FederationManager {
                     "started V1 federation client (adoption)"
                 );
 
+                #[cfg(feature = "mesh-routing")]
+                self.mesh_notify_neighbor_up(&peer_config.id);
                 let _ = self.peers.insert(peer_config.id.clone(), peer);
                 let _ = self.clients.insert(
                     peer_config.id.clone(),
@@ -1649,6 +1704,8 @@ impl FederationManager {
                     "started V2 gRPC federation client (adoption)"
                 );
 
+                #[cfg(feature = "mesh-routing")]
+                self.mesh_notify_neighbor_up(&peer_config.id);
                 let _ = self.peers.insert(peer_config.id.clone(), peer);
                 let _ = self.clients.insert(
                     peer_config.id.clone(),
@@ -1776,6 +1833,11 @@ impl FederationManager {
 
         // Clean up the replay buffer for this peer
         self.remove_replay_buffer(peer_id);
+
+        // Withdraw mesh routes that used this peer as next hop. No-op
+        // when no mesh router is installed.
+        #[cfg(feature = "mesh-routing")]
+        self.mesh_notify_neighbor_down(peer_id);
 
         // Unregister from connection registry / release claim (HA only)
         #[cfg(feature = "ha")]

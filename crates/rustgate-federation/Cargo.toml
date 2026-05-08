@@ -48,6 +48,14 @@ jwks = ["dep:reqwest"]
 # always available — this feature gates only the OTel-aware inject /
 # extract glue. Refs #852.
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+# Mesh-native peer-to-peer multi-hop routing (issue #855). Adds the
+# `mesh` module with a distance-vector routing table and forwarding
+# helpers. Route advertisements ride alongside the existing federation
+# heartbeat as a JSON side-channel in the MVP; a typed proto field is
+# tracked as a follow-up. The mesh module depends only on
+# `rustgate-core` types and the existing `provenance` module, so no
+# transport-layer change is required to compile-test the foundation.
+mesh-routing = []
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }
