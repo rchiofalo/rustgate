@@ -1,0 +1,44 @@
+[package]
+name = "rustgate-foundry"
+description = "Bidirectional REST/WebSocket bridge between rustgate entities and Palantir Foundry / Gotham ontology objects"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Default `foundry` is the trait + config + wiring scaffold. The crate is
+# intentionally split between a partner-gated REST/WebSocket SDK
+# (`foundry-real`, currently a stub — Palantir Foundry's API is partner-
+# gated and the integration-bearing code lands in a follow-up against the
+# real SDK) and an in-memory test mock (`foundry-mock`) that exercises
+# every `FoundryBridge` code path the wiring touches without network
+# access. Closes #851.
+default = []
+foundry-mock = []
+# Reserved for the partner-gated REST/WebSocket SDK integration. Today
+# the gated module is a placeholder so downstream feature math stays
+# stable across the eventual SDK drop. See `src/lib.rs` module docs.
+foundry-real = []
+
+[dependencies]
+rustgate-core = { workspace = true }
+rustgate-router = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+toml = { workspace = true }

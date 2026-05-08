@@ -1500,6 +1500,17 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(not(feature = "lattice"))]
     setup::warn_lattice_disabled(&cli);
 
+    // ── Foundry bridge (issue #851) ─────────────────────────────────
+    //
+    // The Foundry / Gotham bridge is partner-gated; today the wiring
+    // is a scaffold (trait + config + mock + wiring tasks) and the
+    // SDK adapter lands behind a future `foundry-real` feature flag.
+    // Calling `init_foundry_scaffold` here gives operators who built
+    // with `--features foundry` a one-line confirmation that the
+    // scaffold is linked.
+    #[cfg(feature = "foundry")]
+    setup::init_foundry_scaffold();
+
     // ── Federation ──────────────────────────────────────────────────
     //
     // The `FedInboundForwardingHooks` carry the optional NATS-publish

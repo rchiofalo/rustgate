@@ -836,6 +836,41 @@ pub(crate) fn warn_lattice_disabled(cli: &Cli) {
 }
 
 // ---------------------------------------------------------------------------
+// Foundry bridge (issue #851)
+// ---------------------------------------------------------------------------
+//
+// The Foundry / Gotham bridge is partner-gated: today the wiring only
+// activates the trait + scaffold + mock plumbing under the `foundry`
+// feature. The real REST/WebSocket SDK adapter lands behind a future
+// `foundry-real` feature. The `init_foundry_scaffold` entry point
+// below is the seam the SDK adapter will plug into — it currently
+// emits a one-line operator-visible event so an operator who built
+// the binary with `--features foundry` can confirm the scaffold is
+// active without expecting actual Foundry traffic.
+
+/// Initialise the Foundry bridge scaffold.
+///
+/// Today this is a no-op beyond an operator-visible diagnostic. When
+/// the partner-gated SDK adapter lands, this is the seam where:
+///
+/// 1. The TOML config (`rustgate_foundry::FoundryConfig`) is read.
+/// 2. The bridge implementation is constructed.
+/// 3. `rustgate_foundry::wiring::spawn_outbound` and `spawn_inbound`
+///    are called against the live `Router`.
+///
+/// Until then, building with `--features foundry` is a documented
+/// "scaffold ready" signal — useful for CI feature-powerset coverage
+/// and for downstream binaries that want to compile-test the
+/// integration without touching the SDK. Refs #851.
+#[cfg(feature = "foundry")]
+pub(crate) fn init_foundry_scaffold() {
+    tracing::info!(
+        target: "rustgate.foundry",
+        "Foundry bridge scaffold linked (trait + config + wiring); awaiting partner SDK adapter behind future foundry-real feature flag"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Enrollment
 // ---------------------------------------------------------------------------
 

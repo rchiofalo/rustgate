@@ -15,14 +15,14 @@ path = "src/main.rs"
 workspace = true
 
 [package.metadata.cargo-machete]
-# `rustgate-meshtastic` and `rustgate-sapient` are always-linked but the
-# codecs are dispatched via the runtime `EntityCodecRegistry` (added in
-# #1304) rather than imported by name in this crate's source — a follow-up
-# wire-up PR will add the explicit `register(MeshtasticCodec)` /
-# `register(SapientCodec)` calls. The crates ship in the binary regardless
-# so the codecs are available the moment the registration lands. Refs #865,
-# #869.
-ignored = ["rustgate-meshtastic", "rustgate-sapient"]
+# `rustgate-meshtastic`, `rustgate-sapient`, and `rustgate-foundry` are
+# always-linked but dispatched via runtime registration (`EntityCodecRegistry`
+# from #1304 for codecs; `FoundryBridge` runtime impl for the Foundry adapter)
+# rather than imported by name in this crate's source. Follow-up wire-up PRs
+# will add the explicit `register(...)` calls. The crates ship in the binary
+# regardless so the integrations are available the moment the registrations
+# land. Refs #865, #869, #851.
+ignored = ["rustgate-meshtastic", "rustgate-sapient", "rustgate-foundry"]
 
 [features]
 nats = ["dep:rustgate-nats", "rustgate-admin/nats"]
@@ -90,6 +90,13 @@ video = ["rustgate-admin/video"]
 lattice = ["dep:rustgate-lattice"]
 lattice-mock = ["lattice", "rustgate-lattice/lattice-mock"]
 lattice-real = ["lattice", "rustgate-lattice/lattice-real"]
+# Bridge between rustgate entities and Palantir Foundry / Gotham
+# ontology objects. The `foundry` feature pulls in the trait + config +
+# wiring scaffold; `foundry-mock` activates the in-memory test bridge
+# (the only implementation today — the partner-gated REST/WebSocket
+# SDK adapter ships behind a future `foundry-real` flag). Refs #851.
+foundry = ["dep:rustgate-foundry"]
+foundry-mock = ["foundry", "rustgate-foundry/foundry-mock"]
 # Documentary feature for the Meshtastic / LoRa TAKPacket codec
 # (`rustgate-meshtastic`). The codec crate is always linked alongside
 # the other always-on wire-format crates (CoT, MAVLink, ASTERIX,
@@ -144,6 +151,7 @@ rustgate-proto = { workspace = true, optional = true }
 rustgate-federation = { workspace = true, optional = true }
 rustgate-http = { workspace = true, optional = true }
 rustgate-lattice = { workspace = true, optional = true }
+rustgate-foundry = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
