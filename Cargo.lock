@@ -3677,6 +3677,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-nffi"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "quick-xml",
+ "rustgate-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rustgate-proto"
 version = "0.8.0"
 dependencies = [

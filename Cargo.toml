@@ -28,6 +28,7 @@ members = [
     "crates/rustgate-tls",
     "crates/rustgate-router",
     "crates/rustgate-sapient",
+    "crates/rustgate-nffi",
     "crates/rustgate-vmf",
     "crates/rustgate-link16",
     "crates/rustgate-missions",
@@ -184,6 +185,7 @@ rustgate-metrics = { path = "crates/rustgate-metrics" }
 rustgate-tls = { path = "crates/rustgate-tls" }
 rustgate-router = { path = "crates/rustgate-router" }
 rustgate-sapient = { path = "crates/rustgate-sapient" }
+rustgate-nffi = { path = "crates/rustgate-nffi" }
 rustgate-vmf = { path = "crates/rustgate-vmf" }
 rustgate-link16 = { path = "crates/rustgate-link16" }
 rustgate-missions = { path = "crates/rustgate-missions" }

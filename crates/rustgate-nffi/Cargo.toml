@@ -1,0 +1,17 @@
+[package]
+name = "rustgate-nffi"
+description = "NFFI (NATO Friendly Force Information, STANAG 5527) Blue Force Tracking XML codec for rustgate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rustgate-core = { workspace = true }
+bytes = { workspace = true }
+quick-xml = { workspace = true }
+thiserror = { workspace = true }
