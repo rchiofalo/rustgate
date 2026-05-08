@@ -53,6 +53,8 @@ use tracing::warn;
 use crate::engine::PolicyEngine;
 use crate::error::AuthzError;
 use crate::model::{Action, AuthzContext, Decision, DecisionOutcome, Resource, Subject};
+#[cfg(feature = "cjadc2")]
+use crate::route::RoutingDecision;
 
 /// Cedar-backed [`PolicyEngine`].
 pub struct CedarBackend {
@@ -134,6 +136,13 @@ fn action_name(action: Action) -> &'static str {
         Action::Federate => "federate",
         Action::Publish => "publish",
         Action::Subscribe => "subscribe",
+        // CJADC2 routing PEP (closes #853). Cedar policies use
+        // `Action::"Route"` (PascalCase) by convention because routing
+        // policies are a *control-plane* concern: operators tend to
+        // write `action == Action::"Route"` mirroring the typical
+        // entity casing. Keep the literal stable — it appears in
+        // production policy corpora.
+        Action::Route => "Route",
     }
 }
 
@@ -340,6 +349,180 @@ impl CedarBackend {
     }
 }
 
+#[cfg(feature = "cjadc2")]
+impl CedarBackend {
+    /// CJADC2 routing evaluator (closes #853). Issues a Cedar
+    /// `Action::"Route"` request with `subject` and `resource`, walks
+    /// the determining-policy set returned in the response
+    /// diagnostics, and lifts each contributing policy's `@route`
+    /// annotation into a [`RoutingDecision`] that the caller folds
+    /// into the egress fan-out plan.
+    ///
+    /// # Aggregation
+    ///
+    /// When more than one permit policy contributes (operator
+    /// declares `@route` on multiple cohort-specific permit rules),
+    /// the per-policy decisions are merged via
+    /// [`RoutingDecision::merge`]: destination set is unioned and
+    /// per-destination obligation vectors are concatenated in
+    /// policy-iteration order. Empty / missing `@route` annotations
+    /// are skipped silently — the operator may have a permit rule
+    /// for `Action::"Route"` that is purely a permit gate without
+    /// any cross-domain advice.
+    ///
+    /// # Fail-closed semantics
+    ///
+    /// A `Deny` verdict (or a malformed input that escapes the
+    /// `evaluate_inner` rails) returns [`RoutingDecision::none`] so
+    /// no destination receives the message. Per-policy errors flagged
+    /// in `Response::diagnostics().errors()` already force the
+    /// underlying allow/deny verdict to `Deny` inside `evaluate_inner`,
+    /// so a forbid rule that crashed silently does not leak via the
+    /// routing path either.
+    ///
+    /// Per-policy `@route` annotations that fail to parse as JSON
+    /// are logged at `warn!` and the policy is skipped — a malformed
+    /// annotation is a policy author bug rather than an attacker
+    /// signal, so failing the entire evaluation would over-rotate
+    /// (the operator already gets the warning in their startup logs
+    /// when the policy is loaded; the runtime fail is just a second
+    /// signal).
+    fn evaluate_route_inner(
+        &self,
+        subject: &Subject<'_>,
+        resource: &Resource<'_>,
+        authz_ctx: &AuthzContext,
+    ) -> RoutingDecision {
+        let cedar_ctx = build_cedar_context(authz_ctx);
+
+        // Build the principal/action/resource UIDs by hand because
+        // `evaluate_inner` returns a `DecisionOutcome` — we need access
+        // to the raw `Response` for the determining-policies set.
+        let Some(principal_escaped) = escape(subject.cn) else {
+            warn!(
+                target: "authz",
+                cn = %subject.cn.escape_debug(),
+                "cedar: principal escaped to empty string; denying route"
+            );
+            return RoutingDecision::none();
+        };
+        let principal_str = format!(r#"RustgatePrincipal::"{principal_escaped}""#);
+        let action_str = format!(r#"Action::"{}""#, action_name(Action::Route));
+        let Some(resource_str) = resource_uid_str(resource) else {
+            warn!(
+                target: "authz",
+                "cedar: resource escaped to empty string; denying route"
+            );
+            return RoutingDecision::none();
+        };
+
+        let principal = match EntityUid::from_str(&principal_str) {
+            Ok(uid) => uid,
+            Err(e) => {
+                warn!(
+                    target: "authz",
+                    error = %e,
+                    principal = %principal_str,
+                    "cedar: invalid principal uid for route"
+                );
+                return RoutingDecision::none();
+            }
+        };
+        let action_uid = match EntityUid::from_str(&action_str) {
+            Ok(uid) => uid,
+            Err(e) => {
+                warn!(
+                    target: "authz",
+                    error = %e,
+                    action = %action_str,
+                    "cedar: invalid action uid for route"
+                );
+                return RoutingDecision::none();
+            }
+        };
+        let resource_uid = match EntityUid::from_str(&resource_str) {
+            Ok(uid) => uid,
+            Err(e) => {
+                warn!(
+                    target: "authz",
+                    error = %e,
+                    resource = %resource_str,
+                    "cedar: invalid resource uid for route"
+                );
+                return RoutingDecision::none();
+            }
+        };
+
+        let request = match Request::new(principal, action_uid, resource_uid, cedar_ctx, None) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!(target: "authz", error = %e, "cedar: route request construction failed");
+                return RoutingDecision::none();
+            }
+        };
+
+        let response = self
+            .authorizer
+            .is_authorized(&request, &self.policy_set, &self.entities);
+
+        // Fail-closed override mirrors `evaluate_inner`: if any policy
+        // errored we deny the route, otherwise the routing graph is
+        // built only from policies that actually contributed to the
+        // allow verdict. Logged once per error so the operator sees
+        // every misbehaving policy in a single run, then deny.
+        let mut had_errors = false;
+        for err in response.diagnostics().errors() {
+            had_errors = true;
+            warn!(
+                target: "authz",
+                error = %err,
+                principal = %principal_str,
+                action = %action_str,
+                resource = %resource_str,
+                "cedar: route policy evaluation error; forcing deny"
+            );
+        }
+        if had_errors {
+            return RoutingDecision::none();
+        }
+
+        if !matches!(response.decision(), CedarDecision::Allow) {
+            // Deny → no destinations. The operator's
+            // `Response::diagnostics().reason()` contains the forbid
+            // policies that fired; a future audit emission can name
+            // them, but for now the routing path simply returns the
+            // empty decision.
+            return RoutingDecision::none();
+        }
+
+        // Walk the determining-policy set, fetch each policy's
+        // `@route` annotation, parse the contained JSON and merge the
+        // result into a single `RoutingDecision`. Missing annotations
+        // and parse errors are skipped per the docstring contract.
+        let mut decision = RoutingDecision::none();
+        for policy_id in response.diagnostics().reason() {
+            let Some(policy) = self.policy_set.policy(policy_id) else {
+                continue;
+            };
+            let Some(annotation) = policy.annotation("route") else {
+                continue;
+            };
+            match serde_json::from_str::<RoutingDecision>(annotation) {
+                Ok(parsed) => decision.merge(parsed),
+                Err(e) => {
+                    warn!(
+                        target: "authz",
+                        error = %e,
+                        policy_id = %policy_id,
+                        "cedar: failed to parse @route annotation as JSON; skipping policy"
+                    );
+                }
+            }
+        }
+        decision
+    }
+}
+
 impl PolicyEngine for CedarBackend {
     fn evaluate(
         &self,
@@ -367,6 +550,20 @@ impl PolicyEngine for CedarBackend {
     ) -> DecisionOutcome {
         let cedar_ctx = build_cedar_context(authz_ctx);
         self.evaluate_inner(subject, resource, action, cedar_ctx)
+    }
+
+    /// CJADC2 routing PEP (closes #853). Delegates to
+    /// `evaluate_route_inner` which walks the determining-policy set
+    /// and lifts each contributing policy's `@route` annotation into
+    /// a [`RoutingDecision`].
+    #[cfg(feature = "cjadc2")]
+    fn evaluate_route(
+        &self,
+        subject: &Subject<'_>,
+        resource: &Resource<'_>,
+        context: &AuthzContext,
+    ) -> RoutingDecision {
+        self.evaluate_route_inner(subject, resource, context)
     }
 
     fn policy_id(&self) -> &str {
@@ -516,12 +713,13 @@ mod tests {
         // exhaustive — the static `&'static str` pin means adding a new
         // Action variant is a compile error that forces a matching
         // update here.
-        let pairs: [(Action, &'static str); 5] = [
+        let pairs: [(Action, &'static str); 6] = [
             (Action::Send, "send"),
             (Action::Receive, "receive"),
             (Action::Federate, "federate"),
             (Action::Publish, "publish"),
             (Action::Subscribe, "subscribe"),
+            (Action::Route, "Route"),
         ];
         for (action, expected) in pairs {
             let got: &'static str = action_name(action);
@@ -531,12 +729,12 @@ mod tests {
             );
         }
 
-        // All five literals must be distinct — otherwise two actions
+        // All six literals must be distinct — otherwise two actions
         // would collapse onto the same Cedar UID.
         let names: BTreeSet<&'static str> = pairs.iter().map(|(_, n)| *n).collect();
         assert_eq!(
             names.len(),
-            5,
+            6,
             "all Action variants must map to distinct Cedar literals"
         );
     }

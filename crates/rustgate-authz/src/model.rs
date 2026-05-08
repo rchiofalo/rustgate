@@ -46,6 +46,16 @@ pub enum Action {
     Publish,
     /// Subscribe to a NATS subject.
     Subscribe,
+    /// CJADC2 multi-domain routing decision (closes #853). The action
+    /// names a *fan-out* request: given a subject and an inbound
+    /// entity, return the named destination adapters and per-destination
+    /// obligation envelopes the router applies on egress. Distinct
+    /// from [`Action::Send`] because Send is a per-recipient verdict
+    /// while Route is a multi-recipient decision graph. The dedicated
+    /// [`crate::PolicyEngine::evaluate_route`] entrypoint is the only
+    /// PEP that consumes this variant; existing call sites continue
+    /// to produce `Send`/`Receive`/etc. and are unaffected.
+    Route,
 }
 
 /// The core allow/deny verdict.
