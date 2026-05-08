@@ -1484,6 +1484,22 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(not(feature = "http"))]
     setup::warn_http_disabled(&cli);
 
+    // ── Lattice (Anduril) ──────────────────────────────────────────
+    //
+    // Brings up the Lattice bidirectional adapter when `--features
+    // lattice` is enabled and the operator has set
+    // `--lattice-config`. The wiring is a no-op when no
+    // `[lattice]` block is present in the config file. The actual
+    // Lattice gRPC SDK is partner-NDA-gated and lives behind
+    // `--features lattice-real`; the in-memory mock backend used by
+    // integration tests is selected with `--features lattice-mock`.
+    // Refs #850.
+    #[cfg(feature = "lattice")]
+    let _lattice_handles = setup::start_lattice(&cli, &router).await;
+
+    #[cfg(not(feature = "lattice"))]
+    setup::warn_lattice_disabled(&cli);
+
     // ── Federation ──────────────────────────────────────────────────
     //
     // The `FedInboundForwardingHooks` carry the optional NATS-publish

@@ -31,6 +31,7 @@ members = [
     "crates/rustgate-vmf",
     "crates/rustgate-link16",
     "crates/rustgate-missions",
+    "crates/rustgate-lattice",
 ]
 exclude = ["fuzz"]
 
@@ -184,6 +185,7 @@ rustgate-sapient = { path = "crates/rustgate-sapient" }
 rustgate-vmf = { path = "crates/rustgate-vmf" }
 rustgate-link16 = { path = "crates/rustgate-link16" }
 rustgate-missions = { path = "crates/rustgate-missions" }
+rustgate-lattice = { path = "crates/rustgate-lattice" }
 
 [profile.release]
 lto = true

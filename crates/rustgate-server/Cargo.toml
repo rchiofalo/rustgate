@@ -79,6 +79,17 @@ http = ["dep:rustgate-http", "rustgate-admin/http"]
 # In-memory CoT `b-i-v` video stream catalog exposed at
 # `GET /api/video/streams` on the admin HTTP server. MVP — closes #862.
 video = ["rustgate-admin/video"]
+# Anduril Lattice bidirectional adapter (`rustgate-lattice`). The trait,
+# config, mock backend, and router wiring all live in `rustgate-lattice`;
+# this feature pulls the crate in and turns on the `cfg!(feature =
+# "lattice")` startup wiring. The real Lattice gRPC SDK is partner-NDA
+# gated and lives behind a separate `lattice-real` feature on the
+# downstream crate (currently an empty stub). The `lattice-mock` feature
+# selects the in-memory mock backend used by integration tests and
+# air-gapped CI. Refs #850.
+lattice = ["dep:rustgate-lattice"]
+lattice-mock = ["lattice", "rustgate-lattice/lattice-mock"]
+lattice-real = ["lattice", "rustgate-lattice/lattice-real"]
 # Documentary feature for the Meshtastic / LoRa TAKPacket codec
 # (`rustgate-meshtastic`). The codec crate is always linked alongside
 # the other always-on wire-format crates (CoT, MAVLink, ASTERIX,
@@ -132,6 +143,7 @@ rustgate-enrollment = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-federation = { workspace = true, optional = true }
 rustgate-http = { workspace = true, optional = true }
+rustgate-lattice = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
