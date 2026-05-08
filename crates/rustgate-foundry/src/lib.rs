@@ -23,7 +23,7 @@
 //!   property-map machinery, and the inbound/outbound wiring tasks in
 //!   [`wiring`]. Everything the partner-gated SDK does NOT need to
 //!   know about lives here.
-//! - **`foundry-mock` feature** — [`mock::MockFoundryBridge`], an
+//! - **`foundry-mock` feature** — `mock::MockFoundryBridge`, an
 //!   in-memory store + change broadcaster that drives the wiring
 //!   end-to-end in tests without any network surface. The mock is
 //!   the reference implementation against which the partner-gated
@@ -80,7 +80,7 @@
 //!   [`bridge::ActionRequest`] / [`bridge::ActionResult`] — wire types
 //! - [`config::FoundryConfig`] — TOML config root
 //! - [`mapper::PropertyMapper`] — dotted-path entity ↔ JSON projection
-//! - [`mock::MockFoundryBridge`] (feature `foundry-mock`)
+//! - `mock::MockFoundryBridge` (feature `foundry-mock`)
 //! - [`wiring::spawn_outbound`] / [`wiring::spawn_inbound`]
 //! - [`error::FoundryError`]
 

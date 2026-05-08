@@ -15,7 +15,7 @@
 //!   back to the edge).
 //!
 //! Implementors live behind a feature flag: today
-//! [`crate::mock::MockFoundryBridge`] (under `foundry-mock`) is the
+//! `crate::mock::MockFoundryBridge` (under `foundry-mock`) is the
 //! reference implementation; the partner-gated SDK adapter lands
 //! under `foundry-real` in a follow-up.
 
