@@ -26,6 +26,8 @@
 
 pub mod acl;
 pub mod cache;
+#[cfg(feature = "cjadc2")]
+pub mod cjadc2;
 pub mod dedup;
 pub mod egress;
 pub mod filter;
@@ -39,6 +41,8 @@ pub mod throttle;
 
 pub use acl::{GroupAcl, GroupAclPolicy};
 pub use cache::{OnCacheSize, PositionCache};
+#[cfg(feature = "cjadc2")]
+pub use cjadc2::{DestinationEnvelope, plan_routing_fanout};
 pub use dedup::{
     DEFAULT_MAX_ENTRIES as DEFAULT_DEDUP_MAX_ENTRIES, DedupCache, DedupStats, OnDuplicate, OnInsert,
 };

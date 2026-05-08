@@ -21,6 +21,14 @@ cedar = ["dep:cedar-policy"]
 # no-features build of `rustgate-authz` does not pull in `prometheus`.
 # Enabled by `rustgate-server` when its own `metrics` feature is on.
 metrics = ["dep:prometheus", "dep:rustgate-metrics"]
+# CJADC2 multi-domain routing policy (closes #853). Enables the
+# `evaluate_route` PEP entrypoint on the optional Cedar backend so
+# policies carrying a `@route("…")` annotation lift the contained JSON
+# into a [`RoutingDecision`]. The router consumes the decision via its
+# own `cjadc2` feature ladder. Pure additive surface — non-CJADC2
+# deployments pay nothing because the trait method has a default impl
+# returning `RoutingDecision::none()`.
+cjadc2 = []
 
 [dependencies]
 rustgate-core = { workspace = true }

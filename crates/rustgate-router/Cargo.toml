@@ -17,6 +17,12 @@ workspace = true
 # `rustgate-transport` because routing is post-decode: the router
 # operates on `RoutableMessage` from `rustgate-core` and never sees
 # the wire format.
+# CJADC2 multi-domain routing fan-out (closes #853). Enables the
+# `crate::cjadc2` planner that takes a [`rustgate_authz::RoutingDecision`]
+# and produces per-destination egress envelopes. Off by default —
+# non-CJADC2 deployments do not link the planner or pull in the
+# routing-decision types.
+cjadc2 = ["rustgate-authz/cjadc2"]
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }

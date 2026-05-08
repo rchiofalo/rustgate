@@ -2662,6 +2662,46 @@ impl Router {
         prepare_egress_envelope(arc_msg, class, &ctx, self)
     }
 
+    /// CJADC2 multi-domain routing fan-out (closes #853).
+    ///
+    /// Evaluates the installed [`PolicyEngine`]'s
+    /// [`PolicyEngine::evaluate_route`] entrypoint for the inbound
+    /// `arc_msg` and the supplied `subject` / `resource` /
+    /// `authz_ctx`, then runs
+    /// [`crate::cjadc2::plan_routing_fanout`] over the returned
+    /// [`rustgate_authz::RoutingDecision`] to produce one
+    /// [`crate::cjadc2::DestinationEnvelope`] per named adapter
+    /// known to `known_destinations`.
+    ///
+    /// Callers (the CJADC2 dispatch loop in the orchestrator binary)
+    /// invoke this once per inbound message, then walk the returned
+    /// envelopes and dispatch each to the matching adapter. The
+    /// per-destination obligation actuation lives on the adapter side
+    /// — this method is purely the planner.
+    ///
+    /// Returns an empty `Vec` when no policy engine is installed, the
+    /// engine returned the default [`rustgate_authz::RoutingDecision::none`],
+    /// or every named destination was filtered out by
+    /// `known_destinations`. The non-CJADC2 deployment baseline is
+    /// "engine returns the default → empty vec → fallback to the
+    /// pre-existing per-recipient PEP path".
+    #[cfg(feature = "cjadc2")]
+    pub fn plan_cjadc2_routing(
+        &self,
+        arc_msg: Arc<RoutableMessage>,
+        subject: &AuthzSubject<'_>,
+        resource: &AuthzResource<'_>,
+        authz_ctx: &AuthzContext,
+        known_destinations: &[&str],
+    ) -> Vec<crate::cjadc2::DestinationEnvelope> {
+        let authz_guard = self.authz.load();
+        let Some(engine) = (**authz_guard).as_ref() else {
+            return Vec::new();
+        };
+        let decision = engine.evaluate_route(subject, resource, authz_ctx);
+        crate::cjadc2::plan_routing_fanout(&decision, arc_msg, known_destinations)
+    }
+
     /// Inner routing logic, separated so [`Self::route_for_egress`] can
     /// attach a `#[tracing::instrument]` span at the entry boundary
     /// without bloating `route_inner`'s already-large body. The span set

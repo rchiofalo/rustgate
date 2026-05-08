@@ -11,6 +11,7 @@ use crate::model::{
     Action, AuthzContext, CacheStats, Decision, DecisionOutcome, Resource, Subject,
 };
 use crate::policy::{Effect, RuleSet};
+use crate::route::RoutingDecision;
 
 /// A policy engine evaluates a `(subject, resource, action)` tuple.
 ///
@@ -52,6 +53,48 @@ pub trait PolicyEngine: Send + Sync + 'static {
         _context: &AuthzContext,
     ) -> DecisionOutcome {
         self.evaluate(subject, resource, action)
+    }
+
+    /// Evaluate the policy as a CJADC2 multi-domain *routing* request
+    /// (closes #853).
+    ///
+    /// The default implementation returns [`RoutingDecision::none`] so
+    /// every existing backend stays forward-compatible without
+    /// implementing the method. Backends that opt into CJADC2 routing
+    /// (the optional Cedar backend, gated on the `cjadc2` feature)
+    /// override this to inspect each contributing permit policy's
+    /// `@route(...)` annotation, parse it as JSON, and aggregate the
+    /// destination + per-destination obligation graph for the inbound
+    /// entity.
+    ///
+    /// # Why a separate method
+    ///
+    /// The pre-CJADC2 [`PolicyEngine::evaluate`] surface is shaped for
+    /// per-recipient allow/deny verdicts: one subject, one resource,
+    /// one action, optionally a flat obligation list. CJADC2 fan-out
+    /// produces N copies addressed to N **disjoint** adapters with
+    /// **different** obligations on each copy — folding that into the
+    /// single-`Vec<Obligation>` surface would force the router to
+    /// guess which obligation belongs to which adapter at the call
+    /// site. The dedicated [`RoutingDecision`] return value sidesteps
+    /// that ambiguity, and the default impl keeps every non-CJADC2
+    /// build paying nothing.
+    ///
+    /// # Audit hooks
+    ///
+    /// Backends that override this method MUST emit the same
+    /// allow/deny audit trail as [`PolicyEngine::evaluate`] for each
+    /// determining policy: the routing decision is a multi-recipient
+    /// fan-out of an underlying authorization choice and the operator
+    /// needs the per-policy correlation tokens to investigate
+    /// "why did this entity reach Lattice but not Foundry?".
+    fn evaluate_route(
+        &self,
+        _subject: &Subject<'_>,
+        _resource: &Resource<'_>,
+        _context: &AuthzContext,
+    ) -> RoutingDecision {
+        RoutingDecision::none()
     }
 
     /// Stable policy identifier (sha256 hex of the canonical rule set).

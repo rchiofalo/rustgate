@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod model;
 pub mod parser;
 pub mod policy;
+pub mod route;
 
 #[cfg(feature = "cedar")]
 pub use cedar_backend::CedarBackend;
@@ -40,3 +41,4 @@ pub use model::{
     SubjectHash,
 };
 pub use policy::{Effect, ResourceMatcher, Rule, RuleSet, SubjectMatcher};
+pub use route::{RouteObligation, RoutingDecision};
