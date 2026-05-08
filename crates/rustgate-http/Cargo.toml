@@ -20,6 +20,7 @@ post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 [dependencies]
 rustgate-archive = { workspace = true }
 rustgate-core = { workspace = true }
+rustgate-cot = { workspace = true }
 rustgate-metrics = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
 reqwest = { workspace = true }

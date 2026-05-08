@@ -238,6 +238,23 @@ pub enum PayloadFormat {
     /// Protobuf-encoded CoT event via `rustgate-proto` (requires `proto` feature).
     /// Content-Type: `application/x-protobuf`.
     Protobuf,
+    /// GeoJSON ([RFC 7946]) `Feature` per message; FeatureCollection when batched.
+    /// Content-Type: `application/geo+json`.
+    ///
+    /// Lat/lon/altitude from the embedded CoT `<point>` element are
+    /// promoted to the `Feature.geometry` (a 2D `Point` with no altitude
+    /// when `hae` is the CoT sentinel `9_999_999.0`, otherwise a 3D
+    /// `Point` carrying altitude in metres above the WGS-84 ellipsoid).
+    /// Identity, message metadata, and the original CoT UID land in
+    /// `properties` so a downstream consumer can rebuild a
+    /// [`rustgate_core::message::RoutableMessage`] without parsing the
+    /// XML payload again.
+    ///
+    /// Universal exchange format for Leaflet, Mapbox, Kepler.gl, QGIS,
+    /// ArcGIS, and most defence dashboards.
+    ///
+    /// [RFC 7946]: https://datatracker.ietf.org/doc/html/rfc7946
+    GeoJson,
 }
 
 /// Batch framing format for multi-message HTTP requests.
@@ -825,15 +842,18 @@ impl HttpConfig {
         // Pre-#906 configs leave every batch-* field `None` and must
         // not trigger any new error path.
         if target.batch_enabled == Some(true) {
-            // Batching only frames JSON bodies. Raw XML and protobuf
-            // do not have a portable "array of messages" encoding that
-            // every downstream would accept; rejecting at validation
-            // time keeps operators from discovering the mismatch as
-            // silent 4xx responses at runtime.
+            // Batching only frames JSON-shaped bodies. Raw XML and
+            // protobuf do not have a portable "array of messages"
+            // encoding that every downstream would accept; rejecting
+            // at validation time keeps operators from discovering the
+            // mismatch as silent 4xx responses at runtime. GeoJSON is
+            // allowed because the renderer wraps the per-message
+            // Features in a FeatureCollection (RFC 7946 §3.3) — a
+            // first-class GIS-tool input.
             let fmt = target.effective_format();
-            if fmt != PayloadFormat::Json {
+            if !matches!(fmt, PayloadFormat::Json | PayloadFormat::GeoJson) {
                 errors.push(format!(
-                    "target `{}`: batch-enabled = true requires format = json (got {fmt:?}); \
+                    "target `{}`: batch-enabled = true requires format = json or geo_json (got {fmt:?}); \
                      raw-xml and protobuf do not have a portable batch wire format",
                     target.name
                 ));
