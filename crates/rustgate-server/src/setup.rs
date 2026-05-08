@@ -925,6 +925,13 @@ pub(crate) fn warn_enrollment_disabled(cli: &Cli) {
 /// layer to bucket per-identity labels and (optionally) record Tier 2
 /// per-identity metrics. Returns the identity wrapped in an `Arc` so it
 /// can be cheaply shared across spawned session tasks.
+// justification: this is the single dispatch entrypoint that wires every
+// optional admin-API slot (federation, ACL, mgmt, video) into the metrics
+// HTTP server. Each feature flag introduces a conditional parameter; bundling
+// them into a struct would just move the fan-in upstream without reducing the
+// number of live inputs. Called once from main; the count grows linearly with
+// the admin API surface.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "metrics")]
 pub(crate) async fn start_metrics(
     cli: &Cli,
@@ -935,6 +942,9 @@ pub(crate) async fn start_metrics(
     >,
     acl_api_slot: &Arc<std::sync::OnceLock<rustgate_admin::AclApiHandler>>,
     mgmt_api_slot: &Arc<std::sync::OnceLock<rustgate_admin::MgmtApiHandler>>,
+    #[cfg(feature = "video")] video_api_slot: &Arc<
+        std::sync::OnceLock<rustgate_admin::VideoApiHandler>,
+    >,
     router_slot: &rustgate_admin::RouterSlot,
 ) -> anyhow::Result<Arc<metrics::MetricsIdentity>> {
     // Aggregate every domain crate's `init()` callback into a single
@@ -1032,6 +1042,8 @@ pub(crate) async fn start_metrics(
         let fed_api_for_metrics = Arc::clone(fed_api_slot);
         let acl_api_for_metrics = Arc::clone(acl_api_slot);
         let mgmt_api_for_metrics = Arc::clone(mgmt_api_slot);
+        #[cfg(feature = "video")]
+        let video_api_for_metrics = Arc::clone(video_api_slot);
         let metrics_token_for_server = metrics_token.clone();
         let router_for_metrics = Arc::clone(router_slot);
         let max_http_connections = cli.metrics_max_connections;
@@ -1044,6 +1056,8 @@ pub(crate) async fn start_metrics(
                 fed_api_for_metrics,
                 acl_api_for_metrics,
                 mgmt_api_for_metrics,
+                #[cfg(feature = "video")]
+                video_api_for_metrics,
                 metrics_token_for_server,
                 router_for_metrics,
                 max_http_connections,

@@ -689,6 +689,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let mgmt_api_slot: Arc<std::sync::OnceLock<rustgate_admin::MgmtApiHandler>> =
         Arc::new(std::sync::OnceLock::new());
 
+    #[cfg(all(feature = "metrics", feature = "video"))]
+    let video_api_slot: Arc<std::sync::OnceLock<rustgate_admin::VideoApiHandler>> =
+        Arc::new(std::sync::OnceLock::new());
+
     // Shared shutdown notifier driven by either SIGTERM/Ctrl-C
     // (`shutdown_signal()`) or `POST /api/drain` (closes #791). The
     // accept loop awaits on `shutdown_signal()` which races a tokio
@@ -709,6 +713,8 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         &fed_api_slot,
         &acl_api_slot,
         &mgmt_api_slot,
+        #[cfg(feature = "video")]
+        &video_api_slot,
         &router_slot,
     )
     .await?;
@@ -1057,6 +1063,28 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 rustgate_core::audit::message_dropped(source_cn, dest_cn, msg_uid, reason);
             },
         )));
+    }
+
+    // ── Video stream catalog (#862) ─────────────────────────────────
+    //
+    // Behind `--features video,metrics`, install a passive catalog that
+    // captures CoT `b-i-v` events as they flow through the router and
+    // exposes them at `GET /api/video/streams` on the admin HTTP
+    // surface. The router callback is a single `Arc<HashMap>` insert
+    // per matching message; the route dispatch ladder in
+    // `rustgate-admin::server::serve` short-circuits the path when the
+    // slot is unset, so non-video builds pay zero cost.
+    #[cfg(all(feature = "metrics", feature = "video"))]
+    {
+        let catalog = std::sync::Arc::new(rustgate_admin::VideoStreamCatalog::new());
+        router.set_on_routed(Some(rustgate_admin::video::router_callback(Arc::clone(
+            &catalog,
+        ))));
+        let h = rustgate_admin::video::handler(Arc::clone(&catalog));
+        let handler: rustgate_admin::VideoApiHandler =
+            std::sync::Arc::new(move |m, p, b| h(m, p, b));
+        let _ = video_api_slot.set(handler);
+        tracing::info!("video stream catalog enabled at /api/video/streams");
     }
 
     #[cfg(feature = "metrics")]

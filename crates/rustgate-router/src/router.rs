@@ -254,6 +254,23 @@ rustgate_core::on_callback!(
 pub type OnMulticastForward =
     Arc<dyn Fn(Arc<rustgate_core::message::RoutableMessage>) + Send + Sync>;
 
+/// Callback invoked once per message that the router successfully
+/// admitted and fanned out via [`Router::route_for_egress`]. Mirrors
+/// the [`OnMulticastForward`] cadence but is intentionally a separate
+/// slot so feature-gated observers (e.g. the video stream catalog
+/// closing #862) can install themselves without colliding with the
+/// `--udp-multicast-rebroadcast` rebroadcast hook.
+///
+/// Hot-reloadable via `ArcSwap`. Fires once per admitted message
+/// (not per recipient) so downstream catalogs and audit consumers
+/// share the routing-path cardinality model. The hot path on the
+/// un-installed (default) build is a single `ArcSwap::load` +
+/// `is_none()` check.
+///
+/// Uses `Fn` (not `AsyncFn`) for the same object-safety reason as
+/// [`OnMulticastForward`]. Closes #862 (video stream catalog).
+pub type OnRouted = Arc<dyn Fn(Arc<rustgate_core::message::RoutableMessage>) + Send + Sync>;
+
 /// RAII handle that bumps the in-flight authz-evaluation gauge on
 /// construction and decrements it on `Drop`. Constructed at the entry
 /// of [`Router::authz_evaluate_inner`] so every `_send` / `_receive`
@@ -1166,6 +1183,12 @@ pub struct Router {
     /// via `ArcSwap` so the operator can flip rebroadcast at runtime
     /// without restarting the listener. Default `None`. Closes #861.
     on_multicast_forward: ArcSwap<Option<OnMulticastForward>>,
+    /// Optional callback fired once per successfully routed message.
+    /// Mirrors the cadence of [`Self::on_multicast_forward`] but lives
+    /// in its own slot so feature-gated catalog observers (the video
+    /// stream catalog under `--features video`) install without
+    /// colliding with the rebroadcast hook. Default `None`. Closes #862.
+    on_routed: ArcSwap<Option<OnRouted>>,
     /// Optional registry mapping `metadata.source_protocol` to the
     /// `DynEntityCodec` that decodes its wire format into the canonical
     /// [`rustgate_core::entity::Entity`] shape.
@@ -1252,6 +1275,7 @@ impl std::fmt::Debug for Router {
                 "on_multicast_forward_installed",
                 &(**self.on_multicast_forward.load()).is_some(),
             )
+            .field("on_routed_installed", &(**self.on_routed.load()).is_some())
             .field(
                 "entity_codec_registry_installed",
                 &self.entity_codec_registry.is_some(),
@@ -1294,6 +1318,7 @@ impl Default for Router {
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
+            on_routed: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1357,6 +1382,7 @@ impl Router {
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
+            on_routed: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1409,6 +1435,7 @@ impl Router {
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
+            on_routed: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1464,6 +1491,7 @@ impl Router {
             on_message_delivered: ArcSwap::from_pointee(None),
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
+            on_routed: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1967,6 +1995,21 @@ impl Router {
     /// restarting the routing pipeline. Closes #861.
     pub fn set_on_multicast_forward(&self, cb: Option<OnMulticastForward>) {
         self.on_multicast_forward.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the generic post-route observation callback.
+    ///
+    /// Fires once per [`Self::route_for_egress`] call that successfully
+    /// admits and fans out a [`RoutableMessage`]. Wired by the server
+    /// binary under `--features video` to feed the video stream
+    /// catalog (closes #862). The callback decides whether to actually
+    /// act on the message (e.g. inspect `metadata.message_type` or the
+    /// CoT event-type prefix) — the router stays policy-agnostic.
+    ///
+    /// Pass `None` (the default) to disable observation without
+    /// restarting the routing pipeline.
+    pub fn set_on_routed(&self, cb: Option<OnRouted>) {
+        self.on_routed.store(Arc::new(cb));
     }
 
     /// Install (or replace) the per-kind routed-message observer.
@@ -2538,6 +2581,14 @@ impl Router {
         if let Some(ref arc_msg) = routed {
             let guard = self.on_multicast_forward.load();
             if let Some(cb) = (**guard).as_ref() {
+                cb(Arc::clone(arc_msg));
+            }
+            // Closes #862: feed the generic post-route observer (e.g.
+            // the video stream catalog under `--features video`). Same
+            // cadence as the multicast rebroadcast hook above; distinct
+            // slot so observers compose without colliding.
+            let routed_guard = self.on_routed.load();
+            if let Some(cb) = (**routed_guard).as_ref() {
                 cb(Arc::clone(arc_msg));
             }
         }

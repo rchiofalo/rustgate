@@ -244,6 +244,7 @@ cargo build --release --all-features
 | `spiffe` | SPIFFE / SPIRE workload identity (server cert + trust bundle from the Workload API) | `protoc` |
 | `peer-discovery` | DNS-SD, Consul, etcd federation peer discovery | — |
 | `jemalloc` | jemalloc allocator | — |
+| `video` | CoT `b-i-v` video stream catalog with `GET /api/video/streams` | — |
 
 #### SPIFFE workload identity
 
