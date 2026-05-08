@@ -871,6 +871,44 @@ pub(crate) fn init_foundry_scaffold() {
 }
 
 // ---------------------------------------------------------------------------
+// DDS bridge (issue #870)
+// ---------------------------------------------------------------------------
+//
+// The DDS Pub/Sub bridge gives rustgate access to NATO Generic Vehicle
+// Architecture (NGVA, STANAG 4754) and US Army VICTORY in-vehicle data
+// buses. Production-grade DDS Rust bindings are still maturing
+// (`cyclonedds-rs` is unmaintained as of 2026; `dust-dds` is pre-1.0)
+// so today the wiring only activates the trait + scaffold + mock
+// plumbing under the `dds` feature. The real DDS SDK adapter lands
+// behind a future `dds-real` feature. The `init_dds_scaffold` entry
+// point below is the seam the SDK adapter will plug into — it
+// currently emits a one-line operator-visible event so an operator
+// who built the binary with `--features dds` can confirm the scaffold
+// is active without expecting actual DDS traffic.
+
+/// Initialise the DDS bridge scaffold.
+///
+/// Today this is a no-op beyond an operator-visible diagnostic. When
+/// a real DDS SDK adapter lands, this is the seam where:
+///
+/// 1. The TOML config (`rustgate_dds::DdsConfig`) is read.
+/// 2. The bridge implementation is constructed.
+/// 3. `rustgate_dds::wiring::spawn_outbound` and `spawn_inbound` are
+///    called against the live `Router`.
+///
+/// Until then, building with `--features dds` is a documented
+/// "scaffold ready" signal — useful for CI feature-powerset coverage
+/// and for downstream binaries that want to compile-test the
+/// integration without touching the SDK. Refs #870.
+#[cfg(feature = "dds")]
+pub(crate) fn init_dds_scaffold() {
+    tracing::info!(
+        target: "rustgate.dds",
+        "DDS bridge scaffold linked (trait + config + wiring); awaiting real DDS SDK adapter behind future dds-real feature flag"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Enrollment
 // ---------------------------------------------------------------------------
 

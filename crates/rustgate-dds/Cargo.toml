@@ -1,0 +1,45 @@
+[package]
+name = "rustgate-dds"
+description = "DDS Pub/Sub bridge (NGVA / VICTORY) — bridge trait + mock + wiring scaffold for the in-vehicle DDS data bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Default `dds` is the trait + config + wiring scaffold. The crate is
+# intentionally split between a research-grade DDS Rust binding
+# (`dds-real`, currently a stub — `cyclonedds-rs` is unmaintained and
+# `dust-dds` is pre-1.0; pinning a specific impl is a contained
+# follow-up) and an in-memory test mock (`dds-mock`) that exercises
+# every `DdsBridge` code path the wiring touches without an actual DDS
+# domain participant. Closes #870 (DDS half; GeoJSON output landed in
+# #1326).
+default = []
+dds-mock = []
+# Reserved for the real DDS SDK integration. Today the gated module is
+# a placeholder so downstream feature math stays stable across the
+# eventual SDK drop. See `src/lib.rs` module docs.
+dds-real = []
+
+[dependencies]
+rustgate-core = { workspace = true }
+rustgate-router = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+toml = { workspace = true }
