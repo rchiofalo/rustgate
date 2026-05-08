@@ -14,16 +14,13 @@ workspace = true
 nats = ["dep:rustgate-nats"]
 federation = ["dep:rustgate-federation"]
 http = ["dep:rustgate-http"]
-<<<<<<< HEAD
 # Mounts the lightweight Data Packages REST API (Feature 17 of #860)
 # under `/api/packages/`. Pulls in the `rustgate-missions` crate, the
 # package store, and the HMAC-tagged sidecar handler.
 missions = ["dep:rustgate-missions"]
-=======
 # In-memory video stream catalog populated from CoT `b-i-v` events and
 # exposed at `GET /api/video/streams`. MVP — closes #862.
 video = ["dep:quick-xml"]
->>>>>>> d502496 (feat(admin): video stream catalog with /api/video/streams endpoint (closes #862))
 
 [dependencies]
 rustgate-core = { workspace = true }
