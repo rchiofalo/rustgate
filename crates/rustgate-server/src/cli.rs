@@ -390,6 +390,14 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_LATTICE_CONFIG")]
     pub(crate) lattice_config_file: Option<String>,
 
+    /// Path to TOML file configuring the OGC SensorThings v1.0
+    /// polling client. The file's `[sensorthings]` block is parsed
+    /// by `rustgate-ogc-sensorthings`. Requires
+    /// `--features ogc-sensorthings`. Closes #869 alongside the
+    /// parallel NFFI follow-up.
+    #[arg(long, env = "RUSTGATE_OGC_SENSORTHINGS_CONFIG")]
+    pub(crate) ogc_sensorthings_config_file: Option<String>,
+
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
     #[arg(long, env = "RUSTGATE_ENROLLMENT_BIND", value_parser = parse_socket_addr)]
@@ -2130,6 +2138,7 @@ define_config_file! {
     nats_checkpoint_path: Option<String>,
     http_config_file: Option<String>,
     lattice_config_file: Option<String>,
+    ogc_sensorthings_config_file: Option<String>,
     enrollment_bind: Option<String>,
     ca_key: Option<String>,
     enrollment_user: Option<String>,

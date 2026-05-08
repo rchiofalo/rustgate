@@ -35,6 +35,7 @@ members = [
     "crates/rustgate-lattice",
     "crates/rustgate-foundry",
     "crates/rustgate-dds",
+    "crates/rustgate-ogc-sensorthings",
 ]
 exclude = ["fuzz"]
 
@@ -192,6 +193,7 @@ rustgate-missions = { path = "crates/rustgate-missions" }
 rustgate-lattice = { path = "crates/rustgate-lattice" }
 rustgate-foundry = { path = "crates/rustgate-foundry" }
 rustgate-dds = { path = "crates/rustgate-dds" }
+rustgate-ogc-sensorthings = { path = "crates/rustgate-ogc-sensorthings" }
 
 [profile.release]
 lto = true

@@ -107,6 +107,14 @@ foundry-mock = ["foundry", "rustgate-foundry/foundry-mock"]
 # landed in #1326.
 dds = ["dep:rustgate-dds"]
 dds-mock = ["dds", "rustgate-dds/dds-mock"]
+# OGC SensorThings v1.0 client integration (`rustgate-ogc-sensorthings`).
+# Pulls in the polling client, TOML config schema, observation → entity
+# mapper, and background-task wiring that drains observations into
+# `rustgate_router::Router`. The MQTT push-subscription half of
+# SensorThings ships in a follow-up issue and reuses `rustgate-mqtt` plus
+# the existing mapper. Closes #869 alongside the parallel NFFI follow-up
+# PR (SAPIENT shipped in #1327).
+ogc-sensorthings = ["dep:rustgate-ogc-sensorthings"]
 # Documentary feature for the Meshtastic / LoRa TAKPacket codec
 # (`rustgate-meshtastic`). The codec crate is always linked alongside
 # the other always-on wire-format crates (CoT, MAVLink, ASTERIX,
@@ -163,6 +171,7 @@ rustgate-http = { workspace = true, optional = true }
 rustgate-lattice = { workspace = true, optional = true }
 rustgate-foundry = { workspace = true, optional = true }
 rustgate-dds = { workspace = true, optional = true }
+rustgate-ogc-sensorthings = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
