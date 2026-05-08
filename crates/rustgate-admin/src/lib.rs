@@ -18,9 +18,14 @@
 //! * [`acl_config`] — JSON deserialization for the group ACL policy file.
 //! * [`acl_reloader`] — Polling-driven hot-reload for the on-disk ACL file.
 //! * [`acl_api`] — REST API for runtime ACL CRUD mounted under `/api/acl/`.
+<<<<<<< HEAD
 //! * `missions_api` — REST API for the lightweight TAK Data Packages
 //!   endpoint (Feature 17 of #860) mounted under `/api/packages/`.
 //!   Compiled only with the `missions` feature.
+=======
+//! * [`video`] — In-memory CoT `b-i-v` video stream catalog (feature-gated
+//!   on `video`) exposed at `GET /api/video/streams`. Closes #862.
+>>>>>>> d502496 (feat(admin): video stream catalog with /api/video/streams endpoint (closes #862))
 
 #![forbid(unsafe_code)]
 
@@ -30,6 +35,8 @@ pub mod acl_reloader;
 #[cfg(feature = "missions")]
 pub mod missions_api;
 pub mod server;
+#[cfg(feature = "video")]
+pub mod video;
 
 pub use acl_api::{AclApiState, validate_bearer_token_length};
 pub use acl_config::{GroupAclEntry, GroupAclFile};
@@ -38,8 +45,12 @@ pub use acl_reloader::AclReloader;
 pub use missions_api::{MissionsApiHandler, MissionsApiState};
 #[cfg(feature = "federation")]
 pub use server::FedApiHandler;
+#[cfg(feature = "video")]
+pub use server::VideoApiHandler;
 pub use server::{
     AclApiHandler, CheckStatus, DEFAULT_MAX_HTTP_CONNECTIONS, DependencyCheck, HealthState,
     MgmtApiHandler, ReadinessReport, ReadinessState, RouterSlot, cert_expiry_seconds, init,
     register_metrics, serve,
 };
+#[cfg(feature = "video")]
+pub use video::{DEFAULT_VIDEO_TTL, VideoEntry, VideoStreamCatalog};

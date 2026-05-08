@@ -58,6 +58,16 @@ pub type AclApiHandler = Arc<
         + Sync,
 >;
 
+/// Type-erased video stream catalog API handler.
+///
+/// When set, the metrics server delegates `GET /api/video/streams`
+/// to this handler. Returns `None` for unrecognized paths so the
+/// caller can fall through to 404. Wired by the server binary under
+/// `--features video` (closes #862).
+#[cfg(feature = "video")]
+pub type VideoApiHandler =
+    Arc<dyn Fn(&hyper::Method, &str, &[u8]) -> Option<Response<Full<Bytes>>> + Send + Sync>;
+
 /// Type-erased management API handler.
 ///
 /// When set, the metrics server delegates requests under `/api/cert/`,
@@ -774,6 +784,7 @@ pub async fn serve(
     #[cfg(feature = "federation")] fed_api: Arc<OnceLock<FedApiHandler>>,
     acl_api: Arc<OnceLock<AclApiHandler>>,
     mgmt_api: Arc<OnceLock<MgmtApiHandler>>,
+    #[cfg(feature = "video")] video_api: Arc<OnceLock<VideoApiHandler>>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
     router_slot: RouterSlot,
     max_http_connections: usize,
@@ -810,6 +821,8 @@ pub async fn serve(
         let fed_api = Arc::clone(&fed_api);
         let acl_api = Arc::clone(&acl_api);
         let mgmt_api = Arc::clone(&mgmt_api);
+        #[cfg(feature = "video")]
+        let video_api = Arc::clone(&video_api);
         let metrics_token = metrics_token.clone();
         let router_slot = Arc::clone(&router_slot);
         spawn_background("metrics-http-conn", async move {
@@ -826,6 +839,8 @@ pub async fn serve(
                         let fed_api = Arc::clone(&fed_api);
                         let acl_api = Arc::clone(&acl_api);
                         let mgmt_api = Arc::clone(&mgmt_api);
+                        #[cfg(feature = "video")]
+                        let video_api = Arc::clone(&video_api);
                         let metrics_token = metrics_token.clone();
                         let router_slot = Arc::clone(&router_slot);
                         async move {
@@ -846,6 +861,28 @@ pub async fn serve(
                                 return Ok(Response::builder()
                                     .status(StatusCode::SERVICE_UNAVAILABLE)
                                     .body(Full::new(Bytes::from("federation API not ready")))
+                                    .unwrap_or_else(|_| internal_error_response()));
+                            }
+                            // Delegate /api/video/* paths to the video catalog handler.
+                            // Closes #862. The handler is sync because the
+                            // catalog read path is non-blocking; matches the
+                            // shape of the `FedApiHandler` slot above.
+                            #[cfg(feature = "video")]
+                            if req.uri().path().starts_with("/api/video/")
+                                && let Some(handler) = video_api.get()
+                            {
+                                let method = req.method().clone();
+                                let path = req.uri().path().to_string();
+                                let body = http_body_util::BodyExt::collect(req.into_body())
+                                    .await
+                                    .map(|b| b.to_bytes())
+                                    .unwrap_or_default();
+                                if let Some(resp) = handler(&method, &path, &body) {
+                                    return Ok(resp);
+                                }
+                                return Ok(Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::from("not found")))
                                     .unwrap_or_else(|_| internal_error_response()));
                             }
                             // Delegate /api/acl/ paths to the ACL management handler

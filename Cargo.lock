@@ -3219,6 +3219,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "prometheus",
+ "quick-xml",
  "rustgate-core",
  "rustgate-federation",
  "rustgate-http",

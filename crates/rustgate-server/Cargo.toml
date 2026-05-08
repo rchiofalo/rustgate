@@ -76,6 +76,9 @@ spiffe = ["rustgate-tls/spiffe"]
 # Enables the optional Cedar authz policy backend and `--authz-policy-format cedar`.
 cedar = ["rustgate-authz/cedar"]
 http = ["dep:rustgate-http", "rustgate-admin/http"]
+# In-memory CoT `b-i-v` video stream catalog exposed at
+# `GET /api/video/streams` on the admin HTTP server. MVP — closes #862.
+video = ["rustgate-admin/video"]
 # Documentary feature for the Meshtastic / LoRa TAKPacket codec
 # (`rustgate-meshtastic`). The codec crate is always linked alongside
 # the other always-on wire-format crates (CoT, MAVLink, ASTERIX,
