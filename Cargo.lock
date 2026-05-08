@@ -3677,6 +3677,7 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
 name = "rustgate-nffi"
 version = "0.8.0"
 dependencies = [
@@ -3684,6 +3685,22 @@ dependencies = [
  "quick-xml",
  "rustgate-core",
  "thiserror 2.0.18",
+=======
+name = "rustgate-ogc-sensorthings"
+version = "0.8.0"
+dependencies = [
+ "bytes",
+ "reqwest",
+ "rustgate-core",
+ "rustgate-router",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "wiremock",
+>>>>>>> 8d071be (feat(ogc-sensorthings): rustgate-ogc-sensorthings crate for OGC SensorThings v1.0 client (closes #869))
 ]
 
 [[package]]
@@ -3797,6 +3814,7 @@ dependencies = [
  "rustgate-metrics",
  "rustgate-mqtt",
  "rustgate-nats",
+ "rustgate-ogc-sensorthings",
  "rustgate-proto",
  "rustgate-router",
  "rustgate-sapient",

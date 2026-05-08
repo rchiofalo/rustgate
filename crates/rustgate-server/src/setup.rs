@@ -871,6 +871,7 @@ pub(crate) fn init_foundry_scaffold() {
 }
 
 // ---------------------------------------------------------------------------
+<<<<<<< HEAD
 // DDS bridge (issue #870)
 // ---------------------------------------------------------------------------
 //
@@ -906,6 +907,106 @@ pub(crate) fn init_dds_scaffold() {
         target: "rustgate.dds",
         "DDS bridge scaffold linked (trait + config + wiring); awaiting real DDS SDK adapter behind future dds-real feature flag"
     );
+=======
+// OGC SensorThings v1.0 polling client (issue #869)
+// ---------------------------------------------------------------------------
+
+/// Start the OGC SensorThings v1.0 polling client.
+///
+/// Reads the TOML config file under `cli.ogc_sensorthings_config_file`,
+/// validates the `[sensorthings]` block, optionally loads the
+/// bearer token from `auth-token-path`, builds a
+/// [`rustgate_ogc_sensorthings::SensorThingsClient`], and spawns
+/// the polling supervisor task. Returns the
+/// [`rustgate_core::tasks::SubsystemHandle`] that drives graceful
+/// shutdown for the entire SensorThings subsystem.
+///
+/// Returns `None` when the operator did not configure SensorThings
+/// (no `--ogc-sensorthings-config` flag), the config file cannot be
+/// read or parsed, or validation fails. Failure cases log via
+/// `tracing::warn!` and the rest of the server continues unchanged
+/// — SensorThings is an opt-in integration and a misconfigured
+/// `[sensorthings]` block must not block server startup.
+#[cfg(feature = "ogc-sensorthings")]
+pub(crate) async fn start_ogc_sensorthings(
+    cli: &Cli,
+    router: &Arc<Router>,
+) -> Option<SubsystemHandle> {
+    let config_path = cli.ogc_sensorthings_config_file.as_ref()?;
+    let config_str = match tokio::fs::read_to_string(config_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                path = %config_path,
+                error = %e,
+                "failed to read --ogc-sensorthings-config"
+            );
+            return None;
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        sensorthings: rustgate_ogc_sensorthings::SensorThingsConfig,
+    }
+
+    let cfg: rustgate_ogc_sensorthings::SensorThingsConfig =
+        match toml::from_str::<Wrapper>(&config_str) {
+            Ok(w) => w.sensorthings,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to parse [sensorthings] config");
+                return None;
+            }
+        };
+
+    if let Err(e) = cfg.validate() {
+        tracing::warn!(error = %e, "[sensorthings] config validation failed");
+        return None;
+    }
+
+    let bearer = match cfg.auth_token_path.as_deref() {
+        Some(path) => match tokio::fs::read_to_string(path).await {
+            Ok(token) => Some(std::sync::Arc::<str>::from(token.trim())),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path,
+                    error = %e,
+                    "failed to read [sensorthings] auth-token-path; falling back to unauthenticated polling"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    let client = match rustgate_ogc_sensorthings::SensorThingsClient::new(&cfg, bearer) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to build SensorThings polling client");
+            return None;
+        }
+    };
+
+    let endpoint = cfg.normalised_endpoint().to_string();
+    let subscription_count = cfg.subscriptions.len();
+    let handle =
+        rustgate_ogc_sensorthings::spawn_polling_task(client, cfg, std::sync::Arc::clone(router));
+    tracing::info!(
+        endpoint = %endpoint,
+        subscriptions = subscription_count,
+        "OGC SensorThings polling client started"
+    );
+    Some(handle)
+}
+
+/// Warn when --ogc-sensorthings-config is set but the
+/// `ogc-sensorthings` feature is disabled.
+#[cfg(not(feature = "ogc-sensorthings"))]
+pub(crate) fn warn_ogc_sensorthings_disabled(cli: &Cli) {
+    if cli.ogc_sensorthings_config_file.is_some() {
+        tracing::warn!("--ogc-sensorthings-config requires --features ogc-sensorthings; ignoring");
+    }
+>>>>>>> fe1add8 (feat(ogc-sensorthings): rustgate-ogc-sensorthings crate for OGC SensorThings v1.0 client (closes #869))
 }
 
 // ---------------------------------------------------------------------------

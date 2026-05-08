@@ -229,6 +229,7 @@ crate = "rustgate-foundry"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-dds"
+crate = "rustgate-ogc-sensorthings"
 
 [bans]
 multiple-versions = "warn"
