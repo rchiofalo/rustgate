@@ -130,7 +130,12 @@ async fn end_to_end_full_state_round_trip() {
     assert_eq!(json["type"], "TlsConfig");
     assert_eq!(json["data"]["organization"], "rustgate-int-test");
     assert!(!json["data"]["caCert"].as_str().unwrap().is_empty());
-    assert!(!json["data"]["acceptedCiphers"].as_array().unwrap().is_empty());
+    assert!(
+        !json["data"]["acceptedCiphers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let versions = json["data"]["protocolVersions"].as_array().unwrap();
     assert!(versions.iter().any(|v| v == "TLSv1.3"));
 
