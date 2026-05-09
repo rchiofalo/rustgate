@@ -23,6 +23,11 @@
 //!   Compiled only with the `missions` feature.
 //! * `video` — In-memory CoT `b-i-v` video stream catalog (feature-gated
 //!   on the `video` feature) exposed at `GET /api/video/streams`. Closes #862.
+//! * `marti_compat` — Marti API compatibility shim for drop-in TAK Server
+//!   replacement (closes #863). Mounts `/Marti/api/*` under the
+//!   `marti-compat` feature; combines the enrollment, missions, video,
+//!   and contacts subsystems behind one URL surface so existing TAK
+//!   clients connect without reconfiguration.
 
 #![forbid(unsafe_code)]
 
@@ -31,6 +36,8 @@ pub mod acl_config;
 pub mod acl_reloader;
 #[cfg(feature = "correlation")]
 pub mod correlation;
+#[cfg(feature = "marti-compat")]
+pub mod marti_compat;
 #[cfg(feature = "missions")]
 pub mod missions_api;
 pub mod server;
@@ -40,6 +47,8 @@ pub mod video;
 pub use acl_api::{AclApiState, validate_bearer_token_length};
 pub use acl_config::{GroupAclEntry, GroupAclFile};
 pub use acl_reloader::AclReloader;
+#[cfg(feature = "marti-compat")]
+pub use marti_compat::{MARTI_PREFIX, MartiCompatHandler, MartiCompatState};
 #[cfg(feature = "missions")]
 pub use missions_api::{MissionsApiHandler, MissionsApiState};
 #[cfg(feature = "correlation")]
