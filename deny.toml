@@ -238,6 +238,7 @@ crate = "rustgate-correlation"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-operator"
+crate = "rustgate-inference"
 
 [bans]
 multiple-versions = "warn"

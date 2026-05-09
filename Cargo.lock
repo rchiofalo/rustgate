@@ -3641,6 +3641,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-inference"
+version = "0.8.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "rustgate-core",
+ "rustgate-router",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustgate-lattice"
 version = "0.8.0"
 dependencies = [
@@ -3905,6 +3920,7 @@ dependencies = [
  "rustgate-federation",
  "rustgate-foundry",
  "rustgate-http",
+ "rustgate-inference",
  "rustgate-lattice",
  "rustgate-mavlink",
  "rustgate-meshtastic",

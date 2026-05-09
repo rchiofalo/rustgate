@@ -50,6 +50,7 @@ COPY crates/rustgate-dds/Cargo.toml         crates/rustgate-dds/Cargo.toml
 COPY crates/rustgate-ogc-sensorthings/Cargo.toml crates/rustgate-ogc-sensorthings/Cargo.toml
 COPY crates/rustgate-correlation/Cargo.toml crates/rustgate-correlation/Cargo.toml
 COPY crates/rustgate-operator/Cargo.toml    crates/rustgate-operator/Cargo.toml
+COPY crates/rustgate-inference/Cargo.toml   crates/rustgate-inference/Cargo.toml
 
 # Stub lib.rs / main.rs so cargo can resolve and fetch deps.
 RUN for d in crates/*/; do mkdir -p "$d/src" && echo "" > "$d/src/lib.rs"; done \
