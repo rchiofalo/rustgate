@@ -5,7 +5,7 @@
 
 //! Fuzz the obligation application pipeline.
 //!
-//! `rustgate_transport::obligations::apply_obligations` takes an
+//! `rustgate_router::obligations::apply_obligations` takes an
 //! authz decision's obligation list and mutates the outbound
 //! [`RoutableMessage`] in place: [`Obligation::MaskPoint`] zeros the
 //! CoT coordinates via `strip_coordinates` (with fail-closed recovery
@@ -41,7 +41,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use rustgate_authz::Obligation;
 use rustgate_core::message::RoutableMessage;
-use rustgate_transport::obligations::{UnknownObligationPolicy, apply_obligations};
+use rustgate_router::obligations::{UnknownObligationPolicy, apply_obligations};
 
 /// Fuzz input envelope: a `RoutableMessage` plus raw bytes that are
 /// mapped to an obligation list. Using `Vec<u8>` (rather than

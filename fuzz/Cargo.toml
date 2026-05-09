@@ -18,6 +18,7 @@ libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 rustgate-core = { path = "../crates/rustgate-core", features = ["fuzz"] }
 rustgate-transport = { path = "../crates/rustgate-transport" }
+rustgate-router = { path = "../crates/rustgate-router" }
 rustgate-cot = { path = "../crates/rustgate-cot", features = ["fuzz"] }
 rustgate-mavlink = { path = "../crates/rustgate-mavlink" }
 rustgate-proto = { path = "../crates/rustgate-proto" }
