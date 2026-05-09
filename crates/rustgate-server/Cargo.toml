@@ -80,6 +80,13 @@ http = ["dep:rustgate-http", "rustgate-admin/http"]
 # In-memory CoT `b-i-v` video stream catalog exposed at
 # `GET /api/video/streams` on the admin HTTP server. MVP — closes #862.
 video = ["rustgate-admin/video"]
+# Multi-sensor track correlation engine. Wires the
+# `rustgate-correlation::CorrelationEngine` into the router's `OnRouted`
+# slot so every routed message that carries a decodable `Entity` is
+# pushed through the gating + scoring + fusion ladder, and exposes
+# the live snapshot at `GET /api/correlation/fused-entities` via the
+# admin HTTP server. MVP — closes #848.
+correlation = ["dep:rustgate-correlation", "rustgate-admin/correlation"]
 # Anduril Lattice bidirectional adapter (`rustgate-lattice`). The trait,
 # config, mock backend, and router wiring all live in `rustgate-lattice`;
 # this feature pulls the crate in and turns on the `cfg!(feature =
@@ -172,6 +179,7 @@ rustgate-lattice = { workspace = true, optional = true }
 rustgate-foundry = { workspace = true, optional = true }
 rustgate-dds = { workspace = true, optional = true }
 rustgate-ogc-sensorthings = { workspace = true, optional = true }
+rustgate-correlation = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }

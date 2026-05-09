@@ -103,6 +103,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-foundry`](crates/rustgate-foundry/README.md) | Bidirectional REST/WebSocket bridge between rustgate entities and Palantir Foundry / Gotham ontology objects (trait + mock + wiring; partner-gated SDK behind `foundry-real`) |
 | [`rustgate-dds`](crates/rustgate-dds/README.md) | DDS Pub/Sub bridge for NGVA (NATO STANAG 4754) / VICTORY in-vehicle data buses — bridge trait, in-memory mock, NGVA Land Data Model topic mapping; real DDS SDK behind `dds-real` (closes #870 alongside the GeoJSON output that landed in #1326) |
 | [`rustgate-ogc-sensorthings`](crates/rustgate-ogc-sensorthings/README.md) | OGC SensorThings v1.0 client — HTTP polling integration for IoT sensor data (REST + JSON; MQTT push subscription deferred to follow-up) |
+| [`rustgate-correlation`](crates/rustgate-correlation/README.md) | Multi-sensor track correlation engine — fuses CoT / Link 16 / MAVLink / DIS / SAPIENT reports of the same physical object into a single `FusedEntity` (spatial + temporal + kinematic + type gating, inverse-variance position fusion, RTree spatial index, LRU cap; closes #848) |
 | [`rustgate-nats`](crates/rustgate-nats/README.md) | NATS/JetStream bridge for cross-instance message delivery |
 | [`rustgate-enrollment`](crates/rustgate-enrollment/README.md) | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | [`rustgate-proto`](crates/rustgate-proto/README.md) | Protobuf message translation (XML ↔ proto) |

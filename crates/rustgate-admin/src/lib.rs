@@ -29,6 +29,8 @@
 pub mod acl_api;
 pub mod acl_config;
 pub mod acl_reloader;
+#[cfg(feature = "correlation")]
+pub mod correlation;
 #[cfg(feature = "missions")]
 pub mod missions_api;
 pub mod server;
@@ -40,6 +42,8 @@ pub use acl_config::{GroupAclEntry, GroupAclFile};
 pub use acl_reloader::AclReloader;
 #[cfg(feature = "missions")]
 pub use missions_api::{MissionsApiHandler, MissionsApiState};
+#[cfg(feature = "correlation")]
+pub use server::CorrelationApiHandler;
 #[cfg(feature = "federation")]
 pub use server::FedApiHandler;
 #[cfg(feature = "video")]
