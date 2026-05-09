@@ -1089,6 +1089,7 @@ websocat wss://server:8444/ \
 
 ---
 
+<<<<<<< HEAD
 ## Marti API Compatibility (`/Marti/api/*`)
 
 Drop-in TAK Server replacement surface, mounted on the admin HTTP server (default port 9090) when the `marti-compat` feature is enabled. Every endpoint maps a TAK-compatible URL onto an existing rustgate subsystem; this is a compatibility shim, not new functionality. ATAK / WinTAK / iTAK clients connect with no reconfiguration. Closes #863.
@@ -1219,6 +1220,112 @@ Returns the in-memory CoT `b-i-v` video stream catalog (`rustgate-admin::video`)
 - `Marti/api/sync/*` (mission sync — lands with the rest of #860)
 - `Marti/api/cot/xml` (live CoT push — would need a WebSocket tap into the router)
 - Deprecated XML response variants (we ship JSON only — ATAK is tolerant about format)
+=======
+## Expanded Management API (closes #875)
+
+Built behind the `management-api` feature flag, this surface adds operator-facing read endpoints for running configuration, connected clients, build identity, metrics summary, store-and-forward queue depth, and a verifier driver for the hash-chained audit log. It coexists alongside the legacy `/api/cert/*`, `/api/dlq/*`, `/api/reload`, and `/api/drain` endpoints (all of which remain unchanged).
+
+The API is mounted on the same metrics HTTP server (default port 9090). Authentication uses the same `--mgmt-api-token-file` bearer token as the legacy management API — supplying the flag enables both surfaces.
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/api/config` | GET | Running config snapshot (secrets redacted) |
+| `/api/config/reload` | POST | Trigger SIGHUP-equivalent reload (returns `202 Accepted`) |
+| `/api/clients` | GET | Snapshot of connected clients |
+| `/api/clients/{cn}` | GET | Detail for one client (404 when not connected) |
+| `/api/metrics/summary` | GET | JSON router/federation/store-forward summary |
+| `/api/store-forward` | GET | Per-CN store-and-forward queue depth + bytes |
+| `/api/audit/verify` | GET | Run [`verify_audit_log`] over the configured audit log |
+| `/api/version` | GET | Build version, git hash, feature flags, FIPS status |
+
+**Authentication.** All endpoints require `Authorization: Bearer <token>`. The token is compared in constant time via `subtle::ConstantTimeEq`. Token length is bounded (32–256 bytes) and validated at startup. The token is wrapped in `zeroize::Zeroizing` so it is wiped from memory on drop.
+
+**Auth model.** The MOSA OSMP calls for an "admin cert OU group" gate on write endpoints. The metrics HTTP server fronting this API uses bearer tokens, not mTLS — the bearer token itself is the admin credential. A future PR can layer mTLS in front by capturing the peer cert and checking its OU membership without changing the per-endpoint contract.
+
+### GET /api/config
+
+Returns the running CLI configuration as JSON, with secrets redacted via `#[serde(skip_serializing)]` and `#[serde(serialize_with = "redact_…")]` on the CLI struct (so the same redaction surface that governs `--print-config-toml` governs this endpoint — there is no separate redaction surface that can drift).
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/config
+```
+
+**Response shape:** `{"data": <cli-as-json>}` with sensitive fields elided.
+
+### POST /api/config/reload
+
+Fires the shared reload `Notify` instance — the same one SIGHUP and the legacy `/api/reload` endpoint observe — so the same handler in `main.rs` runs regardless of which surface triggered the reload. Returns immediately after `notify_one()`; reload completion is observable via the `rustgate_config_reload_total` counter and the audit log.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/config/reload
+```
+
+**Response:** `202 Accepted` with `{"data": {"status": "reload_initiated", "source": "api"}}`.
+
+### GET /api/clients
+
+Returns a snapshot of connected client sessions from the router's session registry.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/clients
+```
+
+**Response shape:** `{"data": [{"cn": ..., "fingerprint": ..., "groups": [...], "tenant": ..., ...}]}`.
+
+Telemetry fields (`connected_at`, `bytes_rx`, `bytes_tx`, `source_protocol`) are populated when the wiring layer surfaces them through the router's session handle. The MVP scope wires the directly-available fields (cn, fingerprint, groups, tenant); the others are reported as JSON `null` so dashboards can scrape the endpoint unconditionally.
+
+### GET /api/clients/{cn}
+
+Returns the same shape as `/api/clients` plus a per-session `queue_depth` and `rate_limit_per_sec` snapshot. Returns `404 Not Found` when no session matches the supplied CN.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/clients/alice
+```
+
+This route does NOT shadow `POST /api/clients/{cn}/disconnect` — that endpoint is owned by the legacy `mgmt_api` handler and continues to operate unchanged.
+
+### GET /api/metrics/summary
+
+Returns a JSON summary of the most-relevant Prometheus counters so operators reading the HTTP API don't have to parse Prometheus text format.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/metrics/summary
+```
+
+**Response shape:** `{"data": {"router_fanout_total": N, "router_dropped_total": N, "store_forward_messages": N, "store_forward_bytes": N, "federation_peer_count": N, "federation_connected_peers": N, "connected_clients": N}}`.
+
+### GET /api/store-forward
+
+Returns the per-CN store-and-forward queue snapshot. Reports `enabled: false` when the server is running without a configured store-and-forward queue.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/store-forward
+```
+
+**Response shape:** `{"data": {"enabled": true, "total_bytes": N, "total_messages": N, "entries": [{"cn": "...", "messages": N, "bytes": N}]}}`.
+
+### GET /api/audit/verify
+
+Runs `rustgate_archive::audit_chain::verify_audit_log` over the configured `--audit-log` path and returns a typed report. A clean chain returns `verified: true`; a corrupt chain returns `verified: false` with the diagnostic on `error`. Returns `503 Service Unavailable` when no audit log was configured.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/audit/verify
+```
+
+**Response shape (clean):** `{"data": {"verified": true, "records": N, "tip": "<sha256>", "tip_seq": N, "audit_log_path": "..."}}`.
+
+**Response shape (corrupt):** `{"data": {"verified": false, "error": "<diag>", "audit_log_path": "..."}}` (still HTTP 200 — operators distinguish via `verified`).
+
+### GET /api/version
+
+Returns build identity: package version, git hash baked in at build time (via the `RUSTGATE_GIT_HASH` env var if set, else `"unknown"`), the list of feature flags compiled into the running binary, and a `fips_active` flag derived from `cfg!(feature = "fips")`.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/version
+```
+
+**Response shape:** `{"data": {"version": "0.8.0", "git_hash": "abc1234", "features": ["metrics", "nats", ...], "fips_active": false}}`.
+>>>>>>> 92c8464 (feat(admin): management REST API expansion + MOSA OSMP document (closes #875))
 
 ---
 
@@ -1228,10 +1335,12 @@ Returns the in-memory CoT `b-i-v` video stream catalog (`rustgate-admin::video`)
 |------|---------|---------|
 | `200 OK` | Successful request | All endpoints |
 | `201 Created` | Resource created | Federation: create federate, add certificate |
+| `202 Accepted` | Request accepted, completion deferred | Management API: `/api/config/reload`, `/api/drain` |
 | `204 No Content` | Success with no body | Enrollment: profile endpoint |
 | `400 Bad Request` | Invalid input | Federation: invalid JSON; Enrollment: invalid CSR |
-| `401 Unauthorized` | Missing or invalid credentials | Enrollment: signing, upload |
-| `404 Not Found` | Resource not found | Federation: unknown peer/cert; Enrollment: unknown path |
+| `401 Unauthorized` | Missing or invalid credentials | Enrollment: signing, upload; Management API: any route |
+| `404 Not Found` | Resource not found | Federation: unknown peer/cert; Enrollment: unknown path; Management API: unknown CN |
+| `405 Method Not Allowed` | Wrong verb on a known endpoint | Management API |
 | `429 Too Many Requests` | Rate limit exceeded | Enrollment: CSR signing (10 req/IP/min) |
 | `500 Internal Server Error` | Server-side failure | All endpoints |
-| `503 Service Unavailable` | Server not ready | Health: `/health/ready` or `/health/startup`; Federation: API not initialized |
+| `503 Service Unavailable` | Server not ready / dependency missing | Health: `/health/ready` or `/health/startup`; Federation: API not initialized; Management API: missing provider/audit log |

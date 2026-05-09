@@ -108,6 +108,30 @@ pub type MgmtApiHandler = Arc<
         + Sync,
 >;
 
+/// Type-erased expanded-management-API handler (closes #875). When set,
+/// the metrics server delegates requests under `/api/config`,
+/// `/api/config/reload`, `/api/clients`, `/api/clients/{cn}`,
+/// `/api/metrics/summary`, `/api/store-forward`, `/api/audit/verify`,
+/// and `/api/version` to this handler. Returns `None` when the path
+/// does not match any management-API route so the caller can fall
+/// through to the next handler or the default 404.
+///
+/// Distinct from [`MgmtApiHandler`] (which owns the legacy
+/// `/api/cert/*`, `/api/dlq/*`, `/api/reload`, `/api/drain`,
+/// `/api/v1/*`, and `/api/clients/{cn}/disconnect` surface) — both
+/// can be registered on the same metrics server side-by-side.
+#[cfg(feature = "management-api")]
+pub type ManagementApiHandler = Arc<
+    dyn Fn(
+            &hyper::Method,
+            &str,
+            Option<&str>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<Response<Full<Bytes>>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// Default maximum concurrent connections to the metrics HTTP server.
 /// Bounds memory usage from connection floods against the unauthenticated
 /// HTTP endpoint (the TLS listener has its own separate limit).
@@ -798,6 +822,7 @@ pub async fn serve(
     #[cfg(feature = "federation")] fed_api: Arc<OnceLock<FedApiHandler>>,
     acl_api: Arc<OnceLock<AclApiHandler>>,
     mgmt_api: Arc<OnceLock<MgmtApiHandler>>,
+    #[cfg(feature = "management-api")] management_api: Arc<OnceLock<ManagementApiHandler>>,
     #[cfg(feature = "video")] video_api: Arc<OnceLock<VideoApiHandler>>,
     #[cfg(feature = "correlation")] correlation_api: Arc<OnceLock<CorrelationApiHandler>>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
@@ -836,6 +861,8 @@ pub async fn serve(
         let fed_api = Arc::clone(&fed_api);
         let acl_api = Arc::clone(&acl_api);
         let mgmt_api = Arc::clone(&mgmt_api);
+        #[cfg(feature = "management-api")]
+        let management_api = Arc::clone(&management_api);
         #[cfg(feature = "video")]
         let video_api = Arc::clone(&video_api);
         #[cfg(feature = "correlation")]
@@ -856,6 +883,8 @@ pub async fn serve(
                         let fed_api = Arc::clone(&fed_api);
                         let acl_api = Arc::clone(&acl_api);
                         let mgmt_api = Arc::clone(&mgmt_api);
+                        #[cfg(feature = "management-api")]
+                        let management_api = Arc::clone(&management_api);
                         #[cfg(feature = "video")]
                         let video_api = Arc::clone(&video_api);
                         #[cfg(feature = "correlation")]
@@ -950,6 +979,39 @@ pub async fn serve(
                                     .status(StatusCode::NOT_FOUND)
                                     .body(Full::new(Bytes::from("not found")))
                                     .unwrap_or_else(|_| internal_error_response()));
+                            }
+                            // Delegate the expanded management-API
+                            // routes (closes #875) to the dedicated
+                            // handler before falling through to the
+                            // legacy `mgmt_api` slot. The two surfaces
+                            // do not overlap: the expanded API owns
+                            // bare `/api/clients`, `/api/clients/{cn}`
+                            // (read-only detail), `/api/config*`,
+                            // `/api/audit/verify`, `/api/version`,
+                            // `/api/store-forward`, and
+                            // `/api/metrics/summary`; the legacy slot
+                            // continues to own `/api/clients/{cn}/disconnect`,
+                            // `/api/cert/*`, `/api/dlq/*`, `/api/reload`,
+                            // `/api/drain`, and `/api/v1/*`.
+                            #[cfg(feature = "management-api")]
+                            {
+                                let path_str = req.uri().path();
+                                if crate::management_api::handles_path(path_str)
+                                    && let Some(handler) = management_api.get()
+                                {
+                                    let method = req.method().clone();
+                                    let path = path_str.to_string();
+                                    let auth = req
+                                        .headers()
+                                        .get(hyper::header::AUTHORIZATION)
+                                        .and_then(|v| v.to_str().ok())
+                                        .map(|s| s.to_string());
+                                    if let Some(resp) =
+                                        handler(&method, &path, auth.as_deref()).await
+                                    {
+                                        return Ok(resp);
+                                    }
+                                }
                             }
                             // Delegate /api/cert/, /api/crl/, /api/dedup/,
                             // /api/clients/, /api/dlq/, /api/v1/, /api/reload,

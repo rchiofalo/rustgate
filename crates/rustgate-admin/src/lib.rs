@@ -36,6 +36,8 @@ pub mod acl_config;
 pub mod acl_reloader;
 #[cfg(feature = "correlation")]
 pub mod correlation;
+#[cfg(feature = "management-api")]
+pub mod management_api;
 #[cfg(feature = "marti-compat")]
 pub mod marti_compat;
 #[cfg(feature = "missions")]
@@ -47,6 +49,13 @@ pub mod video;
 pub use acl_api::{AclApiState, validate_bearer_token_length};
 pub use acl_config::{GroupAclEntry, GroupAclFile};
 pub use acl_reloader::AclReloader;
+#[cfg(feature = "management-api")]
+pub use management_api::{
+    AuditVerifyReport, ClientDetail, ClientDetailFn, ClientSnapshot, ClientsFn, ConfigFn,
+    ConfigJson, ManagementApiHandler, ManagementApiState, MetricsSummary, MetricsSummaryFn,
+    Providers, StoreForwardEntry, StoreForwardFn, StoreForwardSnapshot, VersionFn, VersionInfo,
+    handles_path as management_api_handles_path,
+};
 #[cfg(feature = "marti-compat")]
 pub use marti_compat::{MARTI_PREFIX, MartiCompatHandler, MartiCompatState};
 #[cfg(feature = "missions")]

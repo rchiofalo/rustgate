@@ -95,6 +95,12 @@ marti-compat = [
     "enrollment",
     "video",
 ]
+# Expanded management REST API (closes #875). Adds /api/config,
+# /api/config/reload, /api/clients, /api/clients/{cn}, /api/metrics/summary,
+# /api/store-forward, /api/audit/verify, and /api/version on top of the
+# legacy /api/cert/*, /api/dlq/*, /api/reload, and /api/drain surface.
+# Auth: same `--mgmt-api-token-file` bearer token as the legacy surface.
+management-api = ["rustgate-admin/management-api"]
 # Anduril Lattice bidirectional adapter (`rustgate-lattice`). The trait,
 # config, mock backend, and router wiring all live in `rustgate-lattice`;
 # this feature pulls the crate in and turns on the `cfg!(feature =

@@ -3253,6 +3253,7 @@ dependencies = [
  "prometheus",
  "quick-xml",
  "rcgen",
+ "rustgate-archive",
  "rustgate-core",
  "rustgate-correlation",
  "rustgate-enrollment",
