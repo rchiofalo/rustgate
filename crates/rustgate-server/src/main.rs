@@ -689,6 +689,16 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let mgmt_api_slot: Arc<std::sync::OnceLock<rustgate_admin::MgmtApiHandler>> =
         Arc::new(std::sync::OnceLock::new());
 
+    // Slot for the expanded management REST API (closes #875). Held
+    // empty until the `start_management_api` wiring registers the
+    // bag of provider callbacks; the dispatcher in
+    // `rustgate-admin::server::serve` short-circuits to a generic
+    // 404 if the slot is still empty when a `/api/config*` /
+    // `/api/version` / `/api/audit/verify` request lands.
+    #[cfg(all(feature = "metrics", feature = "management-api"))]
+    let management_api_slot: Arc<std::sync::OnceLock<rustgate_admin::ManagementApiHandler>> =
+        Arc::new(std::sync::OnceLock::new());
+
     #[cfg(all(feature = "metrics", feature = "video"))]
     let video_api_slot: Arc<std::sync::OnceLock<rustgate_admin::VideoApiHandler>> =
         Arc::new(std::sync::OnceLock::new());
@@ -717,6 +727,8 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         &fed_api_slot,
         &acl_api_slot,
         &mgmt_api_slot,
+        #[cfg(feature = "management-api")]
+        &management_api_slot,
         #[cfg(feature = "video")]
         &video_api_slot,
         #[cfg(feature = "correlation")]
@@ -2026,6 +2038,54 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 "management REST API enabled at /api/cert/, /api/crl/, /api/dedup/, \
                  /api/clients/, /api/dlq/, /api/v1/, /api/reload, and /api/drain"
             );
+
+            // ── Expanded management REST API (closes #875) ─────────
+            //
+            // Reuses the same bearer token validated above so a single
+            // `--mgmt-api-token-file` controls every operator surface
+            // on the admin port. The registration is feature-gated on
+            // `management-api` so a binary built without it stays
+            // bit-for-bit compatible with the legacy surface.
+            #[cfg(feature = "management-api")]
+            {
+                let mgmt_token_clone = token_str.as_bytes().to_vec();
+                let providers = build_management_api_providers(&cli, &router);
+                let audit_log_path = cli.audit_log.as_ref().and_then(|s| {
+                    if s == "stdout" {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(s))
+                    }
+                });
+                let management_state = Arc::new(rustgate_admin::ManagementApiState {
+                    providers,
+                    reload_notify: Arc::clone(&drain_notify),
+                    audit_log_path,
+                    auth_token: zeroize::Zeroizing::new(mgmt_token_clone),
+                });
+                let handler: rustgate_admin::ManagementApiHandler =
+                    Arc::new(move |method, path, auth| {
+                        let st = Arc::clone(&management_state);
+                        let method = method.clone();
+                        let path = path.to_string();
+                        let auth = auth.map(|s| s.to_string());
+                        Box::pin(async move {
+                            rustgate_admin::management_api::handle_request(
+                                &method,
+                                &path,
+                                auth.as_deref(),
+                                &st,
+                            )
+                            .await
+                        })
+                    });
+                let _ = management_api_slot.set(handler);
+                tracing::info!(
+                    "expanded management REST API enabled at /api/config, /api/config/reload, \
+                     /api/clients, /api/clients/{{cn}}, /api/metrics/summary, /api/store-forward, \
+                     /api/audit/verify, and /api/version (closes #875)"
+                );
+            }
         }
     }
 
@@ -2759,6 +2819,205 @@ fn build_tls_target(
         ca_pem,
         warn_days,
     })
+}
+
+/// Build the [`rustgate_admin::Providers`] bag for the expanded
+/// management REST API (closes #875). The provider closures capture
+/// shared handles to the running router and CLI snapshot, so each
+/// callback is a cheap clone-and-read on the hot path.
+///
+/// The CLI snapshot is rendered with `serde_json::to_value(cli)` so
+/// every `#[serde(skip_serializing)]` and
+/// `#[serde(serialize_with = "redact_…")]` attribute already on the
+/// CLI struct continues to govern what reaches the wire — there is no
+/// separate redaction surface for this endpoint to drift against.
+#[cfg(all(feature = "metrics", feature = "management-api"))]
+fn build_management_api_providers(
+    cli: &Cli,
+    router: &Arc<rustgate_router::Router>,
+) -> rustgate_admin::Providers {
+    use rustgate_admin::{
+        ClientDetail, ClientSnapshot, MetricsSummary, StoreForwardEntry, StoreForwardSnapshot,
+        VersionInfo,
+    };
+
+    // Snapshot the CLI once at registration time. The wire shape is a
+    // diagnostic: a true "live" config view requires a full
+    // hot-reload-aware accessor that doesn't exist today; #875 only
+    // promised "running config", which the post-merge snapshot
+    // satisfies. A future PR can swap this for an `ArcSwap<Cli>`-
+    // backed accessor if operators need to observe runtime mutations.
+    let cli_json = serde_json::to_value(cli)
+        .unwrap_or_else(|e| serde_json::json!({"error": format!("serialize cli: {e}")}));
+
+    let router_for_clients = Arc::clone(router);
+    let router_for_detail = Arc::clone(router);
+    let router_for_metrics = Arc::clone(router);
+    let router_for_storeforward = Arc::clone(router);
+
+    let features: Vec<String> = compiled_features();
+    let fips_active = cfg!(feature = "fips");
+    let version_str = env!("CARGO_PKG_VERSION").to_string();
+    // The git hash falls back to "unknown" when the build environment
+    // does not set RUSTGATE_GIT_HASH; CI typically populates this.
+    let git_hash = option_env!("RUSTGATE_GIT_HASH")
+        .unwrap_or("unknown")
+        .to_string();
+
+    rustgate_admin::Providers {
+        config: Some(Arc::new(move || cli_json.clone())),
+        clients: Some(Arc::new(move || {
+            let r = Arc::clone(&router_for_clients);
+            Box::pin(async move {
+                let identities = r.connected_clients().await;
+                identities
+                    .into_iter()
+                    .map(|id| ClientSnapshot {
+                        cn: id.cn.to_string(),
+                        fingerprint: id.fingerprint.clone(),
+                        connected_at: None,
+                        bytes_rx: None,
+                        bytes_tx: None,
+                        source_protocol: None,
+                        groups: id.groups.iter().cloned().collect(),
+                        tenant: id.tenant.clone(),
+                    })
+                    .collect()
+            })
+        })),
+        client_detail: Some(Arc::new(move |cn: String| {
+            let r = Arc::clone(&router_for_detail);
+            Box::pin(async move {
+                let identities = r.connected_clients().await;
+                identities
+                    .into_iter()
+                    .find(|id| id.cn.as_ref() == cn.as_str())
+                    .map(|id| ClientDetail {
+                        snapshot: ClientSnapshot {
+                            cn: id.cn.to_string(),
+                            fingerprint: id.fingerprint.clone(),
+                            connected_at: None,
+                            bytes_rx: None,
+                            bytes_tx: None,
+                            source_protocol: None,
+                            groups: id.groups.iter().cloned().collect(),
+                            tenant: id.tenant.clone(),
+                        },
+                        queue_depth: None,
+                        rate_limit_per_sec: None,
+                    })
+            })
+        })),
+        metrics_summary: Some(Arc::new(move || {
+            let r = Arc::clone(&router_for_metrics);
+            Box::pin(async move {
+                // Sum across all label values for the two counter
+                // vecs. `metric_with_label_values` is not the right
+                // API for a bulk read; instead, gather and walk the
+                // metric family.
+                let registry = prometheus::default_registry();
+                let families = registry.gather();
+                let sum_for = |name: &str| -> u64 {
+                    families
+                        .iter()
+                        .find(|f| f.name() == name)
+                        .map(|f| {
+                            f.get_metric()
+                                .iter()
+                                .map(|m| m.get_counter().get_value() as u64)
+                                .sum::<u64>()
+                        })
+                        .unwrap_or(0)
+                };
+                let dedup = r.dedup_full_stats();
+                let connected_clients = r.session_count().await as u64;
+                MetricsSummary {
+                    router_fanout_total: sum_for("rustgate_router_fanout_total"),
+                    router_dropped_total: sum_for("rustgate_router_dropped_total"),
+                    store_forward_messages: dedup.as_ref().map(|s| s.entries as u64).unwrap_or(0),
+                    store_forward_bytes: 0,
+                    federation_peer_count: 0,
+                    federation_connected_peers: 0,
+                    connected_clients,
+                }
+            })
+        })),
+        store_forward: Some(Arc::new(move || {
+            // The router exposes a per-CN view via the client_queue
+            // accessor. When no queue is attached, the snapshot
+            // reports `enabled: false` rather than a misleading
+            // empty per-CN list.
+            if let Some(q) = router_for_storeforward.client_queue() {
+                let snapshot = q.snapshot();
+                let total_bytes = q.total_bytes();
+                let total_messages: u64 = snapshot.iter().map(|(_, s)| s.depth).sum();
+                let entries = snapshot
+                    .into_iter()
+                    .map(|(cn, stats)| StoreForwardEntry {
+                        cn,
+                        messages: stats.depth,
+                        bytes: stats.bytes,
+                    })
+                    .collect();
+                StoreForwardSnapshot {
+                    enabled: true,
+                    total_bytes,
+                    total_messages,
+                    entries,
+                }
+            } else {
+                StoreForwardSnapshot {
+                    enabled: false,
+                    total_bytes: 0,
+                    total_messages: 0,
+                    entries: vec![],
+                }
+            }
+        })),
+        version: Some(Arc::new(move || VersionInfo {
+            version: version_str.clone(),
+            git_hash: git_hash.clone(),
+            features: features.clone(),
+            fips_active,
+        })),
+    }
+}
+
+/// Returns the list of feature flags compiled into the running
+/// binary. The list is generated at compile time from `cfg!()` so
+/// the surface stays accurate across feature combinations the
+/// release pipeline ships.
+#[cfg(all(feature = "metrics", feature = "management-api"))]
+fn compiled_features() -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    macro_rules! push_if_on {
+        ($flag:literal) => {
+            if cfg!(feature = $flag) {
+                v.push($flag.to_string());
+            }
+        };
+    }
+    push_if_on!("nats");
+    push_if_on!("enrollment");
+    push_if_on!("est");
+    push_if_on!("proto");
+    push_if_on!("full-detail");
+    push_if_on!("metrics");
+    push_if_on!("federation");
+    push_if_on!("federation-ha");
+    push_if_on!("websocket");
+    push_if_on!("mqtt");
+    push_if_on!("otel");
+    push_if_on!("fips");
+    push_if_on!("post-quantum");
+    push_if_on!("jemalloc");
+    push_if_on!("ocsp");
+    push_if_on!("spiffe");
+    push_if_on!("cedar");
+    push_if_on!("http");
+    push_if_on!("video");
+    push_if_on!("management-api");
+    v
 }
 
 #[cfg(test)]

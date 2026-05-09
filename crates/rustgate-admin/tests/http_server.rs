@@ -128,6 +128,8 @@ async fn start_test_server(token: Option<&[u8]>) -> SocketAddr {
             Arc::new(OnceLock::new()),
             Arc::new(OnceLock::new()),
             Arc::new(OnceLock::new()),
+            #[cfg(feature = "management-api")]
+            Arc::new(OnceLock::new()),
             #[cfg(feature = "video")]
             Arc::new(OnceLock::new()),
             #[cfg(feature = "correlation")]
@@ -169,6 +171,8 @@ async fn serve_health_and_metrics_endpoints() {
             #[cfg(feature = "federation")]
             Arc::new(OnceLock::new()),
             Arc::new(OnceLock::new()),
+            Arc::new(OnceLock::new()),
+            #[cfg(feature = "management-api")]
             Arc::new(OnceLock::new()),
             #[cfg(feature = "video")]
             Arc::new(OnceLock::new()),

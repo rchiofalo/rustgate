@@ -1231,6 +1231,9 @@ pub(crate) async fn start_metrics(
     >,
     acl_api_slot: &Arc<std::sync::OnceLock<rustgate_admin::AclApiHandler>>,
     mgmt_api_slot: &Arc<std::sync::OnceLock<rustgate_admin::MgmtApiHandler>>,
+    #[cfg(feature = "management-api")] management_api_slot: &Arc<
+        std::sync::OnceLock<rustgate_admin::ManagementApiHandler>,
+    >,
     #[cfg(feature = "video")] video_api_slot: &Arc<
         std::sync::OnceLock<rustgate_admin::VideoApiHandler>,
     >,
@@ -1334,6 +1337,8 @@ pub(crate) async fn start_metrics(
         let fed_api_for_metrics = Arc::clone(fed_api_slot);
         let acl_api_for_metrics = Arc::clone(acl_api_slot);
         let mgmt_api_for_metrics = Arc::clone(mgmt_api_slot);
+        #[cfg(feature = "management-api")]
+        let management_api_for_metrics = Arc::clone(management_api_slot);
         #[cfg(feature = "video")]
         let video_api_for_metrics = Arc::clone(video_api_slot);
         #[cfg(feature = "correlation")]
@@ -1350,6 +1355,8 @@ pub(crate) async fn start_metrics(
                 fed_api_for_metrics,
                 acl_api_for_metrics,
                 mgmt_api_for_metrics,
+                #[cfg(feature = "management-api")]
+                management_api_for_metrics,
                 #[cfg(feature = "video")]
                 video_api_for_metrics,
                 #[cfg(feature = "correlation")]

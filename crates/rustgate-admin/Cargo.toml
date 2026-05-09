@@ -31,6 +31,11 @@ correlation = ["dep:rustgate-correlation"]
 # Pulls in the upstream subsystems because each Marti URL maps to one
 # of them.
 marti-compat = ["dep:rustgate-enrollment", "missions", "video"]
+# Expanded management REST API (closes #875). Adds `/api/config`,
+# `/api/config/reload`, `/api/clients`, `/api/clients/{cn}`,
+# `/api/metrics/summary`, `/api/store-forward`, `/api/audit/verify`,
+# and `/api/version` to the existing /api/* surface.
+management-api = ["dep:rustgate-archive"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -42,6 +47,7 @@ rustgate-http = { workspace = true, optional = true }
 rustgate-missions = { workspace = true, optional = true }
 rustgate-correlation = { workspace = true, optional = true }
 rustgate-enrollment = { workspace = true, optional = true }
+rustgate-archive = { workspace = true, optional = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
