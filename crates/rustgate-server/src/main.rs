@@ -1609,6 +1609,13 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(not(feature = "ogc-sensorthings"))]
     setup::warn_ogc_sensorthings_disabled(&cli);
 
+    // Edge ML inference pipeline (closes #858). MVP — the helper
+    // is a stub that logs the feature is compiled in. Binary-side
+    // wiring of the back-annotation callback lands in a follow-up
+    // once an operator deployment shape is selected.
+    #[cfg(feature = "inference")]
+    setup::start_inference();
+
     // ── Federation ──────────────────────────────────────────────────
     //
     // The `FedInboundForwardingHooks` carry the optional NATS-publish

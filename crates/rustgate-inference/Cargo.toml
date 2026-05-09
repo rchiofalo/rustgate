@@ -1,0 +1,31 @@
+[package]
+name = "rustgate-inference"
+description = "Edge ML inference pipeline for rustgate — pluggable model backends (ONNX), hot-reloadable pipeline, back-annotation of routed entities. Closes #858."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Mock backend for tests and dev — registers a deterministic
+# `MockInferenceModel` that returns fixed labels/confidence. Pulls
+# no native deps.
+inference-mock = []
+
+[dependencies]
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+rustgate-core = { workspace = true }
+rustgate-router = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -2622,6 +2622,36 @@ pub(crate) async fn start_udp_multicast(
     Ok(Some(SubsystemHandle::new(shutdown, task)))
 }
 
+/// Start the optional edge ML inference pipeline (closes #858).
+///
+/// MVP stub — the binary-side wiring (loading the `[inference]`
+/// config block, building the `Pipeline`, wiring the
+/// `OnRouted` back-annotation callback, and supervising the model
+/// reload task) lands in a follow-up issue once an operator
+/// deployment shape is selected (single-server vs federation-of-
+/// inference-nodes — these have different preferred sinks for the
+/// re-injected annotated messages). For the MVP this helper is a
+/// no-op that simply logs that the inference feature was compiled
+/// in. The crate-level surface (`InferenceModel`, `Pipeline`,
+/// `wiring::router_callback`) is fully implemented and tested in
+/// `rustgate-inference`; only the binary-side glue is deferred.
+///
+/// Intentionally infallible — a missing or invalid inference block
+/// must not block server startup. Operators who want a hard-fail
+/// behaviour should drive the validation from a CLI flag, which is
+/// the natural follow-up.
+#[cfg(feature = "inference")]
+pub fn start_inference() {
+    // Touch the crate's public surface so the optional dep does not
+    // appear unused to `cargo machete`. The constant is `&str`, so
+    // the `let _ = …` is free.
+    let _: &str = rustgate_inference::SOURCE_INFERENCE;
+    tracing::info!(
+        "rustgate-inference compiled in — pipeline scaffolded; \
+         binary-side wiring lands in follow-up. See #858.",
+    );
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {

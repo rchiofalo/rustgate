@@ -87,6 +87,14 @@ video = ["rustgate-admin/video"]
 # the live snapshot at `GET /api/correlation/fused-entities` via the
 # admin HTTP server. MVP — closes #848.
 correlation = ["dep:rustgate-correlation", "rustgate-admin/correlation"]
+# Edge ML inference pipeline. Pulls the optional
+# `rustgate-inference` crate and exposes its trait surface to the
+# server binary. Closes #858. The MVP wires the crate into the
+# build but the binary-side `setup::start_inference` helper is a
+# stub that becomes a no-op when no `[inference]` block is
+# present in the runtime config — full binary wiring lands in a
+# follow-up issue once an operator deployment shape is selected.
+inference = ["dep:rustgate-inference"]
 # Marti API compatibility shim (`/Marti/api/*`) for drop-in TAK Server
 # replacement (closes #863). Pulls the upstream feature on
 # `rustgate-admin` and the optional subsystems it depends on.
@@ -194,6 +202,7 @@ rustgate-foundry = { workspace = true, optional = true }
 rustgate-dds = { workspace = true, optional = true }
 rustgate-ogc-sensorthings = { workspace = true, optional = true }
 rustgate-correlation = { workspace = true, optional = true }
+rustgate-inference = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
