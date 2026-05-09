@@ -1796,6 +1796,7 @@ dependencies = [
  "rustgate-nffi",
  "rustgate-ogc-sensorthings",
  "rustgate-proto",
+ "rustgate-router",
  "rustgate-sapient",
  "rustgate-stanag4586",
  "rustgate-transport",

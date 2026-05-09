@@ -227,6 +227,16 @@ pub enum MaskError {
         /// Maximum allowed attribute count.
         limit: usize,
     },
+    /// An attribute value contains characters that the masker's writer
+    /// cannot faithfully round-trip. Specifically: a raw `"` byte
+    /// inside an attribute value (legal when the input uses single-
+    /// quote delimiters) cannot survive the writer because the writer
+    /// always wraps values in `"` and does not escape inner `"`. The
+    /// resulting bytes parse on the next pass as additional attributes,
+    /// breaking the masker's documented idempotence invariant. Treated
+    /// as fail-closed in line with the masker's contract.
+    #[error("attribute value cannot be round-tripped through the masker")]
+    UnsafeAttrValue,
 }
 
 impl MaskError {
@@ -246,6 +256,7 @@ impl MaskError {
             Self::Xml(_) => "xml_parse_error",
             Self::Io(_) => "io_error",
             Self::AttrBudgetExceeded { .. } => "attr_budget_exceeded",
+            Self::UnsafeAttrValue => "unsafe_attr_value",
         }
     }
 }
@@ -496,6 +507,27 @@ pub fn strip_coordinates_with_level(
     // a vendor extension is covered even on a non-target element.
     loop {
         let event = reader.read_event_into(&mut buf)?;
+        // Fail-closed pre-check on attribute values that would lose
+        // round-trip identity through the writer. quick_xml's reader
+        // accepts attribute values with the *opposite* quote inside
+        // (e.g. `t='"e="'` — a single-quoted value containing raw
+        // `"` bytes). The writer always emits attribute values
+        // wrapped in `"` and does NOT escape inner `"` characters,
+        // so a single-pass through the masker turns `t='"e="'` into
+        // `t=""e=""` — bytes that the parser then reads as **two**
+        // attributes (`t=""` and `e=""`) on the next pass. The
+        // resulting attribute-cardinality drift broke the masker's
+        // documented idempotence invariant. Discovered by the
+        // `cot_mask_strip_coordinates` weekly extended fuzzer; the
+        // 16-byte regression input is pinned by a test below.
+        //
+        // The right answer per the masker's fail-closed contract is
+        // to refuse the document — a sender whose attributes need
+        // escapes the writer cannot faithfully emit must drop, not
+        // forward output that disagrees with the input.
+        if let Event::Start(ref e) | Event::Empty(ref e) = event {
+            check_attrs_round_trip_safe(e)?;
+        }
         match event {
             Event::Eof => break,
             Event::Start(ref e) | Event::Empty(ref e) if is_point_tag(e.name().as_ref()) => {
@@ -774,6 +806,35 @@ fn any_attr_name_is_position_like(e: &BytesStart<'_>) -> Result<bool, MaskError>
     Ok(false)
 }
 
+/// Fail-closed if any attribute value on `e` contains a raw `"` byte.
+///
+/// quick_xml's `BytesStart::push_attribute` (and the
+/// `writer.write_event` pass-through path used for non-target
+/// elements) always wrap attribute values in `"` quotes and do NOT
+/// escape inner `"` characters. An input attribute whose value
+/// genuinely contains a `"` character — possible whenever the input
+/// uses single-quote attribute delimiters — therefore round-trips
+/// through the masker as bytes the next-pass parser splits into
+/// extra attributes. That breaks the masker's documented idempotence
+/// invariant *and* is exactly the fail-closed case the function's
+/// outer doc-comment commits to: when in doubt, drop the payload
+/// rather than forward bytes that downstream consumers may parse
+/// inconsistently with our own.
+///
+/// Returns [`MaskError::UnsafeAttrValue`] so callers and audit logs
+/// can distinguish this fail-closed case from "the input was not
+/// well-formed XML" ([`MaskError::Xml`]) — the input WAS well-formed
+/// XML; we just can't safely re-emit it.
+fn check_attrs_round_trip_safe(e: &BytesStart<'_>) -> Result<(), MaskError> {
+    for attr in e.attributes() {
+        let attr = attr?;
+        if attr.value.as_ref().contains(&b'"') {
+            return Err(MaskError::UnsafeAttrValue);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -781,6 +842,78 @@ mod tests {
     use super::*;
 
     const SAMPLE_COT: &str = r#"<?xml version="1.0"?><event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/><detail><__group name="Cyan"/></detail></event>"#;
+
+    /// Regression for the `cot_mask_strip_coordinates` weekly extended
+    /// fuzz finding: an attribute value containing a raw `"` byte —
+    /// permissible in well-formed XML when the attribute uses single-
+    /// quote delimiters — round-tripped through the masker as bytes the
+    /// next-pass parser split into extra attributes, breaking the
+    /// documented idempotence invariant.
+    ///
+    /// The input below is the libfuzzer-minimised 16-byte reproducer:
+    /// `<point\rt='"e="'>` — a `<point>` start tag with `\r` whitespace
+    /// before the `t='"e="'` attribute. Pre-fix, the masker emitted
+    /// `<point t=""e=""/>` on pass 1 and `<point t="" e=""/>` on pass 2
+    /// (parser saw the unescaped `"` as an attribute boundary). Post-
+    /// fix, the masker fails closed on pass 1 with
+    /// [`MaskError::UnsafeAttrValue`].
+    #[test]
+    fn fuzz_regression_strip_coordinates_unsafe_attr_value_quotes() {
+        // Bytes from the cargo-fuzz minimised artifact.
+        let input: &[u8] = &[
+            0x3c, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0x0d, 0x74, 0x3d, 0x27, 0x22, 0x65, 0x3d, 0x22,
+            0x27, 0x3e,
+        ];
+        match strip_coordinates(input) {
+            Err(MaskError::UnsafeAttrValue) => {}
+            Ok(out) => panic!(
+                "expected fail-closed UnsafeAttrValue, got Ok({} bytes): {:?}",
+                out.len(),
+                std::str::from_utf8(&out)
+            ),
+            Err(other) => panic!("expected UnsafeAttrValue, got {other:?}"),
+        }
+    }
+
+    /// Companion to the regression above: the legitimate single-quote
+    /// attribute case (no `"` inside the value) must continue to
+    /// round-trip cleanly. Pre-fix this also worked; the test exists to
+    /// pin the boundary so a future "drop the round-trip check"
+    /// regression does not silently widen the fail-closed surface.
+    #[test]
+    fn single_quoted_attr_without_inner_double_quote_is_accepted() {
+        let input = br#"<event uid='u1'><point lat='1.0' lon='2.0' hae='3.0'/></event>"#;
+        let masked = strip_coordinates(input).expect("legitimate single-quoted XML must mask");
+        // The masker only re-emits target elements (`<point>` here);
+        // non-target elements (`<event>`) pass through byte-for-byte
+        // and keep their original quote style. The post-fix invariant
+        // we care about is: the canonical `<point>` coordinates were
+        // zeroed AND the masked output is idempotent.
+        assert!(
+            masked
+                .windows(b"lat=\"0.0\"".len())
+                .any(|w| w == b"lat=\"0.0\""),
+            "lat zeroed: {:?}",
+            std::str::from_utf8(&masked)
+        );
+        let twice = strip_coordinates(&masked).expect("second pass must succeed");
+        assert_eq!(masked, twice, "idempotence");
+    }
+
+    /// Properly-escaped `"` inside an attribute value (`&quot;`) must
+    /// continue to be accepted — quick_xml exposes the escaped form
+    /// verbatim from `attr.value`, so the raw-byte check sees `&quot;`
+    /// (no literal `"`) and lets the value through.
+    #[test]
+    fn escaped_double_quote_in_attr_value_is_accepted() {
+        let input =
+            br#"<event uid="say &quot;hi&quot;"><point lat="1.0" lon="2.0" hae="3.0"/></event>"#;
+        let masked =
+            strip_coordinates(input).expect("escaped quote in attr value must mask cleanly");
+        // Idempotence still holds.
+        let twice = strip_coordinates(&masked).expect("second pass must succeed");
+        assert_eq!(masked, twice);
+    }
 
     #[test]
     fn strips_lat_lon_hae_from_self_closing_point() {
@@ -1318,12 +1451,18 @@ mod tests {
                     }
                 }
             }
-            Err(MaskError::Xml(_)) => {
-                // Expected post-fix path: defensive validation rejected
-                // the unwriteable attribute value before the bytes ever
-                // reached the caller.
+            Err(MaskError::Xml(_)) | Err(MaskError::UnsafeAttrValue) => {
+                // Expected post-fix path: either the defensive output
+                // validation rejected the unwriteable bytes
+                // (`MaskError::Xml`) OR the input pre-check fired on a
+                // raw `"` byte inside an attribute value
+                // (`MaskError::UnsafeAttrValue`, added when the
+                // weekly fuzz turned up `<point\rt='"e="'/>` —
+                // a separate but related round-trip violation).
             }
-            Err(other) => panic!("expected `Ok(_)` or `MaskError::Xml(_)`, got {other:?}"),
+            Err(other) => panic!(
+                "expected `Ok(_)` or `MaskError::Xml(_)` or `MaskError::UnsafeAttrValue`, got {other:?}"
+            ),
         }
     }
 
