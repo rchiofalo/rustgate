@@ -101,23 +101,32 @@ struct Entry {
 /// Errors from individual file operations are logged via `tracing` and
 /// do not abort the pass — a transient I/O failure on one file should
 /// not block retention for the rest of the directory.
+///
+/// Recurses one level into per-tenant subdirectories created by the
+/// archive layout introduced in #859 (`<dir>/<tenant>/cot-…`). The
+/// rotation pass treats every regular file across the top-level
+/// directory and every immediate subdirectory as a single retention
+/// pool — `max_bytes` is global, not per-tenant. Operators who need
+/// per-tenant byte caps can run multiple rotation tasks pointed at
+/// each tenant subdirectory; the default single-pass deployment keeps
+/// disk-budget enforcement simple and predictable.
 pub fn run_pass(
     dir: &Path,
     max_bytes: u64,
     max_age: Duration,
-    active_path: Option<&Path>,
+    active_paths: &[std::path::PathBuf],
 ) -> std::io::Result<RotationStats> {
     if !dir.exists() {
         return Ok(RotationStats::default());
     }
 
-    let mut entries = collect_entries(dir)?;
+    let mut entries = collect_entries_recursive(dir)?;
 
-    // Exclude the writer's currently active segment from both size
+    // Exclude every writer's currently active segment from both size
     // accounting and deletion. We never want to delete (or even count
     // the size of) a file the archiver is actively appending to.
-    if let Some(active) = active_path {
-        entries.retain(|e| e.path != active);
+    if !active_paths.is_empty() {
+        entries.retain(|e| !active_paths.iter().any(|a| a == &e.path));
     }
 
     let mut stats = RotationStats::default();
@@ -176,9 +185,34 @@ pub fn run_pass(
     Ok(stats)
 }
 
-fn collect_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
+/// Walk `dir` and every immediate subdirectory (one level deep) and
+/// return one [`Entry`] per regular file. The shallow recursion
+/// matches the post-#859 archive layout: top-level files (legacy
+/// `cot-<date>.jsonl[.enc]`) plus per-tenant
+/// `<dir>/<tenant>/cot-<date>.jsonl[.enc]`. We deliberately do NOT
+/// recurse further — sub-sub-directories are not part of the layout
+/// and treating them recursively would risk scanning an operator's
+/// adjacent data set if `--archive-dir` is misconfigured to a shared
+/// parent.
+fn collect_entries_recursive(dir: &Path) -> std::io::Result<Vec<Entry>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
+    push_dir_entries(dir, &mut out, true);
+    Ok(out)
+}
+
+fn push_dir_entries(dir: &Path, out: &mut Vec<Entry>, recurse: bool) {
+    let read = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %err,
+                "archive rotation: read_dir failed",
+            );
+            return;
+        }
+    };
+    for entry in read {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -194,6 +228,14 @@ fn collect_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
                 continue;
             }
         };
+        if meta.is_dir() {
+            if recurse {
+                // One level only — see the doc comment on
+                // `collect_entries_recursive` for the rationale.
+                push_dir_entries(&path, out, false);
+            }
+            continue;
+        }
         if !meta.is_file() {
             continue;
         }
@@ -204,7 +246,6 @@ fn collect_entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
             size: meta.len(),
         });
     }
-    Ok(out)
 }
 
 /// Spawn the background rotation task. Returns the task handle so the
@@ -235,11 +276,14 @@ pub fn spawn(cfg: RotationConfig) -> tokio::task::JoinHandle<()> {
             let dir = cfg.dir.clone();
             let max_bytes = cfg.max_bytes;
             let max_age = cfg.max_age;
-            let active = cfg.archiver.as_ref().map(|a| a.active_path());
-            let join = tokio::task::spawn_blocking(move || {
-                run_pass(&dir, max_bytes, max_age, active.as_deref())
-            })
-            .await;
+            let active = cfg
+                .archiver
+                .as_ref()
+                .map(|a| a.active_paths())
+                .unwrap_or_default();
+            let join =
+                tokio::task::spawn_blocking(move || run_pass(&dir, max_bytes, max_age, &active))
+                    .await;
             match join {
                 Ok(Ok(stats)) => {
                     if let Some(cb) = cfg.on_stats.as_ref() {
@@ -313,7 +357,7 @@ mod tests {
         set_mtime(&f5, Duration::from_secs(3600));
 
         // Cap at ~2.5 KiB; expect the three oldest files (f1, f2, f3) to be deleted.
-        let stats = run_pass(&dir, 2560, Duration::ZERO, None).unwrap();
+        let stats = run_pass(&dir, 2560, Duration::ZERO, &[]).unwrap();
 
         assert_eq!(stats.files_deleted, 3, "should drop three oldest files");
         assert!(!f1.exists(), "f1 should be deleted");
@@ -338,7 +382,7 @@ mod tests {
         set_mtime(&old, Duration::from_secs(7200));
         set_mtime(&fresh, Duration::from_secs(60));
 
-        let stats = run_pass(&dir, 0, Duration::from_secs(3600), None).unwrap();
+        let stats = run_pass(&dir, 0, Duration::from_secs(3600), &[]).unwrap();
 
         assert_eq!(stats.files_deleted, 1);
         assert!(!old.exists());
@@ -355,7 +399,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let f = write_file(&dir, "cot-1.jsonl", 4096);
-        let stats = run_pass(&dir, 0, Duration::ZERO, None).unwrap();
+        let stats = run_pass(&dir, 0, Duration::ZERO, &[]).unwrap();
         assert_eq!(stats.files_deleted, 0);
         assert_eq!(stats.bytes_after, 4096);
         assert!(f.exists());
@@ -385,7 +429,13 @@ mod tests {
 
         // Cap of 1 KiB and max age of 1 hour: without exclusion both
         // files would be deleted. With exclusion, only `rolled` goes.
-        let stats = run_pass(&dir, 1024, Duration::from_secs(3600), Some(&active)).unwrap();
+        let stats = run_pass(
+            &dir,
+            1024,
+            Duration::from_secs(3600),
+            std::slice::from_ref(&active),
+        )
+        .unwrap();
 
         assert!(active.exists(), "active segment must never be deleted");
         assert!(!rolled.exists(), "rolled segment should be deleted");
@@ -403,7 +453,7 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
-        let stats = run_pass(&dir, 1024, Duration::from_secs(60), None).unwrap();
+        let stats = run_pass(&dir, 1024, Duration::from_secs(60), &[]).unwrap();
         assert_eq!(stats.files_deleted, 0);
         assert_eq!(stats.bytes_after, 0);
     }
@@ -468,11 +518,18 @@ mod tests {
     }
 
     #[test]
-    fn rotation_skips_subdirectories() {
-        // `collect_entries` filters on `meta.is_file()`. A nested
-        // directory under the archive path (e.g. an operator's manual
-        // backup subdir) must not be counted toward `bytes_after`
-        // and must not be considered for deletion.
+    fn rotation_includes_one_level_tenant_subdirectories() {
+        // Post-#859: per-tenant subdirectories are part of the
+        // archive layout. The rotation pass MUST recurse one level
+        // deep so files written under `<dir>/<tenant>/cot-…` are
+        // accounted for in the byte total and are eligible for
+        // size/age eviction. Without this, a single noisy tenant
+        // could grow its subdirectory unbounded while the operator's
+        // configured `max_bytes` cap saw only the (empty) top level.
+        //
+        // We deliberately do NOT recurse further than one level — a
+        // sub-sub-directory is not part of the layout and is treated
+        // as opaque.
         let dir = std::env::temp_dir().join(format!(
             "rustgate-archive-rot-subdir-{}",
             std::process::id()
@@ -481,19 +538,38 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let f = write_file(&dir, "cot-1.jsonl", 512);
-        let subdir = dir.join("backup");
-        fs::create_dir_all(&subdir).unwrap();
-        let _nested = write_file(&subdir, "should-be-ignored.jsonl", 4096);
+        let tenant_dir = dir.join("tenant-a");
+        fs::create_dir_all(&tenant_dir).unwrap();
+        let nested = write_file(&tenant_dir, "cot-old.jsonl", 4096);
+        // Two levels deep — must NOT be visited.
+        let deep = tenant_dir.join("more");
+        fs::create_dir_all(&deep).unwrap();
+        let _ignored = write_file(&deep, "ignored.jsonl", 8192);
 
-        // Cap well below the nested file's size — if subdirectories
-        // were counted, accounting would report >= 4608 bytes and the
-        // sweep might try (and fail) to remove the subdir.
-        let stats = run_pass(&dir, 1024, Duration::ZERO, None).unwrap();
+        // Cap below the combined top-level + tenant-a usage so the
+        // size sweep deletes the oldest (the nested tenant file).
+        // Make the nested file the older one.
+        set_mtime(&nested, Duration::from_secs(3600 * 5));
+        set_mtime(&f, Duration::from_secs(60));
 
-        assert_eq!(stats.files_deleted, 0, "no top-level files exceed cap");
-        assert_eq!(stats.bytes_after, 512, "subdir bytes must not be counted");
-        assert!(f.exists(), "top-level file retained");
-        assert!(subdir.is_dir(), "subdir preserved");
+        let stats = run_pass(&dir, 1024, Duration::ZERO, &[]).unwrap();
+
+        assert!(
+            stats.files_deleted >= 1,
+            "size sweep must reach into tenant subdir (deleted: {})",
+            stats.files_deleted,
+        );
+        assert!(
+            !nested.exists(),
+            "older tenant-subdir file should be evicted"
+        );
+        assert!(f.exists(), "top-level newer file retained");
+        // The two-levels-deep file must remain — the recursion is
+        // intentionally shallow.
+        assert!(
+            deep.join("ignored.jsonl").exists(),
+            "two-levels-deep file must NOT be touched by rotation",
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -508,7 +584,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let stats = run_pass(&dir, 1024, Duration::from_secs(60), None).unwrap();
+        let stats = run_pass(&dir, 1024, Duration::from_secs(60), &[]).unwrap();
         assert_eq!(stats.files_deleted, 0);
         assert_eq!(stats.bytes_after, 0);
 
@@ -535,7 +611,7 @@ mod tests {
         set_mtime(&f_mid, Duration::from_secs(3600 * 2));
         set_mtime(&f_new, Duration::from_secs(3600));
 
-        let stats = run_pass(&dir, 2048, Duration::ZERO, None).unwrap();
+        let stats = run_pass(&dir, 2048, Duration::ZERO, &[]).unwrap();
 
         assert_eq!(
             stats.files_deleted, 1,
@@ -573,7 +649,7 @@ mod tests {
         set_mtime(&fresh_a, Duration::from_secs(60));
         set_mtime(&fresh_b, Duration::from_secs(30));
 
-        let stats = run_pass(&dir, 1024, Duration::from_secs(3600), None).unwrap();
+        let stats = run_pass(&dir, 1024, Duration::from_secs(3600), &[]).unwrap();
 
         assert_eq!(stats.files_deleted, 1, "only the ancient file goes");
         assert!(!ancient.exists(), "ancient file age-evicted");
@@ -614,7 +690,7 @@ mod tests {
         // After age sweep: ancient gone, 3 files × 1 KiB = 3 KiB remain.
         // Size cap 2 KiB forces one more eviction — the oldest of the
         // survivors, which is `old`.
-        let stats = run_pass(&dir, 2048, Duration::from_secs(3600), None).unwrap();
+        let stats = run_pass(&dir, 2048, Duration::from_secs(3600), &[]).unwrap();
 
         assert_eq!(stats.files_deleted, 2, "one by age, one by size");
         assert!(!ancient.exists(), "ancient evicted by age");
@@ -642,7 +718,7 @@ mod tests {
         let _ = write_file(&dir, "cot-b.jsonl", 300);
         let _ = write_file(&dir, "cot-c.jsonl", 400);
 
-        let stats = run_pass(&dir, 0, Duration::ZERO, None).unwrap();
+        let stats = run_pass(&dir, 0, Duration::ZERO, &[]).unwrap();
         assert_eq!(stats.files_deleted, 0);
         assert_eq!(stats.bytes_after, 900);
 

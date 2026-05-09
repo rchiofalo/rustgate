@@ -724,8 +724,39 @@ impl ClientQueue {
     /// before the queue entry is removed, so a crash between drain and
     /// caller acknowledgement will not cause duplicate delivery on
     /// restart — the next `open` will skip delivered entries.
+    ///
+    /// Tenant filtering: callers that pass a tenant to
+    /// [`Self::drain_for_tenant`] (the production path from the
+    /// router accept loop) drain only entries whose stored tenant
+    /// matches — entries belonging to a different tenant remain in
+    /// the queue. Pre-#859 (v1/v2) records carry no tenant tag and
+    /// drain to any caller, preserving backward compatibility for
+    /// queues written before this PR. The legacy
+    /// [`Self::drain`](Self::drain) entry point passes
+    /// `tenant = None` and drains every entry regardless of tenant —
+    /// suitable for tests but NOT used by the production router
+    /// accept path, where leaking a different tenant's queued
+    /// messages would defeat the multi-tenant isolation contract
+    /// (closes #859).
     #[tracing::instrument(level = "debug", skip_all, fields(cn = %hash_cn(cn)), err)]
     pub fn drain(&self, cn: &str) -> Result<Vec<RoutableMessage>, StoreForwardError> {
+        self.drain_for_tenant(cn, None)
+    }
+
+    /// Drain every queued message for `cn` whose stored tenant tag
+    /// matches `tenant` (or has no tenant — legacy entries pre-#859).
+    ///
+    /// `tenant = None` drains every entry regardless of tenant,
+    /// matching the legacy [`Self::drain`] semantics. Production
+    /// callers (router accept path) MUST pass `Some(connecting client's
+    /// tenant)` so a connecting client can never drain another
+    /// tenant's queued messages.
+    #[tracing::instrument(level = "debug", skip_all, fields(cn = %hash_cn(cn), tenant_set = tenant.is_some()), err)]
+    pub fn drain_for_tenant(
+        &self,
+        cn: &str,
+        tenant: Option<&str>,
+    ) -> Result<Vec<RoutableMessage>, StoreForwardError> {
         let seqs: Vec<u64> = {
             let mut inner = self.inner.lock();
             let Some(idx) = inner.per_cn.remove(cn) else {
@@ -748,6 +779,13 @@ impl ClientQueue {
         let mut dwells_secs: Vec<f64> = Vec::with_capacity(seqs.len());
         let mut expired_count: u64 = 0;
         let mut tampered_count: u64 = 0;
+        let mut tenant_mismatch_count: u64 = 0;
+        // Sequence numbers that belong to a different tenant — they
+        // must remain in durable storage and be reinstated in the
+        // in-memory per-cn index so the rightful owner's eventual
+        // reconnect can drain them. Cached as `(seq, size)` so we
+        // don't pay another redb read.
+        let mut tenant_mismatch: Vec<(u64, u64, RoutableMessage)> = Vec::new();
         let drain_now_ms = unix_now_ms();
         let write = self
             .db
@@ -761,53 +799,101 @@ impl ClientQueue {
                 .open_table(DELIVERED_TABLE)
                 .map_err(|e| StoreForwardError::Database(e.to_string()))?;
             for seq in &seqs {
-                let removed = table
-                    .remove(seq)
-                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
-                if let Some(access) = removed {
-                    let stored = access.value();
+                // Read first, decide later whether to remove. If the
+                // entry belongs to a different tenant, we MUST leave
+                // it in the queue — destructive-read-and-reinsert
+                // would change the seq number and break per-tenant
+                // FIFO ordering on the eventual rightful drain.
+                //
+                // Materialise the bytes inside a tight scope so the
+                // immutable read borrow on `table` is released before
+                // the conditional `table.remove` below — redb
+                // disallows overlapping read+write borrows on the same
+                // table handle.
+                let (stored, stored_size) = {
+                    let entry = table
+                        .get(seq)
+                        .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                    let Some(access) = entry else {
+                        continue;
+                    };
+                    let v = access.value().to_vec();
+                    let size = v.len() as u64;
+                    (v, size)
+                };
 
-                    // Verify HMAC integrity before decoding.
-                    match verify_hmac_envelope(&self.hmac_key, stored) {
-                        Ok(msg_data) => match decode(msg_data) {
-                            Ok(decoded) => {
-                                if msg_expired(&decoded.message) {
-                                    expired_count = expired_count.saturating_add(1);
-                                    debug!(
-                                        seq,
-                                        cn, "client queue: dropping expired entry on drain"
-                                    );
-                                } else {
-                                    // Mark as delivered before returning
-                                    // so a crash here won't re-deliver.
-                                    let _ = dtable
-                                        .insert(seq, ())
-                                        .map_err(|e| StoreForwardError::Database(e.to_string()))?;
-                                    // Compute dwell seconds as
-                                    // drain_now - queued_at, clamped at
-                                    // zero. A negative observation could
-                                    // arise from clock-backwards events
-                                    // (NTP step or VM migration); the
-                                    // histogram cannot represent
-                                    // negative values, so we floor it.
-                                    let dwell_ms =
-                                        drain_now_ms.saturating_sub(decoded.queued_at_ms).max(0);
-                                    let dwell_s = (dwell_ms as f64) / 1000.0;
-                                    dwells_secs.push(dwell_s);
-                                    out.push(decoded.message);
-                                }
+                // Verify HMAC integrity before decoding.
+                match verify_hmac_envelope(&self.hmac_key, &stored) {
+                    Ok(msg_data) => match decode(msg_data) {
+                        Ok(decoded) => {
+                            // Tenant filter: legacy (None) entries
+                            // drain to any caller; v3 entries with a
+                            // tenant tag drain only to a caller whose
+                            // tenant matches. A `None` filter (legacy
+                            // `drain(cn)` callers, primarily tests)
+                            // matches every entry.
+                            let stored_tenant = decoded.message.metadata.tenant_id();
+                            let tenant_ok = match (tenant, stored_tenant) {
+                                (None, _) => true,
+                                (Some(_), None) => true,
+                                (Some(want), Some(got)) => want == got,
+                            };
+                            if !tenant_ok {
+                                tenant_mismatch_count = tenant_mismatch_count.saturating_add(1);
+                                debug!(
+                                    seq,
+                                    cn, "client queue: leaving entry in queue (tenant mismatch)"
+                                );
+                                tenant_mismatch.push((*seq, stored_size, decoded.message));
+                                continue;
                             }
-                            Err(_) => {
-                                warn!(seq, cn, "client queue: dropping malformed entry on drain");
+
+                            // Tenant matches — destructively remove
+                            // from the queue, mark delivered, and
+                            // collect for return.
+                            let _ = table
+                                .remove(seq)
+                                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                            if msg_expired(&decoded.message) {
+                                expired_count = expired_count.saturating_add(1);
+                                debug!(seq, cn, "client queue: dropping expired entry on drain");
+                            } else {
+                                let _ = dtable
+                                    .insert(seq, ())
+                                    .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                                // Compute dwell seconds as
+                                // drain_now - queued_at, clamped at
+                                // zero. A negative observation could
+                                // arise from clock-backwards events
+                                // (NTP step or VM migration); the
+                                // histogram cannot represent
+                                // negative values, so we floor it.
+                                let dwell_ms =
+                                    drain_now_ms.saturating_sub(decoded.queued_at_ms).max(0);
+                                let dwell_s = (dwell_ms as f64) / 1000.0;
+                                dwells_secs.push(dwell_s);
+                                out.push(decoded.message);
                             }
-                        },
-                        Err(_) => {
-                            tampered_count = tampered_count.saturating_add(1);
-                            warn!(
-                                seq,
-                                cn, "client queue: HMAC verification failed, discarding"
-                            );
                         }
+                        Err(_) => {
+                            // Malformed entries are unconditionally
+                            // dropped from the queue so they don't
+                            // wedge future drains.
+                            let _ = table
+                                .remove(seq)
+                                .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                            warn!(seq, cn, "client queue: dropping malformed entry on drain");
+                        }
+                    },
+                    Err(_) => {
+                        let _ = table
+                            .remove(seq)
+                            .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+                        tampered_count = tampered_count.saturating_add(1);
+                        warn!(
+                            seq,
+                            cn, "client queue: HMAC verification failed, discarding"
+                        );
                     }
                 }
             }
@@ -815,6 +901,25 @@ impl ClientQueue {
         write
             .commit()
             .map_err(|e| StoreForwardError::Database(e.to_string()))?;
+
+        // Reinstate tenant-mismatch entries in the in-memory index so
+        // the rightful tenant's eventual drain still finds them. Their
+        // bytes are added back to both the global byte counter and the
+        // per-cn index. Re-pushed in original FIFO order via the seqs
+        // walk above.
+        if !tenant_mismatch.is_empty() {
+            let mut inner = self.inner.lock();
+            for (seq, size, _msg) in &tenant_mismatch {
+                inner.global.push_back((*seq, cn.to_string(), *size));
+                let pc = inner
+                    .per_cn
+                    .entry(cn.to_string())
+                    .or_insert_with(PerCnIndex::new);
+                pc.seqs.push_back(*seq);
+                pc.bytes = pc.bytes.saturating_add(*size);
+                inner.total_bytes = inner.total_bytes.saturating_add(*size);
+            }
+        }
 
         if expired_count > 0 || tampered_count > 0 {
             let mut inner = self.inner.lock();
@@ -868,6 +973,7 @@ impl ClientQueue {
             drained = out.len(),
             expired = expired_count,
             tampered = tampered_count,
+            tenant_mismatch = tenant_mismatch_count,
             "client queue: drained"
         );
         Ok(out)
@@ -960,9 +1066,17 @@ impl ClientQueue {
 /// - **v1**: source identity, destination, message type, source
 ///   protocol, received_at_ms, ttl_secs, payload. Read-only —
 ///   produced by older binaries before #729.
-/// - **v2** (current): adds `queued_at_ms` (Unix ms) immediately after
+/// - **v2**: adds `queued_at_ms` (Unix ms) immediately after
 ///   `received_at_ms` so drain can compute dwell time. Issue #729.
-const ENVELOPE_VERSION: u8 = 2;
+/// - **v3** (current): adds a length-prefixed `tenant_id` UTF-8 string
+///   immediately after `queued_at_ms`. An empty string means "no
+///   tenant" so v3 records produced by single-tenant deployments do
+///   not carry an extra heap-allocation per message. Closes #859.
+const ENVELOPE_VERSION: u8 = 3;
+
+/// Envelope version preceding the multi-tenant tag (#859) but
+/// post-dwell-time (#729). Decoded with `tenant_id = None`.
+const ENVELOPE_VERSION_V2: u8 = 2;
 
 /// Legacy envelope version (no `queued_at_ms`). Decoded with a fallback
 /// where `queued_at_ms = received_at_ms`, preserving pre-PR audit
@@ -1085,6 +1199,11 @@ pub fn encode(msg: &RoutableMessage, queued_at_ms: i64) -> Vec<u8> {
     // recipient went offline).
     buf.put_i64(queued_at_ms);
 
+    // #859: tenant id (length-prefixed UTF-8). Empty string when the
+    // message carries no tenant — v1/v2 records on disk were
+    // implicitly "no tenant" and decode equivalently.
+    put_str(&mut buf, msg.metadata.tenant_id().unwrap_or(""));
+
     match msg.metadata.ttl {
         None => buf.put_i64(-1),
         Some(d) => buf.put_i64(d.as_secs() as i64),
@@ -1124,9 +1243,15 @@ pub fn decode(raw: &[u8]) -> Result<DecodedEnvelope, StoreForwardError> {
         return Err(StoreForwardError::Decode);
     }
     let version = buf.get_u8();
-    let is_v2 = match version {
-        ENVELOPE_VERSION => true,
-        ENVELOPE_VERSION_V1 => false,
+    // Track which post-v1 features the envelope carries:
+    //   has_queued_at = v2 or later
+    //   has_tenant    = v3 or later
+    // Older versions populate the missing fields from sensible
+    // fallbacks (queued_at = received_at, tenant = None).
+    let (has_queued_at, has_tenant) = match version {
+        ENVELOPE_VERSION => (true, true),
+        ENVELOPE_VERSION_V2 => (true, false),
+        ENVELOPE_VERSION_V1 => (false, false),
         _ => return Err(StoreForwardError::Decode),
     };
 
@@ -1172,18 +1297,29 @@ pub fn decode(raw: &[u8]) -> Result<DecodedEnvelope, StoreForwardError> {
         SystemTime::now()
     };
 
-    // Issue #729 / backward compat: v2 envelopes carry an explicit
+    // Issue #729 / backward compat: v2+ envelopes carry an explicit
     // queued_at_ms; v1 envelopes did not, so we fall back to
     // received_at_ms. This preserves the pre-PR meaning of dwell on
     // legacy entries (it equals the full received-to-drain interval),
     // exactly what operators saw before the upgrade.
-    let queued_at_ms = if is_v2 {
+    let queued_at_ms = if has_queued_at {
         if buf.remaining() < 8 {
             return Err(StoreForwardError::Decode);
         }
         buf.get_i64()
     } else {
         received_at_ms
+    };
+
+    // Issue #859: v3 envelopes carry an explicit tenant id (empty
+    // string == no tenant); v1/v2 records decode with `tenant = None`
+    // so cross-tenant drain filtering treats them as legacy /
+    // unauthenticated traffic.
+    let tenant_id: Option<String> = if has_tenant {
+        let s = get_str(&mut buf).ok_or(StoreForwardError::Decode)?;
+        if s.is_empty() { None } else { Some(s) }
+    } else {
+        None
     };
 
     if buf.remaining() < 8 {
@@ -1208,6 +1344,9 @@ pub fn decode(raw: &[u8]) -> Result<DecodedEnvelope, StoreForwardError> {
     let mut metadata = Metadata::new(received_at, source_protocol, message_type);
     if let Some(t) = ttl {
         metadata = metadata.with_ttl(t);
+    }
+    if let Some(t) = tenant_id {
+        metadata = metadata.with_tenant_id(t);
     }
     Ok(DecodedEnvelope {
         message: RoutableMessage {
@@ -1471,6 +1610,14 @@ mod tests {
         }
     }
 
+    /// Like [`msg_for`] but stamps a tenant id onto the metadata.
+    /// Used by the #859 cross-tenant isolation tests.
+    fn msg_for_tenant(from: &str, to: &str, tenant: &str, payload: &[u8]) -> RoutableMessage {
+        let mut m = msg_for(from, to, payload);
+        m.metadata = m.metadata.with_tenant_id(tenant);
+        m
+    }
+
     #[test]
     fn encode_decode_roundtrip() {
         let m = msg_for("alice", "bob", b"hello");
@@ -1541,6 +1688,83 @@ mod tests {
         }
         assert_eq!(q.stats("bob").depth, 0);
         assert_eq!(q.drains_total(), 1);
+    }
+
+    // ── #859: cross-tenant drain isolation ──────────────────────────
+
+    #[tokio::test]
+    async fn drain_for_tenant_skips_cross_tenant_entries() {
+        // Closes #859 isolation contract: queueing under tenant A
+        // and then attempting a drain under tenant B (same CN, e.g.
+        // a service-account name reused across tenants) must not
+        // leak the messages. The mismatched entries stay in the
+        // queue so the rightful tenant's eventual reconnect drains
+        // them.
+        let tmp = TempDir::new().unwrap();
+        let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+
+        q.enqueue("svc", &msg_for_tenant("alice", "svc", "acme", b"a1"))
+            .unwrap();
+        q.enqueue("svc", &msg_for_tenant("alice", "svc", "acme", b"a2"))
+            .unwrap();
+        q.enqueue("svc", &msg_for_tenant("bob", "svc", "globex", b"g1"))
+            .unwrap();
+        wait_for_depth(&q, "svc", 3).await;
+
+        // Tenant B (globex) connects: only its own entry drains.
+        let drained_globex = q.drain_for_tenant("svc", Some("globex")).unwrap();
+        assert_eq!(drained_globex.len(), 1, "globex drains exactly one entry");
+        assert_eq!(drained_globex[0].payload.as_ref(), b"g1");
+        // Two acme entries remain.
+        assert_eq!(
+            q.stats("svc").depth,
+            2,
+            "acme entries must remain after globex drain"
+        );
+
+        // Tenant A (acme) connects later: drains its two entries,
+        // FIFO preserved.
+        let drained_acme = q.drain_for_tenant("svc", Some("acme")).unwrap();
+        assert_eq!(drained_acme.len(), 2);
+        assert_eq!(drained_acme[0].payload.as_ref(), b"a1");
+        assert_eq!(drained_acme[1].payload.as_ref(), b"a2");
+        assert_eq!(q.stats("svc").depth, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_for_tenant_legacy_entries_match_any_tenant() {
+        // Pre-#859 v1/v2 envelopes carry no tenant tag and decode
+        // with `tenant = None`. They must drain to any caller —
+        // there is no per-tenant origin to enforce against, and
+        // operators upgrading from a pre-PR binary expect their
+        // existing on-disk queues to flush cleanly.
+        let tmp = TempDir::new().unwrap();
+        let q = ClientQueue::open(tmp.path(), 1_000_000).unwrap();
+
+        q.enqueue("bob", &msg_for("alice", "bob", b"legacy"))
+            .unwrap();
+        wait_for_depth(&q, "bob", 1).await;
+
+        // A tenant-tagged drain still pulls the legacy entry.
+        let drained = q.drain_for_tenant("bob", Some("acme")).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload.as_ref(), b"legacy");
+    }
+
+    #[test]
+    fn encode_decode_preserves_tenant_id() {
+        // Pin the v3 envelope wire format: tenant id round-trips
+        // through encode/decode, and an absent tenant decodes to
+        // `None` rather than a sentinel string.
+        let with_tenant = msg_for_tenant("alice", "bob", "acme", b"hi");
+        let bytes = encode(&with_tenant, 1_700_000_000_000);
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.message.metadata.tenant_id(), Some("acme"));
+
+        let without_tenant = msg_for("alice", "bob", b"hi");
+        let bytes = encode(&without_tenant, 1_700_000_000_000);
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.message.metadata.tenant_id(), None);
     }
 
     #[tokio::test]
@@ -2155,5 +2379,40 @@ mod tests {
         let drain_now_ms = received_at_ms + 300_000;
         let dwell_ms = drain_now_ms.saturating_sub(decoded.queued_at_ms);
         assert_eq!(dwell_ms, 300_000);
+    }
+
+    /// Pre-#859 v2 envelopes (with `queued_at_ms` but no
+    /// `tenant_id` field) must decode cleanly with
+    /// `tenant = None`. Preserves backward compat for queues that
+    /// flushed during the v2-era window between #729 and #859.
+    #[tokio::test]
+    async fn legacy_v2_record_without_tenant_decodes_with_none() {
+        let received_at_ms: i64 = 1_700_000_000_000;
+        let queued_at_ms: i64 = received_at_ms + 1_500;
+        let body = {
+            let mut buf = BytesMut::new();
+            buf.put_u8(ENVELOPE_VERSION_V2);
+            put_identity(&mut buf, &ident("alice"));
+            buf.put_u8(DEST_DIRECT);
+            put_identity(&mut buf, &ident("bob"));
+            buf.put_u8(MT_CHAT);
+            put_str(&mut buf, "tcp");
+            buf.put_i64(received_at_ms);
+            buf.put_i64(queued_at_ms);
+            // No tenant field — the v2 wire format predates #859.
+            buf.put_i64(-1); // ttl: none
+            let payload = b"v2-payload";
+            buf.put_u32(payload.len() as u32);
+            buf.put_slice(payload);
+            buf.to_vec()
+        };
+
+        let decoded = decode(&body).expect("v2 envelope must decode");
+        assert_eq!(decoded.message.payload.as_ref(), b"v2-payload");
+        assert_eq!(decoded.queued_at_ms, queued_at_ms);
+        assert!(
+            decoded.message.metadata.tenant_id().is_none(),
+            "v2 envelopes carry no tenant tag and must decode to None"
+        );
     }
 }

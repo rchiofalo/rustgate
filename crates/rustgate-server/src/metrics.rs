@@ -176,6 +176,11 @@ static AUTHZ_EVALUATIONS_IN_FLIGHT: OnceLock<IntGauge> = OnceLock::new();
 static ROUTER_FANOUT_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static ROUTER_FANOUT_SUBSCRIBERS: OnceLock<Histogram> = OnceLock::new();
 static ROUTER_DROPPED_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+// #859: per-tenant slices of fan-out and dropped counters. Cardinality
+// of the `tenant` label is capped via `tenant_label_for` so a hostile
+// or buggy tenant-id flood collapses to the `_overflow` sentinel.
+static ROUTER_FANOUT_BY_TENANT_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static ROUTER_DROPPED_BY_TENANT_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static PEP_SEND_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
 static PEP_RECEIVE_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
 static PEP_EVALUATION_SECONDS: OnceLock<HistogramVec> = OnceLock::new();
@@ -1209,6 +1214,35 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(router_dropped_total.clone()))?;
     let _ = ROUTER_DROPPED_TOTAL.set(router_dropped_total);
 
+    // #859: per-tenant slices of fan-out and dropped totals. The
+    // `tenant` label is capped at `MAX_TENANT_LABELS` distinct values
+    // by `tenant_label_for`; once exceeded, every subsequent tenant
+    // collapses to `_overflow` so a tenant-id flood cannot exhaust
+    // Prometheus memory.
+    let router_fanout_by_tenant_total = IntCounterVec::new(
+        Opts::new(
+            "rustgate_router_fanout_by_tenant_total",
+            "Per-tenant slice of `rustgate_router_fanout_total`. The \
+             `tenant` label collapses to `_overflow` once the cap of \
+             MAX_TENANT_LABELS distinct values is reached. Closes #859.",
+        ),
+        &["destination", "tenant"],
+    )?;
+    registry.register(Box::new(router_fanout_by_tenant_total.clone()))?;
+    let _ = ROUTER_FANOUT_BY_TENANT_TOTAL.set(router_fanout_by_tenant_total);
+
+    let router_dropped_by_tenant_total = IntCounterVec::new(
+        Opts::new(
+            "rustgate_router_dropped_by_tenant_total",
+            "Per-tenant slice of `rustgate_router_dropped_total`. The \
+             `tenant` label collapses to `_overflow` once the cap of \
+             MAX_TENANT_LABELS distinct values is reached. Closes #859.",
+        ),
+        &["reason", "tenant"],
+    )?;
+    registry.register(Box::new(router_dropped_by_tenant_total.clone()))?;
+    let _ = ROUTER_DROPPED_BY_TENANT_TOTAL.set(router_dropped_by_tenant_total);
+
     let pep_send_decisions = IntCounterVec::new(
         Opts::new(
             "rustgate_pep_send_decisions_total",
@@ -1476,6 +1510,121 @@ pub fn router_dropped_total() -> &'static IntCounterVec {
     })
 }
 
+/// Per-tenant slice of [`router_fanout_total`]. Closes #859.
+pub fn router_fanout_by_tenant_total() -> &'static IntCounterVec {
+    ROUTER_FANOUT_BY_TENANT_TOTAL.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_router_fanout_by_tenant_total",
+            "fallback",
+            &["destination", "tenant"],
+        )
+    })
+}
+
+/// Per-tenant slice of [`router_dropped_total`]. Closes #859.
+pub fn router_dropped_by_tenant_total() -> &'static IntCounterVec {
+    ROUTER_DROPPED_BY_TENANT_TOTAL.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_router_dropped_by_tenant_total",
+            "fallback",
+            &["reason", "tenant"],
+        )
+    })
+}
+
+// ── #859: per-tenant label cardinality cap ─────────────────────────
+
+/// Per-metric registry of distinct tenant labels seen so far. Once a
+/// metric's set exceeds [`rustgate_core::constants::MAX_TENANT_LABELS`],
+/// every subsequent tenant collapses to
+/// [`rustgate_core::constants::TENANT_OVERFLOW_LABEL`] to prevent
+/// unbounded Prometheus child-metric growth from a tenant-id flood.
+///
+/// Indexed by the metric name so the same tenant id can populate
+/// different metrics independently — this is per-metric cardinality,
+/// not per-process.
+static TENANT_LABEL_REGISTRY: OnceLock<std::sync::Mutex<TenantLabelRegistry>> = OnceLock::new();
+
+#[derive(Default)]
+struct TenantLabelRegistry {
+    /// Per-metric set of distinct tenant labels admitted so far.
+    seen: std::collections::HashMap<&'static str, HashSet<String>>,
+    /// Per-metric flag tracking whether the overflow audit event has
+    /// been emitted yet. We emit at most one event per metric per
+    /// process lifetime to avoid log floods.
+    overflow_audited: HashSet<&'static str>,
+}
+
+fn tenant_label_registry() -> &'static std::sync::Mutex<TenantLabelRegistry> {
+    TENANT_LABEL_REGISTRY.get_or_init(Default::default)
+}
+
+/// Resolve the per-metric tenant label for a Prometheus emission,
+/// applying the [`MAX_TENANT_LABELS`](rustgate_core::constants::MAX_TENANT_LABELS)
+/// cap. Returns either:
+///
+/// 1. The (sanitised) tenant id when the cap has not been reached or
+///    the tenant is already known to the metric.
+/// 2. [`TENANT_OVERFLOW_LABEL`](rustgate_core::constants::TENANT_OVERFLOW_LABEL)
+///    once the cap is exceeded; an audit event records the overflow
+///    once per metric per process.
+/// 3. [`DEFAULT_TENANT_ARCHIVE_KEY`](rustgate_core::constants::DEFAULT_TENANT_ARCHIVE_KEY)
+///    when the input is empty/`None` (legacy / unauthenticated traffic).
+///
+/// `metric_name` MUST be `'static` (the Prometheus metric name) so the
+/// registry can use it as a borrow-free hash key.
+pub fn tenant_label_for(metric_name: &'static str, tenant: Option<&str>) -> String {
+    use rustgate_core::constants::{
+        DEFAULT_TENANT_ARCHIVE_KEY, MAX_TENANT_LABELS, TENANT_OVERFLOW_LABEL,
+    };
+
+    let raw = tenant.unwrap_or("");
+    if raw.is_empty() {
+        return DEFAULT_TENANT_ARCHIVE_KEY.to_string();
+    }
+
+    // Lock the registry for the smallest possible critical section:
+    // membership check, capacity decision, audit-flag set.
+    let registry = tenant_label_registry();
+    let mut guard = match registry.lock() {
+        Ok(g) => g,
+        // Another thread panicked while holding the lock. We do not
+        // need the protected state to be consistent for correctness
+        // (the cap is best-effort) so recovering the inner state
+        // without resetting it is fine.
+        Err(p) => p.into_inner(),
+    };
+    // Split-borrow the two registry fields so the conditional check
+    // and the conditional update each see independent &muts on
+    // disjoint sub-fields. Without this Rust rejects the second
+    // mutable borrow.
+    let TenantLabelRegistry {
+        seen,
+        overflow_audited,
+    } = &mut *guard;
+    let entry = seen.entry(metric_name).or_default();
+    if entry.contains(raw) {
+        return raw.to_string();
+    }
+    if entry.len() < MAX_TENANT_LABELS {
+        let _ = entry.insert(raw.to_string());
+        return raw.to_string();
+    }
+    // Overflow: this is the (cap+1)st distinct tenant for this
+    // metric. Emit the audit event exactly once per metric per
+    // process, then collapse every future tenant to the overflow
+    // sentinel so the Prometheus child-metric count cannot grow
+    // beyond `MAX_TENANT_LABELS + 1`.
+    if !overflow_audited.contains(metric_name) {
+        let _ = overflow_audited.insert(metric_name);
+        // The total distinct count we report is the cap plus this
+        // overflowing tenant — i.e. `cap + 1` at the moment of the
+        // first overflow.
+        rustgate_core::audit::tenant_isolation_label_overflow(metric_name, MAX_TENANT_LABELS + 1);
+    }
+    TENANT_OVERFLOW_LABEL.to_string()
+}
+
 /// Send-PEP decision counter. Wired alongside
 /// [`router_fanout_total`] via `OnPepDecision` at startup.
 pub fn pep_send_decisions() -> &'static IntCounterVec {
@@ -1556,6 +1705,48 @@ pub fn router_fanout_callback() -> rustgate_router::OnFanout {
 pub fn router_dropped_callback() -> rustgate_router::OnDropped {
     Arc::new(|reason: &'static str| {
         router_dropped_total().with_label_values(&[reason]).inc();
+    })
+}
+
+/// Closes #859. Build the [`rustgate_router::OnFanoutByTenant`]
+/// callback that feeds
+/// `rustgate_router_fanout_by_tenant_total{destination, tenant}`. The
+/// `tenant` label is filtered through [`tenant_label_for`] so a tenant
+/// flood collapses to `_overflow` and emits an audit event once.
+pub fn router_fanout_by_tenant_callback() -> rustgate_router::OnFanoutByTenant {
+    Arc::new(
+        |destination: &'static str, tenant: String, _subscribers: u64| {
+            let label = tenant_label_for(
+                "rustgate_router_fanout_by_tenant_total",
+                if tenant.is_empty() {
+                    None
+                } else {
+                    Some(tenant.as_str())
+                },
+            );
+            router_fanout_by_tenant_total()
+                .with_label_values(&[destination, label.as_str()])
+                .inc();
+        },
+    )
+}
+
+/// Closes #859. Build the [`rustgate_router::OnDroppedByTenant`]
+/// callback that feeds
+/// `rustgate_router_dropped_by_tenant_total{reason, tenant}`.
+pub fn router_dropped_by_tenant_callback() -> rustgate_router::OnDroppedByTenant {
+    Arc::new(|reason: &'static str, tenant: String| {
+        let label = tenant_label_for(
+            "rustgate_router_dropped_by_tenant_total",
+            if tenant.is_empty() {
+                None
+            } else {
+                Some(tenant.as_str())
+            },
+        );
+        router_dropped_by_tenant_total()
+            .with_label_values(&[reason, label.as_str()])
+            .inc();
     })
 }
 
@@ -2659,6 +2850,72 @@ mod tests {
         INIT.call_once(|| {
             init().expect("metrics init failed");
         });
+    }
+
+    // ── #859: tenant label cardinality cap ──────────────────────────
+
+    #[test]
+    fn tenant_label_for_caps_at_max_tenant_labels_then_overflows() {
+        // Closes #859 cardinality-safety contract: pump
+        // `MAX_TENANT_LABELS + 1` distinct tenant ids through
+        // `tenant_label_for` for one synthetic metric and verify:
+        //   1. The first MAX_TENANT_LABELS labels return verbatim.
+        //   2. The (cap+1)st label returns `_overflow`.
+        //   3. A subsequent re-emission of an already-known tenant
+        //      still returns verbatim (the cap is on distinct labels,
+        //      not on emissions).
+        //
+        // The cap is applied per-metric so we use a fresh metric
+        // name `_test_tenant_overflow_pump` here that no other test
+        // can pollute. (The registry is process-global static, so we
+        // cannot reset it between tests — picking a unique metric
+        // name is the simplest hermeticity strategy.)
+        const METRIC: &str = "_test_tenant_overflow_pump";
+        use rustgate_core::constants::{MAX_TENANT_LABELS, TENANT_OVERFLOW_LABEL};
+
+        // First MAX_TENANT_LABELS distinct tenants pass through.
+        for i in 0..MAX_TENANT_LABELS {
+            let t = format!("tenant-{i}");
+            let label = tenant_label_for(METRIC, Some(t.as_str()));
+            assert_eq!(label, t, "label {i} must pass through verbatim");
+        }
+        // Re-emitting an already-known tenant is not a new
+        // admission — the cap applies to distinct labels seen, not to
+        // the count of `tenant_label_for` invocations.
+        let label = tenant_label_for(METRIC, Some("tenant-0"));
+        assert_eq!(
+            label, "tenant-0",
+            "re-emitting an already-admitted tenant must still return verbatim"
+        );
+
+        // The (cap+1)st distinct tenant overflows.
+        let label = tenant_label_for(METRIC, Some("tenant-overflower"));
+        assert_eq!(
+            label,
+            TENANT_OVERFLOW_LABEL,
+            "the {}st distinct tenant must collapse to overflow sentinel",
+            MAX_TENANT_LABELS + 1
+        );
+
+        // Subsequent overflowers stay collapsed.
+        let label = tenant_label_for(METRIC, Some("yet-another"));
+        assert_eq!(label, TENANT_OVERFLOW_LABEL);
+    }
+
+    #[test]
+    fn tenant_label_for_empty_or_none_returns_default_bucket() {
+        // Closes #859 default-tenant contract: legacy /
+        // unauthenticated / plaintext sessions land under the
+        // `_default` bucket so their metrics still emit cleanly.
+        use rustgate_core::constants::DEFAULT_TENANT_ARCHIVE_KEY;
+        assert_eq!(
+            tenant_label_for("any_metric", None),
+            DEFAULT_TENANT_ARCHIVE_KEY
+        );
+        assert_eq!(
+            tenant_label_for("any_metric", Some("")),
+            DEFAULT_TENANT_ARCHIVE_KEY
+        );
     }
 
     #[test]

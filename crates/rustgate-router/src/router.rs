@@ -114,6 +114,29 @@ rustgate_core::on_callback!(
 );
 
 rustgate_core::on_callback!(
+    /// Closes #859. Per-tenant counterpart to [`OnFanout`] — fired in
+    /// addition to (not instead of) the legacy callback so existing
+    /// dashboards keep working unchanged. The first argument is the
+    /// same destination label (`"direct"`, `"group"`, `"broadcast"`,
+    /// `"multicast"`); the second is the tenant id captured at the
+    /// router accept path (empty string when the source has no tenant);
+    /// the third is the recipient-session count.
+    pub OnFanoutByTenant,
+    &'static str,
+    String,
+    u64
+);
+
+rustgate_core::on_callback!(
+    /// Closes #859. Per-tenant counterpart to [`OnDropped`]. Same
+    /// `reason` vocabulary as [`OnDropped`]; tenant id captured at the
+    /// router accept path (empty string == no tenant).
+    pub OnDroppedByTenant,
+    &'static str,
+    String
+);
+
+rustgate_core::on_callback!(
     /// Callback invoked once per Send and Receive PEP evaluation by the
     /// router. Arguments are the small fixed-vocabulary direction label
     /// (`"send"` or `"receive"`), the decision label (`"allow"`, `"deny"`,
@@ -1142,6 +1165,10 @@ pub struct Router {
     /// feed the `rustgate_router_dropped_total{reason}` counter.
     /// Hot-reloadable via `ArcSwap`. Closes #768.
     on_dropped: ArcSwap<Option<OnDropped>>,
+    /// Optional per-tenant slice of [`Router::on_fanout`]. Closes #859.
+    on_fanout_by_tenant: ArcSwap<Option<OnFanoutByTenant>>,
+    /// Optional per-tenant slice of [`Router::on_dropped`]. Closes #859.
+    on_dropped_by_tenant: ArcSwap<Option<OnDroppedByTenant>>,
     /// Optional callback fired once per Send / Receive PEP evaluation.
     /// Wired by the server binary to feed the
     /// `rustgate_pep_send_decisions_total` /
@@ -1312,6 +1339,8 @@ impl Default for Router {
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
             on_fanout: ArcSwap::from_pointee(None),
             on_dropped: ArcSwap::from_pointee(None),
+            on_fanout_by_tenant: ArcSwap::from_pointee(None),
+            on_dropped_by_tenant: ArcSwap::from_pointee(None),
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
@@ -1376,6 +1405,8 @@ impl Router {
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
             on_fanout: ArcSwap::from_pointee(None),
             on_dropped: ArcSwap::from_pointee(None),
+            on_fanout_by_tenant: ArcSwap::from_pointee(None),
+            on_dropped_by_tenant: ArcSwap::from_pointee(None),
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
@@ -1429,6 +1460,8 @@ impl Router {
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
             on_fanout: ArcSwap::from_pointee(None),
             on_dropped: ArcSwap::from_pointee(None),
+            on_fanout_by_tenant: ArcSwap::from_pointee(None),
+            on_dropped_by_tenant: ArcSwap::from_pointee(None),
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
@@ -1485,6 +1518,8 @@ impl Router {
             on_multicast_oversize_dropped: ArcSwap::from_pointee(None),
             on_fanout: ArcSwap::from_pointee(None),
             on_dropped: ArcSwap::from_pointee(None),
+            on_fanout_by_tenant: ArcSwap::from_pointee(None),
+            on_dropped_by_tenant: ArcSwap::from_pointee(None),
             on_pep_decision: ArcSwap::from_pointee(None),
             on_obligation_applied: ArcSwap::from_pointee(None),
             on_authz_in_flight_changed: ArcSwap::from_pointee(None),
@@ -1847,6 +1882,19 @@ impl Router {
         self.on_dropped.store(Arc::new(cb));
     }
 
+    /// Install (or replace) the per-tenant fan-out observer (closes
+    /// #859). Fires alongside [`Self::set_on_fanout`] so the legacy
+    /// tenant-blind metric continues to populate.
+    pub fn set_on_fanout_by_tenant(&self, cb: Option<OnFanoutByTenant>) {
+        self.on_fanout_by_tenant.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the per-tenant drop observer (closes
+    /// #859). Fires alongside [`Self::set_on_dropped`].
+    pub fn set_on_dropped_by_tenant(&self, cb: Option<OnDroppedByTenant>) {
+        self.on_dropped_by_tenant.store(Arc::new(cb));
+    }
+
     /// Install (or replace) the per-PEP-decision observer.
     ///
     /// The callback fires once per Send and Receive PEP evaluation
@@ -2052,6 +2100,38 @@ impl Router {
         let guard = self.on_dropped.load();
         if let Some(cb) = (**guard).as_ref() {
             cb(reason);
+        }
+    }
+
+    /// Closes #859. Fire only the per-tenant fanout callback. The
+    /// legacy [`Self::emit_fanout`] continues to fire on its own at
+    /// every existing call site so existing dashboards stay
+    /// unchanged. This sibling is invoked by the public
+    /// [`Self::route_for_egress`] hub after `route_inner` returns,
+    /// rather than at every per-destination fanout site, to avoid
+    /// fanning the per-call clones into 30+ call sites for the MVP.
+    fn emit_fanout_by_tenant(
+        &self,
+        destination: &'static str,
+        subscribers: u64,
+        tenant: Option<&str>,
+    ) {
+        let guard = self.on_fanout_by_tenant.load();
+        if let Some(cb) = (**guard).as_ref() {
+            cb(destination, tenant.unwrap_or("").to_string(), subscribers);
+        }
+    }
+
+    /// Closes #859. Fire only the per-tenant dropped callback. The
+    /// MVP wires this from a single `route_for_egress` post-routing
+    /// hub for the "no_subscribers" / unrouted case so the per-tenant
+    /// dropped counter at least covers the dominant "stuff was sent
+    /// but landed nowhere" pathology. The full per-reason coverage
+    /// is left for follow-up.
+    fn emit_dropped_by_tenant(&self, reason: &'static str, tenant: Option<&str>) {
+        let guard = self.on_dropped_by_tenant.load();
+        if let Some(cb) = (**guard).as_ref() {
+            cb(reason, tenant.unwrap_or("").to_string());
         }
     }
 
@@ -2570,7 +2650,44 @@ impl Router {
             .as_ref()
             .map(|gate| Arc::new(gate.acquire(msg.payload.len())));
 
+        // #859: stamp the originating session's tenant onto the
+        // metadata so downstream surfaces (archive directory layout,
+        // store-and-forward keying, NATS subject prefix, per-tenant
+        // metrics) can partition data at rest without re-deriving the
+        // tenant from `msg.source.tenant`. Idempotent — if a federated
+        // peer already populated the field upstream, we preserve their
+        // value rather than clobbering with our local source identity.
+        let mut msg = msg;
+        if msg.metadata.tenant_id().is_none()
+            && let Some(ref t) = msg.source.tenant
+            && !t.is_empty()
+        {
+            msg.metadata.tenant_id = Some(t.clone());
+        }
+
+        // Capture the resolved tenant + destination kind BEFORE moving
+        // `msg` into `route_inner` — the per-tenant metric callbacks
+        // need both, and after the move we only have an
+        // `Arc<RoutableMessage>` (whose mutated copy may differ).
+        let routed_tenant: Option<String> = msg.metadata.tenant_id().map(str::to_string);
+        let routed_destination_kind = destination_kind(&msg.destination);
+
         let routed = self.route_inner(msg, permit).await;
+
+        // #859: fire the per-tenant fanout / dropped callback once
+        // per `route_for_egress` invocation. We do not slice further
+        // by recipient because the metrics layer caps tenant-label
+        // cardinality at the metric level — the per-recipient fanout
+        // count is already captured by the legacy
+        // `rustgate_router_fanout_total` (no tenant label).
+        match routed.as_ref() {
+            Some(_) => {
+                self.emit_fanout_by_tenant(routed_destination_kind, 1, routed_tenant.as_deref());
+            }
+            None => {
+                self.emit_dropped_by_tenant("no_subscribers", routed_tenant.as_deref());
+            }
+        }
 
         // Closes #861: fire the multicast rebroadcast callback for
         // every successfully routed message. The callback decides
@@ -3193,13 +3310,41 @@ impl Router {
     /// drain fails — the caller should proceed with registration
     /// either way.
     pub async fn drain_offline_messages(&self, cn: &str) -> Vec<RoutableMessage> {
+        // Backward-compatible thin wrapper: drains every entry queued
+        // for `cn`, regardless of tenant. Production callers should
+        // prefer [`Self::drain_offline_messages_for_identity`] which
+        // applies the connecting client's tenant filter.
+        self.drain_offline_messages_for_tenant(cn, None).await
+    }
+
+    /// Tenant-aware drain (closes #859): drain only entries whose
+    /// stored tenant tag matches the connecting client's tenant. A
+    /// `None` tenant filter falls through to legacy
+    /// [`Self::drain_offline_messages`] semantics (every entry).
+    pub async fn drain_offline_messages_for_identity(
+        &self,
+        identity: &rustgate_core::identity::Identity,
+    ) -> Vec<RoutableMessage> {
+        self.drain_offline_messages_for_tenant(&identity.cn, identity.tenant.as_deref())
+            .await
+    }
+
+    async fn drain_offline_messages_for_tenant(
+        &self,
+        cn: &str,
+        tenant: Option<&str>,
+    ) -> Vec<RoutableMessage> {
         let Some(queue) = self.client_queue.clone() else {
             return Vec::new();
         };
         let cn_owned = cn.to_string();
+        let tenant_owned = tenant.map(str::to_string);
         // redb operations are synchronous; run on a blocking thread to
         // avoid stalling the runtime for large drains.
-        let drained = tokio::task::spawn_blocking(move || queue.drain(&cn_owned)).await;
+        let drained = tokio::task::spawn_blocking(move || {
+            queue.drain_for_tenant(&cn_owned, tenant_owned.as_deref())
+        })
+        .await;
         match drained {
             Ok(Ok(m)) => m,
             Ok(Err(e)) => {

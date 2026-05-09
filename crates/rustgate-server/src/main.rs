@@ -1024,6 +1024,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     {
         router.set_on_fanout(Some(metrics::router_fanout_callback()));
         router.set_on_dropped(Some(metrics::router_dropped_callback()));
+        // #859: per-tenant slices of the fanout/dropped counters with
+        // `MAX_TENANT_LABELS` cardinality cap on the `tenant` label.
+        router.set_on_fanout_by_tenant(Some(metrics::router_fanout_by_tenant_callback()));
+        router.set_on_dropped_by_tenant(Some(metrics::router_dropped_by_tenant_callback()));
         router.set_on_pep_decision(Some(metrics::router_pep_decision_callback()));
         router.set_on_obligation_applied(Some(metrics::router_obligation_applied_callback()));
         // Closes #721. Operator-visible drain signal for ArcSwap
