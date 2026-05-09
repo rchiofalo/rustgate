@@ -693,6 +693,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let video_api_slot: Arc<std::sync::OnceLock<rustgate_admin::VideoApiHandler>> =
         Arc::new(std::sync::OnceLock::new());
 
+    #[cfg(all(feature = "metrics", feature = "correlation"))]
+    let correlation_api_slot: Arc<std::sync::OnceLock<rustgate_admin::CorrelationApiHandler>> =
+        Arc::new(std::sync::OnceLock::new());
+
     // Shared shutdown notifier driven by either SIGTERM/Ctrl-C
     // (`shutdown_signal()`) or `POST /api/drain` (closes #791). The
     // accept loop awaits on `shutdown_signal()` which races a tokio
@@ -715,6 +719,8 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         &mgmt_api_slot,
         #[cfg(feature = "video")]
         &video_api_slot,
+        #[cfg(feature = "correlation")]
+        &correlation_api_slot,
         &router_slot,
     )
     .await?;
@@ -1065,7 +1071,16 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         )));
     }
 
-    // ── Video stream catalog (#862) ─────────────────────────────────
+    // ── Video stream catalog (#862) and correlation engine (#848) ───
+    //
+    // The router exposes a single `OnRouted` slot; both the video
+    // stream catalog (passive `b-i-v` ingestion) and the correlation
+    // engine (multi-sensor track fusion) want to ride on it. To avoid
+    // mutually-exclusive feature flags, we compose the two callbacks
+    // into a chain when both features are enabled — each callback
+    // does its own filtering / decoding internally so chaining adds
+    // negligible per-message cost beyond the inactive feature's
+    // individual hot path.
     //
     // Behind `--features video,metrics`, install a passive catalog that
     // captures CoT `b-i-v` events as they flow through the router and
@@ -1075,16 +1090,58 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // `rustgate-admin::server::serve` short-circuits the path when the
     // slot is unset, so non-video builds pay zero cost.
     #[cfg(all(feature = "metrics", feature = "video"))]
-    {
+    let video_callback: Option<rustgate_router::OnRouted> = {
         let catalog = std::sync::Arc::new(rustgate_admin::VideoStreamCatalog::new());
-        router.set_on_routed(Some(rustgate_admin::video::router_callback(Arc::clone(
-            &catalog,
-        ))));
+        let cb = rustgate_admin::video::router_callback(Arc::clone(&catalog));
         let h = rustgate_admin::video::handler(Arc::clone(&catalog));
         let handler: rustgate_admin::VideoApiHandler =
             std::sync::Arc::new(move |m, p, b| h(m, p, b));
         let _ = video_api_slot.set(handler);
         tracing::info!("video stream catalog enabled at /api/video/streams");
+        Some(cb)
+    };
+    #[cfg(not(all(feature = "metrics", feature = "video")))]
+    let video_callback: Option<rustgate_router::OnRouted> = None;
+
+    // Behind `--features correlation,metrics`, install a stateful
+    // correlation engine, wire its `OnRouted` callback, and expose
+    // the live snapshot at `GET /api/correlation/fused-entities`.
+    // The decode path uses the router-installed
+    // `EntityCodecRegistry` so codec failures fall through silently
+    // and routing stays on the un-fused critical path. Closes #848.
+    #[cfg(all(feature = "metrics", feature = "correlation"))]
+    let correlation_callback: Option<rustgate_router::OnRouted> = {
+        let engine = std::sync::Arc::new(rustgate_correlation::CorrelationEngine::new());
+        let cb = rustgate_correlation::router_callback(
+            Arc::clone(&engine),
+            Arc::clone(&entity_codec_registry),
+        );
+        let h = rustgate_admin::correlation::handler(Arc::clone(&engine));
+        let handler: rustgate_admin::CorrelationApiHandler =
+            std::sync::Arc::new(move |m, p, b| h(m, p, b));
+        let _ = correlation_api_slot.set(handler);
+        tracing::info!(
+            "multi-sensor correlation engine enabled at \
+             /api/correlation/fused-entities"
+        );
+        Some(cb)
+    };
+    #[cfg(not(all(feature = "metrics", feature = "correlation")))]
+    let correlation_callback: Option<rustgate_router::OnRouted> = None;
+
+    // Compose video + correlation callbacks into the single `OnRouted`
+    // slot the router exposes. Both callbacks are `Arc<dyn Fn(...)>`,
+    // so chaining is trivial — invoke each in turn.
+    match (video_callback, correlation_callback) {
+        (Some(v), Some(c)) => {
+            router.set_on_routed(Some(std::sync::Arc::new(move |msg| {
+                v(Arc::clone(&msg));
+                c(msg);
+            })));
+        }
+        (Some(v), None) => router.set_on_routed(Some(v)),
+        (None, Some(c)) => router.set_on_routed(Some(c)),
+        (None, None) => {}
     }
 
     #[cfg(feature = "metrics")]

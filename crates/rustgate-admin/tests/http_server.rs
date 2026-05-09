@@ -130,6 +130,8 @@ async fn start_test_server(token: Option<&[u8]>) -> SocketAddr {
             Arc::new(OnceLock::new()),
             #[cfg(feature = "video")]
             Arc::new(OnceLock::new()),
+            #[cfg(feature = "correlation")]
+            Arc::new(OnceLock::new()),
             metrics_token,
             router_slot,
             DEFAULT_MAX_HTTP_CONNECTIONS,
@@ -169,6 +171,8 @@ async fn serve_health_and_metrics_endpoints() {
             Arc::new(OnceLock::new()),
             Arc::new(OnceLock::new()),
             #[cfg(feature = "video")]
+            Arc::new(OnceLock::new()),
+            #[cfg(feature = "correlation")]
             Arc::new(OnceLock::new()),
             None,
             server_router_slot,

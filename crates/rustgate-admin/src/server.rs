@@ -68,6 +68,20 @@ pub type AclApiHandler = Arc<
 pub type VideoApiHandler =
     Arc<dyn Fn(&hyper::Method, &str, &[u8]) -> Option<Response<Full<Bytes>>> + Send + Sync>;
 
+/// Type-erased correlation engine API handler.
+///
+/// When set, the metrics server delegates
+/// `GET /api/correlation/fused-entities` to this handler. Returns
+/// `None` for unrecognized paths so the caller can fall through to
+/// 404. Wired by the server binary under `--features correlation`
+/// (closes #848). The shape mirrors the video catalog handler — sync
+/// `Fn`, no `auth` parameter (the snapshot endpoint is read-only and
+/// unauthenticated by default; operators that need auth wrap the
+/// metrics endpoint in their reverse proxy).
+#[cfg(feature = "correlation")]
+pub type CorrelationApiHandler =
+    Arc<dyn Fn(&hyper::Method, &str, &[u8]) -> Option<Response<Full<Bytes>>> + Send + Sync>;
+
 /// Type-erased management API handler.
 ///
 /// When set, the metrics server delegates requests under `/api/cert/`,
@@ -785,6 +799,7 @@ pub async fn serve(
     acl_api: Arc<OnceLock<AclApiHandler>>,
     mgmt_api: Arc<OnceLock<MgmtApiHandler>>,
     #[cfg(feature = "video")] video_api: Arc<OnceLock<VideoApiHandler>>,
+    #[cfg(feature = "correlation")] correlation_api: Arc<OnceLock<CorrelationApiHandler>>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
     router_slot: RouterSlot,
     max_http_connections: usize,
@@ -823,6 +838,8 @@ pub async fn serve(
         let mgmt_api = Arc::clone(&mgmt_api);
         #[cfg(feature = "video")]
         let video_api = Arc::clone(&video_api);
+        #[cfg(feature = "correlation")]
+        let correlation_api = Arc::clone(&correlation_api);
         let metrics_token = metrics_token.clone();
         let router_slot = Arc::clone(&router_slot);
         spawn_background("metrics-http-conn", async move {
@@ -841,6 +858,8 @@ pub async fn serve(
                         let mgmt_api = Arc::clone(&mgmt_api);
                         #[cfg(feature = "video")]
                         let video_api = Arc::clone(&video_api);
+                        #[cfg(feature = "correlation")]
+                        let correlation_api = Arc::clone(&correlation_api);
                         let metrics_token = metrics_token.clone();
                         let router_slot = Arc::clone(&router_slot);
                         async move {
@@ -870,6 +889,29 @@ pub async fn serve(
                             #[cfg(feature = "video")]
                             if req.uri().path().starts_with("/api/video/")
                                 && let Some(handler) = video_api.get()
+                            {
+                                let method = req.method().clone();
+                                let path = req.uri().path().to_string();
+                                let body = http_body_util::BodyExt::collect(req.into_body())
+                                    .await
+                                    .map(|b| b.to_bytes())
+                                    .unwrap_or_default();
+                                if let Some(resp) = handler(&method, &path, &body) {
+                                    return Ok(resp);
+                                }
+                                return Ok(Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::from("not found")))
+                                    .unwrap_or_else(|_| internal_error_response()));
+                            }
+                            // Delegate /api/correlation/* paths to the
+                            // correlation engine snapshot handler. Closes
+                            // #848. Sync `Fn` because the engine snapshot
+                            // is non-blocking — same shape as the video
+                            // catalog block above.
+                            #[cfg(feature = "correlation")]
+                            if req.uri().path().starts_with("/api/correlation/")
+                                && let Some(handler) = correlation_api.get()
                             {
                                 let method = req.method().clone();
                                 let path = req.uri().path().to_string();

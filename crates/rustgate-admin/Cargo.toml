@@ -21,6 +21,10 @@ missions = ["dep:rustgate-missions"]
 # In-memory video stream catalog populated from CoT `b-i-v` events and
 # exposed at `GET /api/video/streams`. MVP — closes #862.
 video = ["dep:quick-xml"]
+# Multi-sensor track correlation engine snapshot endpoint. Mounts a
+# read-only `GET /api/correlation/fused-entities` route backed by an
+# in-memory `rustgate_correlation::CorrelationEngine`. Closes #848.
+correlation = ["dep:rustgate-correlation"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -30,6 +34,7 @@ rustgate-nats = { workspace = true, optional = true }
 rustgate-federation = { workspace = true, optional = true }
 rustgate-http = { workspace = true, optional = true }
 rustgate-missions = { workspace = true, optional = true }
+rustgate-correlation = { workspace = true, optional = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }

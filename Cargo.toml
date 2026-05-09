@@ -36,6 +36,7 @@ members = [
     "crates/rustgate-foundry",
     "crates/rustgate-dds",
     "crates/rustgate-ogc-sensorthings",
+    "crates/rustgate-correlation",
 ]
 exclude = ["fuzz"]
 
@@ -134,6 +135,11 @@ unicode-normalization = "0.1"
 arc-swap = "1"
 dashmap = "6"
 lru = "0.18.0"
+# R*-tree spatial index for the multi-sensor track correlation engine
+# (`rustgate-correlation`, closes #848). Used to find fused-entity
+# candidates near an incoming sensor report so the gating ladder runs in
+# O(log N) per submit instead of scanning the whole fused-entity map.
+rstar = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 ocsp-stapler = "0.4"
 fastrand = "2"
@@ -194,6 +200,7 @@ rustgate-lattice = { path = "crates/rustgate-lattice" }
 rustgate-foundry = { path = "crates/rustgate-foundry" }
 rustgate-dds = { path = "crates/rustgate-dds" }
 rustgate-ogc-sensorthings = { path = "crates/rustgate-ogc-sensorthings" }
+rustgate-correlation = { path = "crates/rustgate-correlation" }
 
 [profile.release]
 lto = true
