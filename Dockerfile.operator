@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1
+#
+# Image build for the rustgate Kubernetes operator (closes #874).
+#
+# Mirrors the layered cache-then-build pattern from the main `Dockerfile`,
+# but the operator has a much smaller dependency footprint so the cache
+# layer copies only the operator crate's manifests plus the workspace
+# manifests it depends on.
+
+# ── Builder stage ────────────────────────────────────────────────────────
+FROM rust:1.95-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS builder
+
+RUN apk add --no-cache musl-dev make
+
+WORKDIR /src
+
+# Cache dependency build: copy only manifests, create stub sources, build.
+COPY Cargo.toml Cargo.lock ./
+
+# The operator only needs the workspace manifest plus its own crate. Copy
+# every crate manifest so the workspace's `members = […]` resolves; stub
+# the sources so cargo can compute the dependency graph.
+COPY crates/rustgate-admin/Cargo.toml       crates/rustgate-admin/Cargo.toml
+COPY crates/rustgate-archive/Cargo.toml     crates/rustgate-archive/Cargo.toml
+COPY crates/rustgate-asterix/Cargo.toml     crates/rustgate-asterix/Cargo.toml
+COPY crates/rustgate-authz/Cargo.toml       crates/rustgate-authz/Cargo.toml
+COPY crates/rustgate-client/Cargo.toml      crates/rustgate-client/Cargo.toml
+COPY crates/rustgate-mqtt/Cargo.toml        crates/rustgate-mqtt/Cargo.toml
+COPY crates/rustgate-core/Cargo.toml        crates/rustgate-core/Cargo.toml
+COPY crates/rustgate-cot/Cargo.toml         crates/rustgate-cot/Cargo.toml
+COPY crates/rustgate-dis/Cargo.toml         crates/rustgate-dis/Cargo.toml
+COPY crates/rustgate-enrollment/Cargo.toml  crates/rustgate-enrollment/Cargo.toml
+COPY crates/rustgate-federation/Cargo.toml  crates/rustgate-federation/Cargo.toml
+COPY crates/rustgate-guard/Cargo.toml       crates/rustgate-guard/Cargo.toml
+COPY crates/rustgate-http/Cargo.toml       crates/rustgate-http/Cargo.toml
+COPY crates/rustgate-mavlink/Cargo.toml    crates/rustgate-mavlink/Cargo.toml
+COPY crates/rustgate-meshtastic/Cargo.toml crates/rustgate-meshtastic/Cargo.toml
+COPY crates/rustgate-metrics/Cargo.toml    crates/rustgate-metrics/Cargo.toml
+COPY crates/rustgate-nats/Cargo.toml        crates/rustgate-nats/Cargo.toml
+COPY crates/rustgate-nffi/Cargo.toml        crates/rustgate-nffi/Cargo.toml
+COPY crates/rustgate-proto/Cargo.toml       crates/rustgate-proto/Cargo.toml
+COPY crates/rustgate-resilience/Cargo.toml  crates/rustgate-resilience/Cargo.toml
+COPY crates/rustgate-router/Cargo.toml      crates/rustgate-router/Cargo.toml
+COPY crates/rustgate-sapient/Cargo.toml     crates/rustgate-sapient/Cargo.toml
+COPY crates/rustgate-server/Cargo.toml      crates/rustgate-server/Cargo.toml
+COPY crates/rustgate-stanag4586/Cargo.toml  crates/rustgate-stanag4586/Cargo.toml
+COPY crates/rustgate-test-utils/Cargo.toml  crates/rustgate-test-utils/Cargo.toml
+COPY crates/rustgate-tls/Cargo.toml         crates/rustgate-tls/Cargo.toml
+COPY crates/rustgate-transport/Cargo.toml   crates/rustgate-transport/Cargo.toml
+COPY crates/rustgate-vmf/Cargo.toml         crates/rustgate-vmf/Cargo.toml
+COPY crates/rustgate-websocket/Cargo.toml   crates/rustgate-websocket/Cargo.toml
+COPY crates/rustgate-link16/Cargo.toml      crates/rustgate-link16/Cargo.toml
+COPY crates/rustgate-missions/Cargo.toml    crates/rustgate-missions/Cargo.toml
+COPY crates/rustgate-lattice/Cargo.toml     crates/rustgate-lattice/Cargo.toml
+COPY crates/rustgate-foundry/Cargo.toml     crates/rustgate-foundry/Cargo.toml
+COPY crates/rustgate-dds/Cargo.toml         crates/rustgate-dds/Cargo.toml
+COPY crates/rustgate-ogc-sensorthings/Cargo.toml crates/rustgate-ogc-sensorthings/Cargo.toml
+COPY crates/rustgate-correlation/Cargo.toml crates/rustgate-correlation/Cargo.toml
+COPY crates/rustgate-operator/Cargo.toml    crates/rustgate-operator/Cargo.toml
+
+RUN for d in crates/*/; do mkdir -p "$d/src" && echo "" > "$d/src/lib.rs"; done \
+    && mkdir -p crates/rustgate-server/src && echo "fn main() {}" > crates/rustgate-server/src/main.rs \
+    && mkdir -p crates/rustgate-operator/src && echo "fn main() {}" > crates/rustgate-operator/src/main.rs
+
+RUN cargo build --release -p rustgate-operator 2>/dev/null || true
+
+# Now copy real source and build for real.
+COPY . .
+RUN find crates -name "*.rs" -exec touch {} +
+RUN cargo build --release -p rustgate-operator
+
+# ── Runtime stage ────────────────────────────────────────────────────────
+FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
+
+LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
+      org.opencontainers.image.description="Kubernetes operator for the RustgateCluster CRD" \
+      org.opencontainers.image.licenses="LicenseRef-Proprietary"
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -g 10001 -S rustgate && adduser -u 10001 -S rustgate -G rustgate
+
+USER 10001
+
+COPY --from=builder --chmod=755 /src/target/release/rustgate-operator /usr/local/bin/rustgate-operator
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["rustgate-operator"]
+CMD ["run"]

@@ -1,0 +1,31 @@
+[package]
+name = "rustgate-operator"
+description = "Kubernetes operator for the RustgateCluster CRD — closes #874"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rustgate-operator"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+serde_yaml = { workspace = true }

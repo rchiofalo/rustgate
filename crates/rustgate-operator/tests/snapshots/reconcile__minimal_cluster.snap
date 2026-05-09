@@ -1,0 +1,166 @@
+---
+source: crates/rustgate-operator/tests/reconcile.rs
+assertion_line: 62
+expression: yaml
+---
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: rustgate-min
+    app.kubernetes.io/managed-by: rustgate-operator
+    app.kubernetes.io/name: rustgate
+    rustgate.io/cluster: rustgate-min
+  name: rustgate-min-headless
+  namespace: default
+  ownerReferences: []
+spec:
+  clusterIP: None
+  ports:
+  - name: tactical
+    port: 4433
+    protocol: TCP
+    targetPort: 4433
+  - name: federation
+    port: 9001
+    protocol: TCP
+    targetPort: 9001
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/instance: rustgate-min
+    app.kubernetes.io/name: rustgate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: rustgate-min
+    app.kubernetes.io/managed-by: rustgate-operator
+    app.kubernetes.io/name: rustgate
+    rustgate.io/cluster: rustgate-min
+  name: rustgate-min
+  namespace: default
+  ownerReferences: []
+spec:
+  ports:
+  - name: tactical
+    port: 4433
+    protocol: TCP
+    targetPort: 4433
+  selector:
+    app.kubernetes.io/instance: rustgate-min
+    app.kubernetes.io/name: rustgate
+  type: ClusterIP
+---
+apiVersion: v1
+data:
+  rustgate.toml: |+
+    # rustgate.toml — managed by rustgate-operator
+    # Source: RustgateCluster rustgate-min
+
+    [server]
+    tactical-bind = "0.0.0.0:4433"
+
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: rustgate-min
+    app.kubernetes.io/managed-by: rustgate-operator
+    app.kubernetes.io/name: rustgate
+    rustgate.io/cluster: rustgate-min
+  name: rustgate-min-config
+  namespace: default
+  ownerReferences: []
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app.kubernetes.io/instance: rustgate-min
+    app.kubernetes.io/managed-by: rustgate-operator
+    app.kubernetes.io/name: rustgate
+    rustgate.io/cluster: rustgate-min
+  name: rustgate-min
+  namespace: default
+  ownerReferences: []
+spec:
+  podManagementPolicy: Parallel
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: rustgate-min
+      app.kubernetes.io/name: rustgate
+  serviceName: rustgate-min-headless
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: rustgate-min
+        app.kubernetes.io/managed-by: rustgate-operator
+        app.kubernetes.io/name: rustgate
+        rustgate.io/cluster: rustgate-min
+    spec:
+      containers:
+      - args:
+        - --config
+        - /etc/rustgate/rustgate.toml
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: RUSTGATE_CONFIG
+          value: /etc/rustgate/rustgate.toml
+        image: ghcr.io/rchiofalo/rustgate:latest
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          tcpSocket:
+            port: 4433
+        name: rustgate
+        ports:
+        - containerPort: 4433
+          name: tactical
+          protocol: TCP
+        - containerPort: 9001
+          name: federation
+          protocol: TCP
+        readinessProbe:
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          tcpSocket:
+            port: 4433
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /etc/rustgate
+          name: config
+          readOnly: true
+        - mountPath: /certs
+          name: tls
+          readOnly: true
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - configMap:
+          name: rustgate-min-config
+        name: config
+      - name: tls
+        secret:
+          secretName: rustgate-min-tls
+  volumeClaimTemplates: []

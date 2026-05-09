@@ -248,3 +248,69 @@ externalSecrets:
     remoteRef:
       key: ""           # e.g., "production/rustgate/federation-peers"
       property: ""      # optional property within the secret
+
+# Kubernetes operator integration (closes #874).
+#
+# When `operator.enabled: true` the chart deploys the rustgate-operator
+# Deployment alongside the StatefulSet path, and (when `cluster.create:
+# true`) a single `RustgateCluster` instance the operator reconciles. The
+# operator owns the CRD + manifests; the bare StatefulSet path is kept
+# for deployments that prefer to manage the rustgate fleet directly.
+operator:
+  # Master enable switch for the operator-led deployment path.
+  enabled: false
+  image:
+    repository: ghcr.io/rchiofalo/rustgate-operator
+    tag: "0.8.0"
+    pullPolicy: IfNotPresent
+  # CLI args for the operator binary. The MVP ships a `validate` and
+  # `render` subcommand for one-shot use; the live cluster controller is
+  # a deferred follow-up. Override to `["run"]` once the controller is
+  # available.
+  args:
+    - run
+  # Filter for the `tracing` env-filter. `info,rustgate_operator=debug`
+  # is a sensible default for the live controller.
+  logLevel: "info,rustgate_operator=info"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  livenessProbe: {}
+  readinessProbe: {}
+
+# RustgateCluster instance the chart creates when `operator.enabled` is
+# true. Mirrors the CRD schema in `helm/crds/rustgatecluster.yaml`.
+cluster:
+  # Create a `RustgateCluster` resource as part of the chart install.
+  create: true
+  # Override the cluster name. Defaults to the chart fullname template.
+  name: ""
+  replicas: 3
+  # Tactical service port. Defaults to `service.port` (4433).
+  servicePort: ""
+  terminationGracePeriodSeconds: 30
+  certManager:
+    # Name of the cert-manager Issuer or ClusterIssuer. Empty disables
+    # cert-manager integration.
+    issuer: ""
+    issuerKind: ClusterIssuer
+    commonName: ""
+  federation:
+    # When true, the operator generates the federation peer list from
+    # the StatefulSet's stable pod DNS records.
+    autoDiscover: false
+    port: 9001
+  storage:
+    storeForward:
+      # PVC size for the redb-backed store-and-forward queue. Empty
+      # disables provisioning.
+      size: 10Gi
+      storageClass: ""
+    auditLog:
+      # PVC size for the audit log archive. Empty disables provisioning.
+      size: 5Gi
+      storageClass: ""
