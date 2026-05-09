@@ -26,6 +26,13 @@ rustgate-nats = { path = "../crates/rustgate-nats" }
 rustgate-authz = { path = "../crates/rustgate-authz" }
 rustgate-stanag4586 = { path = "../crates/rustgate-stanag4586" }
 rustgate-asterix = { path = "../crates/rustgate-asterix" }
+rustgate-meshtastic = { path = "../crates/rustgate-meshtastic" }
+rustgate-vmf = { path = "../crates/rustgate-vmf" }
+rustgate-dis = { path = "../crates/rustgate-dis" }
+rustgate-link16 = { path = "../crates/rustgate-link16" }
+rustgate-sapient = { path = "../crates/rustgate-sapient" }
+rustgate-nffi = { path = "../crates/rustgate-nffi" }
+rustgate-ogc-sensorthings = { path = "../crates/rustgate-ogc-sensorthings" }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 serde_json = "1"
 rustls-pki-types = { version = "1", features = ["std"] }
@@ -139,4 +146,39 @@ doc = false
 [[bin]]
 name = "asterix_cat021"
 path = "fuzz_targets/asterix_cat021.rs"
+doc = false
+
+[[bin]]
+name = "meshtastic_decode"
+path = "fuzz_targets/meshtastic_decode.rs"
+doc = false
+
+[[bin]]
+name = "vmf_decode"
+path = "fuzz_targets/vmf_decode.rs"
+doc = false
+
+[[bin]]
+name = "dis_entity_state"
+path = "fuzz_targets/dis_entity_state.rs"
+doc = false
+
+[[bin]]
+name = "link16_jreap_frame"
+path = "fuzz_targets/link16_jreap_frame.rs"
+doc = false
+
+[[bin]]
+name = "sapient_decode"
+path = "fuzz_targets/sapient_decode.rs"
+doc = false
+
+[[bin]]
+name = "nffi_document"
+path = "fuzz_targets/nffi_document.rs"
+doc = false
+
+[[bin]]
+name = "sensorthings_observation"
+path = "fuzz_targets/sensorthings_observation.rs"
 doc = false
