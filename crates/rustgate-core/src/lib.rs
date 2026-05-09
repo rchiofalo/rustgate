@@ -23,6 +23,7 @@
 //! in `rustgate-server` propagate every error via `?` and surface them
 //! through `anyhow::Error` at the orchestration layer.
 
+pub mod air_gap;
 pub mod audit;
 pub mod b64;
 pub mod callbacks;

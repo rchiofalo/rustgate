@@ -523,6 +523,28 @@ fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "otel")]
     let otel_layer = if let Some(ref endpoint) = cli.otel_endpoint {
+        // Air-gap enforcement: refuse OTEL endpoints that resolve to
+        // public hostnames or addresses. The exporter is a long-lived
+        // outbound stream, so a misconfigured endpoint here would
+        // continually leak traces to an external destination — exactly
+        // what air-gap mode is meant to prevent.
+        if cli.air_gap {
+            let host = rustgate_core::air_gap::extract_host(endpoint);
+            let permitted = host
+                .map(rustgate_core::air_gap::is_private_host)
+                .unwrap_or(false);
+            if !permitted {
+                rustgate_core::audit::air_gap_violation(
+                    "otel_exporter",
+                    endpoint,
+                    "non-private host",
+                );
+                anyhow::bail!(
+                    "--air-gap rejects --otel-endpoint `{endpoint}`: host is not in the private/loopback/link-local set. \
+                     Configure an in-cluster or loopback collector, or unset --air-gap."
+                );
+            }
+        }
         Some(otel::init_layer(endpoint, &cli.otel_service_name)?)
     } else {
         None

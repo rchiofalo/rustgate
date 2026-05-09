@@ -293,7 +293,9 @@ pub(crate) async fn bind_tls_listener(
     // wrapper is gated on `--features ocsp` because it reuses the
     // OCSP fetcher from the same upstream crate as server stapling.
     #[cfg(feature = "ocsp")]
-    let verifier: std::sync::Arc<dyn rustgate_transport::ClientCertVerifier> = if cli.client_ocsp {
+    let verifier: std::sync::Arc<dyn rustgate_transport::ClientCertVerifier> = if cli.client_ocsp
+        && !cli.air_gap
+    {
         #[cfg(feature = "metrics")]
         let on_hit: Option<rustgate_tls::client_ocsp::OnCacheHit> =
             Some(std::sync::Arc::new(|| {
@@ -322,6 +324,17 @@ pub(crate) async fn bind_tls_listener(
         );
         wrapped as std::sync::Arc<dyn rustgate_transport::ClientCertVerifier>
     } else {
+        if cli.client_ocsp && cli.air_gap {
+            rustgate_core::audit::air_gap_violation(
+                "client_ocsp",
+                "<aia-cert-extension>",
+                "OCSP responder URL not knowable at config time; CRL-only mode under --air-gap",
+            );
+            tracing::warn!(
+                "--client-ocsp ignored under --air-gap; OCSP responders are external by definition. \
+                 Use --crl for revocation in air-gapped deployments."
+            );
+        }
         inner_verifier
     };
 
@@ -343,17 +356,35 @@ pub(crate) async fn bind_tls_listener(
         std::sync::Arc<dyn rustgate_transport::ResolvesServerCert>,
         Option<std::sync::Arc<rustgate_tls::ocsp::Stapler>>,
     ) = if cli.ocsp_stapling {
-        let stapler = rustgate_tls::ocsp::wrap_resolver(reloader.clone());
-        // Preload the active certificate so the stapler queues its first
-        // OCSP fetch immediately rather than waiting for the inaugural
-        // handshake to surface it. This shrinks (but does not eliminate)
-        // the unstapled window at startup; the background fetcher still
-        // needs one cycle (up to ~60s) to actually populate the cache.
-        if let Some(ckey) = reloader.certified_key() {
-            rustgate_tls::ocsp::preload(&stapler, ckey);
+        if cli.air_gap {
+            // Air-gap: OCSP stapling fetches from the issuing CA's OCSP
+            // responder, an external endpoint we cannot enumerate at
+            // config time (it lives in the AIA extension of the
+            // certificate). The only safe posture is to disable
+            // stapling entirely and fall back to CRL-based revocation.
+            rustgate_core::audit::air_gap_violation(
+                "ocsp_stapling",
+                "<aia-cert-extension>",
+                "OCSP responder URL not knowable at config time; CRL-only mode under --air-gap",
+            );
+            tracing::warn!(
+                "--ocsp-stapling ignored under --air-gap; OCSP responders are external by definition. \
+                 Use --crl for revocation in air-gapped deployments."
+            );
+            (reloader.clone(), None)
+        } else {
+            let stapler = rustgate_tls::ocsp::wrap_resolver(reloader.clone());
+            // Preload the active certificate so the stapler queues its first
+            // OCSP fetch immediately rather than waiting for the inaugural
+            // handshake to surface it. This shrinks (but does not eliminate)
+            // the unstapled window at startup; the background fetcher still
+            // needs one cycle (up to ~60s) to actually populate the cache.
+            if let Some(ckey) = reloader.certified_key() {
+                rustgate_tls::ocsp::preload(&stapler, ckey);
+            }
+            tracing::info!("OCSP stapling enabled for server certificate");
+            (stapler.clone(), Some(stapler))
         }
-        tracing::info!("OCSP stapling enabled for server certificate");
-        (stapler.clone(), Some(stapler))
     } else {
         (reloader.clone(), None)
     };
@@ -696,6 +727,41 @@ pub(crate) async fn connect_http(
             return None;
         }
     };
+
+    // Air-gap enforcement: reject any target whose URL host falls
+    // outside the private/loopback/link-local set. Each violation emits
+    // an audit event so the operator's compliance trail captures the
+    // exact endpoint that tripped the gate. We refuse the entire HTTP
+    // subsystem rather than silently dropping individual targets — a
+    // partial bring-up would be worse than no bring-up because
+    // downstream observers might assume "no targets configured" rather
+    // than "some targets refused."
+    if cli.air_gap {
+        let mut violations: Vec<String> = Vec::new();
+        for target in &config.targets {
+            let host = rustgate_core::air_gap::extract_host(&target.url);
+            let permitted = host
+                .map(rustgate_core::air_gap::is_private_host)
+                .unwrap_or(false);
+            if !permitted {
+                rustgate_core::audit::air_gap_violation(
+                    "http_egress",
+                    &target.url,
+                    "non-private host",
+                );
+                violations.push(target.name.clone());
+            }
+        }
+        if !violations.is_empty() {
+            tracing::warn!(
+                violations = ?violations,
+                "--air-gap rejects HTTP egress: {} target(s) point outside the private address space; HTTP bridge will not start",
+                violations.len()
+            );
+            return None;
+        }
+    }
+
     match rustgate_http::HttpPublisher::new(config) {
         Ok(publisher) => {
             let p = publisher.clone();
@@ -1918,12 +1984,34 @@ pub(crate) fn start_federation_peer_discovery(
                 );
             }
             #[cfg(feature = "peer-discovery-consul")]
-            PeerDiscoveryBackend::Consul => Arc::new(
-                rustgate_federation::discovery::consul::ConsulDiscovery::new(
-                    cli.federation_peer_discovery_consul_addr.clone(),
-                    cli.federation_peer_discovery_consul_service.clone(),
-                )?,
-            ),
+            PeerDiscoveryBackend::Consul => {
+                if cli.air_gap {
+                    let host = rustgate_core::air_gap::extract_host(
+                        &cli.federation_peer_discovery_consul_addr,
+                    );
+                    let permitted = host
+                        .map(rustgate_core::air_gap::is_private_host)
+                        .unwrap_or(false);
+                    if !permitted {
+                        rustgate_core::audit::air_gap_violation(
+                            "peer_discovery_consul",
+                            &cli.federation_peer_discovery_consul_addr,
+                            "non-private host",
+                        );
+                        anyhow::bail!(
+                            "--air-gap rejects --federation-peer-discovery-consul-addr `{}`: \
+                             host is not in the private/loopback/link-local set.",
+                            cli.federation_peer_discovery_consul_addr
+                        );
+                    }
+                }
+                Arc::new(
+                    rustgate_federation::discovery::consul::ConsulDiscovery::new(
+                        cli.federation_peer_discovery_consul_addr.clone(),
+                        cli.federation_peer_discovery_consul_service.clone(),
+                    )?,
+                )
+            }
             #[cfg(not(feature = "peer-discovery-consul"))]
             PeerDiscoveryBackend::Consul => {
                 anyhow::bail!(
@@ -1942,6 +2030,25 @@ pub(crate) fn start_federation_peer_discovery(
                     anyhow::bail!(
                         "--federation-peer-discovery-etcd-endpoints must contain at least one endpoint"
                     );
+                }
+                if cli.air_gap {
+                    for ep in &endpoints {
+                        let host = rustgate_core::air_gap::extract_host(ep);
+                        let permitted = host
+                            .map(rustgate_core::air_gap::is_private_host)
+                            .unwrap_or(false);
+                        if !permitted {
+                            rustgate_core::audit::air_gap_violation(
+                                "peer_discovery_etcd",
+                                ep,
+                                "non-private host",
+                            );
+                            anyhow::bail!(
+                                "--air-gap rejects --federation-peer-discovery-etcd-endpoints entry `{ep}`: \
+                                 host is not in the private/loopback/link-local set."
+                            );
+                        }
+                    }
                 }
                 Arc::new(rustgate_federation::discovery::etcd::EtcdDiscovery::new(
                     endpoints,

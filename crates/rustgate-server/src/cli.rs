@@ -242,6 +242,18 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_FIPS_REQUIRED")]
     pub(crate) fips_required: bool,
 
+    /// Run in air-gap mode. Every external-facing subsystem refuses
+    /// non-private endpoints at startup: HTTP egress targets, OTEL
+    /// exporters, peer-discovery (Consul / etcd / DNS-SD), and OCSP
+    /// fetching. Acceptable hosts are RFC 1918 / loopback / link-local
+    /// IPv4, IPv6 ULA / loopback / link-local, plus the
+    /// `localhost`, `*.localhost`, `local`, and `*.local` (mDNS) DNS
+    /// labels. Violations refuse to start the affected subsystem and
+    /// emit `audit::air_gap_violation`. The mTLS data plane is
+    /// unaffected — peers may still connect from any address.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_AIR_GAP")]
+    pub(crate) air_gap: bool,
+
     /// Prefer post-quantum key exchange (X25519MLKEM768). Build with
     /// --features post-quantum to enable. PQ-capable clients negotiate hybrid
     /// PQ+classical key exchange; others fall back to X25519 transparently.
@@ -2113,6 +2125,7 @@ define_config_file! {
     tls_min_version: String,
     crl_warn_stale: bool,
     fips_required: bool,
+    air_gap: bool,
     prefer_post_quantum: bool,
     kx_groups: Option<String>,
     cert_reload_interval: u64,
