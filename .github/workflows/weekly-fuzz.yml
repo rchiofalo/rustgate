@@ -36,6 +36,16 @@ jobs:
           - v2_federation_convert
           - ws_frame
           - xml_stream_codec
+          - asterix_cat021
+          - asterix_cat062
+          - stanag4586_vehicle_position
+          - meshtastic_decode
+          - vmf_decode
+          - dis_entity_state
+          - link16_jreap_frame
+          - sapient_decode
+          - nffi_document
+          - sensorthings_observation
     name: fuzz-extended (${{ matrix.target }})
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

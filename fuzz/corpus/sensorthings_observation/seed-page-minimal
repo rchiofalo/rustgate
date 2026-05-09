@@ -1,0 +1,10 @@
+{
+  "@iot.count": 1,
+  "value": [
+    {
+      "@iot.id": 42,
+      "phenomenonTime": "2026-05-08T12:00:00Z",
+      "result": 23.5
+    }
+  ]
+}
