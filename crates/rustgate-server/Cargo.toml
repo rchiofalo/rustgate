@@ -87,6 +87,14 @@ video = ["rustgate-admin/video"]
 # the live snapshot at `GET /api/correlation/fused-entities` via the
 # admin HTTP server. MVP — closes #848.
 correlation = ["dep:rustgate-correlation", "rustgate-admin/correlation"]
+# Marti API compatibility shim (`/Marti/api/*`) for drop-in TAK Server
+# replacement (closes #863). Pulls the upstream feature on
+# `rustgate-admin` and the optional subsystems it depends on.
+marti-compat = [
+    "rustgate-admin/marti-compat",
+    "enrollment",
+    "video",
+]
 # Anduril Lattice bidirectional adapter (`rustgate-lattice`). The trait,
 # config, mock backend, and router wiring all live in `rustgate-lattice`;
 # this feature pulls the crate in and turns on the `cfg!(feature =

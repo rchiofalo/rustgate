@@ -251,6 +251,7 @@ cargo build --release --all-features
 | `peer-discovery` | DNS-SD, Consul, etcd federation peer discovery | — |
 | `jemalloc` | jemalloc allocator | — |
 | `video` | CoT `b-i-v` video stream catalog with `GET /api/video/streams` | — |
+| `marti-compat` | Marti API compatibility shim (`/Marti/api/*`) for drop-in TAK Server replacement | — |
 
 #### SPIFFE workload identity
 

@@ -8,6 +8,7 @@ rustgate exposes several HTTP/HTTPS endpoints across different ports and feature
 |--------|-------------|---------------|------|----------|
 | Metrics / Health | 9090 | `metrics` | None | HTTP |
 | Federation API | 9090 | `federation` + `metrics` | None | HTTP |
+| Marti API (`/Marti/api/*`) | 9090 | `marti-compat` | Basic (signClient) / Bearer (read-only) | HTTP |
 | Enrollment | Configurable | `enrollment` | Basic / None | HTTPS |
 | WebSocket | Configurable | `websocket` | mTLS | WSS |
 
@@ -1085,6 +1086,139 @@ websocat wss://server:8444/ \
   --tls-key client-key.pem \
   --tls-ca ca.pem
 ```
+
+---
+
+## Marti API Compatibility (`/Marti/api/*`)
+
+Drop-in TAK Server replacement surface, mounted on the admin HTTP server (default port 9090) when the `marti-compat` feature is enabled. Every endpoint maps a TAK-compatible URL onto an existing rustgate subsystem; this is a compatibility shim, not new functionality. ATAK / WinTAK / iTAK clients connect with no reconfiguration. Closes #863.
+
+The URL prefix `/Marti/` is **case-sensitive** with a capital `M` — ATAK builds the URL with that exact spelling and rustgate matches it byte-for-byte. Any other casing (e.g. `/marti/`) returns a 404 fall-through.
+
+### Endpoint summary
+
+| Marti endpoint                       | Maps to                                              | Auth                                |
+| ------------------------------------ | ---------------------------------------------------- | ----------------------------------- |
+| `POST /Marti/api/tls/signClient[/]`  | `rustgate-enrollment` CSR signer → PKCS#12 (`.p12`)  | HTTP Basic (TAK enrollment flow)    |
+| `GET  /Marti/api/tls/config`         | CA cert + accepted ciphers + protocol versions       | None (unauthenticated preflight)    |
+| `GET  /Marti/api/missions`           | `rustgate-missions` lightweight package store        | Bearer token (when configured)      |
+| `GET  /Marti/api/contacts/all`       | Connected client list from the router                | Bearer token (when configured)      |
+| `GET  /Marti/api/video`              | Video stream catalog from `rustgate-admin::video`    | Bearer token (when configured)      |
+
+When no bearer token is configured, the GET endpoints fall through to "open" — the same disposition the existing `signClient` enrollment endpoint uses, on the assumption the admin port is fronted by mTLS.
+
+### POST /Marti/api/tls/signClient
+
+ATAK posts a PKCS#10 CSR (PEM) and expects a PKCS#12 (`.p12`) bundle in response containing the signed client certificate plus the CA chain.
+
+**Authentication:** HTTP Basic. The authenticated username overrides any subject in the CSR (subject-injection-proof). Both a trailing-slash and trailing-slash-free URL are accepted because pre-2024 TAK Server ships the route both ways.
+
+**Request:**
+
+```bash
+curl -u operator:secret \
+  --data-binary @client.csr \
+  https://rustgate.example.com:9090/Marti/api/tls/signClient \
+  -o client.p12
+```
+
+**Response:** binary PKCS#12 bundle, `Content-Type: application/x-pkcs12`. The standard TAK ecosystem password (`atakatak`) is used for the bundle's HMAC-SHA1 integrity layer; the certificate bags themselves are unencrypted because the password is publicly known and confidentiality is provided by the mTLS-protected channel.
+
+### GET /Marti/api/tls/config
+
+Unauthenticated preflight returning the CA cert (base64 DER) plus the static cipher / protocol-version list rustgate's TLS provider accepts.
+
+```bash
+curl https://rustgate.example.com:9090/Marti/api/tls/config
+```
+
+```json
+{
+  "version": "3",
+  "type": "TlsConfig",
+  "data": {
+    "organization": "rustgate-deployment",
+    "caCert": "MIID...",
+    "acceptedCiphers": ["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256", "..."],
+    "protocolVersions": ["TLSv1.3", "TLSv1.2"]
+  },
+  "nodeId": "rustgate"
+}
+```
+
+ATAK is tolerant about extra / missing fields in this response — rustgate ships a stable JSON shape rather than reproducing TAK Server's exact XML envelope.
+
+### GET /Marti/api/missions
+
+Returns the lightweight Mission Packages store (`rustgate-missions`) inventory inside the Marti `Mission` envelope. Empty when no store is wired in — silent-success rather than error so an ATAK client polling for missions does not spam the log.
+
+```json
+{
+  "version": "3",
+  "type": "Mission",
+  "data": [
+    {
+      "name": "ops-overlay.zip",
+      "hash": "5bf1fd927dfb...",
+      "size": 4096,
+      "creatorUid": "operator-1",
+      "uploadTime": 1715040000
+    }
+  ],
+  "nodeId": "rustgate"
+}
+```
+
+### GET /Marti/api/contacts/all
+
+Returns connected clients in the field-stable ATAK shape. The field names are load-bearing — every Marti consumer relies on them.
+
+```json
+[
+  {
+    "uid": "alpha-1",
+    "callsign": "Alpha-One",
+    "team": "Team-Red",
+    "role": "Team Member",
+    "takv": "rustgate",
+    "endpoint": "*:-1:stcp",
+    "lastStatus": "Connected",
+    "filterGroups": ["Team-Red", "All"]
+  }
+]
+```
+
+### GET /Marti/api/video
+
+Returns the in-memory CoT `b-i-v` video stream catalog (`rustgate-admin::video`) in the Marti `Feed` envelope. Each entry carries the stream URL, the per-stream `protocol` (inferred from the URL scheme), and the sensor framing block ATAK uses to drive the in-app feed list.
+
+```json
+{
+  "version": "3",
+  "type": "Feed",
+  "data": [
+    {
+      "uid": "VID-A",
+      "alias": "VID-A",
+      "url": "rtsp://10.0.0.1/feed",
+      "protocol": "rtsp",
+      "address": "rtsp://10.0.0.1/feed",
+      "fov": 42.5,
+      "azimuth": 180.0,
+      "elevation": -15.0,
+      "lat": 35.0,
+      "lon": -100.0
+    }
+  ],
+  "nodeId": "rustgate"
+}
+```
+
+### Out of scope (deferred)
+
+- `Marti/api/sync/*` (mission sync — lands with the rest of #860)
+- `Marti/api/cot/xml` (live CoT push — would need a WebSocket tap into the router)
+- Deprecated XML response variants (we ship JSON only — ATAK is tolerant about format)
 
 ---
 
