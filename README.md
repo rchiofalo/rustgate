@@ -40,6 +40,8 @@ rustgate is a lightweight alternative that handles mTLS client connections, rout
 
 ## Quick Start
 
+> **New here?** Start with the [**10-minute walkthrough**](docs/getting-started.md) — `git clone` to a routed message in ten minutes, no Docker required. Then read the [**mental model**](docs/mental-model.md) to understand how rustgate thinks.
+
 Generate test certificates and run with Docker Compose:
 
 ```bash
@@ -789,6 +791,8 @@ All tests use ephemeral certificates generated at runtime via `rustgate-test-uti
 
 | Document | Description |
 |----------|-------------|
+| [**Getting Started**](docs/getting-started.md) | Run a local rustgate with one client connected, end to end, in ten minutes |
+| [**Mental Model**](docs/mental-model.md) | The four abstractions, the message lifecycle, and the four extension points |
 | [Architecture](docs/architecture.md) | System design and crate responsibilities |
 | [Protocol Specification](docs/protocol.md) | Wire format, framing, codecs, routing, federation, HA |
 | [TLS Certificates](docs/tls-certificates.md) | Certificate requirements, generation, and management |
