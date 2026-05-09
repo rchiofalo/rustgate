@@ -44,7 +44,7 @@ use rustgate_core::message::RoutableMessage;
 /// [`rustgate_core::message::Metadata::tenant_id`] gets its own daily
 /// rotation cycle under `<dir>/<tenant>/`. Messages with no tenant id
 /// land under
-/// [`DEFAULT_TENANT_ARCHIVE_KEY`].
+/// `DEFAULT_TENANT_ARCHIVE_KEY`.
 pub struct CotArchiver {
     dir: PathBuf,
     key_ring: Option<Arc<crate::encrypted::KeyRing>>,
@@ -77,7 +77,7 @@ struct TenantState {
 
 /// Per-tenant rotation state. The outer map is keyed by the resolved
 /// tenant bucket (the populated `tenant_id` or
-/// [`DEFAULT_TENANT_ARCHIVE_KEY`]). Each tenant rotates and rolls
+/// `DEFAULT_TENANT_ARCHIVE_KEY`). Each tenant rotates and rolls
 /// independently — a flood of messages from one tenant cannot starve
 /// another tenant of its own daily rotation tick.
 #[derive(Default)]
@@ -86,7 +86,7 @@ struct ArchiverInner {
 }
 
 /// Resolve the on-disk tenant bucket for a message: the message's
-/// populated `tenant_id`, or [`DEFAULT_TENANT_ARCHIVE_KEY`] when absent.
+/// populated `tenant_id`, or `DEFAULT_TENANT_ARCHIVE_KEY` when absent.
 ///
 /// Sanitises path-traversal characters (`/`, `\`, NUL) to `_` so a
 /// hostile cert Organization field cannot escape the archive directory.
@@ -105,7 +105,7 @@ fn resolve_tenant_bucket(msg: &RoutableMessage) -> String {
 /// Replace path-traversal characters (`/`, `\`, NUL) and leading dots
 /// with `_` so the resulting string is safe to use as a single
 /// directory-name component. Returns the
-/// [`DEFAULT_TENANT_ARCHIVE_KEY`] sentinel when sanitisation produces
+/// `DEFAULT_TENANT_ARCHIVE_KEY` sentinel when sanitisation produces
 /// an empty string.
 fn sanitize_tenant_path_component(raw: &str) -> String {
     let mut cleaned: String = raw
@@ -234,7 +234,7 @@ impl CotArchiver {
     }
 
     /// Backward-compatible single-segment accessor: returns the
-    /// active path for [`DEFAULT_TENANT_ARCHIVE_KEY`].
+    /// active path for `DEFAULT_TENANT_ARCHIVE_KEY`.
     ///
     /// Pre-#859 callers (and tests written against the single-segment
     /// model) continue to compile. New callers that need to enumerate

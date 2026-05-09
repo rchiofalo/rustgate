@@ -1568,7 +1568,7 @@ fn tenant_label_registry() -> &'static std::sync::Mutex<TenantLabelRegistry> {
 /// 2. [`TENANT_OVERFLOW_LABEL`](rustgate_core::constants::TENANT_OVERFLOW_LABEL)
 ///    once the cap is exceeded; an audit event records the overflow
 ///    once per metric per process.
-/// 3. [`DEFAULT_TENANT_ARCHIVE_KEY`]
+/// 3. `DEFAULT_TENANT_ARCHIVE_KEY`
 ///    when the input is empty/`None` (legacy / unauthenticated traffic).
 ///
 /// `metric_name` MUST be `'static` (the Prometheus metric name) so the
