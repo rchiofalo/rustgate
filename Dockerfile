@@ -49,10 +49,12 @@ COPY crates/rustgate-foundry/Cargo.toml     crates/rustgate-foundry/Cargo.toml
 COPY crates/rustgate-dds/Cargo.toml         crates/rustgate-dds/Cargo.toml
 COPY crates/rustgate-ogc-sensorthings/Cargo.toml crates/rustgate-ogc-sensorthings/Cargo.toml
 COPY crates/rustgate-correlation/Cargo.toml crates/rustgate-correlation/Cargo.toml
+COPY crates/rustgate-operator/Cargo.toml    crates/rustgate-operator/Cargo.toml
 
 # Stub lib.rs / main.rs so cargo can resolve and fetch deps.
 RUN for d in crates/*/; do mkdir -p "$d/src" && echo "" > "$d/src/lib.rs"; done \
-    && mkdir -p crates/rustgate-server/src && echo "fn main() {}" > crates/rustgate-server/src/main.rs
+    && mkdir -p crates/rustgate-server/src && echo "fn main() {}" > crates/rustgate-server/src/main.rs \
+    && mkdir -p crates/rustgate-operator/src && echo "fn main() {}" > crates/rustgate-operator/src/main.rs
 
 # Proto files are needed at build time by rustgate-proto and rustgate-federation.
 COPY crates/rustgate-proto/proto crates/rustgate-proto/proto

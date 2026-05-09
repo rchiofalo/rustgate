@@ -1,0 +1,58 @@
+{{- if .Values.operator.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "rustgate.fullname" . }}-operator
+  labels:
+    {{- include "rustgate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "rustgate.fullname" . }}-operator
+  labels:
+    {{- include "rustgate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+rules:
+  # Watch and update the RustgateCluster CRD plus its status subresource.
+  - apiGroups: ["rustgate.io"]
+    resources: ["rustgateclusters", "rustgateclusters/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Server-side apply the owned StatefulSets, Services, and ConfigMaps.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read pod state for observed-status (readyReplicas).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # cert-manager Certificate resources, only when cert-manager is in use.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Event emission so `kubectl describe rustgatecluster` shows progress.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "rustgate.fullname" . }}-operator
+  labels:
+    {{- include "rustgate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "rustgate.fullname" . }}-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "rustgate.fullname" . }}-operator
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -1,0 +1,32 @@
+{{- if and .Values.operator.enabled .Values.cluster.create }}
+apiVersion: rustgate.io/v1alpha1
+kind: RustgateCluster
+metadata:
+  name: {{ default (include "rustgate.fullname" .) .Values.cluster.name }}
+  labels:
+    {{- include "rustgate.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.cluster.replicas }}
+  image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+  imagePullPolicy: {{ .Values.image.pullPolicy }}
+  servicePort: {{ .Values.cluster.servicePort | default .Values.service.port }}
+  terminationGracePeriodSeconds: {{ .Values.cluster.terminationGracePeriodSeconds | default 30 }}
+  {{- if .Values.cluster.certManager.issuer }}
+  certManager:
+    issuer: {{ .Values.cluster.certManager.issuer | quote }}
+    issuerKind: {{ .Values.cluster.certManager.issuerKind | quote }}
+    {{- with .Values.cluster.certManager.commonName }}
+    commonName: {{ . | quote }}
+    {{- end }}
+  {{- end }}
+  federation:
+    autoDiscover: {{ .Values.cluster.federation.autoDiscover }}
+    port: {{ .Values.cluster.federation.port }}
+  storage:
+    storeForward:
+      size: {{ .Values.cluster.storage.storeForward.size | quote }}
+      storageClass: {{ .Values.cluster.storage.storeForward.storageClass | quote }}
+    auditLog:
+      size: {{ .Values.cluster.storage.auditLog.size | quote }}
+      storageClass: {{ .Values.cluster.storage.auditLog.storageClass | quote }}
+{{- end }}

@@ -1,0 +1,196 @@
+# CRD for the rustgate Kubernetes operator (closes #874).
+#
+# Helm 3 installs CRDs from `helm/crds/*.yaml` once on first install and
+# does not modify them on upgrade — this is the standard Helm pattern for
+# CRDs and the right behaviour for a long-lived cluster operator.
+#
+# Apply manually with:
+#   kubectl apply -f helm/crds/rustgatecluster.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rustgateclusters.rustgate.io
+  labels:
+    app.kubernetes.io/name: rustgate-operator
+    app.kubernetes.io/managed-by: rustgate-operator
+spec:
+  group: rustgate.io
+  scope: Namespaced
+  names:
+    kind: RustgateCluster
+    listKind: RustgateClusterList
+    plural: rustgateclusters
+    singular: rustgatecluster
+    shortNames:
+      - rg
+      - rgc
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Replicas
+          type: integer
+          jsonPath: .spec.replicas
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas
+        - name: Image
+          type: string
+          jsonPath: .spec.image
+          priority: 1
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - replicas
+                - image
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                  default: 1
+                  description: Number of rustgate replicas to run.
+                image:
+                  type: string
+                  default: ghcr.io/rchiofalo/rustgate:latest
+                  description: Container image for the rustgate replicas.
+                imagePullPolicy:
+                  type: string
+                  enum:
+                    - IfNotPresent
+                    - Always
+                    - Never
+                  default: IfNotPresent
+                  description: Kubernetes imagePullPolicy.
+                servicePort:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                  default: 4433
+                  description: Port on which the rustgate tactical mTLS listener accepts connections.
+                terminationGracePeriodSeconds:
+                  type: integer
+                  minimum: 1
+                  default: 30
+                  description: |
+                    Pod termination grace period. Must exceed the rustgate
+                    `SubsystemHandle` 5 s drain budget plus the preStop sleep.
+                certManager:
+                  type: object
+                  description: |
+                    Optional cert-manager integration. When present, the
+                    operator emits a `cert-manager.io/v1/Certificate` per
+                    cluster with SANs covering the headless service and
+                    every replica's pod DNS name.
+                  required:
+                    - issuer
+                  properties:
+                    issuer:
+                      type: string
+                      description: Name of the cert-manager Issuer or ClusterIssuer.
+                    issuerKind:
+                      type: string
+                      enum:
+                        - Issuer
+                        - ClusterIssuer
+                      default: ClusterIssuer
+                    commonName:
+                      type: string
+                      description: |
+                        CN on the issued cert. Defaults to the cluster name
+                        when omitted.
+                federation:
+                  type: object
+                  description: Federation configuration.
+                  properties:
+                    autoDiscover:
+                      type: boolean
+                      default: false
+                      description: |
+                        When true, the operator generates the federation
+                        peer list from the StatefulSet's stable pod DNS
+                        records and writes it into the rendered ConfigMap.
+                    port:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 9001
+                      description: V2 federation listen port.
+                storage:
+                  type: object
+                  description: Persistent storage configuration.
+                  properties:
+                    storeForward:
+                      type: object
+                      description: Store-and-forward queue PVC.
+                      properties:
+                        size:
+                          type: string
+                          description: |
+                            PVC `requests.storage` value (e.g. "10Gi").
+                            Empty disables provisioning.
+                        storageClass:
+                          type: string
+                          description: storageClassName. Empty uses cluster default.
+                    auditLog:
+                      type: object
+                      description: Audit log archive PVC.
+                      properties:
+                        size:
+                          type: string
+                        storageClass:
+                          type: string
+            status:
+              type: object
+              description: Operator-reported status.
+              properties:
+                readyReplicas:
+                  type: integer
+                  description: Number of replicas that are Ready.
+                availableReplicas:
+                  type: integer
+                  description: Number of replicas matching the selector regardless of Ready.
+                lastReconciled:
+                  type: string
+                  format: date-time
+                  description: RFC 3339 timestamp of the last successful reconcile.
+                conditions:
+                  type: array
+                  description: |
+                    Standard Kubernetes condition list. Reports
+                    `Ready` and `Progressing` conditions.
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - reason
+                      - lastTransitionTime
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - "Unknown"
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
