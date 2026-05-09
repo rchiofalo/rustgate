@@ -44,7 +44,7 @@ use rustgate_core::message::RoutableMessage;
 /// [`rustgate_core::message::Metadata::tenant_id`] gets its own daily
 /// rotation cycle under `<dir>/<tenant>/`. Messages with no tenant id
 /// land under
-/// [`DEFAULT_TENANT_ARCHIVE_KEY`](rustgate_core::constants::DEFAULT_TENANT_ARCHIVE_KEY).
+/// [`DEFAULT_TENANT_ARCHIVE_KEY`].
 pub struct CotArchiver {
     dir: PathBuf,
     key_ring: Option<Arc<crate::encrypted::KeyRing>>,
