@@ -169,6 +169,72 @@ jobs:
             --predicate sbom-container.spdx.json \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
 
+      # ── CycloneDX source SBOM ────────────────────────────────────
+      # Some downstream compliance pipelines (Iron Bank, NTIA "Minimum
+      # Elements for an SBOM") prefer CycloneDX over SPDX. We publish
+      # both: the SPDX flow above attests the container image, and the
+      # CycloneDX flow below produces a workspace-level SBOM in JSON
+      # and XML for archival in the release notes. The job is
+      # best-effort and never gates the release.
+      - name: Generate CycloneDX SBOM (source)
+        id: cyclonedx
+        if: ${{ !cancelled() && steps.push.conclusion == 'success' }}
+        continue-on-error: true
+        run: |
+          cargo install --locked cargo-cyclonedx --version 0.5.7
+          cargo cyclonedx --format json --override-filename rustgate.cdx
+          # The XML form is also accepted by the CycloneDX tooling; emit
+          # both so consumers can pick whichever format their pipeline
+          # consumes natively.
+          cargo cyclonedx --format xml --override-filename rustgate.cdx
+          # Move the generated files to the workspace root so the
+          # signing / upload steps below can find them with predictable
+          # paths regardless of where cargo-cyclonedx writes them.
+          find . -maxdepth 3 -name 'rustgate.cdx.json' -exec cp {} ./rustgate.cdx.json \; -quit
+          find . -maxdepth 3 -name 'rustgate.cdx.xml' -exec cp {} ./rustgate.cdx.xml \; -quit
+          ls -la rustgate.cdx.* || true
+
+      - name: Sign CycloneDX SBOM with cosign (key-signed)
+        # TODO(operator): set the `COSIGN_KEY` repository secret to a
+        # cosign private key (`cosign generate-key-pair`) and the
+        # `COSIGN_PASSWORD` secret to its passphrase. Without those
+        # secrets the step is silently skipped — consumers in forks /
+        # mirrors are not blocked from building. The keyless OIDC
+        # signature on the container image continues to work without
+        # this secret because it uses GitHub's OIDC issuer.
+        if: ${{ !cancelled() && steps.cyclonedx.outcome == 'success' && env.COSIGN_KEY != '' }}
+        env:
+          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        continue-on-error: true
+        run: |
+          # Write the key out to a tmpfs path; cosign accepts it via
+          # `--key`. The runner cleans /tmp at end of job.
+          install -m 0600 /dev/null /tmp/cosign.key
+          printf '%s' "$COSIGN_KEY" > /tmp/cosign.key
+          cosign sign-blob --yes \
+            --key /tmp/cosign.key \
+            --output-signature rustgate.cdx.json.sig \
+            rustgate.cdx.json
+          rm -f /tmp/cosign.key
+
+      - name: Upload CycloneDX SBOM to release
+        if: ${{ !cancelled() && steps.cyclonedx.outcome == 'success' && github.event_name == 'release' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Best-effort upload of the CycloneDX SBOM (and its
+          # signature, when produced) to the GitHub release. Missing
+          # files are tolerated so a failed cyclonedx step does not
+          # cascade.
+          gh release upload "${{ steps.version.outputs.version }}" \
+            rustgate.cdx.json rustgate.cdx.xml --clobber || true
+          if [ -f rustgate.cdx.json.sig ]; then
+            gh release upload "${{ steps.version.outputs.version }}" \
+              rustgate.cdx.json.sig --clobber || true
+          fi
+
       - name: Generate release notes
         if: ${{ github.event_name == 'release' && !cancelled() }}
         continue-on-error: true

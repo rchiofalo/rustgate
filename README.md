@@ -801,6 +801,8 @@ All tests use ephemeral certificates generated at runtime via `rustgate-test-uti
 | [Configuration](docs/configuration.md) | All CLI flags, env vars, and runtime options |
 | [Security Posture](docs/security-posture.md) | NIST 800-53 control mapping and compliance overview |
 | [Threat Model](docs/threat-model.md) | STRIDE methodology threats, mitigations, and residual risks |
+| [STIG Mapping](docs/security/stig-mapping.md) | DISA STIG controls mapped to rustgate config knobs and CI artifacts |
+| [cATO Evidence Template](docs/security/cato-evidence-template.md) | NIST 800-53 evidence inventory for continuous Authority To Operate packages |
 | [Graceful Degradation](docs/graceful-degradation.md) | Subsystem failure modes and recovery behavior |
 | [Post-Quantum Roadmap](docs/post-quantum.md) | Path to post-quantum cryptographic protection |
 | [Observability](docs/observability.md) | Structured logging, metrics, and distributed tracing |

@@ -5,6 +5,16 @@
 # by dependabot (see .github/dependabot.yml, ecosystem: docker). The
 # @sha256 digest is mandatory — the CI "Validate Dockerfile FROM digest
 # pinning" step fails any FROM line without it.
+#
+# TODO(operator): For Iron Bank / Platform One deployment, swap the
+# builder base to a hardened image such as:
+#
+#   FROM registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:9.x@sha256:<digest>
+#
+# Iron Bank pulls require Platform One credentials and a registered
+# robot account; substitute the tag and digest from your IB account at
+# the time of the build. The default `rust:1.95-alpine` base below is
+# suitable for non-IB deployments and is what CI publishes today.
 FROM rust:1.95-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS builder
 
 RUN apk add --no-cache musl-dev protobuf-dev make
@@ -72,16 +82,35 @@ RUN find crates -name "*.rs" -exec touch {} +
 RUN cargo build --release --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel,mqtt,http
 
 # ── Runtime stage ────────────────────────────────────────────────────────
+# TODO(operator): For Iron Bank deployment, swap the runtime base to:
+#
+#   FROM registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:9.x@sha256:<digest>
+#
+# IB images already enforce non-root, no SUID/SGID binaries, and
+# read-only filesystem compatibility, so the hardening commands below
+# become no-ops (safe to leave in for portability). The default
+# `alpine:3.23` base below is what CI publishes today.
 FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
 
 LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
       org.opencontainers.image.description="Secure tactical message router with mTLS and NATS bridge" \
       org.opencontainers.image.licenses="LicenseRef-Proprietary"
 
+# Drop SUID/SGID bits from any binaries the base image ships. STIG
+# V-RHEL-08-010040 family requires that no setuid/setgid binaries
+# remain on a hardened image; we satisfy this by deleting any such
+# binaries entirely. Run before the `USER` switch so we still have
+# root privileges to chmod/delete; the `|| true` keeps the build
+# resilient if the base image already trimmed them.
 RUN apk add --no-cache ca-certificates \
-    && addgroup -g 10001 -S rustgate && adduser -u 10001 -S rustgate -G rustgate
+    && addgroup -g 10001 -S rustgate && adduser -u 10001 -S rustgate -G rustgate \
+    && find / -xdev -type f -perm /6000 -delete 2>/dev/null || true
 
-USER 10001
+# Run unprivileged. The Helm chart and Pod Security Standards
+# `restricted` profile additionally enforce `runAsNonRoot: true`,
+# `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`,
+# and drop ALL Linux capabilities — see helm/values-production.yaml.
+USER 10001:10001
 
 COPY --from=builder --chmod=755 /src/target/release/rustgate /usr/local/bin/rustgate
 
@@ -89,6 +118,10 @@ EXPOSE 4433 8443 8446 8883 9000 9001 9090
 
 STOPSIGNAL SIGTERM
 
+# Recommended runtime invocation:
+#   docker run --read-only --tmpfs /tmp --user 10001:10001 \
+#              --cap-drop=ALL --security-opt=no-new-privileges \
+#              ghcr.io/rchiofalo/rustgate:<tag>
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --spider -q http://localhost:9090/healthz 2>/dev/null || \
         nc -z localhost 4433 || exit 1

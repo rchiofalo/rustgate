@@ -1,0 +1,74 @@
+# Zarf bundle manifest for rustgate.
+#
+# Zarf packages let an operator install a fully-self-contained set of
+# resources (container images, charts, scripts) into a disconnected /
+# air-gapped Kubernetes cluster. This package is the air-gap-friendly
+# counterpart to the public `helm install` flow on the README — it
+# bundles the same Helm chart but pins the container image and runs a
+# pre-deploy hook to set up the mTLS CA the chart expects.
+#
+# Build:
+#     zarf package create .
+#
+# Deploy (on the air-gapped target):
+#     zarf init
+#     zarf package deploy zarf-package-rustgate-amd64-0.8.0.tar.zst
+#
+# TODO(operator): see comments inline for fields that need credentials
+# or registry information specific to your deployment.
+
+kind: ZarfPackageConfig
+metadata:
+  name: rustgate
+  description: "Tactical mTLS message router — air-gap-ready bundle"
+  version: "0.8.0"
+  url: "https://github.com/rchiofalo/rustgate"
+  source: "https://github.com/rchiofalo/rustgate"
+  authors: "Roberto Chiofalo"
+  vendor: "rustgate"
+  # When you publish into a registry, also set:
+  # architecture: "amd64"
+  # yolo: false
+
+components:
+  - name: rustgate
+    description: "Core rustgate router StatefulSet, Service, and ConfigMap via the Helm chart"
+    required: true
+    only:
+      cluster:
+        # Uncomment to limit deployment to a specific architecture.
+        # architecture: amd64
+        distros:
+          - "*"
+    images:
+      # TODO(operator): pin a digest before publishing. The `:latest`
+      # tag is fine for development but Zarf strongly prefers a sha
+      # digest so the same package always materialises the same
+      # workload (`zarf prepare find-images` will produce the digest).
+      #
+      #   - "ghcr.io/rchiofalo/rustgate@sha256:<digest>"
+      - "ghcr.io/rchiofalo/rustgate:latest"
+    charts:
+      - name: rustgate
+        # The chart lives in this repo at `helm/`. Zarf resolves the
+        # path relative to the package root.
+        localPath: ./helm
+        version: "1.4.0"
+        namespace: rustgate
+        # values:
+        #   # TODO(operator): override values that bake in environment
+        #   # specifics — registry, certificate paths, replica count.
+        #   - ./helm/values-production.yaml
+    actions:
+      onCreate:
+        before:
+          - cmd: ./scripts/zarf-prebuild-mtls-ca.sh
+            description: "Generate or import the mTLS CA used by clients"
+            mute: false
+      onDeploy:
+        # Print the post-install hint so the operator knows how to
+        # bootstrap their first client cert. Real deployments swap
+        # this with a real bootstrap step (External Secrets Operator
+        # pulling a CA from Vault, OpenBao, or a sealed-secrets bundle).
+        before:
+          - cmd: echo "Deploying rustgate. Reminder — verify the CA bundle in /etc/rustgate/ca.pem matches your client trust roots."

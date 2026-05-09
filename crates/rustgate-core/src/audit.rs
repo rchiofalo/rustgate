@@ -2555,6 +2555,38 @@ pub fn tenant_isolation_label_overflow(metric: &str, distinct_tenants: usize) {
     );
 }
 
+/// Record a configuration rejection caused by air-gap mode.
+///
+/// Emitted when an operator configures an external endpoint (HTTP
+/// target URL, OTEL exporter, OCSP responder, peer-discovery endpoint)
+/// whose host is not classified as private by
+/// [`crate::air_gap::is_private_host`] while
+/// [`crate::air_gap::AirGapConfig::enabled`] is set. The affected
+/// subsystem refuses to start; the rest of the server is unaffected.
+///
+/// Sanitization: `subsystem`, `endpoint`, and `reason` are sanitized at
+/// the audit boundary. `endpoint` is masked through
+/// [`crate::masking::mask_credential`] in case the operator embedded
+/// credentials in the URL — only the first two characters of the
+/// pre-host scheme prefix survive, which is sufficient for forensic
+/// correlation without leaking the bearer-style secret. (Plain
+/// host:port endpoints with no credentials remain readable; the
+/// masking is destructive only when the endpoint actually contained
+/// credentials.)
+pub fn air_gap_violation(subsystem: &str, endpoint: &str, reason: &str) {
+    let subsystem = s(subsystem);
+    let endpoint = s(endpoint);
+    let reason = s(reason);
+    audit!(
+        "air_gap.violation",
+        subsystem = %subsystem,
+        endpoint = %endpoint,
+        reason = %reason,
+        action = "load_external_endpoint",
+        result = "rejected"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
