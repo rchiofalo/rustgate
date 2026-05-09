@@ -108,6 +108,19 @@ pub struct Metadata {
     /// not dominate the marking (closes #849 items 3 + 4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classification: Option<crate::classification::ClassificationMarking>,
+    /// Optional tenant identifier associated with the originating
+    /// session. Populated at the router accept path from
+    /// [`crate::identity::Identity::tenant`] (which is itself derived
+    /// from the certificate Organization (`O=`) field) so downstream
+    /// surfaces — archive directories, store-and-forward keying, NATS
+    /// subject prefix, per-tenant metrics — can partition data at
+    /// rest without re-deriving the tenant from the source identity.
+    /// `None` for legacy traffic and unauthenticated/plaintext
+    /// sessions; consumers fall back to
+    /// [`crate::constants::DEFAULT_TENANT_ARCHIVE_KEY`] when a key is
+    /// required (closes #859).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
     // Future optional fields land here. Each must:
     //   1. Be `Option<T>` (or another type with a sensible default).
     //   2. Carry `#[serde(default, skip_serializing_if = "…")]` so absent
@@ -139,6 +152,7 @@ impl Metadata {
             ttl: None,
             trace_context: None,
             classification: None,
+            tenant_id: None,
         }
     }
 
@@ -166,6 +180,32 @@ impl Metadata {
     ) -> Self {
         self.classification = Some(marking);
         self
+    }
+
+    /// Builder-style setter for [`Metadata::tenant_id`]. Returns `self`
+    /// for chaining. Closes #859.
+    ///
+    /// Tenant identifiers are arbitrary operator-supplied strings drawn
+    /// from the cert Organization (`O=`) field. Consumers that key
+    /// per-tenant data structures should treat `None` and the empty
+    /// string equivalently and fall back to
+    /// [`crate::constants::DEFAULT_TENANT_ARCHIVE_KEY`].
+    #[must_use]
+    pub fn with_tenant_id(mut self, tenant: impl Into<String>) -> Self {
+        let s: String = tenant.into();
+        self.tenant_id = if s.is_empty() { None } else { Some(s) };
+        self
+    }
+
+    /// Borrow the tenant identifier on this metadata, if any.
+    ///
+    /// Returns `Some(&str)` when [`Metadata::with_tenant_id`] was called
+    /// with a non-empty value, `None` otherwise. Callers that key data at
+    /// rest by tenant should pair this with
+    /// [`crate::constants::DEFAULT_TENANT_ARCHIVE_KEY`] to materialise a
+    /// concrete bucket name for legacy / unauthenticated traffic.
+    pub fn tenant_id(&self) -> Option<&str> {
+        self.tenant_id.as_deref()
     }
 
     /// Returns `true` when this message has a TTL and `received_at + ttl`
@@ -319,6 +359,18 @@ impl<'a> Arbitrary<'a> for Metadata {
         let mut meta = Self::new(SystemTime::now(), source_protocol, u.arbitrary()?);
         if let Some(t) = ttl {
             meta = meta.with_ttl(t);
+        }
+        if let Ok(tag) = u.int_in_range::<u8>(0..=2) {
+            // 0/1 → keep tenant absent (legacy shape); 2 → fabricate a
+            // small tenant id so the fuzzer also exercises the
+            // populated-tenant code path on archive / SF / NATS.
+            if tag == 2 {
+                let len = u.int_in_range(1..=8)?;
+                let tenant: String = (0..len)
+                    .map(|_| u.int_in_range(b'a'..=b'z').map(|b| b as char))
+                    .collect::<arbitrary::Result<_>>()?;
+                meta = meta.with_tenant_id(tenant);
+            }
         }
         Ok(meta)
     }
@@ -1238,6 +1290,108 @@ mod tests {
         let parsed: Metadata = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, original);
         assert_eq!(parsed.classification, Some(marking));
+    }
+
+    // ── tenant_id builder coverage (closes #859) ────────────────────
+
+    #[test]
+    fn metadata_new_initializes_tenant_id_to_none() {
+        // Constructor invariant for the additive #859 field: zero the
+        // tenant slot so callers that did not opt-in observe identical
+        // pre-PR behaviour. A regression that defaulted to a placeholder
+        // tenant would silently route every message into one tenant
+        // bucket on disk.
+        let meta = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position);
+        assert!(
+            meta.tenant_id.is_none(),
+            "Metadata::new must default tenant_id to None"
+        );
+        assert!(meta.tenant_id().is_none());
+    }
+
+    #[test]
+    fn metadata_with_tenant_id_sets_field_and_accessor_agrees() {
+        // Builder-pin: `with_tenant_id` populates the field, returns
+        // `Self` for chaining, and the accessor mirrors the value
+        // verbatim. Pin both so a future refactor that diverged the
+        // field and the accessor (e.g. lower-cased only one of them)
+        // surfaces here, not at the archive directory layout test.
+        let meta = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position)
+            .with_tenant_id("acme");
+        assert_eq!(meta.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(meta.tenant_id(), Some("acme"));
+    }
+
+    #[test]
+    fn metadata_with_tenant_id_empty_string_collapses_to_none() {
+        // Empty-string tenant is treated as absent so cert Organization
+        // == "" matches the same code path as legacy traffic. A
+        // regression that stored `Some("")` would create an archive
+        // subdirectory with an empty path component (`<dir>//cot-…`)
+        // and break the rotation sweep.
+        let meta = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position)
+            .with_tenant_id("");
+        assert!(meta.tenant_id.is_none());
+        assert!(meta.tenant_id().is_none());
+    }
+
+    #[test]
+    fn metadata_with_tenant_id_overwrites_previous_value() {
+        // Mirrors the with_ttl / with_trace_context idempotency pin.
+        let meta = Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position)
+            .with_tenant_id("acme")
+            .with_tenant_id("globex");
+        assert_eq!(meta.tenant_id.as_deref(), Some("globex"));
+    }
+
+    #[test]
+    fn metadata_serde_round_trip_preserves_tenant_id() {
+        // Pin that a `Some(tenant)` round-trips through the wire form
+        // unchanged and the JSON includes the explicit field.
+        let original = Metadata::new(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            "tcp".into(),
+            MessageType::Position,
+        )
+        .with_tenant_id("coalition-a");
+        let json = serde_json::to_string(&original).expect("serialize");
+        assert!(
+            json.contains("\"tenant_id\""),
+            "wire format must include tenant_id when Some, got {json}"
+        );
+        assert!(json.contains("coalition-a"));
+        let parsed: Metadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.tenant_id.as_deref(), Some("coalition-a"));
+    }
+
+    #[test]
+    fn metadata_serde_old_wire_format_without_tenant_id_still_deserializes() {
+        // Backward compat: pre-#859 federation peers and on-disk
+        // store-and-forward queues do not include the `tenant_id` key.
+        // Both omitted-field and explicit-null shapes must continue to
+        // deserialize cleanly so a binary built with this PR can replay
+        // older queues without a one-shot migration.
+        let with_omitted = "{\"received_at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"source_protocol\":\"tcp\",\"message_type\":\"Position\"}";
+        let parsed: Metadata = serde_json::from_str(with_omitted).expect("omitted tenant");
+        assert!(parsed.tenant_id.is_none());
+
+        let with_null = "{\"received_at\":{\"secs_since_epoch\":1700000000,\"nanos_since_epoch\":0},\"source_protocol\":\"tcp\",\"message_type\":\"Position\",\"tenant_id\":null}";
+        let parsed: Metadata = serde_json::from_str(with_null).expect("null tenant");
+        assert!(parsed.tenant_id.is_none());
+    }
+
+    #[test]
+    fn metadata_serde_omits_tenant_id_when_none() {
+        // Wire-size invariant: skip-serializing on `None` keeps the
+        // legacy bytes-on-the-wire shape, so a federation peer that has
+        // not opted in pays no size penalty for the new field.
+        let original = Metadata::new(SystemTime::UNIX_EPOCH, "tcp".into(), MessageType::Chat);
+        let json = serde_json::to_string(&original).expect("serialize");
+        assert!(
+            !json.contains("\"tenant_id\""),
+            "wire format must omit tenant_id when None, got {json}"
+        );
     }
 
     #[test]

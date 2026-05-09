@@ -153,7 +153,21 @@ impl NatsPublisher {
         let group =
             sanitize_nats_token(raw_group).unwrap_or(Cow::Borrowed(&self.config.default_group));
 
-        let subject = format!("{}.{}.update", self.config.subject_prefix, group);
+        // #859: tenant subject prefix. Off by default — operators who
+        // opt in (`tenant_subject_prefix = true`) and whose messages
+        // carry a populated `tenant_id` see the live and JetStream
+        // history subjects prefixed with `tenant.<sanitized-tenant>.`.
+        // Sanitisation reuses `sanitize_nats_token` so a hostile cert
+        // Organization field cannot inject NATS subject separators.
+        let tenant_prefix = tenant_prefix_for(msg, &self.config);
+
+        let subject = match &tenant_prefix {
+            Some(t) => format!(
+                "tenant.{}.{}.{}.update",
+                t, self.config.subject_prefix, group
+            ),
+            None => format!("{}.{}.update", self.config.subject_prefix, group),
+        };
 
         let wire_event = match self.build_wire_event(&msg.payload) {
             Some(event) => event,
@@ -194,7 +208,13 @@ impl NatsPublisher {
 
         // Publish to JetStream history stream (reuse serialized bytes)
         if let Some(uid) = sanitize_nats_token(&wire_event.uid) {
-            let history_subject = format!("{}.{}", self.config.jetstream_subject_prefix, uid);
+            let history_subject = match &tenant_prefix {
+                Some(t) => format!(
+                    "tenant.{}.{}.{}",
+                    t, self.config.jetstream_subject_prefix, uid
+                ),
+                None => format!("{}.{}", self.config.jetstream_subject_prefix, uid),
+            };
             if let Err(e) = self
                 .client
                 .publish_with_headers(history_subject, headers, payload)
@@ -241,6 +261,21 @@ impl NatsPublisher {
 /// waste memory and can indicate malicious input. 256 bytes is generous
 /// enough for legitimate identifiers while bounding resource usage.
 const MAX_TOKEN_LENGTH: usize = 256;
+
+/// Compute the per-message tenant prefix for the publish path.
+///
+/// Returns `Some(sanitised_tenant)` when the publisher is configured
+/// with `tenant_subject_prefix = true` AND the message carries a
+/// non-empty `tenant_id`. Returns `None` otherwise — the legacy /
+/// pre-#859 wire format. Extracted from
+/// [`NatsPublisher::publish_inner`] so the prefix decision is
+/// testable without standing up a real NATS broker.
+fn tenant_prefix_for<'a>(msg: &'a RoutableMessage, config: &NatsConfig) -> Option<Cow<'a, str>> {
+    if !config.tenant_subject_prefix {
+        return None;
+    }
+    msg.metadata.tenant_id().and_then(sanitize_nats_token)
+}
 
 /// Sanitize a string into a valid single NATS subject token.
 ///
@@ -305,6 +340,78 @@ fn sanitize_nats_token(s: &str) -> Option<Cow<'_, str>> {
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
     use super::*;
+
+    fn make_msg(tenant: Option<&str>) -> RoutableMessage {
+        let id = rustgate_core::identity::Identity::new(
+            "alice".to_string(),
+            "fp".to_string(),
+            std::collections::BTreeSet::new(),
+        )
+        .expect("valid identity");
+        let mut meta = rustgate_core::message::Metadata::new(
+            std::time::SystemTime::now(),
+            "tcp".to_string(),
+            rustgate_core::message::MessageType::Position,
+        );
+        if let Some(t) = tenant {
+            meta = meta.with_tenant_id(t);
+        }
+        RoutableMessage {
+            source: id,
+            destination: rustgate_core::message::Destination::Broadcast,
+            payload: bytes::Bytes::new(),
+            metadata: meta,
+        }
+    }
+
+    // ── #859: tenant subject prefix coverage ────────────────────────
+
+    #[test]
+    fn tenant_prefix_off_by_default_returns_none_even_with_tenant() {
+        // Pre-#859 wire-compat: with `tenant_subject_prefix = false`
+        // (the default) a populated tenant on the message MUST NOT
+        // surface in the subject. Operators must explicitly opt in.
+        let cfg = NatsConfig {
+            tenant_subject_prefix: false,
+            ..NatsConfig::default()
+        };
+        let msg = make_msg(Some("acme"));
+        assert!(
+            tenant_prefix_for(&msg, &cfg).is_none(),
+            "off-by-default must override tenant on the message",
+        );
+    }
+
+    #[test]
+    fn tenant_prefix_on_returns_sanitised_tenant() {
+        // Opt-in path: with the flag on and a populated tenant, the
+        // helper returns the sanitised tenant token. Sanitisation
+        // reuses `sanitize_nats_token` so subject-injection
+        // characters are stripped/replaced.
+        let cfg = NatsConfig {
+            tenant_subject_prefix: true,
+            ..NatsConfig::default()
+        };
+        let msg = make_msg(Some("acme"));
+        assert_eq!(tenant_prefix_for(&msg, &cfg).as_deref(), Some("acme"));
+        // Subject-injection defence: a tenant id like `evil.>` must
+        // not produce a wildcard publish subject.
+        let msg = make_msg(Some("evil.>"));
+        assert_eq!(tenant_prefix_for(&msg, &cfg).as_deref(), Some("evil_"));
+    }
+
+    #[test]
+    fn tenant_prefix_on_returns_none_when_message_has_no_tenant() {
+        // Opt-in path with no tenant on the message: the publisher
+        // falls back to the legacy subject — no `tenant.…` prefix
+        // and no wedging on a `None` tenant.
+        let cfg = NatsConfig {
+            tenant_subject_prefix: true,
+            ..NatsConfig::default()
+        };
+        let msg = make_msg(None);
+        assert!(tenant_prefix_for(&msg, &cfg).is_none());
+    }
 
     #[test]
     fn sanitize_normal_input_unchanged() {

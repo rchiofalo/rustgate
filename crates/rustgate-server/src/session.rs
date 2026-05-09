@@ -196,7 +196,15 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     // registering the handle — otherwise live traffic routed between
     // `register` and the drain would slip ahead of the queued
     // messages, breaking FIFO across the reconnect boundary.
-    let buffered_offline = deps.router.drain_offline_messages(&cn).await;
+    // Tenant-aware drain (closes #859): only entries whose stored
+    // tenant matches this connecting client's tenant are returned.
+    // Cross-tenant queue entries remain in storage for the rightful
+    // owner's reconnect, preventing data leakage across tenant
+    // boundaries.
+    let buffered_offline = deps
+        .router
+        .drain_offline_messages_for_identity(&identity)
+        .await;
     let before = buffered_offline.len();
     let buffered_offline = deps
         .router
@@ -840,7 +848,10 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                         let session_id = handle.id;
                         // Drain offline queue BEFORE register so live
                         // traffic cannot race ahead of queued entries.
-                        let buffered_offline = router.drain_offline_messages(&cn).await;
+                        // Tenant-aware (closes #859): only this
+                        // connecting client's tenant entries drain.
+                        let buffered_offline =
+                            router.drain_offline_messages_for_identity(&identity).await;
                         let before = buffered_offline.len();
                         let buffered_offline = router.filter_offline_messages(&identity, buffered_offline);
                         let filtered = before - buffered_offline.len();

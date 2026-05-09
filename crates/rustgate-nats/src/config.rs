@@ -233,6 +233,26 @@ pub struct NatsConfig {
     /// with `server_2_10` enabled workspace-wide so both wires are
     /// available unconditionally here.
     pub subject_filters: Vec<String>,
+
+    /// Prepend `tenant.<tenant_id>.` to every published subject when
+    /// the message carries a populated `tenant_id` (closes #859).
+    ///
+    /// **Wire-format change — opt in.** When `false` (the default)
+    /// every message lands at the legacy `<subject_prefix>.<group>.…`
+    /// subject regardless of the message's tenant — preserving
+    /// pre-#859 wire compatibility for single-tenant or
+    /// trust-the-room deployments where downstream subscribers are
+    /// not yet tenant-aware.
+    ///
+    /// When `true` and the message carries a tenant tag (sourced
+    /// from the cert Organization field via the router accept path),
+    /// the publisher emits to `tenant.<tenant>.<subject_prefix>…`
+    /// for both the live publish and the JetStream history publish.
+    /// Coalition deployments with per-tenant subscriber subjects
+    /// gain isolation at the broker layer; tenant-blind subscribers
+    /// must extend their wildcards (`tenant.*.<subject_prefix>.>`)
+    /// to keep observing.
+    pub tenant_subject_prefix: bool,
 }
 
 impl NatsConfig {
@@ -412,6 +432,11 @@ impl Default for NatsConfig {
             request_subject: None,
             dead_letter_subject: None,
             subject_filters: Vec::new(),
+            // Off by default: pre-#859 single-tenant deployments
+            // observe no wire-format change. Coalition / multi-tenant
+            // operators flip this on after their subscribers learn the
+            // `tenant.<id>.` prefix.
+            tenant_subject_prefix: false,
         }
     }
 }

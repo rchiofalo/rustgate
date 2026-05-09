@@ -109,6 +109,47 @@ pub fn is_reserved_group_id(name: &str) -> bool {
     name.len() >= 4 && name.starts_with("__") && name.ends_with("__")
 }
 
+// ── Multi-tenant data-isolation constants (closes #859) ────────────
+
+/// Reserved bucket name used by per-tenant data-at-rest layouts when
+/// the originating session presents no tenant identifier.
+///
+/// rustgate uses the sentinel-shape `__default__` (matching
+/// `rustgate_router::quota::DEFAULT_TENANT_KEY`) for the
+/// store-and-forward queue's tenant-quota bookkeeping. The
+/// **on-disk** form drops the leading/trailing underscores so the
+/// archive directory layout stays human-readable when listed (`ls
+/// /var/lib/rustgate/archive/`) and POSIX-portable: a literal `__`
+/// prefix on a directory name is occasionally treated specially by
+/// shell completion or treated as hidden by GUI file managers.
+///
+/// Operators with single-tenant deployments see every message land
+/// under `<archive-dir>/_default/cot-<date>.jsonl[.enc]` — exactly
+/// one extra path component compared to the pre-#859 layout.
+pub const DEFAULT_TENANT_ARCHIVE_KEY: &str = "_default";
+
+/// Reserved label value emitted on per-tenant Prometheus metrics
+/// when the cardinality cap [`MAX_TENANT_LABELS`] is exceeded.
+///
+/// A flood of distinct tenant identifiers (legitimate or adversarial)
+/// must not exhaust Prometheus memory through unbounded label
+/// growth. Once [`MAX_TENANT_LABELS`] distinct tenant strings have
+/// been registered for a metric in this process, every subsequent
+/// tenant collapses to this single label value and a structured
+/// audit event records the overflow so an operator can see the cap
+/// was hit.
+pub const TENANT_OVERFLOW_LABEL: &str = "_overflow";
+
+/// Cap on the number of distinct `tenant_id` label values that a
+/// single Prometheus metric will track in this process.
+///
+/// 256 is comfortably above any plausible coalition / multi-customer
+/// deployment, leaves headroom for short-lived churn (rolling test
+/// tenants), and keeps the per-metric memory footprint bounded:
+/// 256 distinct labels across a half-dozen `*_by_tenant` counters
+/// is at most ~1500 child metrics.
+pub const MAX_TENANT_LABELS: usize = 256;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +192,23 @@ mod tests {
                 "ordinary name {name:?} must not be treated as a sentinel"
             );
         }
+    }
+
+    #[test]
+    fn tenant_constants_pin_advertised_values() {
+        // These three constants are advertised in the playbook
+        // (shared-infrastructure.md, decision table) and consumed by
+        // multiple crates: the archive layout, the SF tenant filter,
+        // and the per-tenant Prometheus metric helpers in
+        // rustgate-server. Pinning the exact strings/value defends
+        // against silent drift in any one of those call sites.
+        assert_eq!(DEFAULT_TENANT_ARCHIVE_KEY, "_default");
+        assert_eq!(TENANT_OVERFLOW_LABEL, "_overflow");
+        assert_eq!(MAX_TENANT_LABELS, 256);
+        // The two reserved labels must remain pairwise distinct so the
+        // cardinality-overflow path cannot collide with a legitimate
+        // tenant that happens to be called "_default".
+        assert_ne!(DEFAULT_TENANT_ARCHIVE_KEY, TENANT_OVERFLOW_LABEL);
     }
 
     #[test]

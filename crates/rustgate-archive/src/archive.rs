@@ -8,12 +8,30 @@
 //!
 //! Files rotate daily (one file per UTC date). The archive directory is
 //! created on first write if it does not exist.
+//!
+//! # Tenant partitioning (closes #859)
+//!
+//! When a [`RoutableMessage`] carries a populated
+//! [`rustgate_core::message::Metadata::tenant_id`] the archiver routes
+//! the JSONL line into a per-tenant subdirectory:
+//!
+//! ```text
+//! <archive-dir>/<tenant-id>/cot-<date>.jsonl[.enc]
+//! ```
+//!
+//! Messages with no tenant id fall back to the reserved
+//! [`rustgate_core::constants::DEFAULT_TENANT_ARCHIVE_KEY`] bucket
+//! (`_default`). Operators with single-tenant deployments observe one
+//! extra path component compared to the pre-#859 layout — no other
+//! behaviour change.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use rustgate_core::constants::DEFAULT_TENANT_ARCHIVE_KEY;
 use rustgate_core::message::RoutableMessage;
 
 /// Writes CoT events as JSONL to date-stamped archive files.
@@ -21,10 +39,16 @@ use rustgate_core::message::RoutableMessage;
 /// When constructed via [`CotArchiver::with_encryption`], each daily file is
 /// written through a streaming ChaCha20-Poly1305 sink and gains an `.enc`
 /// suffix. Plaintext callers continue to use [`CotArchiver::new`].
+///
+/// Per-tenant data isolation (closes #859): each unique
+/// [`rustgate_core::message::Metadata::tenant_id`] gets its own daily
+/// rotation cycle under `<dir>/<tenant>/`. Messages with no tenant id
+/// land under
+/// `DEFAULT_TENANT_ARCHIVE_KEY`.
 pub struct CotArchiver {
     dir: PathBuf,
     key_ring: Option<Arc<crate::encrypted::KeyRing>>,
-    inner: Arc<Mutex<ArchiverState>>,
+    inner: Arc<Mutex<ArchiverInner>>,
 }
 
 // Custom `Debug` so a `{:?}` print never reveals key material or the
@@ -45,9 +69,63 @@ enum ArchiveSink {
     Encrypted(crate::encrypted::EncryptedWriter),
 }
 
-struct ArchiverState {
+#[derive(Default)]
+struct TenantState {
     current_date: String,
     writer: Option<ArchiveSink>,
+}
+
+/// Per-tenant rotation state. The outer map is keyed by the resolved
+/// tenant bucket (the populated `tenant_id` or
+/// `DEFAULT_TENANT_ARCHIVE_KEY`). Each tenant rotates and rolls
+/// independently — a flood of messages from one tenant cannot starve
+/// another tenant of its own daily rotation tick.
+#[derive(Default)]
+struct ArchiverInner {
+    tenants: HashMap<String, TenantState>,
+}
+
+/// Resolve the on-disk tenant bucket for a message: the message's
+/// populated `tenant_id`, or `DEFAULT_TENANT_ARCHIVE_KEY` when absent.
+///
+/// Sanitises path-traversal characters (`/`, `\`, NUL) to `_` so a
+/// hostile cert Organization field cannot escape the archive directory.
+/// The tenant id source is the certificate Organization (`O=`) field
+/// which the operator controls, but defence-in-depth sanitisation here
+/// closes the door on a misconfigured CA that issues certs with `..` in
+/// the O field.
+fn resolve_tenant_bucket(msg: &RoutableMessage) -> String {
+    let raw = msg
+        .metadata
+        .tenant_id()
+        .unwrap_or(DEFAULT_TENANT_ARCHIVE_KEY);
+    sanitize_tenant_path_component(raw)
+}
+
+/// Replace path-traversal characters (`/`, `\`, NUL) and leading dots
+/// with `_` so the resulting string is safe to use as a single
+/// directory-name component. Returns the
+/// `DEFAULT_TENANT_ARCHIVE_KEY` sentinel when sanitisation produces
+/// an empty string.
+fn sanitize_tenant_path_component(raw: &str) -> String {
+    let mut cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    // Reject pure-dot components and leading-dot components which
+    // would otherwise be interpreted as parent / hidden directories.
+    while cleaned.starts_with('.') {
+        cleaned.replace_range(..1, "_");
+    }
+    if cleaned.is_empty() {
+        DEFAULT_TENANT_ARCHIVE_KEY.to_string()
+    } else {
+        cleaned
+    }
 }
 
 impl CotArchiver {
@@ -58,10 +136,7 @@ impl CotArchiver {
         Self {
             dir: dir.into(),
             key_ring: None,
-            inner: Arc::new(Mutex::new(ArchiverState {
-                current_date: String::new(),
-                writer: None,
-            })),
+            inner: Arc::new(Mutex::new(ArchiverInner::default())),
         }
     }
 
@@ -74,10 +149,7 @@ impl CotArchiver {
         Self {
             dir: dir.into(),
             key_ring: Some(key_ring),
-            inner: Arc::new(Mutex::new(ArchiverState {
-                current_date: String::new(),
-                writer: None,
-            })),
+            inner: Arc::new(Mutex::new(ArchiverInner::default())),
         }
     }
 
@@ -95,6 +167,7 @@ impl CotArchiver {
 
         // Compute UTC date string (YYYY-MM-DD) without chrono
         let today = utc_date_string(secs);
+        let tenant = resolve_tenant_bucket(msg);
 
         // Build JSONL line on the async task (cheap CPU work).
         let payload_b64 = base64_encode(&msg.payload);
@@ -111,9 +184,14 @@ impl CotArchiver {
                 format!("multicast:[{}]", groups.join(","))
             }
         };
+        // Embed the resolved tenant bucket on every JSONL line so a
+        // forensic analyst can re-bucket records that have been merged
+        // out of their original directory (e.g. a `tar -czf
+        // archive.tgz <archive-dir>/` flatten).
+        let tenant_field = escape_json(&tenant);
 
         let line = format!(
-            "{{\"ts\":{secs},\"cn\":\"{}\",\"fp\":\"{}\",\"type\":\"{msg_type}\",\"dest\":\"{dest}\",\"proto\":\"{}\",\"payload\":\"{payload_b64}\"}}\n",
+            "{{\"ts\":{secs},\"cn\":\"{}\",\"fp\":\"{}\",\"type\":\"{msg_type}\",\"dest\":\"{dest}\",\"proto\":\"{}\",\"tenant\":\"{tenant_field}\",\"payload\":\"{payload_b64}\"}}\n",
             escape_json(&msg.source.cn),
             escape_json(&msg.source.fingerprint),
             escape_json(&msg.metadata.source_protocol),
@@ -124,117 +202,168 @@ impl CotArchiver {
         let dir = self.dir.clone();
         let key_ring = self.key_ring.clone();
         let _result = tokio::task::spawn_blocking(move || {
-            write_line(&inner, &dir, &today, &line, key_ring.as_deref());
+            write_line(&inner, &dir, &tenant, &today, &line, key_ring.as_deref());
         })
         .await;
     }
 
-    /// Return the path of the archive segment that is currently active
-    /// (i.e. the file the writer would append to right now).
+    /// Return the per-tenant archive segment the writer would append
+    /// to right now if it received a message tagged with `tenant`.
     ///
     /// Encrypted archivers include the `.enc` suffix — previously this
     /// always returned the plaintext name, which meant the rotation
     /// sweep never actually matched (and therefore never excluded) the
     /// encrypted active file from deletion.
     ///
-    /// The rotation task uses this to exclude the in-progress file from
-    /// both size accounting and deletion sweeps, avoiding races against
-    /// the writer.
-    pub fn active_path(&self) -> PathBuf {
+    /// The rotation task uses this (via [`Self::active_paths`]) to
+    /// exclude every in-progress file from both size accounting and
+    /// deletion sweeps, avoiding races against the writer.
+    pub fn active_path_for_tenant(&self, tenant: &str) -> PathBuf {
         let secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let today = utc_date_string(secs);
+        let tenant_clean = sanitize_tenant_path_component(tenant);
+        let tenant_dir = self.dir.join(&tenant_clean);
         if self.key_ring.is_some() {
-            self.dir.join(format!("cot-{today}.jsonl.enc"))
+            tenant_dir.join(format!("cot-{today}.jsonl.enc"))
         } else {
-            self.dir.join(format!("cot-{today}.jsonl"))
+            tenant_dir.join(format!("cot-{today}.jsonl"))
         }
     }
 
-    /// If the currently-active archive file exceeds `max_bytes`, seal
-    /// and rename it to a timestamp-suffixed path, then drop the writer
-    /// so the next record opens a fresh segment at the stable
-    /// `cot-<date>.jsonl[.enc]` name.
+    /// Backward-compatible single-segment accessor: returns the
+    /// active path for `DEFAULT_TENANT_ARCHIVE_KEY`.
     ///
-    /// Returns `Some(rolled_path)` when a roll occurred; `None` when
-    /// `max_bytes == 0`, the writer is not open yet, or the on-disk
-    /// size is still under the cap.
+    /// Pre-#859 callers (and tests written against the single-segment
+    /// model) continue to compile. New callers that need to enumerate
+    /// every active segment should use [`Self::active_paths`] instead.
+    pub fn active_path(&self) -> PathBuf {
+        self.active_path_for_tenant(DEFAULT_TENANT_ARCHIVE_KEY)
+    }
+
+    /// Return the active segment path for every tenant that has at
+    /// least one open writer in this process. Used by the rotation
+    /// sweep to exclude every in-progress file from deletion.
+    pub fn active_paths(&self) -> Vec<PathBuf> {
+        let secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let today = utc_date_string(secs);
+        let tenants: Vec<String> = {
+            let inner = match self.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            inner.tenants.keys().cloned().collect()
+        };
+        let suffix = if self.key_ring.is_some() {
+            format!("cot-{today}.jsonl.enc")
+        } else {
+            format!("cot-{today}.jsonl")
+        };
+        tenants
+            .into_iter()
+            .map(|t| self.dir.join(t).join(&suffix))
+            .collect()
+    }
+
+    /// If any tenant's currently-active archive file exceeds
+    /// `max_bytes`, seal and rename each one to a timestamp-suffixed
+    /// path, then drop the writers so the next record per-tenant
+    /// opens a fresh segment at the stable `cot-<date>.jsonl[.enc]`
+    /// name.
+    ///
+    /// Returns the list of rolled paths (one per tenant whose
+    /// segment was over-cap). An empty vector means `max_bytes == 0`,
+    /// no writer is open, or every segment is still under the cap.
     ///
     /// Encrypted files are sealed by dropping the underlying
     /// [`EncryptedWriter`](crate::encrypted::EncryptedWriter),
     /// which writes the terminator chunk in its `Drop` impl. Without
     /// that the rolled `.enc` file would fail decryption.
-    pub fn roll_if_over_size(&self, max_bytes: u64) -> Option<PathBuf> {
+    pub fn roll_if_over_size(&self, max_bytes: u64) -> Vec<PathBuf> {
         if max_bytes == 0 {
-            return None;
+            return Vec::new();
         }
-        let active = self.active_path();
-        let mut state = match self.inner.lock() {
+
+        // Snapshot the tenant set under the lock so each rename
+        // happens with the per-tenant lock released — avoids holding
+        // the mutex across a filesystem rename.
+        let mut rolled = Vec::new();
+        let mut inner = match self.inner.lock() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
-
-        // Flush any buffered writes so the on-disk size accurately
-        // reflects what we have written. BufWriter (plaintext) batches
-        // small writes; the EncryptedWriter already persists each chunk
-        // on `write_chunk` but flushing is still cheap.
-        let writer = state.writer.as_mut()?;
-        match writer {
-            ArchiveSink::Plain(p) => {
-                let _ = p.flush();
-            }
-            ArchiveSink::Encrypted(e) => {
-                let _ = e.flush();
-            }
-        }
-
-        let size = std::fs::metadata(&active).map(|m| m.len()).unwrap_or(0);
-        if size < max_bytes {
-            return None;
-        }
-
-        // Over threshold: drop the writer (this seals encrypted files
-        // via `EncryptedWriter::Drop`) then rename the now-closed file
-        // to carry a roll-timestamp suffix. Clearing `current_date`
-        // forces `write_line` to open a fresh segment on the next
-        // write — the stable `cot-<date>.jsonl[.enc]` path is free
-        // again after the rename.
-        state.writer = None;
-        let rolled = rolled_path(&active);
-        if let Err(err) = std::fs::rename(&active, &rolled) {
-            tracing::warn!(
-                from = %active.display(),
-                to = %rolled.display(),
-                error = %err,
-                "archive rotation: failed to rename rolled segment",
-            );
-            return None;
-        }
-        state.current_date = String::new();
-        tracing::info!(
-            rolled = %rolled.display(),
-            bytes = size,
-            max_bytes,
-            "CoT archive: rolled active segment due to size cap",
-        );
-        Some(rolled)
-    }
-
-    /// Flush any buffered data to disk.
-    pub fn flush(&self) {
-        let mut state = match self.inner.lock() {
-            Ok(s) => s,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(ref mut w) = state.writer {
-            match w {
+        let tenants: Vec<String> = inner.tenants.keys().cloned().collect();
+        for tenant in &tenants {
+            let active = self.active_path_for_tenant(tenant);
+            let Some(state) = inner.tenants.get_mut(tenant) else {
+                continue;
+            };
+            let Some(writer) = state.writer.as_mut() else {
+                continue;
+            };
+            // Flush any buffered writes so the on-disk size accurately
+            // reflects what we have written.
+            match writer {
                 ArchiveSink::Plain(p) => {
                     let _ = p.flush();
                 }
                 ArchiveSink::Encrypted(e) => {
                     let _ = e.flush();
+                }
+            }
+            let size = std::fs::metadata(&active).map(|m| m.len()).unwrap_or(0);
+            if size < max_bytes {
+                continue;
+            }
+            // Drop the writer (seals encrypted files via Drop), then
+            // rename. Clearing `current_date` forces `write_line` to
+            // open a fresh segment on the next write under this
+            // tenant.
+            state.writer = None;
+            state.current_date.clear();
+            let target = rolled_path(&active);
+            if let Err(err) = std::fs::rename(&active, &target) {
+                tracing::warn!(
+                    tenant = %tenant,
+                    from = %active.display(),
+                    to = %target.display(),
+                    error = %err,
+                    "archive rotation: failed to rename rolled segment",
+                );
+                continue;
+            }
+            tracing::info!(
+                tenant = %tenant,
+                rolled = %target.display(),
+                bytes = size,
+                max_bytes,
+                "CoT archive: rolled active segment due to size cap",
+            );
+            rolled.push(target);
+        }
+        rolled
+    }
+
+    /// Flush any buffered data to disk for every tenant.
+    pub fn flush(&self) {
+        let mut inner = match self.inner.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for state in inner.tenants.values_mut() {
+            if let Some(ref mut w) = state.writer {
+                match w {
+                    ArchiveSink::Plain(p) => {
+                        let _ = p.flush();
+                    }
+                    ArchiveSink::Encrypted(e) => {
+                        let _ = e.flush();
+                    }
                 }
             }
         }
@@ -252,16 +381,19 @@ impl Drop for CotArchiver {
 /// Extracted as a free function so it can be called inside
 /// `spawn_blocking` without borrowing `self`.
 fn write_line(
-    inner: &Mutex<ArchiverState>,
-    dir: &std::path::Path,
+    inner: &Mutex<ArchiverInner>,
+    base_dir: &std::path::Path,
+    tenant: &str,
     today: &str,
     line: &str,
     key_ring: Option<&crate::encrypted::KeyRing>,
 ) {
-    let mut state = match inner.lock() {
+    let mut inner = match inner.lock() {
         Ok(s) => s,
         Err(poisoned) => poisoned.into_inner(),
     };
+
+    let state = inner.tenants.entry(tenant.to_string()).or_default();
 
     // Rotate file if date changed
     if state.current_date != today {
@@ -278,12 +410,18 @@ fn write_line(
         state.writer = None;
         state.current_date = today.to_owned();
 
-        match open_sink(dir, today, key_ring) {
+        let tenant_dir = base_dir.join(tenant);
+        match open_sink(&tenant_dir, today, key_ring) {
             Ok(sink) => {
                 state.writer = Some(sink);
             }
             Err(e) => {
-                tracing::error!(error = %e, dir = %dir.display(), "failed to open archive file");
+                tracing::error!(
+                    error = %e,
+                    dir = %tenant_dir.display(),
+                    tenant = %tenant,
+                    "failed to open archive file",
+                );
                 return;
             }
         }
@@ -300,7 +438,7 @@ fn write_line(
             .map_err(|err| err.to_string()),
     };
     if let Err(e) = res {
-        tracing::error!(error = %e, "failed to write archive line");
+        tracing::error!(error = %e, tenant = %tenant, "failed to write archive line");
     }
 }
 
@@ -501,7 +639,13 @@ mod tests {
         archiver.record(&msg).await;
         archiver.flush();
 
-        let entries: Vec<_> = std::fs::read_dir(&dir).expect("dir should exist").collect();
+        // Post-#859 layout: messages with no tenant_id land under
+        // `<dir>/_default/cot-…`. Walk into the default subdir to
+        // find the segment.
+        let tenant_dir = dir.join(DEFAULT_TENANT_ARCHIVE_KEY);
+        let entries: Vec<_> = std::fs::read_dir(&tenant_dir)
+            .expect("default tenant dir should exist")
+            .collect();
         assert_eq!(entries.len(), 1);
 
         let file_path = entries[0].as_ref().expect("entry").path();
@@ -562,9 +706,10 @@ mod tests {
         archiver.flush();
         drop(archiver);
 
-        // Locate the encrypted file
-        let entries: Vec<_> = std::fs::read_dir(&dir)
-            .expect("dir should exist")
+        // Locate the encrypted file under the default-tenant subdir.
+        let tenant_dir = dir.join(DEFAULT_TENANT_ARCHIVE_KEY);
+        let entries: Vec<_> = std::fs::read_dir(&tenant_dir)
+            .expect("default tenant dir should exist")
             .filter_map(|e| e.ok())
             .collect();
         assert_eq!(entries.len(), 1);
@@ -652,9 +797,9 @@ mod tests {
         assert!(size_before > 0);
 
         // Cap well below what we just wrote.
-        let rolled = archiver
-            .roll_if_over_size(1)
-            .expect("should roll when size > cap");
+        let rolled_paths = archiver.roll_if_over_size(1);
+        assert_eq!(rolled_paths.len(), 1, "expected exactly one rolled segment");
+        let rolled = rolled_paths.into_iter().next().expect("rolled segment");
 
         assert_ne!(rolled, active_before, "rolled name must differ from active");
         assert!(rolled.exists(), "rolled file must exist on disk");
@@ -690,7 +835,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let archiver = CotArchiver::new(&dir);
-        assert_eq!(archiver.roll_if_over_size(1024), None);
+        assert!(
+            archiver.roll_if_over_size(1024).is_empty(),
+            "no writer open yet — roll must produce zero rolled segments",
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -708,7 +856,10 @@ mod tests {
         archiver.flush();
 
         // Cap well above what we wrote.
-        assert_eq!(archiver.roll_if_over_size(10 * 1024 * 1024), None);
+        assert!(
+            archiver.roll_if_over_size(10 * 1024 * 1024).is_empty(),
+            "under-cap must produce zero rolled segments",
+        );
         assert!(archiver.active_path().exists(), "active file must remain");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -732,7 +883,10 @@ mod tests {
         let before = archiver.active_path();
         let bytes = std::fs::metadata(&before).unwrap().len();
 
-        assert_eq!(archiver.roll_if_over_size(0), None);
+        assert!(
+            archiver.roll_if_over_size(0).is_empty(),
+            "zero cap is disabled — must produce zero rolled segments",
+        );
         assert!(before.exists(), "zero cap must not roll");
         assert_eq!(std::fs::metadata(&before).unwrap().len(), bytes);
 
@@ -812,9 +966,13 @@ mod tests {
             active_before.display()
         );
 
-        let rolled = archiver
-            .roll_if_over_size(1)
-            .expect("should roll encrypted segment");
+        let rolled_paths = archiver.roll_if_over_size(1);
+        assert_eq!(
+            rolled_paths.len(),
+            1,
+            "encrypted single-tenant roll must produce exactly one rolled segment",
+        );
+        let rolled = rolled_paths.into_iter().next().expect("rolled segment");
         assert!(rolled.exists(), "rolled .enc file must exist");
         assert!(
             rolled.to_string_lossy().ends_with(".jsonl.enc"),
@@ -851,6 +1009,181 @@ mod tests {
         }
     }
 
+    fn make_tenant_msg(tenant: &str) -> rustgate_core::message::RoutableMessage {
+        let mut m = make_test_msg();
+        m.metadata = m.metadata.with_tenant_id(tenant);
+        m
+    }
+
+    // ── tenant partitioning coverage (closes #859) ───────────────────
+
+    #[tokio::test]
+    async fn archive_writes_under_default_subdir_when_tenant_is_none() {
+        // Backward-compat invariant: a message with no tenant lands
+        // under `<archive-dir>/_default/cot-…`. Operators with
+        // single-tenant deployments see one extra path component
+        // compared to pre-#859 — and nothing else changes.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-tenant-default-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let archiver = CotArchiver::new(&dir);
+        archiver.record(&make_test_msg()).await;
+        archiver.flush();
+
+        let default_dir = dir.join(DEFAULT_TENANT_ARCHIVE_KEY);
+        assert!(
+            default_dir.is_dir(),
+            "expected default tenant directory at {}",
+            default_dir.display(),
+        );
+        let entries: Vec<_> = std::fs::read_dir(&default_dir)
+            .expect("read default subdir")
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one segment under the default tenant subdirectory"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn archive_writes_under_tenant_subdir_when_tenant_is_set() {
+        // Per-tenant directories are created on demand. Two messages
+        // tagged with different tenants must land in distinct
+        // subdirectories — the cross-tenant isolation invariant.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-tenant-split-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let archiver = CotArchiver::new(&dir);
+        archiver.record(&make_tenant_msg("acme")).await;
+        archiver.record(&make_tenant_msg("globex")).await;
+        archiver.flush();
+
+        let acme_dir = dir.join("acme");
+        let globex_dir = dir.join("globex");
+        assert!(acme_dir.is_dir(), "acme/ subdirectory must exist");
+        assert!(globex_dir.is_dir(), "globex/ subdirectory must exist");
+        assert!(
+            !dir.join(DEFAULT_TENANT_ARCHIVE_KEY).exists(),
+            "_default/ must not be created when every message carries a tenant"
+        );
+
+        // Each tenant directory holds exactly one segment.
+        for d in [&acme_dir, &globex_dir] {
+            let entries: Vec<_> = std::fs::read_dir(d).expect("read tenant subdir").collect();
+            assert_eq!(entries.len(), 1, "tenant {} segment count", d.display());
+        }
+
+        // The JSONL line records the tenant for forensic re-bucketing.
+        let acme_segment = std::fs::read_dir(&acme_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let acme_text = std::fs::read_to_string(&acme_segment).unwrap();
+        assert!(
+            acme_text.contains("\"tenant\":\"acme\""),
+            "acme segment must embed tenant field, got {acme_text}",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn archive_sanitizes_path_traversal_in_tenant_id() {
+        // Defence-in-depth: a hostile cert Organization field
+        // (e.g. `..`) must not escape the archive directory. Tenant
+        // path components with `..`, `/`, `\`, NUL, or leading dots
+        // get replaced with `_` so the resulting bucket is always a
+        // safe single directory name under `dir`.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-tenant-traversal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let archiver = CotArchiver::new(&dir);
+        archiver.record(&make_tenant_msg("../escape")).await;
+        archiver.record(&make_tenant_msg(".hidden")).await;
+        archiver.record(&make_tenant_msg("with/slash")).await;
+        archiver.flush();
+
+        // No traversal: the parent of `dir` must hold nothing of ours.
+        let parent = dir.parent().expect("temp dir has parent");
+        for entry in std::fs::read_dir(parent).unwrap() {
+            let p = entry.unwrap().path();
+            // Anything matching our test prefix must live INSIDE `dir`,
+            // not as a sibling.
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                assert!(
+                    !name.starts_with("escape"),
+                    "tenant id `../escape` must not produce `escape` sibling: found {}",
+                    p.display(),
+                );
+            }
+        }
+
+        // The sanitised buckets exist under our archive dir.
+        let entries: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        assert!(
+            entries.iter().any(|n| n.contains("escape")),
+            "sanitised escape bucket missing, dir entries: {entries:?}",
+        );
+        assert!(
+            entries.iter().any(|n| n.starts_with('_')),
+            "leading-dot tenant must be replaced with `_`, dir entries: {entries:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn archive_active_paths_lists_every_open_tenant_segment() {
+        // The rotation sweep relies on `active_paths()` to skip
+        // every in-progress segment. After writing under two
+        // tenants, both segment paths must appear so neither file
+        // races the writer during deletion.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-active-paths-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let archiver = CotArchiver::new(&dir);
+        archiver.record(&make_tenant_msg("acme")).await;
+        archiver.record(&make_tenant_msg("globex")).await;
+        archiver.flush();
+
+        let actives = archiver.active_paths();
+        assert_eq!(actives.len(), 2);
+        let names: std::collections::BTreeSet<String> = actives
+            .iter()
+            .filter_map(|p| {
+                p.parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(String::from)
+            })
+            .collect();
+        assert!(names.contains("acme"));
+        assert!(names.contains("globex"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn archiver_creates_file() {
         let dir =
@@ -878,8 +1211,12 @@ mod tests {
         archiver.record(&msg).await;
         archiver.flush();
 
-        // Verify file exists and has content
-        let entries: Vec<_> = std::fs::read_dir(&dir).expect("dir should exist").collect();
+        // Verify file exists and has content under the default tenant
+        // subdirectory (post-#859 layout).
+        let tenant_dir = dir.join(DEFAULT_TENANT_ARCHIVE_KEY);
+        let entries: Vec<_> = std::fs::read_dir(&tenant_dir)
+            .expect("default tenant dir should exist")
+            .collect();
         assert_eq!(entries.len(), 1, "should have one archive file");
 
         let file_path = entries[0].as_ref().expect("entry").path();

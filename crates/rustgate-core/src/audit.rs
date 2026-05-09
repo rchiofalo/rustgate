@@ -2528,6 +2528,33 @@ pub fn mesh_no_route_to_destination(destination: &PeerId) {
     );
 }
 
+/// Record that the per-tenant Prometheus metric label cardinality cap
+/// has been exceeded.
+///
+/// Closes #859. When more than [`crate::constants::MAX_TENANT_LABELS`]
+/// distinct `tenant_id` strings have appeared on a `*_by_tenant`
+/// metric in this process, every subsequent tenant collapses to the
+/// reserved [`crate::constants::TENANT_OVERFLOW_LABEL`] bucket and a
+/// single audit event is emitted naming the offending metric and the
+/// total distinct-tenant count observed so far.
+///
+/// `metric` identifies the Prometheus metric name (e.g.
+/// `"rustgate_router_fanout_by_tenant_total"`) and `distinct_tenants`
+/// is the count at the moment the cap was first exceeded.
+///
+/// Sanitization: `metric` is sanitized at the audit boundary; the
+/// counter is a numeric and bypasses sanitization.
+pub fn tenant_isolation_label_overflow(metric: &str, distinct_tenants: usize) {
+    let metric = s(metric);
+    audit!(
+        "tenant.isolation_label_overflow",
+        metric = %metric,
+        distinct_tenants = distinct_tenants,
+        action = "metric_label_emit",
+        result = "overflow_to_reserved_label"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2671,6 +2698,24 @@ mod tests {
         #[test]
         fn test_no_route_to_destination() {
             mesh_no_route_to_destination(&PeerId::new("dest-1"));
+        }
+    }
+
+    mod tenant {
+        use super::*;
+
+        #[test]
+        fn test_tenant_isolation_label_overflow_smoke() {
+            // Smoke-test the audit emission: covers the typical
+            // overflow-on-257th-tenant case and confirms the metric
+            // name field is sanitized at the boundary even if the
+            // caller forgot to (newlines / control bytes get folded to
+            // U+FFFD by `s()`).
+            tenant_isolation_label_overflow("rustgate_router_fanout_by_tenant_total", 257);
+            tenant_isolation_label_overflow(
+                "metric_with\ncontrol\rchars",
+                crate::constants::MAX_TENANT_LABELS + 1,
+            );
         }
     }
 
