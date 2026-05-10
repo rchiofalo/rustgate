@@ -170,13 +170,19 @@ async fn apply_one(
     let recorded_name = applied.name_any();
     let recorded_ns = applied.namespace();
 
+    // Prefer the server's echoed name (it's the canonical form),
+    // but fall back to the manifest's name if the response was empty
+    // — defensive against a stripped-down API response in older
+    // Kubernetes versions.
+    let final_name = if recorded_name.is_empty() {
+        name
+    } else {
+        recorded_name
+    };
     Ok(AppliedRef {
         api_version,
         kind,
-        name: recorded_name
-            .is_empty()
-            .then(|| name)
-            .unwrap_or(recorded_name),
+        name: final_name,
         namespace: recorded_ns.or(Some(namespace)),
     })
 }
