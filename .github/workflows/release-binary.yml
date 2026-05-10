@@ -268,6 +268,12 @@ jobs:
           echo "hashes=$(cat *.sha256 | base64 -w0)" >> "$GITHUB_OUTPUT"
 
   provenance:
+    # SLSA's generic generator halts on private repos by default to avoid
+    # leaking the repository name through the public Sigstore transparency
+    # log. Mirroring the gate on the per-asset attest steps above: skip on
+    # private, run on public. Once the repo is public, the .intoto.jsonl
+    # attestation will be uploaded alongside the binaries automatically.
+    if: ${{ github.event.repository.visibility == 'public' }}
     needs: [build, combine-hashes]
     permissions:
       actions: read
