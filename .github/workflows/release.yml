@@ -116,14 +116,21 @@ jobs:
       # SARIF upload and SBOM generation are informational artefacts.
 
       - name: Attest build provenance
-        # Previously gated on `github.repository_visibility == 'public'`, which
-        # silently skipped provenance attestation on private forks / internal
-        # mirrors. The `attest-build-provenance` action uses the Sigstore public
-        # good instance for both public and private repos per upstream docs —
-        # the transparency-log entry contains only the subject digest and the
-        # build metadata, no private source material — so unconditional
-        # attestation is both safe and required by SLSA L3 for every build.
+        # `actions/attest-build-provenance` ultimately calls the GitHub
+        # attestation API (`POST /repos/.../attestations`). The earlier
+        # iteration of this comment claimed the action uses Sigstore's public
+        # good instance directly — that was wrong. The GitHub API endpoint is
+        # gated on the repo being **public** (or on a paid GHEC plan with
+        # the feature explicitly enabled); user-owned private repos receive
+        # `Feature not available for user-owned private repositories` and
+        # the step fails, taking the whole release job with it. Gate on
+        # `repository_visibility == 'public'` so the release succeeds on
+        # private forks / internal mirrors. Add `continue-on-error` as a
+        # second safety net so a transient API hiccup on a public repo
+        # also does not un-ship a built image.
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        if: ${{ github.event.repository.visibility == 'public' }}
+        continue-on-error: true
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}

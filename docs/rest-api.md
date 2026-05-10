@@ -1235,7 +1235,7 @@ The API is mounted on the same metrics HTTP server (default port 9090). Authenti
 | `/api/clients/{cn}` | GET | Detail for one client (404 when not connected) |
 | `/api/metrics/summary` | GET | JSON router/federation/store-forward summary |
 | `/api/store-forward` | GET | Per-CN store-and-forward queue depth + bytes |
-| `/api/audit/verify` | GET | Run [`verify_audit_log`] over the configured audit log |
+| `/api/audit/verify` | GET | Run `verify_audit_log` over the configured audit log |
 | `/api/version` | GET | Build version, git hash, feature flags, FIPS status |
 
 **Authentication.** All endpoints require `Authorization: Bearer <token>`. The token is compared in constant time via `subtle::ConstantTimeEq`. Token length is bounded (32–256 bytes) and validated at startup. The token is wrapped in `zeroize::Zeroizing` so it is wiped from memory on drop.
