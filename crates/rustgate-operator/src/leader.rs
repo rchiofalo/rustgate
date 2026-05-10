@@ -305,10 +305,13 @@ pub fn default_identity() -> String {
     let suffix: String = {
         let mut s = String::with_capacity(6);
         for _ in 0..6 {
-            // justification: fastrand is workspace dep; range bound is
-            // a constant so `index` cannot panic on an empty alphabet.
             let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789";
             let idx = (fastrand::u32(0..alphabet.len() as u32)) as usize;
+            // justification: `fastrand::u32(0..N)` returns a value
+            // strictly less than `N`, so indexing the 36-byte
+            // alphabet is provably in-bounds. The expect message is
+            // a defensive marker; the panic is unreachable for any
+            // alphabet of non-zero length.
             #[allow(clippy::expect_used)]
             s.push(*alphabet.get(idx).expect("idx is in 0..alphabet.len()") as char);
         }
