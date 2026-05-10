@@ -38,6 +38,16 @@ jobs:
           - target: aarch64-unknown-linux-musl
             cc: aarch64-linux-gnu-gcc
             linker: aarch64-linux-gnu-gcc
+            # The aarch64 cross-compiler we use is `aarch64-linux-gnu-gcc`
+            # (a glibc compiler producing a musl binary). When `tonic`'s
+            # `zstd` feature pulls in `zstd-sys`, the build script picks up
+            # `-D_FORTIFY_SOURCE=2` from the host's glibc headers and emits
+            # calls to `__memcpy_chk` / `__memmove_chk`, which musl libc
+            # does not provide — the link step then fails with `undefined
+            # reference to __memcpy_chk`. Disabling `_FORTIFY_SOURCE` for
+            # this target removes the chk-suffix calls and lets the link
+            # complete cleanly. Refs the v0.9.0 release-binary failure.
+            cflags: "-U_FORTIFY_SOURCE"
             fips: false
             pq: false
           - target: x86_64-unknown-linux-musl
@@ -112,6 +122,12 @@ jobs:
         env:
           CC_${{ matrix.target }}: ${{ matrix.cc }}
           C_INCLUDE_PATH: ${{ matrix.fips && contains(matrix.target, 'musl') && '/usr/include:/usr/include/x86_64-linux-gnu' || '' }}
+          # Per-target CFLAGS injected via cargo's CFLAGS_<target> env var.
+          # The build-script sysroot for `cc-rs` (which `zstd-sys` uses)
+          # honours this env var when set; empty values are no-ops.
+          # `tr '-' '_'` because the cargo env var name uses underscores
+          # whereas the matrix `target` field uses dashes.
+          CFLAGS_aarch64_unknown_linux_musl: ${{ matrix.target == 'aarch64-unknown-linux-musl' && matrix.cflags || '' }}
         run: |
           FEATURES="${{ env.RELEASE_FEATURES }}"
           if [ "${{ matrix.fips }}" = "true" ]; then
