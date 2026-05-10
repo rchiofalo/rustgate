@@ -50,9 +50,7 @@ controller = [
     "dep:axum",
     "dep:prometheus",
     "dep:chrono",
-    "dep:json-patch",
     "dep:futures",
-    "dep:anyhow",
     "dep:fastrand",
     "dep:schemars",
 ]
@@ -74,9 +72,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "
 axum = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
-json-patch = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-anyhow = { workspace = true, optional = true }
 fastrand = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 

@@ -95,7 +95,14 @@ pub async fn serve(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
     let app = router(client, registry);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // The `configure_tactical_socket` / keepalive helpers apply
+    // per-stream after `accept()`; axum's `serve()` consumes the
+    // listener and manages per-connection lifecycle internally so
+    // we cannot interpose. This socket is a Prometheus scrape +
+    // kubelet probe endpoint (short-lived HTTP/1.1 requests from a
+    // sibling pod), not a tactical message stream — Nagle and TCP
+    // keepalive don't apply.
+    let listener = tokio::net::TcpListener::bind(addr).await?; // playbook-drift-ok: axum-managed scrape + probe endpoint, not a tactical stream
     tracing::info!(target: "operator", addr = %addr, "health/metrics server listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

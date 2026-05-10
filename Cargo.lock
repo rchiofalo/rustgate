@@ -4185,14 +4185,12 @@ dependencies = [
 name = "rustgate-operator"
 version = "0.9.0"
 dependencies = [
- "anyhow",
  "axum",
  "chrono",
  "clap",
  "fastrand",
  "futures",
  "insta",
- "json-patch",
  "k8s-openapi",
  "kube",
  "prometheus",

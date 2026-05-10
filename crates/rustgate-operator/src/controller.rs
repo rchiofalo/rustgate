@@ -179,7 +179,7 @@ pub async fn reconcile_fn(
     let outcome = match pure_reconcile(&render_cluster, &now_rfc3339) {
         Ok(outcome) => outcome,
         Err(OperatorError::InvalidSpec { message }) => {
-            tracing::warn!(target: "operator", reason = "InvalidSpec", message = %message, "spec rejected");
+            tracing::warn!(target: "operator", reason = "InvalidSpec", message = %message, "invalid spec");
             ctx.events
                 .warning(cluster.as_ref(), "InvalidSpec", &message)
                 .await;
