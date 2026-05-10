@@ -186,14 +186,18 @@ jobs:
         run: cosign sign-blob --yes --bundle "$ARCHIVE.sigstore.json" "$ARCHIVE"
 
       - name: Attest binary provenance
-        # Previously gated on `github.repository_visibility == 'public'`, which
-        # silently skipped binary provenance attestation on private forks /
-        # internal mirrors. `attest-build-provenance` uses the Sigstore public
-        # good instance for both public and private repos per upstream docs —
-        # the transparency-log entry contains only the archive digest and the
-        # build metadata, no private source material — so unconditional
-        # attestation is both safe and required for SLSA L3 for every build.
+        # `actions/attest-build-provenance` calls the GitHub attestation API
+        # (`POST /repos/.../attestations`), which is **not available on
+        # user-owned private repos** — the call returns
+        # "Feature not available for user-owned private repositories" and
+        # the step fails, taking the binary upload step below with it.
+        # Gate on `repository_visibility == 'public'` so the release
+        # actually ships its archives on private forks / internal mirrors.
+        # `continue-on-error` is a second safety net for transient API
+        # failures on a public repo.
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        if: ${{ github.event.repository.visibility == 'public' }}
+        continue-on-error: true
         with:
           subject-path: ${{ env.ARCHIVE }}
 
@@ -317,7 +321,11 @@ jobs:
         # Provenance attestation on the SBOM file proves it was produced by
         # this exact workflow run (not substituted after release). Consumers
         # verify with `gh attestation verify sbom-source-*.spdx.json`.
+        # See the gating note on the binary attest step above — the GitHub
+        # attestation API is not available for user-owned private repos.
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        if: ${{ github.event.repository.visibility == 'public' }}
+        continue-on-error: true
         with:
           subject-path: "sbom-source-${{ steps.version.outputs.version }}.spdx.json"
 
