@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Live K8s controller apply-loop for `rustgate-operator` (closes the deferred half of #874)** — the operator now ships a `controller` Cargo feature that turns the binary into a full kube-runtime reconciler. The pure-render path stays the default (no `kube` / `k8s-openapi` in the dep tree), and the controller feature layers on top:
+  - **`controller.rs`** — `kube_runtime::Controller` wired to the existing pure `reconcile()` function. Watches `RustgateCluster` cluster-wide (or in a single namespace) and `.owns(...)` the rendered children (StatefulSet, Service, ConfigMap) so drift on any child re-queues the parent.
+  - **`apply.rs`** — server-side apply via `kube::api::DynamicObject` with a stable field manager (`rustgate-operator`) and `force: true`. Kind-agnostic so future renderer outputs (NetworkPolicy, PDB, …) land without code changes.
+  - **`leader.rs`** — `coordination.k8s.io/v1` Lease-based leader election with the standard `leaseDuration / renewDeadline / retryPeriod` knobs (30s / 20s / 5s defaults). Followers keep watches warm and re-queue cheaply via a shared `LeaderGate`; on SIGTERM the leader clears `holderIdentity` so a peer can take over without waiting the full leaseDuration.
+  - **`events.rs`** — Kubernetes Event emission via `kube::runtime::events::Recorder`. Every reconcile emits `Normal/Reconciled` (apply summary), `Warning/InvalidSpec`, `Warning/ApplyFailed`, etc., visible in `kubectl describe rustgatecluster`.
+  - **`health.rs`** — `axum`-based HTTP server exposing `/healthz`, `/readyz` (probes the API server reachability), and `/metrics` (Prometheus text exposition).
+  - **`metrics.rs`** — Prometheus instrumentation under the `rustgate_operator_*` namespace: `reconcile_total{result}`, `reconcile_duration_seconds`, `apply_total{kind,result}`, `clusters_total`, `leader`, `last_reconcile_timestamp_seconds`.
+  - **`main.rs run` subcommand** — wires the kube client (`Client::try_default`, picks up in-cluster ServiceAccount tokens or `~/.kube/config`), spawns the elector / HTTP / signal tasks, drains in-flight reconciles on SIGTERM, and releases the lease on shutdown.
+  - **Helm chart updates** — `operator-rbac.yaml` adds `coordination.k8s.io/leases` and `events.k8s.io/events` permissions; `operator-deployment.yaml` sets `replicas: 2` for hot-standby, wires `/healthz` and `/readyz` probes, exposes `:8080`, adds Prometheus scrape annotations and topology spread constraints, and increases `terminationGracePeriodSeconds` to give the drain + lease-release sequence headroom. `values.yaml` exposes `operator.leaderElection.enabled`, `operator.replicas`, `operator.watchNamespace`, `operator.httpPort`, `operator.prometheus.scrape`.
+  - **`kube_types.rs`** — `#[derive(CustomResource)]` view of `RustgateCluster` so `kube_runtime::Controller` can watch it; round-trips losslessly to the existing hand-rolled `crd::RustgateCluster` via JSON so the renderer-side golden snapshots stay valid.
+
 ## [0.9.0] - 2026-05-09
 
 ### Added
