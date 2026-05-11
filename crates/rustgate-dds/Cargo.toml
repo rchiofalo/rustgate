@@ -27,7 +27,7 @@ dds-mock = []
 # UDP loopback discovery between two participants in the same
 # process — works on every CI runner that doesn't firewall multicast
 # on the loopback interface (i.e. the standard `ubuntu-latest`).
-dds-real = ["dep:rustdds", "dep:ros2-client", "dep:tracing-subscriber"]
+dds-real = ["dep:rustdds", "dep:ros2-client"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -47,7 +47,6 @@ bytes = { workspace = true }
 # stack on the dep tree.
 rustdds = { workspace = true, optional = true }
 ros2-client = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

@@ -35,15 +35,20 @@
 //! - **`dds-real` feature** — pulls in the pure-Rust `rustdds`
 //!   RTPS stack plus `ros2-client` for ROS 2 graph interop. Two
 //!   bridges land behind the gate:
-//!   - [`real::RealDdsBridge`] for raw DDS topics (NGVA / VICTORY
+//!   - `real::RealDdsBridge` for raw DDS topics (NGVA / VICTORY
 //!     vehicle buses, RTI Connext peers, Eclipse Cyclone DDS,
 //!     FastDDS, …) — CDR-encoded `DdsPayloadWire` wrapping the
 //!     property-bag bytes.
-//!   - [`ros2::Ros2Bridge`] for ROS 2 topics — shares the
+//!   - `ros2::Ros2Bridge` for ROS 2 topics — shares the
 //!     `DomainParticipant` with the raw-DDS bridge so a single
 //!     rustgate process serves both DDS-native peers and ROS 2
 //!     graph tools (`ros2 topic echo`, `ros2 bag record`, etc.)
 //!     without running two parallel RTPS stacks.
+//!
+//!   Intra-doc links to `real::*` and `ros2::*` use plain backticks
+//!   rather than `[…]` references because rustdoc's `cargo doc`
+//!   pass on the workspace does not enable `dds-real` and would
+//!   fail on the broken links under `-D rustdoc::broken-intra-doc-links`.
 //!
 //! # NGVA Land Data Model topics
 //!
