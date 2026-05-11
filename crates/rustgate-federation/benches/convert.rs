@@ -1,5 +1,12 @@
 // Copyright © 2026 Roberto Chiofalo.
 
+// Gated at the Cargo manifest level via `required-features = ["v2"]`
+// on the matching `[[bench]]` block — when the `v2` feature is off,
+// Cargo skips this target entirely. Source-level cfg gating would
+// also work but would conflict with criterion's `main` symbol
+// expectations on a default-feature build, since cfg-ing the file
+// out empties it and `[[bench]] harness = false` then complains about
+// the missing main function.
 #![allow(unused_results)]
 
 use std::hint::black_box;

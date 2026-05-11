@@ -123,3 +123,10 @@ proptest = { workspace = true }
 [[bench]]
 name = "convert"
 harness = false
+# The bench uses `rustgate_federation::v2::convert::xml_to_federated_event`,
+# which is `#[cfg(feature = "v2")]`-gated in the library. Cargo skips
+# this target entirely when the listed features aren't enabled, which
+# is cleaner than putting `#![cfg(feature = "v2")]` at the top of the
+# bench file (where it would conflict with criterion's `main` symbol
+# expectations on a default-feature build).
+required-features = ["v2"]

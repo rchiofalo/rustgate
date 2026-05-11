@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cargo check --workspace --all-targets` now passes on the default feature set.** Two targets in `rustgate-federation` referenced `v2`-gated symbols (`v2::proto::*`, `FederationManager::create_v2_event_handler`) without their own `#[cfg(feature = "v2")]` gate:
+  - `benches/convert.rs` — added `required-features = ["v2"]` to the matching `[[bench]]` block in `Cargo.toml`. Cleaner than a source-level cfg, which would empty the file and break criterion's `main` symbol expectation under `harness = false`.
+  - `manager.rs::tests::v2_handler_forwards_when_peer_groups_trusted` — added `#[cfg(feature = "v2")]` (the adjacent `v2_handler_forwards_even_with_untrusted_wire_groups` test already had the gate; this one was missed when the pair was originally added).
+
+  Pre-existing defect; closes a CI-only red flag that would have surfaced as soon as any contributor ran the canonical workspace check locally.
+
 ### Added
 
 - **Live K8s controller apply-loop for `rustgate-operator` (closes the deferred half of #874)** — the operator now ships a `controller` Cargo feature that turns the binary into a full kube-runtime reconciler. The pure-render path stays the default (no `kube` / `k8s-openapi` in the dep tree), and the controller feature layers on top:
