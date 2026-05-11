@@ -32,13 +32,18 @@
 //!   wiring end-to-end in tests without any DDS domain participant.
 //!   The mock is the reference implementation against which a future
 //!   `dds-real` binding is written.
-//! - **`dds-real` feature** — currently a placeholder for a pinned
-//!   DDS impl (Cyclone DDS via `cyclonedds-rs`, RTI Connext via
-//!   FFI, or `dust-dds` once 1.0 ships). Bringing the real
-//!   integration online is a contained follow-up: implement
-//!   [`bridge::DdsBridge`] against the chosen runtime's reader /
-//!   writer APIs and gate the existing wiring on this feature flag
-//!   without touching any other crate.
+//! - **`dds-real` feature** — pulls in the pure-Rust `rustdds`
+//!   RTPS stack plus `ros2-client` for ROS 2 graph interop. Two
+//!   bridges land behind the gate:
+//!   - [`real::RealDdsBridge`] for raw DDS topics (NGVA / VICTORY
+//!     vehicle buses, RTI Connext peers, Eclipse Cyclone DDS,
+//!     FastDDS, …) — CDR-encoded `DdsPayloadWire` wrapping the
+//!     property-bag bytes.
+//!   - [`ros2::Ros2Bridge`] for ROS 2 topics — shares the
+//!     `DomainParticipant` with the raw-DDS bridge so a single
+//!     rustgate process serves both DDS-native peers and ROS 2
+//!     graph tools (`ros2 topic echo`, `ros2 bag record`, etc.)
+//!     without running two parallel RTPS stacks.
 //!
 //! # NGVA Land Data Model topics
 //!
@@ -110,10 +115,19 @@ pub mod wiring;
 #[cfg(feature = "dds-mock")]
 pub mod mock;
 
+#[cfg(feature = "dds-real")]
+pub mod real;
+#[cfg(feature = "dds-real")]
+pub mod ros2;
+
 pub use bridge::{DdsBridge, DdsSample, Durability, History, QosProfile, Reliability};
 pub use config::{DdsConfig, PropertyMap, Subscription};
 pub use error::DdsError;
 pub use mapper::PropertyMapper;
 #[cfg(feature = "dds-mock")]
 pub use mock::MockDdsBridge;
+#[cfg(feature = "dds-real")]
+pub use real::{RealDdsBridge, TYPE_NAME as REAL_TYPE_NAME};
+#[cfg(feature = "dds-real")]
+pub use ros2::{Ros2Bridge, Ros2TopicConfig};
 pub use wiring::{OutboundHandle, SOURCE_DDS};

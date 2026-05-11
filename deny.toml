@@ -82,6 +82,40 @@ ignore = [
     # a published `tikv-jemalloc-ctl` and we bump our pin past it. At
     # that point `cargo tree -i paste` should return no entries.
     "RUSTSEC-2024-0436",
+    # RUSTSEC-2020-0016 — `net2` 0.2.39 is unmaintained; the maintained
+    # replacement is `socket2`.
+    #
+    # Dependency-graph entry point: net2 enters the dep graph only when
+    # the `rustgate-dds` `dds-real` feature is enabled, via the chain
+    #   rustgate-server -> rustgate-dds -> rustdds 0.11 -> mio 0.6 -> net2
+    # and the parallel chain
+    #   rustgate-server -> rustgate-dds -> ros2-client 0.8 -> mio 0.6 -> net2
+    # `cargo tree --features dds-real -i net2` confirms there is no other
+    # use site; rustgate itself uses the workspace's `socket2` everywhere
+    # (`net` socket-option helpers, plaintext listener, websocket).
+    #
+    # Risk surface: the advisory is "unmaintained" (informational), not a
+    # vulnerability. The DDS transport in rustdds uses net2 only for its
+    # legacy socket-options shim — the actual RTPS wire path runs on
+    # std::net + mio I/O readiness. There is no known CVE, no
+    # remote-exploitable surface, and the unmaintained crate is locked at
+    # 0.2.39 (no upstream churn that could surprise us). The `audit-soft`
+    # CI job surfaces this advisory as a warning so a future maintained
+    # successor (or a vulnerability finding on the locked version) is
+    # visible without blocking the merge gate today.
+    #
+    # Why we cannot fix this in our tree: rustdds 0.11.8 and ros2-client
+    # 0.8.2 both pin `mio = "0.6"`; upgrading to mio 0.8+ would require
+    # an upstream rustdds release. Forking rustdds to upgrade its mio
+    # pin is out of scope; the project is actively maintained and a
+    # future mio bump is the right fix.
+    #
+    # Removal trigger: drop this ignore the next release after rustdds
+    # bumps its mio pin to `>= 0.8` (which removes the transitive net2
+    # dep) and we update our `rustdds` workspace pin past it. At that
+    # point `cargo tree --features dds-real -i net2` should return no
+    # entries.
+    "RUSTSEC-2020-0016",
 ]
 
 [licenses]
