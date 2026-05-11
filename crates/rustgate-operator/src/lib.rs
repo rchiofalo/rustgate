@@ -30,10 +30,12 @@
 //!    validate, render, and produce a status patch. Stays free of
 //!    `kube::Api`/`kube::Client` calls so the renderer stays easy to test.
 //!
-//! The live cluster controller (which would call the Kubernetes API to
-//! apply, observe, and update status) is documented as a deferred
-//! follow-up in [`mod@reconcile`]: the renderer is the source of truth
-//! for *what* gets created, and the apply-loop is mechanical glue.
+//! Behind the `controller` feature flag the crate also ships the live
+//! cluster controller — the kube-runtime harness that watches
+//! `RustgateCluster` resources, server-side-applies the renderer's
+//! output, reads back the owned `StatefulSet.status`, and patches the
+//! parent `RustgateCluster.status`. Default builds omit `controller` so
+//! the pure-render binary stays lean; the release Docker image opts in.
 //!
 //! ## Usage
 //!
@@ -53,7 +55,29 @@ pub mod error;
 pub mod reconcile;
 pub mod render;
 
+// Controller-only modules. Each one gates itself on
+// `#[cfg(feature = "controller")]` at the top, so this re-export block
+// only needs to gate the `pub mod` declaration.
+#[cfg(feature = "controller")]
+pub mod apply;
+#[cfg(feature = "controller")]
+pub mod controller;
+#[cfg(feature = "controller")]
+pub mod events;
+#[cfg(feature = "controller")]
+pub mod health;
+#[cfg(feature = "controller")]
+pub mod kube_types;
+#[cfg(feature = "controller")]
+pub mod leader;
+#[cfg(feature = "controller")]
+pub mod metrics;
+
+#[cfg(feature = "controller")]
+pub use controller::{Context as ControllerContext, run as run_controller};
 pub use crd::{RustgateCluster, RustgateClusterSpec, RustgateClusterStatus};
 pub use error::{OperatorError, Result};
+#[cfg(feature = "controller")]
+pub use leader::{LeaderConfig, LeaderElector, LeaderGate, default_identity};
 pub use reconcile::{ReconcileOutcome, reconcile};
 pub use render::{RenderedManifest, render_all, render_all_yaml};

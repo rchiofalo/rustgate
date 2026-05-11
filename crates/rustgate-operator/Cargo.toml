@@ -17,6 +17,44 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# Pure renderer mode. The default — no Kubernetes client, no async runtime,
+# no network surface. `rustgate-operator render` and `validate` work in this
+# mode and produce identical output to the live controller. Useful for CI
+# smoke tests and dry-run pipelines.
+default = []
+# Live cluster controller. Pulls in `kube`, `k8s-openapi`, `tokio` (with
+# the multi-thread runtime), `axum` (for the healthz/metrics surface),
+# `prometheus`, `chrono`, and `json-patch`. Enables the `run` subcommand
+# which:
+#   * watches `RustgateCluster` resources cluster-wide (or in a single
+#     namespace, configurable);
+#   * server-side applies the renderer's output with a stable field
+#     manager (`rustgate-operator`);
+#   * reads back the owned StatefulSet's observed status and patches the
+#     parent `RustgateCluster.status` accordingly;
+#   * acquires a `coordination.k8s.io/v1` Lease so a multi-replica
+#     operator Deployment can run hot-standby without double-applying;
+#   * emits Kubernetes Events on every reconcile (`Normal/Reconciled`,
+#     `Warning/InvalidSpec`, `Warning/ApplyFailed`, etc.) so
+#     `kubectl describe rustgatecluster` shows progress;
+#   * exposes a Prometheus `/metrics` endpoint with reconcile / apply /
+#     leader gauges and counters;
+#   * drains in-flight reconciles on SIGTERM and releases the lease.
+# Builds with `--features controller` for development / image bake; the
+# release Docker image embeds the controller by default.
+controller = [
+    "dep:kube",
+    "dep:k8s-openapi",
+    "dep:tokio",
+    "dep:axum",
+    "dep:prometheus",
+    "dep:chrono",
+    "dep:futures",
+    "dep:fastrand",
+    "dep:schemars",
+]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,6 +64,20 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 
+# Controller-only deps. Gated by the `controller` feature so the default
+# build stays a pure-render binary.
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"], optional = true }
+axum = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+fastrand = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+
 [dev-dependencies]
 insta = { workspace = true }
 serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }

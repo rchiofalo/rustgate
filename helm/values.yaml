@@ -261,17 +261,47 @@ operator:
   enabled: false
   image:
     repository: ghcr.io/rchiofalo/rustgate-operator
-    tag: "0.8.0"
+    tag: "0.9.0"
     pullPolicy: IfNotPresent
-  # CLI args for the operator binary. The MVP ships a `validate` and
-  # `render` subcommand for one-shot use; the live cluster controller is
-  # a deferred follow-up. Override to `["run"]` once the controller is
-  # available.
-  args:
-    - run
-  # Filter for the `tracing` env-filter. `info,rustgate_operator=debug`
-  # is a sensible default for the live controller.
+  # Number of operator replicas. Defaults to 2 so the leader-election
+  # path is exercised; a hot-standby replica takes over on the active
+  # leader's voluntary shutdown without waiting for the full
+  # leaseDuration to expire. Set to 1 only when you also disable
+  # leader election via `leaderElection.enabled: false`.
+  replicas: 2
+  # Leader election via `coordination.k8s.io/v1` Lease. When enabled
+  # the operator uses the workspace default lease cadence
+  # (lease=30s, renew=20s, retry=5s). When disabled the operator acts
+  # as if it holds the lease from startup; only safe with `replicas: 1`.
+  leaderElection:
+    enabled: true
+  # When set, the operator watches only this namespace. RBAC stays
+  # cluster-scoped today; namespace-scoped RBAC is a follow-up.
+  watchNamespace: ""
+  # Extra CLI args appended after `run --http-addr ...`. Use for
+  # `--identity` overrides in tests.
+  extraArgs: []
+  # tracing env-filter. `info,rustgate_operator=debug` for live debug.
   logLevel: "info,rustgate_operator=info"
+  # HTTP server port for /healthz, /readyz, /metrics.
+  httpPort: 8080
+  # Prometheus pod-annotation scrape toggle. Disable when using a
+  # ServiceMonitor to avoid double-scraping.
+  prometheus:
+    scrape: true
+  # Deployment / Pod metadata extras.
+  annotations: {}
+  podAnnotations: {}
+  # Extra env vars / volumes wired to the operator container.
+  extraEnv: []
+  volumes: []
+  volumeMounts: []
+  # SIGTERM drain budget. The signal handler flips the shutdown watch,
+  # the reconcile loop finishes its current pass, and the Lease is
+  # released so a peer can take over without waiting for the full
+  # leaseDuration to expire. 30 s is plenty for the in-flight apply +
+  # status patch + lease release sequence.
+  terminationGracePeriodSeconds: 30
   resources:
     requests:
       cpu: 100m
@@ -279,6 +309,9 @@ operator:
     limits:
       cpu: 500m
       memory: 256Mi
+  # The Deployment template wires probes inline against /healthz and
+  # /readyz. These overrides remain for forward compatibility with
+  # downstream values that expect them.
   livenessProbe: {}
   readinessProbe: {}
 

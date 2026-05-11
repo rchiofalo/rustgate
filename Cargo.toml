@@ -180,6 +180,37 @@ mdns-sd = { version = "0.19", default-features = false, features = ["async"] }
 etcd-client = { version = "0.18", default-features = false, features = ["tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 wiremock = "0.6"
+# Kubernetes client + runtime for the operator's live apply-loop
+# (`rustgate-operator`, feature `controller`). Pulls in the typed API
+# client, the `kube_runtime::Controller` harness used to watch and
+# reconcile `RustgateCluster` resources, the `derive` macros for
+# generating a `CustomResource` wrapper, and the leader-election
+# primitives backed by `coordination.k8s.io/v1` Leases. Default features
+# include `openssl-tls`, which would pull `openssl` into the dep tree and
+# trip the deny.toml ban, so the default set is disabled and
+# `rustls-tls` is opted into explicitly.
+kube = { version = "3.1", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
+# Typed Kubernetes resource bindings. Pinned to the same minor as `kube`'s
+# tested-against version per the `kube` README. The `latest` feature picks
+# the most recent Kubernetes API surface the bindings ship; the operator
+# only uses StatefulSet / Service / ConfigMap / Lease / Event types so any
+# 1.28+ cluster works.
+k8s-openapi = { version = "0.27", features = ["latest"] }
+# Lightweight HTTP router for the operator's `/healthz`, `/readyz`, and
+# `/metrics` endpoints. Default features are disabled so we don't pull in
+# multipart, ws, or other surface area we don't need.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+# JSON Patch (RFC 6902) — used to build the strategic-merge / JSON-patch
+# document for `Api::patch_status`. Re-exported from `kube` but pinning it
+# at workspace level so any other crate that needs it lands on the same
+# version.
+json-patch = "4"
+# Calendar / wall-clock timestamps for the operator's `lastReconciled`
+# field and `Condition.lastTransitionTime`. The `time` crate is already
+# in the workspace for `formatting` only, but `chrono` matches the RFC
+# 3339 + serde patterns used by `k8s-openapi` and `kube` everywhere
+# else, so for the operator we use `chrono` to avoid impedance mismatch.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }
