@@ -46,6 +46,7 @@ pub mod provenance;
 pub mod replay_buffer;
 pub mod replay_persist;
 pub mod store;
+pub mod topology;
 pub mod trust_store;
 pub mod v1;
 pub mod v2;

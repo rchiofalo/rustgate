@@ -129,6 +129,8 @@ impl ConsulDiscovery {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         }
     }
 }
