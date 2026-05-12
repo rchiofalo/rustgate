@@ -21,10 +21,13 @@ workspace = true
 # #1326).
 default = []
 dds-mock = []
-# Reserved for the real DDS SDK integration. Today the gated module is
-# a placeholder so downstream feature math stays stable across the
-# eventual SDK drop. See `src/lib.rs` module docs.
-dds-real = []
+# Real DDS bindings backed by `rustdds` (pure-Rust RTPS). Pulls in the
+# `RealDdsBridge` implementation in `src/real.rs` and the ROS 2 wire
+# compat layer in `src/ros2.rs`. Tests behind this feature require
+# UDP loopback discovery between two participants in the same
+# process — works on every CI runner that doesn't firewall multicast
+# on the loopback interface (i.e. the standard `ubuntu-latest`).
+dds-real = ["dep:rustdds", "dep:ros2-client"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -39,7 +42,13 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
+# Real DDS (and ROS 2) deps live behind the `dds-real` feature so the
+# default build stays a trait + mock + wiring scaffold without an RTPS
+# stack on the dep tree.
+rustdds = { workspace = true, optional = true }
+ros2-client = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 toml = { workspace = true }
+tracing-subscriber = { workspace = true }

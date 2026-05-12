@@ -5,15 +5,27 @@ Architecture (NGVA, STANAG 4754)** and the US Army's **VICTORY** standard.
 
 ## Status
 
-This crate ships the **integration scaffold** for the DDS bridge: the
-`DdsBridge` trait, the TOML config schema, the `PropertyMapper`
-dotted-path projection machinery, the `MockDdsBridge` reference
-implementation, and the inbound / outbound wiring tasks. Production-grade
-DDS Rust bindings are still maturing (`cyclonedds-rs` is unmaintained as
-of 2026; `dust-dds` is pre-1.0); plugging a real adapter in is a contained
-change behind a future `dds-real` feature flag.
+This crate ships the DDS bridge end-to-end. The default build is a
+trait + config + mock + wiring scaffold; the **`dds-real` feature**
+layers on real bindings backed by [`rustdds`] (pure-Rust RTPS) and
+[`ros2-client`] (ROS 2 graph compatibility on top of rustdds).
 
-This is the DDS half of #870. The GeoJSON output half landed in #1326.
+Two production-grade bridge implementations:
+
+| Type | Use case | Wire format |
+|---|---|---|
+| [`MockDdsBridge`] (`dds-mock`) | In-memory tests | Broadcast channel per topic |
+| [`RealDdsBridge`] (`dds-real`) | Raw DDS-RTPS peers (NGVA, VICTORY, Cyclone DDS, RTI Connext, FastDDS) | CDR-encoded `DdsPayloadWire` |
+| [`Ros2Bridge`] (`dds-real`) | ROS 2 nodes — `ros2 topic echo`, `ros2 bag record`, `ros2 node list` see published topics | CDR-encoded ROS 2 IDL types |
+
+The `Ros2Bridge` shares its `DomainParticipant` with the `RealDdsBridge`
+so a single rustgate process serves both DDS-native peers and ROS 2
+graph tools without running two parallel RTPS stacks.
+
+This closes the DDS half of #870 (the GeoJSON output half landed in
+#1326). DDS Security plugin configuration remains deferred to a
+follow-up — in-vehicle deployments today rely on link-layer security
+(IPsec / MACsec / RF crypto) rather than DDS-level auth.
 
 ## Why DDS
 
@@ -37,6 +49,8 @@ surface of those platforms without bolt-on translation layers.
 | `Subscription` / `PropertyMap` | Per-topic config + property-map rule |
 | `PropertyMapper` | Stateless dotted-path entity ↔ JSON projection |
 | `MockDdsBridge` (feature `dds-mock`) | In-memory bridge for tests |
+| `RealDdsBridge` (feature `dds-real`) | Real DDS-RTPS bridge via rustdds |
+| `Ros2Bridge` / `Ros2TopicConfig` (feature `dds-real`) | ROS 2 graph bridge via ros2-client |
 | `wiring::spawn_outbound` / `wiring::spawn_inbound` | Background-task constructors |
 
 ## NGVA Land Data Model topic mapping

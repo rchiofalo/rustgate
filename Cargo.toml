@@ -211,6 +211,18 @@ json-patch = "4"
 # 3339 + serde patterns used by `k8s-openapi` and `kube` everywhere
 # else, so for the operator we use `chrono` to avoid impedance mismatch.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+# Pure-Rust DDS implementation (RTPS wire protocol) used by
+# `rustgate-dds` behind the `dds-real` feature flag. Chosen over the
+# Cyclone DDS FFI binding because rustdds is `#![forbid(unsafe_code)]`
+# compatible, has no native-library install step, and is the
+# foundation `ros2-client` builds on (so the same dependency satisfies
+# both raw-DDS and ROS 2 wire compat).
+rustdds = "0.11"
+# ROS 2 client wrapping rustdds. Exposes the ROS 2 graph (nodes,
+# topics, parameters, rosout) and applies the ROS 2 name-mangling
+# convention (`rt/<topic>`) so a rustgate-published message is
+# visible to `ros2 topic echo`.
+ros2-client = "0.8"
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }
