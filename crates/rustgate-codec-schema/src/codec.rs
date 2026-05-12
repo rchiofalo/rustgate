@@ -1,7 +1,7 @@
 // Copyright © 2026 Roberto Chiofalo.
 
-//! Generic [`EntityCodec`](rustgate_core::entity::EntityCodec)
-//! implementation driven by a [`Schema`] document.
+//! Generic [`EntityCodec`] implementation driven by a [`Schema`]
+//! document.
 //!
 //! Construct a [`SchemaCodec`] with a parsed + validated [`Schema`];
 //! the codec then handles every payload that matches the schema's
@@ -13,10 +13,9 @@
 //! - Little- and big-endian wire ordering.
 //! - Linear calibration on integer fields (`scale * raw + offset`).
 //! - Optional projection of decoded values onto first-class
-//!   [`Entity`](rustgate_core::entity::Entity) fields
-//!   (`uid`, `callsign`, `mil_std_2525_sidc`, `position.lat`,
-//!   `position.lon`, `position.hae_meters`, `velocity.speed_m_s`,
-//!   `velocity.course_deg`).
+//!   [`Entity`] fields (`uid`, `callsign`, `mil_std_2525_sidc`,
+//!   `position.lat`, `position.lon`, `position.hae_meters`,
+//!   `velocity.speed_m_s`, `velocity.course_deg`).
 //! - Fields without an `entity_path` are preserved under
 //!   `Entity::attributes` with the key
 //!   `"schema.<message>.<field>"` so round-trips never lose data.
@@ -408,9 +407,8 @@ impl DecodedValue {
     }
 }
 
-/// Internal encode-side value, derived from the
-/// [`Entity`](rustgate_core::entity::Entity) field a schema field
-/// projects from.
+/// Internal encode-side value, derived from the [`Entity`] field a
+/// schema field projects from.
 #[derive(Debug, Clone, PartialEq)]
 enum EncodedValue {
     I64(i64),
