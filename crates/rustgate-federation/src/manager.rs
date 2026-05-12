@@ -3415,6 +3415,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "v2")]
     #[tokio::test]
     async fn v2_handler_forwards_when_peer_groups_trusted() {
         use bytes::Bytes;
