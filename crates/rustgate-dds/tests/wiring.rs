@@ -76,6 +76,8 @@ fn ground_entity(uid: &str, callsign: &str, lat: f64, lon: f64, speed: f64) -> E
         callsign: Some(callsign.into()),
         mil_std_2525_sidc: None,
         attributes: BTreeMap::new(),
+        taskings: Default::default(),
+        files: Default::default(),
     }
 }
 

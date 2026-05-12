@@ -23,6 +23,8 @@ fn make_entity(uid: &str) -> Entity {
         callsign: None,
         mil_std_2525_sidc: None,
         attributes: BTreeMap::new(),
+        taskings: Default::default(),
+        files: Default::default(),
     }
 }
 
