@@ -2,11 +2,17 @@
 
 //! Per-tenant peer selection with Active / Standby topology roles.
 //!
-//! This module is the policy layer that sits between
-//! [`crate::manager::FederationManager::forward_inner`] and the raw peer
-//! snapshot the manager iterates. Given a message's `tenant_id` and the
-//! current snapshot of `(PeerId, PeerHandle)` pairs, it returns the
-//! subset of peers that should receive the message.
+//! This module is the policy layer that sits between the federation
+//! manager's `forward_inner` path and the raw peer snapshot it
+//! iterates. Given a message's `tenant_id` and the current snapshot
+//! of `(PeerId, PeerHandle)` pairs, it returns the subset of peers
+//! that should receive the message.
+//!
+//! (The link target `manager::FederationManager::forward_inner` is
+//! private and would trip `rustdoc::private-intra-doc-links` under
+//! the workspace's `-D warnings`; referencing it in plain backticks
+//! avoids that gate while keeping the name discoverable via
+//! grep / `cargo doc --document-private-items`.)
 //!
 //! ## Filter pipeline
 //!

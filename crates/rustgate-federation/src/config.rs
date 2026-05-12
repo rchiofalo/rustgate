@@ -121,10 +121,11 @@ pub enum TopologyRole {
     /// that don't opt in to topology configuration.
     #[default]
     Active,
-    /// Held back from the fan-out while at least one [`Active`] peer
-    /// in the same tenant is available. Promoted to receive messages
-    /// when every Active peer in scope is unavailable (circuit-open,
-    /// disconnected, or otherwise filtered out by `is_available()`).
+    /// Held back from the fan-out while at least one
+    /// [`TopologyRole::Active`] peer in the same tenant is available.
+    /// Promoted to receive messages when every Active peer in scope
+    /// is unavailable (circuit-open, disconnected, or otherwise
+    /// filtered out by `is_available()`).
     ///
     /// Standby is *not* a fully-passive backup — the gRPC client is
     /// still established and authenticated against the peer's TLS
