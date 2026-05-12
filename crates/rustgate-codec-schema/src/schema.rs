@@ -11,6 +11,10 @@
 //!
 //! ## Document shape
 //!
+//! [`FieldType`] is internally tagged on `kind`, so the wire form
+//! for a field type is `{ kind: <name> }`, NOT the YAML `!<name> {}`
+//! tag syntax some other schema formats use:
+//!
 //! ```yaml
 //! schema-version: "1"
 //! protocol-name: "example.fixed-binary"
@@ -21,18 +25,18 @@
 //!     fields:
 //!       - name: "track-id"
 //!         offset: 0
-//!         field-type: !u32 {}
+//!         field-type: { kind: u32 }
 //!         endian: big
 //!         entity-path: "uid"
 //!       - name: "latitude-microdeg"
 //!         offset: 4
-//!         field-type: !i32 {}
+//!         field-type: { kind: i32 }
 //!         endian: big
 //!         calibration: { scale: 1e-6, offset: 0.0 }
 //!         entity-path: "position.lat"
 //!       - name: "longitude-microdeg"
 //!         offset: 8
-//!         field-type: !i32 {}
+//!         field-type: { kind: i32 }
 //!         endian: big
 //!         calibration: { scale: 1e-6, offset: 0.0 }
 //!         entity-path: "position.lon"
@@ -193,7 +197,7 @@ impl FieldType {
 /// ```yaml
 /// - name: "affiliation"
 ///   offset: 12
-///   field-type: !u8 {}
+///   field-type: { kind: u8 }
 ///   value-mapping:
 ///     entries:
 ///       0: "unknown"
@@ -376,6 +380,22 @@ impl Schema {
                     ),
                 })?,
             };
+            // Reject zero-size variable-length fields. A `length-bytes: 0`
+            // declaration has no semantic meaning (the field reads/writes
+            // zero bytes) and silently breaks the overlap-detection loop:
+            // `prev_end` does not advance, so the next field at the same
+            // offset passes the `f.offset < prev_end` check and the runtime
+            // accepts an aliased schema.
+            if size == 0 {
+                return Err(SchemaError::Validation {
+                    message: format!(
+                        "message `{}` field `{}` type `{}` declares zero size (length-bytes must be > 0 for variable-length fields)",
+                        mt.name,
+                        f.name,
+                        f.field_type.as_str()
+                    ),
+                });
+            }
             if f.offset < prev_end {
                 return Err(SchemaError::Validation {
                     message: format!(
@@ -439,6 +459,46 @@ impl Schema {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The module-level doc on this file shows operators a YAML
+    /// example for a position-report schema. This test re-parses
+    /// the same shape so the doc and runtime can't silently drift —
+    /// previously the doc used `field-type: !u32 {}` (YAML tag
+    /// syntax) but `FieldType` is `#[serde(tag = "kind")]`
+    /// (internally tagged), so the operator-copyable example failed
+    /// to parse.
+    #[test]
+    fn module_doc_position_report_example_parses() {
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "example.fixed-binary"
+message-types:
+  - name: "Position Report"
+    id: 1
+    size-bytes: 24
+    fields:
+      - name: "track-id"
+        offset: 0
+        field-type: { kind: u32 }
+        endian: big
+        entity-path: "uid"
+      - name: "latitude-microdeg"
+        offset: 4
+        field-type: { kind: i32 }
+        endian: big
+        calibration: { scale: 1e-6, offset: 0.0 }
+        entity-path: "position.lat"
+      - name: "longitude-microdeg"
+        offset: 8
+        field-type: { kind: i32 }
+        endian: big
+        calibration: { scale: 1e-6, offset: 0.0 }
+        entity-path: "position.lon"
+"#;
+        let schema = Schema::parse(yaml).expect("doc example must parse");
+        schema.validate().expect("doc example must validate");
+        assert_eq!(schema.message_types[0].fields.len(), 3);
+    }
 
     #[test]
     fn parses_minimal_schema() {
@@ -527,6 +587,38 @@ message-types:
             panic!("expected validation error");
         };
         assert!(message.contains("discriminator"), "got: {message}");
+    }
+
+    #[test]
+    fn rejects_bytes_field_with_zero_length() {
+        // Closes the validator hole where `length-bytes: 0` on a
+        // Bytes / Utf8 field silently produced size=0, which left
+        // `prev_end` unchanged and let a subsequent field at the same
+        // offset slip past the overlap check.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "ZeroLen"
+    size-bytes: 8
+    fields:
+      - name: "blob"
+        offset: 0
+        field-type: { kind: bytes }
+        length-bytes: 0
+      - name: "v"
+        offset: 0
+        field-type: { kind: u32 }
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("zero size"),
+            "expected zero-size rejection, got: {message}"
+        );
     }
 
     #[test]
