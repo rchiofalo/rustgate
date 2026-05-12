@@ -140,6 +140,8 @@ mod federation_gate {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         assert_eq!(peer.id.as_str(), "peer-1");
         assert!(peer.enabled);
