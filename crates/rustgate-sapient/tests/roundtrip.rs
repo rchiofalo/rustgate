@@ -150,6 +150,8 @@ fn entity_codec_round_trip_preserves_position_and_classification() {
         callsign: None,
         mil_std_2525_sidc: None,
         attributes: attrs,
+        taskings: Default::default(),
+        files: Default::default(),
     };
 
     let bytes = codec.from_entity(&original).expect("encode");
@@ -227,6 +229,8 @@ fn entity_without_position_is_unsupported() {
         callsign: None,
         mil_std_2525_sidc: None,
         attributes: BTreeMap::new(),
+        taskings: Default::default(),
+        files: Default::default(),
     };
     let err = codec.from_entity(&entity).expect_err("must fail");
     assert!(matches!(err, SapientError::UnsupportedEntity(_)));

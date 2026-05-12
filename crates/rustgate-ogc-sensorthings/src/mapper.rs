@@ -104,6 +104,8 @@ pub fn observation_to_entity(observation: &Observation, kind: EntityKind) -> Ent
         callsign,
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     }
 }
 

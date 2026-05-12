@@ -78,6 +78,8 @@ fn pli_only_entity_fits_well_inside_cap() {
         callsign: None,
         mil_std_2525_sidc: None,
         attributes: BTreeMap::new(),
+        taskings: Default::default(),
+        files: Default::default(),
     };
     let bytes: Bytes = codec.from_entity(&entity).expect("encode");
     assert!(
@@ -162,6 +164,8 @@ fn entity_codec_round_trip_preserves_callsign_and_kind() {
         callsign: Some("Charlie-2".into()),
         mil_std_2525_sidc: None,
         attributes: attrs,
+        taskings: Default::default(),
+        files: Default::default(),
     };
 
     let bytes = codec.from_entity(&original).expect("encode");
@@ -205,6 +209,8 @@ fn chat_only_entity_round_trips_through_codec() {
         callsign: Some("Bravo-1".into()),
         mil_std_2525_sidc: None,
         attributes: attrs,
+        taskings: Default::default(),
+        files: Default::default(),
     };
 
     let bytes = codec.from_entity(&original).expect("encode");
@@ -233,6 +239,8 @@ fn compressed_oversize_chat_message_rejected_by_encoder() {
         callsign: None,
         mil_std_2525_sidc: None,
         attributes: attrs,
+        taskings: Default::default(),
+        files: Default::default(),
     };
     let err = codec.from_entity(&entity).expect_err("must fail");
     assert!(matches!(err, MeshtasticError::PayloadTooLarge { .. }));

@@ -506,6 +506,8 @@ fn build_entity_from_overlay(
         callsign: overlay.callsign,
         mil_std_2525_sidc: overlay.mil_std_2525_sidc,
         attributes: overlay.attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     }
 }
 

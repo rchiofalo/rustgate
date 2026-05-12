@@ -329,6 +329,8 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
         callsign,
         mil_std_2525_sidc: sidc,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     })
 }
 

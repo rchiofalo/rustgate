@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Entity extensions — `Tasking` + `FileRef` first-class fields on `rustgate_core::entity::Entity`.** Two new always-on, `#[serde(default)]` vector fields plus their associated types:
+  - **`Tasking`** with `task_id`, `state` (`TaskingState`: `Assigned` / `Acknowledged` / `Executing` / `Complete` / `Failed` / `Cancelled`), `role` (`TaskingRole`: `Subject` / `Assignee` / `Target` / `Observer`), and optional `name`. Routing-graph artifact only — rustgate does not own task state, it just carries references through the routing pipeline so consumers can correlate.
+  - **`FileRef`** with `uri`, optional `size_bytes` / `mime` / `hash` (`FileHash` = `{algorithm, hex}`) / `label`. rustgate stores only the URI + metadata; the bytes live wherever the URI points at (HTTPS, S3, `content://`). Mission-file storage proper remains off-mission.
+  - Both fields are `Vec<T>` with `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so pre-extension wire payloads round-trip unchanged.
+
+  11 new unit tests in `rustgate-core::entity::tests` covering: empty-default construction, JSON back-compat round-trip on pre-extension payloads, full `Tasking` and `FileRef` round-trips, vocabulary stability for `TaskingState::as_str` / `TaskingRole::as_str`, `Default` impls, optional-field skipping on `FileRef` wire shape, and a multi-tasking-different-roles round-trip.
+
+  Compatibility: every `Entity { ... }` struct literal in the workspace (codecs, correlation engine, mappers, tests — ~40+ sites across 19 files) updated to set the new fields to `Default::default()`. Each `EntityCodec::to_entity` implementation continues to leave the new fields empty; future per-codec work to populate them from native wire fields (CoT `<__chat>` for taskings, CoT `<fileshare>` for file refs) ships incrementally without further breakage.
+
 ### Fixed
 
 - **`cargo check --workspace --all-targets` now passes on the default feature set.** Two targets in `rustgate-federation` referenced `v2`-gated symbols (`v2::proto::*`, `FederationManager::create_v2_event_handler`) without their own `#[cfg(feature = "v2")]` gate:
