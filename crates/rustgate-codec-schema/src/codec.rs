@@ -343,6 +343,8 @@ impl EntityCodec for SchemaCodec {
             callsign,
             mil_std_2525_sidc: sidc,
             attributes: attrs,
+            taskings: Default::default(),
+            files: Default::default(),
         })
     }
 
@@ -967,6 +969,8 @@ message-types:
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         }
     }
 }
