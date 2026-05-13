@@ -436,6 +436,15 @@ impl EntityCodec for SchemaCodec {
         for field in &mt.fields {
             let decoded = Self::decode_field(field, payload)?;
             Self::check_range_on_decode(field, &decoded)?;
+            // Apply value-mapping if the field declares one. The
+            // mapping replaces the decoded integer with the label
+            // string from `entries`, falling back to `default_raw`
+            // for unrecognised raw values. After this step the
+            // projection logic below treats the field as a string
+            // — calibration/range checks already ran above and
+            // value-mapping is incoherent with both per the
+            // validator.
+            let decoded = Self::apply_value_mapping(field, decoded)?;
             let path = field.entity_path.as_deref();
             let physical_for_path = |dv: &DecodedValue| -> Option<f64> {
                 dv.to_calibrated_f64(field.calibration.as_ref())
@@ -524,7 +533,20 @@ impl EntityCodec for SchemaCodec {
             out[off] = id_byte;
         }
         for field in &mt.fields {
-            let value = lookup_encoded_value(entity, field, &self.schema.protocol_name)?;
+            let mut value = lookup_encoded_value(entity, field, &self.schema.protocol_name)?;
+            // Reverse value-mapping: if the field declares one and
+            // the looked-up value is a string label, swap it for
+            // the matching raw integer before the wire encode
+            // runs. The validator guarantees value-mapping only
+            // appears on integer field types, so the rebound
+            // `EncodedValue::I64` flows cleanly through the
+            // per-type encoder branches.
+            if field.value_mapping.is_some()
+                && let EncodedValue::Str(label) = &value
+            {
+                let raw = Self::reverse_value_mapping(field, label)?;
+                value = EncodedValue::I64(raw);
+            }
             Self::check_range_on_encode(field, &value)?;
             Self::encode_field(field, &value, &mut out)?;
         }
@@ -588,6 +610,82 @@ impl SchemaCodec {
             });
         }
         Ok(())
+    }
+
+    /// Apply the field's [`ValueMapping`] to a freshly-decoded
+    /// value. Integer values get looked up in the mapping's
+    /// `entries`: a hit replaces the integer with the label
+    /// `DecodedValue::Str`; a miss falls back to the
+    /// `default_raw` entry if configured, otherwise surfaces
+    /// `SchemaCodecError::UnmappedValue`.
+    ///
+    /// `Schema::validate` guarantees `value_mapping` only appears
+    /// on integer field types, so `DecodedValue::F64` / `Str` /
+    /// `Bytes` reach this path only when the field has no
+    /// mapping — in which case we pass the value through.
+    ///
+    /// [`ValueMapping`]: crate::ValueMapping
+    fn apply_value_mapping(
+        field: &FieldDef,
+        decoded: DecodedValue,
+    ) -> Result<DecodedValue, SchemaCodecError> {
+        let Some(vm) = &field.value_mapping else {
+            return Ok(decoded);
+        };
+        let raw = match &decoded {
+            DecodedValue::U64(v) => *v as i64,
+            DecodedValue::I64(v) => *v,
+            // Non-integer wire types reach here only when the
+            // validator missed a misconfiguration — pass through
+            // so we don't double-error.
+            _ => return Ok(decoded),
+        };
+        if let Some(label) = vm.entries.get(&raw) {
+            return Ok(DecodedValue::Str(label.clone()));
+        }
+        if let Some(default_raw) = vm.default_raw {
+            // justification: validator guarantees default_raw is
+            // a key in entries.
+            #[allow(clippy::expect_used)]
+            let label = vm
+                .entries
+                .get(&default_raw)
+                .expect("validator: default-raw is a key in entries");
+            return Ok(DecodedValue::Str(label.clone()));
+        }
+        Err(SchemaCodecError::UnmappedValue {
+            field: field.name.clone(),
+            value: raw.to_string(),
+        })
+    }
+
+    /// Reverse-lookup the raw integer for a string label via a
+    /// field's [`ValueMapping`]. Used on the encode side: if the
+    /// label matches an entry, return the raw key; if it doesn't
+    /// match and `default_raw` is set, return that fallback; if
+    /// neither, surface `SchemaCodecError::UnmappedValue` so the
+    /// encoder can fail the call instead of shipping a garbled
+    /// raw byte.
+    ///
+    /// [`ValueMapping`]: crate::ValueMapping
+    fn reverse_value_mapping(field: &FieldDef, label: &str) -> Result<i64, SchemaCodecError> {
+        // justification: caller checks `field.value_mapping.is_some()`
+        // before calling.
+        #[allow(clippy::expect_used)]
+        let vm = field
+            .value_mapping
+            .as_ref()
+            .expect("reverse_value_mapping called without value_mapping");
+        if let Some((raw, _)) = vm.entries.iter().find(|(_, v)| v.as_str() == label) {
+            return Ok(*raw);
+        }
+        if let Some(default_raw) = vm.default_raw {
+            return Ok(default_raw);
+        }
+        Err(SchemaCodecError::UnmappedValue {
+            field: field.name.clone(),
+            value: label.to_string(),
+        })
     }
 }
 
@@ -1519,6 +1617,123 @@ message-types:
             panic!("expected MissingRequiredEntityField, got {err:?}");
         };
         assert_eq!(field, "__discriminator__");
+    }
+
+    /// Affiliation byte → NATO friend/hostile/etc label, the
+    /// canonical value-mapping use case.
+    const AFFILIATION_SCHEMA: &str = r#"
+schema-version: "1"
+protocol-name: "test.affil"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "affiliation"
+        offset: 0
+        field-type: { kind: u8 }
+        entity-path: "attributes.affiliation"
+        value-mapping:
+          entries:
+            0: "unknown"
+            1: "friend"
+            2: "neutral"
+            3: "hostile"
+          default-raw: 0
+"#;
+
+    #[test]
+    fn value_mapping_decode_projects_label() {
+        let codec = SchemaCodec::from_schema_text(AFFILIATION_SCHEMA).unwrap();
+        let entity = codec.to_entity(&[1u8]).unwrap();
+        let Some(AttributeValue::Str(label)) = entity.attributes.get("attributes.affiliation")
+        else {
+            panic!("expected str affiliation, got: {:?}", entity.attributes);
+        };
+        assert_eq!(label, "friend");
+    }
+
+    #[test]
+    fn value_mapping_decode_uses_default_raw_for_unknown_byte() {
+        let codec = SchemaCodec::from_schema_text(AFFILIATION_SCHEMA).unwrap();
+        // 0x42 is not in the mapping, but default_raw=0 → "unknown".
+        let entity = codec.to_entity(&[0x42u8]).unwrap();
+        let Some(AttributeValue::Str(label)) = entity.attributes.get("attributes.affiliation")
+        else {
+            panic!("expected str affiliation, got: {:?}", entity.attributes);
+        };
+        assert_eq!(label, "unknown");
+    }
+
+    #[test]
+    fn value_mapping_decode_without_default_errors_on_unknown() {
+        // Same schema as AFFILIATION_SCHEMA but no default_raw —
+        // an unmapped wire byte must surface UnmappedValue.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test.affil"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "affiliation"
+        offset: 0
+        field-type: { kind: u8 }
+        entity-path: "attributes.affiliation"
+        value-mapping:
+          entries:
+            0: "unknown"
+            1: "friend"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let err = codec.to_entity(&[0x42u8]).unwrap_err();
+        let SchemaCodecError::UnmappedValue { field, value } = err else {
+            panic!("expected UnmappedValue, got {err:?}");
+        };
+        assert_eq!(field, "affiliation");
+        assert_eq!(value, "66");
+    }
+
+    #[test]
+    fn value_mapping_encode_reverses_label_to_raw() {
+        let codec = SchemaCodec::from_schema_text(AFFILIATION_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity.attributes.insert(
+            "attributes.affiliation".into(),
+            AttributeValue::Str("hostile".into()),
+        );
+        let bytes = codec.from_entity(&entity).unwrap();
+        assert_eq!(&bytes[..], &[3u8]);
+    }
+
+    #[test]
+    fn value_mapping_round_trips_label_byte_identical() {
+        let codec = SchemaCodec::from_schema_text(AFFILIATION_SCHEMA).unwrap();
+        for raw in 0u8..=3 {
+            let entity = codec.to_entity(&[raw]).unwrap();
+            let re_encoded = codec.from_entity(&entity).unwrap();
+            assert_eq!(
+                &re_encoded[..],
+                &[raw],
+                "round-trip mismatch for affiliation byte {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_mapping_encode_unknown_label_uses_default_raw() {
+        // Entity carries a label the schema doesn't know about —
+        // `default_raw=0` lets the encoder ship the fallback raw
+        // instead of failing the call. Decoded back the label
+        // becomes "unknown" (the default's entry), so the
+        // round-trip is *byte*-identical but the label changes.
+        let codec = SchemaCodec::from_schema_text(AFFILIATION_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity.attributes.insert(
+            "attributes.affiliation".into(),
+            AttributeValue::Str("pending".into()),
+        );
+        let bytes = codec.from_entity(&entity).unwrap();
+        assert_eq!(&bytes[..], &[0u8]);
     }
 
     fn empty_entity() -> Entity {
