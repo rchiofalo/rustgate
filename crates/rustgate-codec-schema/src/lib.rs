@@ -71,5 +71,6 @@ pub mod schema;
 pub use codec::SchemaCodec;
 pub use error::{SchemaCodecError, SchemaError};
 pub use schema::{
-    Calibration, Endian, FieldDef, FieldType, MessageType, Schema, SchemaVersion, ValueMapping,
+    Calibration, Endian, FieldDef, FieldType, MessageType, Range, Schema, SchemaVersion,
+    ValueMapping,
 };

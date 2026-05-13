@@ -84,6 +84,41 @@ pub enum Endian {
     Big,
 }
 
+/// Inclusive range constraint applied to a field's *physical* value
+/// (post-calibration on decode, pre-reverse-calibration on encode).
+/// Used to guard against values that fit the wire type but are
+/// semantically invalid — e.g. WGS-84 latitude wraps to `[-90, 90]`
+/// even though `f64` happily holds `200.0`.
+///
+/// On decode, an out-of-range payload surfaces as
+/// [`crate::SchemaCodecError::OutOfRange`] *before* any
+/// `Entity::attributes` projection happens — the field-level error
+/// names the offending value so an operator can correlate to the
+/// wire bytes that produced it. On encode, the symmetric check
+/// fires *before* the bytes are written, so a buggy upstream that
+/// stuffs lat = 200 into the entity fails the encode call instead
+/// of shipping a garbled frame.
+///
+/// `min` / `max` are inclusive. Both are required when `range` is
+/// present — the half-open case (only `min`, only `max`) doesn't
+/// show up in real protocols and the explicit form is easier to
+/// read in a schema diff.
+///
+/// Range constraints compose with [`Calibration`]: the decoded
+/// physical value (after applying calibration) is what the range
+/// is compared against. For integer fields without calibration the
+/// physical value equals the raw integer, so the range applies
+/// directly to the wire bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct Range {
+    /// Inclusive lower bound on the physical value. Must be finite.
+    pub min: f64,
+    /// Inclusive upper bound on the physical value. Must be finite
+    /// and `>= min`.
+    pub max: f64,
+}
+
 /// Linear calibration applied during decode:
 /// `physical = raw * scale + offset`.
 /// Reversed on encode: `raw = (physical - offset) / scale`.
@@ -254,6 +289,14 @@ pub struct FieldDef {
     /// Applies only to integer field types.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_mapping: Option<ValueMapping>,
+    /// Inclusive `[min, max]` range constraint on the physical
+    /// value (post-calibration on decode, pre-reverse-calibration
+    /// on encode). Decode + encode both reject values outside the
+    /// range with [`crate::SchemaCodecError::OutOfRange`]. Skip when
+    /// the field's wire type already constrains the value (e.g. a
+    /// `u8` flag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<Range>,
     /// Dotted path on the [`Entity`](rustgate_core::entity::Entity)
     /// shape the decoded value projects onto. Supported paths:
     /// `uid`, `callsign`, `mil_std_2525_sidc`, `position.lat`,
@@ -442,6 +485,24 @@ impl Schema {
                         message: format!(
                             "message `{}` field `{}` calibration scale must be non-zero",
                             mt.name, f.name
+                        ),
+                    });
+                }
+            }
+            if let Some(range) = &f.range {
+                if !range.min.is_finite() || !range.max.is_finite() {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` range bounds must be finite",
+                            mt.name, f.name
+                        ),
+                    });
+                }
+                if range.max < range.min {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` range max ({}) is less than min ({})",
+                            mt.name, f.name, range.max, range.min
                         ),
                     });
                 }
@@ -694,6 +755,61 @@ message-types:
             panic!("expected validation error");
         };
         assert!(message.contains("scale must be non-zero"), "got: {message}");
+    }
+
+    #[test]
+    fn rejects_range_with_nan_or_inf() {
+        // serde_yaml accepts the YAML 1.2 special-float literals
+        // `.nan`, `.inf`, `-.inf`. The validator catches them
+        // before the codec sees a half-defined range bound.
+        for bad in [".nan", ".inf", "-.inf"] {
+            let yaml = format!(
+                r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: {{ kind: f64 }}
+        range: {{ min: {bad}, max: 1.0 }}
+"#
+            );
+            let schema = Schema::parse(&yaml)
+                .unwrap_or_else(|e| panic!("schema with range min={bad} should parse, got: {e:?}"));
+            let err = schema.validate().unwrap_err();
+            let SchemaError::Validation { message } = err else {
+                panic!("expected validation error");
+            };
+            assert!(
+                message.contains("range bounds must be finite"),
+                "got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_range_with_max_less_than_min() {
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: f64 }
+        range: { min: 10.0, max: 1.0 }
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("less than min"), "got: {message}");
     }
 
     #[test]
