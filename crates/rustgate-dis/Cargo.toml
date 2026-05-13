@@ -17,3 +17,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Schema-parity proptest in `tests/schema_parity.rs` builds a
+# `SchemaCodec` from `schemas/pdu_header.yaml` and asserts byte-
+# equivalent round-trip against the hand-rolled `PduHeader` codec.
+# Not pulled into the production crate — the codec runtime stays
+# hand-rolled.
+rustgate-codec-schema = { workspace = true }
