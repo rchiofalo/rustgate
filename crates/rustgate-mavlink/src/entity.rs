@@ -452,6 +452,8 @@ fn decode_heartbeat(header: &FrameHeader, frame: &[u8]) -> Result<Entity, Mavlin
         callsign: None,
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     })
 }
 
@@ -587,6 +589,8 @@ fn decode_global_position_int(
         callsign: None,
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     })
 }
 
@@ -1107,6 +1111,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = codec.from_entity(&entity).expect_err("must fail");
         assert!(matches!(err, MavlinkEntityError::UnsupportedEntityKind(_)));

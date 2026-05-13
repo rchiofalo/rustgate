@@ -189,6 +189,8 @@ fn decode_jreap_c(payload: &[u8]) -> Result<Entity, Link16EntityError> {
         callsign: None,
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     })
 }
 
@@ -514,6 +516,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = Link16Codec.from_entity(&entity).expect_err("must fail");
         assert!(matches!(err, Link16EntityError::UnsupportedEntityKind(_)));
@@ -534,6 +538,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = Link16Codec.from_entity(&entity).expect_err("must fail");
         assert!(matches!(err, Link16EntityError::UnsupportedEntityKind(_)));

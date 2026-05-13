@@ -181,6 +181,8 @@ fn message_to_entity(msg: SapientMessage) -> Entity {
                 callsign: None,
                 mil_std_2525_sidc: None,
                 attributes,
+                taskings: Default::default(),
+                files: Default::default(),
             }
         }
         // Decoder rejects content-less frames with `MissingContent`,
@@ -197,6 +199,8 @@ fn message_to_entity(msg: SapientMessage) -> Entity {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes,
+            taskings: Default::default(),
+            files: Default::default(),
         },
     }
 }
@@ -286,6 +290,8 @@ fn detection_report_to_entity(
         callsign: None,
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     }
 }
 
@@ -725,6 +731,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: attrs,
+            taskings: Default::default(),
+            files: Default::default(),
         }
     }
 
@@ -758,6 +766,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = codec.from_entity(&entity).expect_err("must fail");
         assert!(matches!(err, SapientError::UnsupportedEntity(_)));

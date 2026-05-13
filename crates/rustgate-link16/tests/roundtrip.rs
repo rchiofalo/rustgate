@@ -125,6 +125,8 @@ fn cross_codec_entity_encodes_with_derived_track_number() {
         callsign: Some("alpha".into()),
         mil_std_2525_sidc: None,
         attributes: BTreeMap::new(),
+        taskings: Default::default(),
+        files: Default::default(),
     };
     let frame = Link16Codec.from_entity(&entity).expect("encode");
     let header = JreapFrame::decode(&frame).expect("header decode");
@@ -195,6 +197,8 @@ fn attribute_carry_round_trips_track_number_exactly() {
         callsign: None,
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     };
     let frame = Link16Codec.from_entity(&entity).expect("encode");
     let body = &frame[JREAP_HEADER_LEN..];
