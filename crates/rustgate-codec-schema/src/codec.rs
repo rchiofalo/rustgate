@@ -314,6 +314,7 @@ impl EntityCodec for SchemaCodec {
 
         for field in &mt.fields {
             let decoded = Self::decode_field(field, payload)?;
+            Self::check_range_on_decode(field, &decoded)?;
             let path = field.entity_path.as_deref();
             let physical_for_path = |dv: &DecodedValue| -> Option<f64> {
                 dv.to_calibrated_f64(field.calibration.as_ref())
@@ -382,9 +383,69 @@ impl EntityCodec for SchemaCodec {
         let mut out = vec![0u8; mt.size_bytes];
         for field in &mt.fields {
             let value = lookup_encoded_value(entity, field, &self.schema.protocol_name)?;
+            Self::check_range_on_encode(field, &value)?;
             Self::encode_field(field, &value, &mut out)?;
         }
         Ok(Bytes::from(out))
+    }
+}
+
+impl SchemaCodec {
+    /// Apply the field's optional [`Range`] check on the calibrated
+    /// physical value of a freshly-decoded `DecodedValue`. Returns
+    /// `Ok(())` when no range is declared or the value falls within
+    /// `[range.min, range.max]`. Surfaces
+    /// [`SchemaCodecError::OutOfRange`] with the field name + the
+    /// physical value as a string so the operator can correlate the
+    /// reject back to a schema line.
+    ///
+    /// Skipped for `Bytes` / `Utf8` field types — `to_calibrated_f64`
+    /// returns `None` for those and a range constraint on a byte
+    /// slice is not a meaningful concept.
+    fn check_range_on_decode(
+        field: &FieldDef,
+        decoded: &DecodedValue,
+    ) -> Result<(), SchemaCodecError> {
+        let Some(range) = &field.range else {
+            return Ok(());
+        };
+        let Some(physical) = decoded.to_calibrated_f64(field.calibration.as_ref()) else {
+            return Ok(());
+        };
+        if physical < range.min || physical > range.max {
+            return Err(SchemaCodecError::OutOfRange {
+                field: field.name.clone(),
+                value: physical.to_string(),
+                type_name: field.field_type.as_str().into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Apply the field's optional [`Range`] check on an
+    /// [`EncodedValue`] before it is written to the wire buffer.
+    /// Mirrors [`Self::check_range_on_decode`] so an out-of-range
+    /// value fails the encode call symmetrically — the operator
+    /// sees the same `OutOfRange` error class whether the offending
+    /// payload was received or produced.
+    fn check_range_on_encode(
+        field: &FieldDef,
+        value: &EncodedValue,
+    ) -> Result<(), SchemaCodecError> {
+        let Some(range) = &field.range else {
+            return Ok(());
+        };
+        let Some(physical) = value.to_physical(field) else {
+            return Ok(());
+        };
+        if physical < range.min || physical > range.max {
+            return Err(SchemaCodecError::OutOfRange {
+                field: field.name.clone(),
+                value: physical.to_string(),
+                type_name: field.field_type.as_str().into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -449,6 +510,33 @@ enum EncodedValue {
 }
 
 impl EncodedValue {
+    /// Best-effort conversion to the field's physical (calibrated)
+    /// `f64` value. Used by the range-constraint check at encode
+    /// time; returns `None` for `Bytes` (range checks don't apply
+    /// to byte slices).
+    ///
+    /// For numeric variants, the rule is:
+    /// - `F64`: already physical (projected from a first-class
+    ///   `Entity` field like `position.lat`).
+    /// - `I64`: raw integer; apply the field's calibration if any
+    ///   so the comparison happens in the same units the range was
+    ///   declared in.
+    /// - `Str`: parse as `f64`; if the string is non-numeric the
+    ///   subsequent per-type encoder call surfaces the typed error
+    ///   so we don't need to error here.
+    fn to_physical(&self, field: &FieldDef) -> Option<f64> {
+        let value = match self {
+            Self::F64(v) => *v,
+            Self::I64(v) => match &field.calibration {
+                Some(cal) => (*v as f64) * cal.scale + cal.offset,
+                None => *v as f64,
+            },
+            Self::Str(s) => s.parse::<f64>().ok()?,
+            Self::Bytes(_) => return None,
+        };
+        Some(value)
+    }
+
     fn as_u64(&self, field: &FieldDef) -> Result<u64, SchemaCodecError> {
         match self {
             // Bit-cast the i64 to u64 rather than rejecting
@@ -1060,6 +1148,100 @@ message-types:
             panic!("expected OutOfRange, got {err:?}");
         };
         assert_eq!(type_name, "f64");
+    }
+
+    #[test]
+    fn decode_rejects_out_of_range_value() {
+        // f64 lat field with WGS-84 range constraint. A payload
+        // carrying lat=200 fits the wire type but is outside the
+        // declared physical-value range; decode must surface an
+        // `OutOfRange` error pointing at the offending field.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "lat"
+        offset: 0
+        field-type: { kind: f64 }
+        endian: big
+        range: { min: -90.0, max: 90.0 }
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let payload = 200.0_f64.to_be_bytes().to_vec();
+        let err = codec.to_entity(&payload).unwrap_err();
+        let SchemaCodecError::OutOfRange { field, .. } = err else {
+            panic!("expected OutOfRange, got {err:?}");
+        };
+        assert_eq!(field, "lat");
+    }
+
+    #[test]
+    fn encode_rejects_out_of_range_value() {
+        // Symmetric to the decode-side test — an entity whose
+        // `position.lat` is 91.0 must fail the encode call with
+        // the same `OutOfRange` class so an operator sees one
+        // error vocabulary on both sides of the wire.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "lat"
+        offset: 0
+        field-type: { kind: f64 }
+        endian: big
+        range: { min: -90.0, max: 90.0 }
+        entity-path: "position.lat"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let entity = Entity {
+            position: Some(Position {
+                lat: 91.0,
+                lon: 0.0,
+                hae_meters: None,
+            }),
+            ..empty_entity()
+        };
+        let err = codec.from_entity(&entity).unwrap_err();
+        let SchemaCodecError::OutOfRange { field, .. } = err else {
+            panic!("expected OutOfRange, got {err:?}");
+        };
+        assert_eq!(field, "lat");
+    }
+
+    #[test]
+    fn range_check_uses_calibrated_physical_value_on_decode() {
+        // Field stores microdegrees as i32 with calibration
+        // scale=1e-6. Wire value 95_000_000 maps to 95.0 physical
+        // which is out of range; wire value 89_000_000 maps to
+        // 89.0 which is in range.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 4
+    fields:
+      - name: "lat-microdeg"
+        offset: 0
+        field-type: { kind: i32 }
+        endian: big
+        calibration: { scale: 1.0e-6, offset: 0.0 }
+        range: { min: -90.0, max: 90.0 }
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let in_range = 89_000_000i32.to_be_bytes().to_vec();
+        assert!(codec.to_entity(&in_range).is_ok());
+        let out_of_range = 95_000_000i32.to_be_bytes().to_vec();
+        let err = codec.to_entity(&out_of_range).unwrap_err();
+        let SchemaCodecError::OutOfRange { .. } = err else {
+            panic!("expected OutOfRange, got {err:?}");
+        };
     }
 
     fn empty_entity() -> Entity {
