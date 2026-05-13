@@ -16,3 +16,6 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
