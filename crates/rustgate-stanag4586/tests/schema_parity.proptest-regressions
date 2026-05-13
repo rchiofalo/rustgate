@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 56ff62e8fafb32ccbc23ed03246e97008aad9512a830c9bac6b26d37f374ce32 # shrinks to msg = VehiclePosition { vehicle_id: 0, flight_state: Other(0), latitude_deg: 0.0, longitude_deg: 0.0, altitude_msl_m: 0.0, ground_speed_mps: 0.0, heading_deg: 0.0, timestamp_unix_ms: 9223372036854775808 }

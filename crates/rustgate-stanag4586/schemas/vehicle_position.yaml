@@ -1,0 +1,81 @@
+# STANAG 4586 LOI 2-3 vehicle position telemetry message.
+#
+# Wire layout (NATO big-endian, fixed 48-byte frame):
+#
+# offset │ size │ field             │ type
+# ───────┼──────┼───────────────────┼──────────────────────────
+#   0    │  4   │ vehicle_id        │ u32  big-endian
+#   4    │  1   │ flight_state      │ u8   enum value (raw byte)
+#   5    │  3   │ reserved          │ zero-padded
+#   8    │  8   │ latitude_deg      │ f64  big-endian IEEE-754
+#  16    │  8   │ longitude_deg     │ f64  big-endian IEEE-754
+#  24    │  4   │ altitude_msl_m    │ f32  big-endian IEEE-754
+#  28    │  4   │ ground_speed_mps  │ f32  big-endian IEEE-754
+#  32    │  4   │ heading_deg       │ f32  big-endian IEEE-754
+#  36    │  4   │ reserved          │ zero-padded
+#  40    │  8   │ timestamp_unix_ms │ u64  big-endian
+#
+# Reserved regions are not declared as fields — the `SchemaCodec`
+# encoder pre-fills its output buffer with zeros, so the gaps stay
+# zero on encode (matches the hand-rolled `vehicle_position::encode`
+# behaviour, which also resizes its buffer to zeros).
+#
+# What this schema does NOT carry today (v1 limitations):
+#
+# - The `FlightState` enum byte → typed-variant mapping. v1 schemas
+#   have a `value-mapping` grammar but the runtime treats the raw
+#   integer as the value; the typed `FlightState::LaunchPreparation`
+#   / `::Loiter` / `::Transit` / `::ReturnToBase` / `::Landed`
+#   / `::Other(u8)` projection is a v2 feature. The byte appears in
+#   `Entity::attributes` under `schema.stanag4586_vehicle_position.flight_state`.
+# - The lat ∈ [-90, 90] / lon ∈ [-180, 180] range guards from the
+#   hand-rolled decoder. v1 schemas have no range-constraint
+#   grammar; the schema parity test below only exercises in-range
+#   inputs so byte-equivalence holds. A v2 schema feature for
+#   range constraints would let us re-add these as a parse-time
+#   error rather than carrying them in a wrapper layer.
+#
+# Provenance: byte layout cross-checked against
+# `crates/rustgate-stanag4586/src/vehicle_position.rs` — the
+# `schema_parity` proptest in this crate's `tests/` directory
+# asserts the byte-identical round-trip for every (vehicle_id,
+# flight_state, lat, lon, alt, speed, heading, timestamp)
+# combination proptest generates.
+schema-version: "1"
+protocol-name: "stanag4586.vehicle_position"
+message-types:
+  - name: "VehiclePosition"
+    size-bytes: 48
+    fields:
+      - name: "vehicle_id"
+        offset: 0
+        field-type: { kind: u32 }
+        endian: big
+      - name: "flight_state"
+        offset: 4
+        field-type: { kind: u8 }
+        endian: big
+      - name: "latitude_deg"
+        offset: 8
+        field-type: { kind: f64 }
+        endian: big
+      - name: "longitude_deg"
+        offset: 16
+        field-type: { kind: f64 }
+        endian: big
+      - name: "altitude_msl_m"
+        offset: 24
+        field-type: { kind: f32 }
+        endian: big
+      - name: "ground_speed_mps"
+        offset: 28
+        field-type: { kind: f32 }
+        endian: big
+      - name: "heading_deg"
+        offset: 32
+        field-type: { kind: f32 }
+        endian: big
+      - name: "timestamp_unix_ms"
+        offset: 40
+        field-type: { kind: u64 }
+        endian: big
