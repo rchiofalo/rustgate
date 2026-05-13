@@ -535,6 +535,71 @@ impl Schema {
                     });
                 }
             }
+            if let Some(vm) = &f.value_mapping {
+                if vm.entries.is_empty() {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` value-mapping must declare at least one entry",
+                            mt.name, f.name
+                        ),
+                    });
+                }
+                // Value mapping only makes sense on integer fields —
+                // the entries map raw int → label string, and a
+                // float / bytes / utf8 field would have no
+                // meaningful raw int to look up.
+                if !matches!(
+                    f.field_type,
+                    FieldType::U8
+                        | FieldType::U16
+                        | FieldType::U32
+                        | FieldType::U64
+                        | FieldType::I8
+                        | FieldType::I16
+                        | FieldType::I32
+                        | FieldType::I64
+                ) {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` type `{}` does not support value-mapping (integer types only)",
+                            mt.name,
+                            f.name,
+                            f.field_type.as_str()
+                        ),
+                    });
+                }
+                // Value mapping replaces the raw integer with a
+                // label string; calibration and range constraints
+                // both operate on the numeric value and are
+                // incoherent with the string projection. Reject
+                // these combinations at schema-load.
+                if f.calibration.is_some() {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` cannot combine value-mapping with calibration",
+                            mt.name, f.name
+                        ),
+                    });
+                }
+                if f.range.is_some() {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` cannot combine value-mapping with range constraints",
+                            mt.name, f.name
+                        ),
+                    });
+                }
+                if let Some(default_raw) = vm.default_raw
+                    && !vm.entries.contains_key(&default_raw)
+                {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` value-mapping default-raw {} has no matching entry",
+                            mt.name, f.name, default_raw
+                        ),
+                    });
+                }
+            }
             prev_end = end;
         }
         if let Some(off) = self.discriminator_offset
@@ -900,6 +965,117 @@ message-types:
             panic!("expected validation error");
         };
         assert!(message.contains("less than min"), "got: {message}");
+    }
+
+    #[test]
+    fn rejects_value_mapping_on_non_integer_field() {
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 4
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: f32 }
+        value-mapping:
+          entries:
+            0: "zero"
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("integer types only"), "got: {message}");
+    }
+
+    #[test]
+    fn rejects_value_mapping_combined_with_calibration() {
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u8 }
+        calibration: { scale: 2.0 }
+        value-mapping:
+          entries:
+            0: "off"
+            1: "on"
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("cannot combine value-mapping with calibration"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_value_mapping_combined_with_range() {
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u8 }
+        range: { min: 0.0, max: 10.0 }
+        value-mapping:
+          entries:
+            0: "off"
+            1: "on"
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("cannot combine value-mapping with range"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_value_mapping_with_default_pointing_nowhere() {
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u8 }
+        value-mapping:
+          entries:
+            0: "off"
+            1: "on"
+          default-raw: 99
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("default-raw 99 has no matching entry"),
+            "got: {message}"
+        );
     }
 
     #[test]
