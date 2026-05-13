@@ -100,4 +100,20 @@ pub enum SchemaCodecError {
         /// Schema field type name (`u8`, `i16`, `f32`, …).
         type_name: String,
     },
+
+    /// Multi-message dispatch failed to find a [`MessageType`] whose
+    /// `id` matches the byte read at the schema's
+    /// `discriminator_offset`. The schema's vocabulary doesn't
+    /// cover the wire variant the producer is emitting.
+    ///
+    /// [`MessageType`]: crate::MessageType
+    #[error(
+        "no message type matches discriminator byte 0x{value:02x} at offset {offset}; add the missing message-type id to the schema"
+    )]
+    UnknownDiscriminator {
+        /// Offset where the runtime read the discriminator byte.
+        offset: usize,
+        /// Byte value that did not match any declared `id`.
+        value: u8,
+    },
 }
