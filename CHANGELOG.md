@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Per-tenant federation topology (Active / Standby roles) — completes the multi-tenancy story from #859.** v0.9.0 isolated `tenant_id` at rest (per-tenant archive subdirectories, store-and-forward keying, optional NATS subject prefix), but federation fan-out was still all-peers-every-tenant. PR adds two additive `PeerConfig` fields and a topology selection layer:
+  - **`PeerConfig.tenants: Vec<String>`** — empty / `["*"]` keeps legacy shared-fleet semantics; `["alpha", "bravo"]` pins the peer to specific tenant IDs. The `serves_tenant(tenant_id)` predicate filters the candidate peer set during forward — pinned peers never receive traffic outside their tenant list, and untagged messages (`tenant_id = None`) reach only shared peers.
+  - **`PeerConfig.topology_role: TopologyRole`** — `Active` (default, legacy fan-out) or `Standby` (held back from forward unless every Active peer in the same tenant is unavailable, then promoted automatically for that forwarding pass).
+  - **`crates/rustgate-federation/src/topology.rs`** — the selection layer with 10 unit tests covering the tenant + role matrix (shared/wildcard/pinned × tagged/untagged × all-active/standby-promoted/no-candidates). The hot path in `manager::forward_inner` applies the same rule inline; the spec module is the test surface.
+  - **No persistent state** — promotion is recomputed per message from the current connection state. Operators wanting hysteresis configure circuit-breaker trip / recovery cadence rather than asking this layer to debounce.
+
+  Back-compat: deployments with no `tenants` field on any peer behave identically to pre-PR. The wire format is unchanged.
+
+  **Out of scope** (deferred to follow-up): Hub / Spoke topology (the local-node-role question is non-trivial; we want concrete deployment pressure first); weighted active sets; time-windowed activation policies.
+
 - **Entity extensions — `Tasking` + `FileRef` first-class fields on `rustgate_core::entity::Entity`.** Two new always-on, `#[serde(default)]` vector fields plus their associated types:
   - **`Tasking`** with `task_id`, `state` (`TaskingState`: `Assigned` / `Acknowledged` / `Executing` / `Complete` / `Failed` / `Cancelled`), `role` (`TaskingRole`: `Subject` / `Assignee` / `Target` / `Observer`), and optional `name`. Routing-graph artifact only — rustgate does not own task state, it just carries references through the routing pipeline so consumers can correlate.
   - **`FileRef`** with `uri`, optional `size_bytes` / `mime` / `hash` (`FileHash` = `{algorithm, hex}`) / `label`. rustgate stores only the URI + metadata; the bytes live wherever the URI points at (HTTPS, S3, `content://`). Mission-file storage proper remains off-mission.

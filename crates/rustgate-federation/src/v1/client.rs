@@ -672,6 +672,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -756,6 +758,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -822,6 +826,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -886,6 +892,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -958,6 +966,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1019,6 +1029,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1081,6 +1093,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1163,6 +1177,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1226,6 +1242,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));

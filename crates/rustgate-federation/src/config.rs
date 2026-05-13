@@ -90,6 +90,63 @@ pub enum CompressionKind {
     Zstd,
 }
 
+/// Tenant-scoped topology role for a federation peer.
+///
+/// The forward path uses this to decide whether a peer should be in the
+/// candidate set for a given message. By default every peer is [`Active`]
+/// — the legacy fan-out-to-all-peers behaviour. Setting `topology_role`
+/// to [`Standby`] holds the peer back from the fan-out unless every
+/// `Active` peer for the same tenant is currently unavailable, at which
+/// point the standby is promoted automatically for the duration of the
+/// outage.
+///
+/// `Standby` peers still maintain their gRPC connection and complete
+/// the inbound handshake — promotion is a *forwarding-side* decision
+/// only, so handover is one round-trip away from being effective rather
+/// than blocked on a fresh TLS + JWT exchange.
+///
+/// See `topology` module docs for the full state-machine treatment and
+/// the documented out-of-scope items (Hub/Spoke, time-windowed
+/// activation policies, weighted active sets).
+///
+/// [`Active`]: TopologyRole::Active
+/// [`Standby`]: TopologyRole::Standby
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default, Hash,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum TopologyRole {
+    /// Receives every forwarded message that passes the tenant + group
+    /// filters. Default — preserves legacy semantics for deployments
+    /// that don't opt in to topology configuration.
+    #[default]
+    Active,
+    /// Held back from the fan-out while at least one
+    /// [`TopologyRole::Active`] peer in the same tenant is available.
+    /// Promoted to receive messages when every Active peer in scope
+    /// is unavailable (circuit-open, disconnected, or otherwise
+    /// filtered out by `is_available()`).
+    ///
+    /// Standby is *not* a fully-passive backup — the gRPC client is
+    /// still established and authenticated against the peer's TLS
+    /// endpoint so a promotion is one message-send away from being
+    /// effective.
+    Standby,
+}
+
+impl TopologyRole {
+    /// Stable lowercase tag for tracing fields and Prometheus labels.
+    /// The vocabulary is closed: every variant maps to one of
+    /// `"active"`, `"standby"`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Standby => "standby",
+        }
+    }
+}
+
 /// Top-level federation configuration.
 #[derive(Debug, Clone)]
 pub struct FederationConfig {
@@ -324,6 +381,36 @@ pub struct PeerConfig {
     /// decompressed transparently regardless of this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<CompressionKind>,
+    /// Tenants this peer is scoped to. The forward path only considers
+    /// this peer for messages whose [`Metadata::tenant_id`] matches one
+    /// of these IDs.
+    ///
+    /// Special values:
+    /// - Empty (`[]`, the default) — legacy shared-fleet semantics: the
+    ///   peer accepts every message regardless of tenant tag. Preserves
+    ///   pre-tenant-topology behaviour for deployments that do not opt
+    ///   in to per-tenant routing.
+    /// - `["*"]` — explicit form of "accept every tenant", equivalent
+    ///   to the empty default but useful when the operator wants the
+    ///   intent to be visible in config.
+    ///
+    /// Non-shared values: a peer with `tenants = ["alpha"]` receives
+    /// only messages tagged `tenant_id = Some("alpha")`. Untagged
+    /// messages (`tenant_id = None`) reach only shared peers — a
+    /// pinned peer never sees legacy untagged traffic.
+    ///
+    /// [`Metadata::tenant_id`]: rustgate_core::message::Metadata::tenant_id
+    #[serde(default)]
+    pub tenants: Vec<String>,
+    /// Role this peer plays within its tenant's topology.
+    ///
+    /// Default is [`TopologyRole::Active`] (every peer in scope receives
+    /// every forwarded message). [`TopologyRole::Standby`] holds the
+    /// peer back from the fan-out unless every Active peer in the same
+    /// tenant is currently unavailable, at which point Standbys are
+    /// promoted automatically.
+    #[serde(default, rename = "topologyRole", alias = "topology_role")]
+    pub topology_role: TopologyRole,
 }
 
 impl PeerConfig {
@@ -337,6 +424,36 @@ impl PeerConfig {
     /// Returns `outbound_groups` if set, otherwise falls back to `groups`.
     pub fn effective_outbound_groups(&self) -> &[String] {
         self.outbound_groups.as_deref().unwrap_or(&self.groups)
+    }
+
+    /// Returns `true` when this peer's `tenants` scope accepts the
+    /// supplied `tenant_id`.
+    ///
+    /// The matrix:
+    ///
+    /// | `peer.tenants`           | `tenant_id`          | Result |
+    /// |--------------------------|----------------------|--------|
+    /// | `[]` (default)           | any (`Some` / `None`) | accept |
+    /// | `["*"]`                  | any                  | accept |
+    /// | `["alpha", "bravo"]`     | `Some("alpha")`      | accept |
+    /// | `["alpha", "bravo"]`     | `Some("charlie")`    | reject |
+    /// | `["alpha"]`              | `None`               | reject |
+    ///
+    /// Untagged messages (`tenant_id = None`) reach only peers
+    /// configured as shared (`[]` or `["*"]`). This preserves the
+    /// pre-#859 backward-compat contract: a deployment that has never
+    /// opted in to tenants sees every message everywhere, but a
+    /// deployment that pins a peer to one tenant does NOT leak untagged
+    /// traffic into that tenant's slice of the federation graph.
+    #[must_use]
+    pub fn serves_tenant(&self, tenant_id: Option<&str>) -> bool {
+        if self.tenants.is_empty() || self.tenants.iter().any(|s| s == "*") {
+            return true;
+        }
+        match tenant_id {
+            Some(t) => self.tenants.iter().any(|s| s == t),
+            None => false,
+        }
     }
 }
 
@@ -420,6 +537,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -577,6 +696,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -601,6 +722,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -625,6 +748,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         assert!(!peer.enabled);
     }
@@ -653,6 +778,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -684,6 +811,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -708,6 +837,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         assert_eq!(peer.effective_inbound_groups(), &["Alpha", "Bravo"]);
         assert_eq!(peer.effective_outbound_groups(), &["Alpha", "Bravo"]);
@@ -731,6 +862,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1", "Inbound2"]);
         assert_eq!(peer.effective_outbound_groups(), &["Outbound1"]);
@@ -754,6 +887,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1"]);
         // outbound falls back to groups
@@ -778,6 +913,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(json.contains("inbound_groups"));
@@ -809,6 +946,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(!json.contains("inbound_groups"));
@@ -921,6 +1060,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(
@@ -949,6 +1090,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: Some(CompressionKind::Zstd),
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(json.contains("\"zstd\""), "expected zstd token: {json}");
@@ -974,6 +1117,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: Some(CompressionKind::Gzip),
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");

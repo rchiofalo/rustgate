@@ -81,6 +81,8 @@ fn peer(id: &str, addr: &str) -> PeerConfig {
         zone: None,
         priority: 100,
         compression: None,
+        tenants: Default::default(),
+        topology_role: Default::default(),
     }
 }
 

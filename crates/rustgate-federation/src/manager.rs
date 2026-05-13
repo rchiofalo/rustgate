@@ -940,7 +940,40 @@ impl FederationManager {
         // measured latency (ascending), then by priority (ascending).
         sort_peers_by_preference(&mut snapshot, self.config.local_region.as_deref());
 
+        // Tenant + topology filter. The message's `tenant_id` (set on
+        // `Metadata` at the router accept path, post-#859) selects the
+        // candidate peer set: shared peers (`tenants = []` / `["*"]`)
+        // accept every message, pinned peers receive only their tagged
+        // tenant. The Active/Standby promotion rule then partitions the
+        // candidates — Standbys are held back unless every Active peer
+        // in scope is currently unavailable, in which case they are
+        // promoted for this forwarding pass.
+        let tenant_id = metadata.and_then(|m| m.tenant_id.as_deref());
+        let any_active_in_scope = snapshot.iter().any(|(_, _, peer)| {
+            peer.config.serves_tenant(tenant_id)
+                && peer.config.topology_role == crate::config::TopologyRole::Active
+                && peer.is_available()
+        });
+
         for (id, client, peer) in &snapshot {
+            // Tenant scope: pinned peers never see traffic outside
+            // their tenant list; shared peers see everything.
+            if !peer.config.serves_tenant(tenant_id) {
+                continue;
+            }
+
+            // Standby promotion: hold standbys back unless every
+            // matching Active peer is currently unavailable. Inline
+            // re-check of the same rule encoded in
+            // `topology::select_peers_for_tenant` — the spec module
+            // has unit tests against the rule that this branch
+            // implements on the hot path.
+            if peer.config.topology_role == crate::config::TopologyRole::Standby
+                && any_active_in_scope
+            {
+                continue;
+            }
+
             if !peer.is_available() {
                 continue;
             }
@@ -2064,6 +2097,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         }
     }
 
@@ -3129,6 +3164,8 @@ mod tests {
             zone: None,
             priority,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         }
     }
 
@@ -3330,6 +3367,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let err = mgr
             .connect_outbound_peer(&cfg)
@@ -3393,6 +3432,8 @@ mod tests {
             zone: None,
             priority: 100,
             compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
         };
         let err = mgr
             .connect_outbound_peer(&cfg)
