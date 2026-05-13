@@ -29,9 +29,12 @@
 //! - Value mapping (enum-style raw → label) is parsed by the
 //!   schema layer but the runtime treats the raw integer as the
 //!   value. Real enum projection follows in a v2 PR.
-//! - Multi-message schemas (with `discriminator_offset`) parse but
-//!   the runtime only dispatches the first message type. Multi-
-//!   message dispatch lands when a real codec port needs it.
+//! - Multi-message schemas (with `discriminator_offset`) are
+//!   **rejected** at schema-load time by [`Schema::validate`] until
+//!   v2 ships dispatch. The `discriminator_offset` field stays in
+//!   the grammar so v2 schemas don't need a wire-format change; the
+//!   call site splits multi-message protocols into N single-message
+//!   schemas it dispatches itself in the meantime.
 
 use std::collections::BTreeMap;
 
@@ -82,18 +85,19 @@ impl SchemaCodec {
     }
 
     /// Choose the message type to apply for an inbound payload.
-    /// v1 simplification: the first declared message type wins.
-    /// Multi-message dispatch lands when a real codec port needs
-    /// it.
+    /// v1 schemas declare exactly one message type — multi-message
+    /// dispatch is deferred to v2 and rejected at parse time by
+    /// [`Schema::validate`]. This accessor therefore always returns
+    /// the sole entry.
     fn select_message_type(&self) -> &MessageType {
-        // Safe — `Schema::validate` rejects empty message_types.
-        // justification: validation guarantees at least one
+        // Safe — `Schema::validate` rejects empty and multi-message
+        // schemas. justification: validation guarantees exactly one
         // entry; expect() carries the invariant to the reader.
         #[allow(clippy::expect_used)]
         self.schema
             .message_types
             .first()
-            .expect("validated schema has at least one message type")
+            .expect("validated schema has exactly one message type")
     }
 
     /// Decode a single field at its declared offset.
@@ -228,11 +232,36 @@ impl SchemaCodec {
                 write_u64(slice, v as u64, field.endian);
             }
             FieldType::F32 => {
-                let v = value.as_f64(field)? as f32;
+                let raw = value.as_f64(field)?;
+                let v = raw as f32;
+                // The `f64 as f32` cast silently saturates to
+                // `±f32::INFINITY` for out-of-range values (and to
+                // `NaN` for `NaN`). The integer types all surface
+                // overflow as `OutOfRange`; do the same here so a
+                // miscalibrated schema fails the encode rather than
+                // shipping `+inf` on the wire. NaN inputs are
+                // similarly rejected — they almost always indicate
+                // a calibration bug rather than a real wire value.
+                if !v.is_finite() {
+                    return Err(SchemaCodecError::OutOfRange {
+                        field: field.name.clone(),
+                        value: raw.to_string(),
+                        type_name: "f32".into(),
+                    });
+                }
                 write_u32(slice, v.to_bits(), field.endian);
             }
             FieldType::F64 => {
                 let v = value.as_f64(field)?;
+                // Same guard as F32: NaN / ±inf on the wire is
+                // almost certainly a bug, not a real measurement.
+                if !v.is_finite() {
+                    return Err(SchemaCodecError::OutOfRange {
+                        field: field.name.clone(),
+                        value: v.to_string(),
+                        type_name: "f64".into(),
+                    });
+                }
                 write_u64(slice, v.to_bits(), field.endian);
             }
             FieldType::Bytes => {
@@ -422,12 +451,21 @@ enum EncodedValue {
 impl EncodedValue {
     fn as_u64(&self, field: &FieldDef) -> Result<u64, SchemaCodecError> {
         match self {
-            Self::I64(v) if *v >= 0 => Ok(*v as u64),
+            // Bit-cast the i64 to u64 rather than rejecting
+            // negative values. Decode-side projects u64 wire values
+            // through `AttributeValue::Int(i64)` (the only integer
+            // variant `Entity::attributes` carries), so a u64 with
+            // its high bit set arrives here as a "negative" i64.
+            // The subsequent per-type range check on each
+            // `FieldType::U{8,16,32}` call site catches values
+            // that genuinely overflow the field width — for U64
+            // the bit pattern is exactly what we want to write.
+            Self::I64(v) => Ok(*v as u64),
             Self::F64(v) => Ok(EncodedValue::reverse_calibration(*v, field) as u64),
-            // String → integer fallback so an `Entity` whose `uid` is
-            // a decimal string like `"42"` can still project onto a
-            // `u32` track-id field. Non-numeric strings fail the
-            // call.
+            // String → integer fallback so an `Entity` whose `uid`
+            // is a decimal string like `"42"` can still project
+            // onto a `u32` track-id field. Non-numeric strings fail
+            // the call.
             Self::Str(s) => s.parse::<u64>().map_err(|_| SchemaCodecError::OutOfRange {
                 field: field.name.clone(),
                 value: format!("Str({s:?})"),
@@ -957,6 +995,71 @@ message-types:
             panic!("expected float");
         };
         assert!(((*decoded as f32) - 1.5_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f32_encode_rejects_out_of_range_value() {
+        // The `f64 as f32` cast saturates to `+inf` for values
+        // above `f32::MAX`. Without the `is_finite()` guard the
+        // codec would happily ship `+inf` on the wire; with it,
+        // operators see a typed `OutOfRange` at encode time and can
+        // fix the calibration / source value.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 4
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: f32 }
+        endian: little
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.v".into(), AttributeValue::Float(1e40));
+        let err = codec.from_entity(&entity).unwrap_err();
+        let SchemaCodecError::OutOfRange {
+            field, type_name, ..
+        } = err
+        else {
+            panic!("expected OutOfRange, got {err:?}");
+        };
+        assert_eq!(field, "v");
+        assert_eq!(type_name, "f32");
+    }
+
+    #[test]
+    fn f64_encode_rejects_nan() {
+        // NaN is almost always a calibration bug, not a real
+        // measurement — surface it at encode time.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: f64 }
+        endian: little
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.v".into(), AttributeValue::Float(f64::NAN));
+        let err = codec.from_entity(&entity).unwrap_err();
+        let SchemaCodecError::OutOfRange { type_name, .. } = err else {
+            panic!("expected OutOfRange, got {err:?}");
+        };
+        assert_eq!(type_name, "f64");
     }
 
     fn empty_entity() -> Entity {

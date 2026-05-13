@@ -350,16 +350,23 @@ impl Schema {
                 message: "schema must declare at least one message_types entry".to_string(),
             });
         }
-        for mt in &self.message_types {
-            self.validate_message_type(mt)?;
-        }
-        if self.message_types.len() > 1 && self.discriminator_offset.is_none() {
+        // Multi-message dispatch is v2. The v1 codec runtime always
+        // selects the first message type, which would silently
+        // mis-decode payloads that match a non-first variant.
+        // Reject the schema at startup instead so operators see the
+        // gap during a schema-load step, not after the first payload
+        // surprises them. The `discriminator_offset` field stays in
+        // the grammar so v2 schemas don't need a wire-format change.
+        if self.message_types.len() > 1 {
             return Err(SchemaError::Validation {
                 message: format!(
-                    "schema has {} message types but no discriminator_offset",
+                    "schema declares {} message types but multi-message dispatch is not yet implemented (v2); split into separate schemas dispatched at the call site",
                     self.message_types.len()
                 ),
             });
+        }
+        for mt in &self.message_types {
+            self.validate_message_type(mt)?;
         }
         Ok(())
     }
@@ -567,8 +574,28 @@ message-types:
     }
 
     #[test]
-    fn rejects_multi_message_without_discriminator() {
-        let yaml = r#"
+    fn rejects_multi_message_schemas() {
+        // v1 codec runtime always selects the first message type;
+        // accepting a multi-message schema would silently mis-decode
+        // payloads that match the non-first variant. `validate` must
+        // reject the schema at startup so the gap surfaces during
+        // schema-load, not on the first payload. Covers both the
+        // discriminator-present and discriminator-absent cases.
+        let with_discriminator = r#"
+schema-version: "1"
+protocol-name: "test"
+discriminator-offset: 0
+message-types:
+  - name: "A"
+    id: 1
+    size-bytes: 4
+    fields: []
+  - name: "B"
+    id: 2
+    size-bytes: 4
+    fields: []
+"#;
+        let without_discriminator = r#"
 schema-version: "1"
 protocol-name: "test"
 message-types:
@@ -581,12 +608,17 @@ message-types:
     size-bytes: 4
     fields: []
 "#;
-        let schema = Schema::parse(yaml).unwrap();
-        let err = schema.validate().unwrap_err();
-        let SchemaError::Validation { message } = err else {
-            panic!("expected validation error");
-        };
-        assert!(message.contains("discriminator"), "got: {message}");
+        for yaml in [with_discriminator, without_discriminator] {
+            let schema = Schema::parse(yaml).unwrap();
+            let err = schema.validate().unwrap_err();
+            let SchemaError::Validation { message } = err else {
+                panic!("expected validation error");
+            };
+            assert!(
+                message.contains("multi-message dispatch is not yet implemented"),
+                "got: {message}"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rustgate-codec-schema` hardening pass (XTCE v1 rough edges)** — three correctness fixes the post-merge review surfaced before any real codec port lands on the schema runtime:
+  - **Multi-message schemas now fail at `Schema::validate`** instead of silently picking the first message type at decode. v1 has no discriminator-byte dispatch, so a 2-message schema was producing systematically-wrong decodes for payloads matching the non-first variant. The `discriminator_offset` field stays in the grammar (v2 schemas will not need a wire-format change), and the validator's error message points operators at the splitting workaround.
+  - **`f32` / `f64` encode rejects non-finite values with a typed `OutOfRange`.** The `f64 as f32` cast in `encode_field` was silently saturating to `±f32::INFINITY` for out-of-range inputs and propagating `NaN` for `NaN` inputs — both almost always indicate a calibration bug, not a real measurement. Surface the failure on encode, not on the wire.
+  - **`u64` round-trip is byte-exact for values with the high bit set.** Decode projects `u64` wire values through `AttributeValue::Int(i64)` (the only integer variant `Entity::attributes` carries), so a `u64` with its high bit set arrived at encode time as a "negative" `i64` and tripped the `as_u64` rejection. Bit-cast `i64 → u64` in the encoder; per-type bounds checks on `U8` / `U16` / `U32` still catch values that genuinely overflow the field width. Caught by the new proptest harness.
+
+- **proptest harness on the schema codec** (`tests/proptest_codec.rs`). Two properties: (1) `decode_does_not_panic` exercises every primitive kind × endian × arbitrary payload bytes (including float NaN / subnormal / inf bit patterns) and asserts the codec never crashes the process; (2) `integer_payload_round_trips_byte_exact` generates arbitrary integer payloads, decodes through the attribute fallback, re-encodes, and asserts byte-equality with the original. This is the property that surfaced the `u64` high-bit bug above and now pins the fix.
+
+- **`cargo check --workspace --all-targets` now passes on the default feature set.** Two targets in `rustgate-federation` referenced `v2`-gated symbols (`v2::proto::*`, `FederationManager::create_v2_event_handler`) without their own `#[cfg(feature = "v2")]` gate:
+  - `benches/convert.rs` — added `required-features = ["v2"]` to the matching `[[bench]]` block in `Cargo.toml`. Cleaner than a source-level cfg, which would empty the file and break criterion's `main` symbol expectation under `harness = false`.
+  - `manager.rs::tests::v2_handler_forwards_when_peer_groups_trusted` — added `#[cfg(feature = "v2")]` (the adjacent `v2_handler_forwards_even_with_untrusted_wire_groups` test already had the gate; this one was missed when the pair was originally added).
+
+  Pre-existing defect; closes a CI-only red flag that would have surfaced as soon as any contributor ran the canonical workspace check locally.
+
 ### Added
 
 - **Per-tenant federation topology (Active / Standby roles) — completes the multi-tenancy story from #859.** v0.9.0 isolated `tenant_id` at rest (per-tenant archive subdirectories, store-and-forward keying, optional NATS subject prefix), but federation fan-out was still all-peers-every-tenant. PR adds two additive `PeerConfig` fields and a topology selection layer:
@@ -27,16 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   11 new unit tests in `rustgate-core::entity::tests` covering: empty-default construction, JSON back-compat round-trip on pre-extension payloads, full `Tasking` and `FileRef` round-trips, vocabulary stability for `TaskingState::as_str` / `TaskingRole::as_str`, `Default` impls, optional-field skipping on `FileRef` wire shape, and a multi-tasking-different-roles round-trip.
 
   Compatibility: every `Entity { ... }` struct literal in the workspace (codecs, correlation engine, mappers, tests — ~40+ sites across 19 files) updated to set the new fields to `Default::default()`. Each `EntityCodec::to_entity` implementation continues to leave the new fields empty; future per-codec work to populate them from native wire fields (CoT `<__chat>` for taskings, CoT `<fileshare>` for file refs) ships incrementally without further breakage.
-
-### Fixed
-
-- **`cargo check --workspace --all-targets` now passes on the default feature set.** Two targets in `rustgate-federation` referenced `v2`-gated symbols (`v2::proto::*`, `FederationManager::create_v2_event_handler`) without their own `#[cfg(feature = "v2")]` gate:
-  - `benches/convert.rs` — added `required-features = ["v2"]` to the matching `[[bench]]` block in `Cargo.toml`. Cleaner than a source-level cfg, which would empty the file and break criterion's `main` symbol expectation under `harness = false`.
-  - `manager.rs::tests::v2_handler_forwards_when_peer_groups_trusted` — added `#[cfg(feature = "v2")]` (the adjacent `v2_handler_forwards_even_with_untrusted_wire_groups` test already had the gate; this one was missed when the pair was originally added).
-
-  Pre-existing defect; closes a CI-only red flag that would have surfaced as soon as any contributor ran the canonical workspace check locally.
-
-### Added
 
 - **Declarative XTCE-style codec authoring via `rustgate-codec-schema`** — a new workspace crate that adds a `SchemaCodec` implementing `EntityCodec` driven by a YAML / JSON wire-format description, so binary protocols can be onboarded by editing a schema file instead of writing Rust per protocol. Inspired by the OMG XTCE spec used by Yamcs / Open MCT and the CCSDS Space Packet Protocol descriptors, with v1 deliberately scoped to the 80% of practical wire formats that fit a fixed-offset / fixed-length model.
   - **What's in** — fixed-offset binary fields with little- and big-endian primitive types (`u8`/`u16`/`u32`/`u64`, `i8`/`i16`/`i32`/`i64`, `f32`/`f64`), fixed-length byte slices and fixed-length UTF-8 strings, linear calibration (`physical = raw * scale + offset`) applied during decode and reversed on encode, field-to-`Entity` projection via dotted-path mapping (`uid`, `callsign`, `mil_std_2525_sidc`, `position.{lat,lon,hae_meters}`, `velocity.{speed_m_s,course_deg}`, `attributes.<key>`), round-trip discipline — fields without an `entity_path` land on `Entity::attributes` under `schema.<protocol>.<field>` so a `decode → encode` cycle preserves payload bytes the `Entity` shape doesn't carry.
