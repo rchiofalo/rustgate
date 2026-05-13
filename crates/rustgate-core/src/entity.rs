@@ -252,6 +252,43 @@ pub enum AttributeValue {
     Bool(bool),
 }
 
+/// Maximum byte length of [`Tasking::task_id`]. 256 mirrors
+/// [`crate::identity::MAX_CN_LENGTH`] (the same upper bound applied
+/// to every operator-facing string identifier rustgate accepts at
+/// the wire boundary). Producers that need longer ids should
+/// content-hash them down to a stable 256-byte prefix rather than
+/// the codec dropping or truncating arbitrarily.
+pub const MAX_TASK_ID_LEN: usize = 256;
+
+/// Maximum byte length of [`Tasking::name`].
+pub const MAX_TASKING_NAME_LEN: usize = 256;
+
+/// Maximum byte length of [`FileRef::uri`]. URIs longer than
+/// 4 KiB are almost always a downstream bug (data URIs, query
+/// parameters being abused as state). The cap matches the
+/// `MAX_ATTR_BAG_BYTES` budget for the entity's free-form
+/// attribute map so a single URI cannot exceed the size of every
+/// other attribute combined.
+pub const MAX_FILE_REF_URI_LEN: usize = 4 * 1024;
+
+/// Maximum byte length of [`FileRef::label`].
+pub const MAX_FILE_REF_LABEL_LEN: usize = 256;
+
+/// Maximum byte length of [`FileRef::mime`]. IANA media types are
+/// short; 256 bytes comfortably accommodates `application/vnd.…`
+/// long-form types with parameters.
+pub const MAX_FILE_REF_MIME_LEN: usize = 256;
+
+/// Maximum byte length of [`FileHash::algorithm`]. Algorithm
+/// identifiers are short (`"sha256"`, `"blake2b"`); 32 bytes is
+/// generous.
+pub const MAX_FILE_HASH_ALGORITHM_LEN: usize = 32;
+
+/// Maximum byte length of [`FileHash::hex`]. A 512-byte hex
+/// envelope accommodates SHA-512 (128 hex chars) with headroom for
+/// future strong hashes.
+pub const MAX_FILE_HASH_HEX_LEN: usize = 512;
+
 /// A tasking this entity is involved in.
 ///
 /// rustgate does NOT own mission / tasking state — that's the
@@ -263,7 +300,12 @@ pub enum AttributeValue {
 /// task T is responsible for transitions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tasking {
-    /// Opaque identifier set by the originating system.
+    /// Opaque identifier set by the originating system. Operators
+    /// should treat this as caller-supplied and pass it through
+    /// [`crate::sanitize::sanitize_for_log`] before including it
+    /// in any structured-tracing field. Maximum byte length is
+    /// [`MAX_TASK_ID_LEN`]; [`Tasking::validate`] enforces the
+    /// cap.
     pub task_id: String,
     /// What state the task is in, as observed from this entity's
     /// perspective.
@@ -271,16 +313,43 @@ pub struct Tasking {
     /// What role this entity plays in the task.
     pub role: TaskingRole,
     /// Optional human-readable task name / mission code (e.g.
-    /// `"OP IRON HAMMER"`).
+    /// `"OP IRON HAMMER"`). Maximum byte length is
+    /// [`MAX_TASKING_NAME_LEN`]; pass through
+    /// [`crate::sanitize::sanitize_for_log`] before logging since
+    /// operators often inject newlines / control chars when
+    /// generating callsigns by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+impl Tasking {
+    /// Validate that string fields fit within the documented byte
+    /// caps. Returns the offending field name on the first
+    /// violation; otherwise `Ok(())`.
+    ///
+    /// This is a defensive check operators can call on inbound
+    /// taskings before storing them. The serde layer does not
+    /// enforce caps automatically because not every consumer
+    /// wants to reject — some prefer to truncate-and-warn — so
+    /// the policy decision stays at the call site.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.task_id.len() > MAX_TASK_ID_LEN {
+            return Err("task_id exceeds MAX_TASK_ID_LEN");
+        }
+        if let Some(name) = &self.name
+            && name.len() > MAX_TASKING_NAME_LEN
+        {
+            return Err("name exceeds MAX_TASKING_NAME_LEN");
+        }
+        Ok(())
+    }
 }
 
 /// State of a [`Tasking`]. Closed vocabulary; loose progression is
 /// `Assigned → Acknowledged → Executing → (Complete | Failed | Cancelled)`,
 /// skips permitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "snake_case")]
 pub enum TaskingState {
     /// Task has been issued but not yet acknowledged.
     #[default]
@@ -314,7 +383,7 @@ impl TaskingState {
 
 /// Role a [`Tasking`] entity plays in its task. Closed vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "snake_case")]
 pub enum TaskingRole {
     /// This entity is the subject the task is acting upon.
     #[default]
@@ -352,11 +421,16 @@ impl TaskingRole {
 pub struct FileRef {
     /// Where the file lives. Common schemes: `https://...`,
     /// `s3://...`, `content://<algo>/<hex>`, `file://...`.
+    /// Maximum byte length is [`MAX_FILE_REF_URI_LEN`]; pass
+    /// through [`crate::sanitize::sanitize_for_log`] before
+    /// logging — URIs frequently carry query parameters with
+    /// CR/LF that would otherwise enable log forging.
     pub uri: String,
     /// File size in bytes when known by the producer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     /// IANA media type (`image/jpeg`, `video/mp4`, …) when known.
+    /// Maximum byte length is [`MAX_FILE_REF_MIME_LEN`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime: Option<String>,
     /// Strong-hash digest for content-addressed retrieval and
@@ -364,8 +438,38 @@ pub struct FileRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<FileHash>,
     /// Human-readable display label (the file's display name).
+    /// Maximum byte length is [`MAX_FILE_REF_LABEL_LEN`]; pass
+    /// through [`crate::sanitize::sanitize_for_log`] before
+    /// logging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+impl FileRef {
+    /// Validate that string fields fit within the documented byte
+    /// caps. Returns the offending field name on the first
+    /// violation; otherwise `Ok(())`. Mirrors
+    /// [`Tasking::validate`] — defensive check operators may call
+    /// on inbound `FileRef` values before storing them.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.uri.len() > MAX_FILE_REF_URI_LEN {
+            return Err("uri exceeds MAX_FILE_REF_URI_LEN");
+        }
+        if let Some(mime) = &self.mime
+            && mime.len() > MAX_FILE_REF_MIME_LEN
+        {
+            return Err("mime exceeds MAX_FILE_REF_MIME_LEN");
+        }
+        if let Some(label) = &self.label
+            && label.len() > MAX_FILE_REF_LABEL_LEN
+        {
+            return Err("label exceeds MAX_FILE_REF_LABEL_LEN");
+        }
+        if let Some(hash) = &self.hash {
+            hash.validate()?;
+        }
+        Ok(())
+    }
 }
 
 /// Cryptographic digest of a [`FileRef`]'s contents.
@@ -375,9 +479,27 @@ pub struct FileRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileHash {
     /// Hash algorithm identifier (`"sha256"`, `"sha1"`, …).
+    /// Maximum byte length is [`MAX_FILE_HASH_ALGORITHM_LEN`].
     pub algorithm: String,
-    /// Lowercase hex digest of the file contents.
+    /// Lowercase hex digest of the file contents. Maximum byte
+    /// length is [`MAX_FILE_HASH_HEX_LEN`] (room for SHA-512 with
+    /// headroom).
     pub hex: String,
+}
+
+impl FileHash {
+    /// Validate that string fields fit within the documented byte
+    /// caps. Returns the offending field name on the first
+    /// violation; otherwise `Ok(())`.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.algorithm.len() > MAX_FILE_HASH_ALGORITHM_LEN {
+            return Err("algorithm exceeds MAX_FILE_HASH_ALGORITHM_LEN");
+        }
+        if self.hex.len() > MAX_FILE_HASH_HEX_LEN {
+            return Err("hex exceeds MAX_FILE_HASH_HEX_LEN");
+        }
+        Ok(())
+    }
 }
 
 /// Bidirectional codec between a wire format and the canonical
@@ -898,6 +1020,103 @@ mod tests {
     #[test]
     fn tasking_role_default_is_subject() {
         assert_eq!(TaskingRole::default(), TaskingRole::Subject);
+    }
+
+    #[test]
+    fn tasking_state_wire_format_is_snake_case() {
+        // Regression test — the original PR #1358 shipped
+        // `rename_all = "kebab-case"` here while sibling enums
+        // (`EntityKind`, `AttributeValue`) use snake_case. The
+        // mismatch was harmless today (every variant is single-
+        // word) but would silently split the wire form the moment
+        // someone added e.g. `InProgress`. Pin the convention.
+        let json = serde_json::to_string(&TaskingState::Acknowledged).unwrap();
+        assert_eq!(json, "\"acknowledged\"");
+        let json = serde_json::to_string(&TaskingRole::Subject).unwrap();
+        assert_eq!(json, "\"subject\"");
+    }
+
+    #[test]
+    fn tasking_state_rejects_unknown_variant_at_deserialize() {
+        // Closed-vocabulary contract — deserializing a wire form
+        // outside the documented variant set MUST fail rather
+        // than silently fall through to a default. Caught by
+        // serde's per-enum strict matching.
+        let err = serde_json::from_str::<TaskingState>("\"bogus\"").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "expected unknown variant error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn tasking_role_rejects_unknown_variant_at_deserialize() {
+        let err = serde_json::from_str::<TaskingRole>("\"orchestrator\"").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "expected unknown variant error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn tasking_validate_rejects_oversize_task_id() {
+        let big = Tasking {
+            task_id: "x".repeat(MAX_TASK_ID_LEN + 1),
+            state: TaskingState::Assigned,
+            role: TaskingRole::Subject,
+            name: None,
+        };
+        assert_eq!(big.validate(), Err("task_id exceeds MAX_TASK_ID_LEN"));
+        let big_name = Tasking {
+            task_id: "ok".into(),
+            state: TaskingState::Assigned,
+            role: TaskingRole::Subject,
+            name: Some("y".repeat(MAX_TASKING_NAME_LEN + 1)),
+        };
+        assert_eq!(
+            big_name.validate(),
+            Err("name exceeds MAX_TASKING_NAME_LEN")
+        );
+    }
+
+    #[test]
+    fn file_ref_validate_rejects_oversize_fields() {
+        let big_uri = FileRef {
+            uri: "x".repeat(MAX_FILE_REF_URI_LEN + 1),
+            size_bytes: None,
+            mime: None,
+            hash: None,
+            label: None,
+        };
+        assert_eq!(big_uri.validate(), Err("uri exceeds MAX_FILE_REF_URI_LEN"));
+        let big_mime = FileRef {
+            uri: "ok".into(),
+            size_bytes: None,
+            mime: Some("y".repeat(MAX_FILE_REF_MIME_LEN + 1)),
+            hash: None,
+            label: None,
+        };
+        assert_eq!(
+            big_mime.validate(),
+            Err("mime exceeds MAX_FILE_REF_MIME_LEN")
+        );
+    }
+
+    #[test]
+    fn file_hash_validate_rejects_oversize_fields() {
+        let big_algo = FileHash {
+            algorithm: "x".repeat(MAX_FILE_HASH_ALGORITHM_LEN + 1),
+            hex: "deadbeef".into(),
+        };
+        assert_eq!(
+            big_algo.validate(),
+            Err("algorithm exceeds MAX_FILE_HASH_ALGORITHM_LEN")
+        );
+        let big_hex = FileHash {
+            algorithm: "sha256".into(),
+            hex: "0".repeat(MAX_FILE_HASH_HEX_LEN + 1),
+        };
+        assert_eq!(big_hex.validate(), Err("hex exceeds MAX_FILE_HASH_HEX_LEN"));
     }
 
     #[test]

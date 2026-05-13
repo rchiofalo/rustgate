@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
   Pre-existing defect; closes a CI-only red flag that would have surfaced as soon as any contributor ran the canonical workspace check locally.
 
+### Changed
+
+- **`Entity` `Tasking` / `FileRef` review polish (closes #1376)** — three follow-up fixes from the review of #1358:
+  - `TaskingState` and `TaskingRole` switched from `rename_all = "kebab-case"` to `rename_all = "snake_case"` to match the sibling closed-vocabulary enums on `Entity` (`EntityKind`, `AttributeValue`). Every variant in the current vocabulary is single-word so the wire bytes are identical today, but a future `InProgress`-style addition would have silently split the wire form across sibling enums.
+  - Added byte-length cap constants (`MAX_TASK_ID_LEN = 256`, `MAX_TASKING_NAME_LEN = 256`, `MAX_FILE_REF_URI_LEN = 4 KiB`, `MAX_FILE_REF_LABEL_LEN = 256`, `MAX_FILE_REF_MIME_LEN = 256`, `MAX_FILE_HASH_ALGORITHM_LEN = 32`, `MAX_FILE_HASH_HEX_LEN = 512`) and `Tasking::validate` / `FileRef::validate` / `FileHash::validate` defensive checks operators can call on inbound values before storing them. Mirrors the `MAX_CN_LENGTH = 256` / `MAX_ATTR_BAG_BYTES = 4 KiB` precedent.
+  - Field docstrings now point operators at `crate::sanitize::sanitize_for_log` for the operator-facing strings (`Tasking::task_id`, `Tasking::name`, `FileRef::uri`, `FileRef::label`) — those carry caller-supplied bytes that can include CR/LF and need scrubbing before structured-tracing inclusion.
+  - 6 new tests: wire-form pinning (`"acknowledged"` / `"subject"` JSON regression), unknown-variant rejection for both enums (`"bogus"` → `unknown variant` error), and oversize-string rejection for `Tasking` / `FileRef` / `FileHash`.
+
 ### Added
 
 - **DIS PDU-header schema-parity test** — second cross-protocol confidence test for the declarative XTCE-style schema vocabulary (the first is STANAG 4586 in #1365). Ships `crates/rustgate-dis/schemas/pdu_header.yaml` describing the 12-byte IEEE 1278.1-2012 common header (clause 5.2.32) — `u8` protocol_version / exercise_id / pdu_type / protocol_family + `u32` timestamp + two `u16` length / padding — and a `tests/schema_parity.rs` proptest that asserts byte-identical round-trip against the hand-rolled `PduHeader::encode_into` for every arbitrary input. A companion non-parity test demonstrates v2 typed `value-mapping` projection on the `pdu_type` byte (raw `1` → `"EntityState"` label on `Entity::attributes`). The hand-rolled codec stays in place; per-PDU body schemas remain out of scope until the schema grammar grows variable-length record support (v3).
