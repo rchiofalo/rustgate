@@ -1,0 +1,73 @@
+# DIS (IEEE 1278.1-2012) PDU common header, clause 5.2.32.
+#
+# Every DIS PDU starts with this 12-byte big-endian header,
+# regardless of the PDU type. The body that follows is type-
+# dependent and out of scope for the v2 schema vocabulary (variable-
+# length records on Entity State, articulation parameter arrays,
+# etc. need v3+ extensions).
+#
+# Wire layout:
+#
+# offset │ size │ field             │ type
+# ───────┼──────┼───────────────────┼──────────────────────────
+#   0    │  1   │ protocol_version  │ u8   (IEEE 1278.1-2012 → 7)
+#   1    │  1   │ exercise_id       │ u8
+#   2    │  1   │ pdu_type          │ u8   (IEEE 1278.1 Annex A)
+#   3    │  1   │ protocol_family   │ u8
+#   4    │  4   │ timestamp         │ u32  big-endian
+#   8    │  2   │ length            │ u16  big-endian
+#  10    │  2   │ padding           │ u16  big-endian
+#
+# What this schema does NOT carry today:
+#
+# - The `PduType` enum (IEEE 1278.1 Annex A defines 72 values).
+#   The schema runtime supports `value-mapping` since #1370 but
+#   the parity-test goal is byte-equivalence for arbitrary input,
+#   not just the listed enum values. With `default-raw` set,
+#   round-trip is lossy for unknown PDU types (decode → default's
+#   label → encode → default's raw). Operators who want typed PDU-
+#   type projection can layer their own `value-mapping` overlay
+#   on top of this base schema in a future v3 schema-inheritance
+#   feature, or carry the raw byte under `attributes` as we do
+#   here today.
+# - The `ProtocolFamily` enum (IEEE 1278.1 defines 7 families).
+#   Same reasoning as above.
+# - Per-PDU body schemas. Entity State, Fire, Detonation, etc.
+#   ride on per-protocol follow-up schemas dispatched at the
+#   call-site by the header's `pdu_type` field.
+#
+# Provenance: byte layout cross-checked against
+# `crates/rustgate-dis/src/header.rs::PduHeader::{decode,encode_into}`
+# — the `schema_parity` proptest in this crate's `tests/`
+# directory asserts byte-identical round-trip for every arbitrary
+# `PduHeader` proptest generates.
+schema-version: "1"
+protocol-name: "dis.pdu_header"
+message-types:
+  - name: "PduHeader"
+    size-bytes: 12
+    fields:
+      - name: "protocol_version"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "exercise_id"
+        offset: 1
+        field-type: { kind: u8 }
+      - name: "pdu_type"
+        offset: 2
+        field-type: { kind: u8 }
+      - name: "protocol_family"
+        offset: 3
+        field-type: { kind: u8 }
+      - name: "timestamp"
+        offset: 4
+        field-type: { kind: u32 }
+        endian: big
+      - name: "length"
+        offset: 8
+        field-type: { kind: u16 }
+        endian: big
+      - name: "padding"
+        offset: 10
+        field-type: { kind: u16 }
+        endian: big
