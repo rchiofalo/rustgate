@@ -217,6 +217,8 @@ fn k05_1_to_entity(header: &VmfHeader, body: &K051PositionReport) -> Entity {
         callsign: body.unit_identifier.clone(),
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     }
 }
 
@@ -470,6 +472,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = codec.from_entity(&entity).unwrap_err();
         assert!(matches!(err, VmfEntityError::UnsupportedEntityKind(_)));
@@ -491,6 +495,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = codec.from_entity(&entity).unwrap_err();
         assert!(matches!(err, VmfEntityError::UnsupportedEntityKind(_)));

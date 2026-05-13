@@ -946,6 +946,8 @@ fn track_to_entity(namespace: &Option<String>, track: NffiTrack) -> Entity {
         callsign: unit_name,
         mil_std_2525_sidc: sidc,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     }
 }
 
@@ -1254,6 +1256,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = codec.from_entity(&e).expect_err("must reject");
         assert!(matches!(err, NffiError::UnsupportedEntity(_)));

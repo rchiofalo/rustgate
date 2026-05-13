@@ -176,6 +176,8 @@ fn programmatic_entity_encodes_to_valid_nffi() {
         callsign: Some("Charlie".to_string()),
         mil_std_2525_sidc: Some("SFAPMFFJ-------".to_string()),
         attributes: attrs,
+        taskings: Default::default(),
+        files: Default::default(),
     };
     let codec = NffiCodec::new();
     let bytes = codec.from_entity(&entity).expect("encode");

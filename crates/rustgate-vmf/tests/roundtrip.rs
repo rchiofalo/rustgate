@@ -121,6 +121,8 @@ fn encode_from_entity_carries_attributes_into_header() {
         callsign: Some("CHARLIE".into()),
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     };
 
     let frame = codec.from_entity(&entity).expect("encode");

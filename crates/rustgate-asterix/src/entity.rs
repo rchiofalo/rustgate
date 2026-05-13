@@ -233,6 +233,8 @@ fn decode_datablock(payload: &[u8]) -> Result<Entity, AsterixEntityError> {
         callsign: None,
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     })
 }
 
@@ -1215,6 +1217,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let bytes = codec.from_entity(&entity).expect("encode");
         // Datablock must start with CAT-062.
@@ -1262,6 +1266,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = codec.from_entity(&entity).expect_err("must fail");
         assert!(matches!(err, AsterixEntityError::UnsupportedEntityKind(_)));
@@ -1288,6 +1294,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = codec.from_entity(&entity).expect_err("must fail");
         assert!(matches!(err, AsterixEntityError::UnsupportedEntityKind(_)));

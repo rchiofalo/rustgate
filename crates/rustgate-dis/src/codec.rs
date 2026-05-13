@@ -146,6 +146,8 @@ fn decode_entity_state(payload: &[u8]) -> Result<Entity, DisEntityError> {
         callsign,
         mil_std_2525_sidc: None,
         attributes,
+        taskings: Default::default(),
+        files: Default::default(),
     })
 }
 
@@ -778,6 +780,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = codec.from_entity(&entity).expect_err("must fail");
         assert!(matches!(err, DisEntityError::UnsupportedEntityKind(_)));
@@ -799,6 +803,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let err = codec.from_entity(&entity).expect_err("must fail");
         assert!(matches!(err, DisEntityError::UnsupportedEntityKind(_)));
@@ -834,6 +840,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: attrs,
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let bytes = codec.from_entity(&entity).expect("encode");
         let decoded = codec.to_entity(&bytes).expect("decode");

@@ -124,6 +124,25 @@ pub struct Entity {
     /// `"mavlink.system_id"`) — codecs MUST namespace their keys to
     /// avoid collisions in a multi-codec ingestion path.
     pub attributes: BTreeMap<String, AttributeValue>,
+
+    /// Taskings this entity is involved in. Routing-graph artifact
+    /// only — rustgate does not own task state, it just carries
+    /// references through the routing pipeline so consumers can
+    /// correlate. Additive, `#[serde(default)]`: pre-tasking Entity
+    /// values deserialize with an empty vector and any codec that
+    /// does not emit taskings sees the same shape on the wire as
+    /// before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub taskings: Vec<Tasking>,
+
+    /// File / media attachments associated with this entity (image,
+    /// video clip, document, CoT data-package, …). rustgate stores
+    /// only the URI + metadata; the bytes live at whatever sink the
+    /// URI points at. Mission-file storage proper is off-mission.
+    /// Additive, `#[serde(default)]` — same back-compat shape as
+    /// [`Self::taskings`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileRef>,
 }
 
 /// Coarse entity classification used for routing and dashboards.
@@ -231,6 +250,134 @@ pub enum AttributeValue {
     Float(f64),
     /// Boolean value.
     Bool(bool),
+}
+
+/// A tasking this entity is involved in.
+///
+/// rustgate does NOT own mission / tasking state — that's the
+/// off-mission concern an upstream C2 platform owns. [`Tasking`]
+/// carries a *reference* to an external task so the routing graph
+/// can correlate entities to taskings without taking on the
+/// state-management burden. The contract is "this entity is involved
+/// in task T in state S in role R"; the upstream system that owns
+/// task T is responsible for transitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tasking {
+    /// Opaque identifier set by the originating system.
+    pub task_id: String,
+    /// What state the task is in, as observed from this entity's
+    /// perspective.
+    pub state: TaskingState,
+    /// What role this entity plays in the task.
+    pub role: TaskingRole,
+    /// Optional human-readable task name / mission code (e.g.
+    /// `"OP IRON HAMMER"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// State of a [`Tasking`]. Closed vocabulary; loose progression is
+/// `Assigned → Acknowledged → Executing → (Complete | Failed | Cancelled)`,
+/// skips permitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskingState {
+    /// Task has been issued but not yet acknowledged.
+    #[default]
+    Assigned,
+    /// Assignee has acknowledged the task but not started.
+    Acknowledged,
+    /// Assignee is actively working on the task.
+    Executing,
+    /// Task has been completed successfully.
+    Complete,
+    /// Task could not be completed.
+    Failed,
+    /// Task has been cancelled before completion.
+    Cancelled,
+}
+
+impl TaskingState {
+    /// Stable lowercase tag for Prometheus labels and `tracing` fields.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Assigned => "assigned",
+            Self::Acknowledged => "acknowledged",
+            Self::Executing => "executing",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Role a [`Tasking`] entity plays in its task. Closed vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskingRole {
+    /// This entity is the subject the task is acting upon.
+    #[default]
+    Subject,
+    /// This entity has been assigned to execute the task.
+    Assignee,
+    /// This entity is the target of the task.
+    Target,
+    /// This entity is reporting on / observing the task.
+    Observer,
+}
+
+impl TaskingRole {
+    /// Stable lowercase tag for Prometheus labels and `tracing` fields.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subject => "subject",
+            Self::Assignee => "assignee",
+            Self::Target => "target",
+            Self::Observer => "observer",
+        }
+    }
+}
+
+/// Reference to an external file / media artifact attached to an
+/// entity.
+///
+/// rustgate stores ONLY the URI + metadata. The file bytes live at
+/// whatever sink the URI points at (HTTPS endpoint, S3 bucket,
+/// content-addressed store, on-platform filesystem). Storing the
+/// bytes themselves is a state-management concern, and is off-mission
+/// for rustgate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRef {
+    /// Where the file lives. Common schemes: `https://...`,
+    /// `s3://...`, `content://<algo>/<hex>`, `file://...`.
+    pub uri: String,
+    /// File size in bytes when known by the producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// IANA media type (`image/jpeg`, `video/mp4`, …) when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    /// Strong-hash digest for content-addressed retrieval and
+    /// integrity verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<FileHash>,
+    /// Human-readable display label (the file's display name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Cryptographic digest of a [`FileRef`]'s contents.
+///
+/// Algorithm + lowercase hex digest. `"sha256"` is the recommended
+/// default — every modern object store and TAK client supports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHash {
+    /// Hash algorithm identifier (`"sha256"`, `"sha1"`, …).
+    pub algorithm: String,
+    /// Lowercase hex digest of the file contents.
+    pub hex: String,
 }
 
 /// Bidirectional codec between a wire format and the canonical
@@ -447,6 +594,8 @@ mod tests {
             callsign: Some("alpha".into()),
             mil_std_2525_sidc: Some("SFGPUCI-----".into()),
             attributes: attrs,
+            taskings: Default::default(),
+            files: Default::default(),
         };
 
         let json = serde_json::to_string(&entity).expect("serialise");
@@ -522,6 +671,8 @@ mod tests {
                 callsign: None,
                 mil_std_2525_sidc: None,
                 attributes: BTreeMap::new(),
+                taskings: Default::default(),
+                files: Default::default(),
             })
         }
 
@@ -658,5 +809,201 @@ mod tests {
             dbg.contains("cot"),
             "Debug must include registered protocol keys, got {dbg}",
         );
+    }
+
+    // ----- Tasking / FileRef tests -----
+
+    #[test]
+    fn entity_default_taskings_and_files_are_empty() {
+        let entity = Entity {
+            uid: "uid-1".into(),
+            kind: EntityKind::Track,
+            position: None,
+            velocity: None,
+            timestamp: SystemTime::UNIX_EPOCH,
+            callsign: None,
+            mil_std_2525_sidc: None,
+            attributes: BTreeMap::new(),
+            taskings: Vec::new(),
+            files: Vec::new(),
+        };
+        assert!(entity.taskings.is_empty());
+        assert!(entity.files.is_empty());
+    }
+
+    #[test]
+    fn pre_extension_json_round_trips_with_empty_taskings_and_files() {
+        // Verifies the additive-with-defaults back-compat contract:
+        // an Entity JSON document that pre-dates the Tasking / FileRef
+        // fields must deserialize cleanly with empty vectors and
+        // re-serialize identically (the new fields are
+        // `skip_serializing_if = Vec::is_empty`).
+        let json = r#"{
+            "uid": "uid-1",
+            "kind": {"type": "track"},
+            "position": null,
+            "velocity": null,
+            "timestamp": {"secs_since_epoch": 0, "nanos_since_epoch": 0},
+            "callsign": null,
+            "mil_std_2525_sidc": null,
+            "attributes": {}
+        }"#;
+        let entity: Entity = serde_json::from_str(json).unwrap();
+        assert!(entity.taskings.is_empty());
+        assert!(entity.files.is_empty());
+
+        let reserialised = serde_json::to_string(&entity).unwrap();
+        assert!(!reserialised.contains("taskings"));
+        assert!(!reserialised.contains("files"));
+    }
+
+    #[test]
+    fn tasking_round_trips_through_serde_json() {
+        let tasking = Tasking {
+            task_id: "T-001".into(),
+            state: TaskingState::Executing,
+            role: TaskingRole::Assignee,
+            name: Some("OP IRON HAMMER".into()),
+        };
+        let json = serde_json::to_string(&tasking).unwrap();
+        let back: Tasking = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tasking);
+        assert!(json.contains(r#""state":"executing""#));
+        assert!(json.contains(r#""role":"assignee""#));
+    }
+
+    #[test]
+    fn tasking_state_as_str_pins_closed_label_vocabulary() {
+        assert_eq!(TaskingState::Assigned.as_str(), "assigned");
+        assert_eq!(TaskingState::Acknowledged.as_str(), "acknowledged");
+        assert_eq!(TaskingState::Executing.as_str(), "executing");
+        assert_eq!(TaskingState::Complete.as_str(), "complete");
+        assert_eq!(TaskingState::Failed.as_str(), "failed");
+        assert_eq!(TaskingState::Cancelled.as_str(), "cancelled");
+    }
+
+    #[test]
+    fn tasking_role_as_str_pins_closed_label_vocabulary() {
+        assert_eq!(TaskingRole::Subject.as_str(), "subject");
+        assert_eq!(TaskingRole::Assignee.as_str(), "assignee");
+        assert_eq!(TaskingRole::Target.as_str(), "target");
+        assert_eq!(TaskingRole::Observer.as_str(), "observer");
+    }
+
+    #[test]
+    fn tasking_state_default_is_assigned() {
+        assert_eq!(TaskingState::default(), TaskingState::Assigned);
+    }
+
+    #[test]
+    fn tasking_role_default_is_subject() {
+        assert_eq!(TaskingRole::default(), TaskingRole::Subject);
+    }
+
+    #[test]
+    fn fileref_minimal_skips_optional_fields_on_wire() {
+        let fr = FileRef {
+            uri: "https://example.com/image.jpg".into(),
+            size_bytes: None,
+            mime: None,
+            hash: None,
+            label: None,
+        };
+        let json = serde_json::to_string(&fr).unwrap();
+        // Only `uri` should appear; the other four fields have
+        // `skip_serializing_if = Option::is_none`.
+        assert!(json.contains("\"uri\":\"https://example.com/image.jpg\""));
+        assert!(!json.contains("size_bytes"));
+        assert!(!json.contains("\"mime\""));
+        assert!(!json.contains("\"hash\""));
+        assert!(!json.contains("\"label\""));
+    }
+
+    #[test]
+    fn fileref_full_round_trips() {
+        let fr = FileRef {
+            uri: "s3://tactical-images/abc.jpg".into(),
+            size_bytes: Some(1024),
+            mime: Some("image/jpeg".into()),
+            hash: Some(FileHash {
+                algorithm: "sha256".into(),
+                hex: "abc123".into(),
+            }),
+            label: Some("Target photo".into()),
+        };
+        let json = serde_json::to_string(&fr).unwrap();
+        let back: FileRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, fr);
+    }
+
+    #[test]
+    fn entity_with_taskings_and_files_round_trips() {
+        let entity = Entity {
+            uid: "track-1".into(),
+            kind: EntityKind::Ground,
+            position: None,
+            velocity: None,
+            timestamp: SystemTime::UNIX_EPOCH,
+            callsign: Some("BRAVO-2".into()),
+            mil_std_2525_sidc: None,
+            attributes: BTreeMap::new(),
+            taskings: vec![Tasking {
+                task_id: "T-007".into(),
+                state: TaskingState::Acknowledged,
+                role: TaskingRole::Target,
+                name: None,
+            }],
+            files: vec![FileRef {
+                uri: "content://sha256/deadbeef".into(),
+                size_bytes: Some(2048),
+                mime: Some("image/png".into()),
+                hash: Some(FileHash {
+                    algorithm: "sha256".into(),
+                    hex: "deadbeef".into(),
+                }),
+                label: None,
+            }],
+        };
+        let json = serde_json::to_string(&entity).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.taskings.len(), 1);
+        assert_eq!(back.files.len(), 1);
+        assert_eq!(back.taskings[0].task_id, "T-007");
+        assert_eq!(back.files[0].uri, "content://sha256/deadbeef");
+    }
+
+    #[test]
+    fn multiple_taskings_with_different_roles_round_trip() {
+        let entity = Entity {
+            uid: "vehicle-1".into(),
+            kind: EntityKind::Ground,
+            position: None,
+            velocity: None,
+            timestamp: SystemTime::UNIX_EPOCH,
+            callsign: None,
+            mil_std_2525_sidc: None,
+            attributes: BTreeMap::new(),
+            taskings: vec![
+                Tasking {
+                    task_id: "MOVE-1".into(),
+                    state: TaskingState::Executing,
+                    role: TaskingRole::Assignee,
+                    name: Some("Patrol Charlie".into()),
+                },
+                Tasking {
+                    task_id: "OBS-2".into(),
+                    state: TaskingState::Acknowledged,
+                    role: TaskingRole::Observer,
+                    name: None,
+                },
+            ],
+            files: Vec::new(),
+        };
+        let json = serde_json::to_string(&entity).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.taskings.len(), 2);
+        let roles: Vec<TaskingRole> = back.taskings.iter().map(|t| t.role).collect();
+        assert!(roles.contains(&TaskingRole::Assignee));
+        assert!(roles.contains(&TaskingRole::Observer));
     }
 }

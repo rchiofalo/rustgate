@@ -320,6 +320,8 @@ mod tests {
             callsign: Some("alpha".into()),
             mil_std_2525_sidc: Some("SFGPUCI-----".into()),
             attributes: attrs,
+            taskings: Default::default(),
+            files: Default::default(),
         }
     }
 
@@ -381,6 +383,8 @@ mod tests {
             callsign: None,
             mil_std_2525_sidc: None,
             attributes: BTreeMap::new(),
+            taskings: Default::default(),
+            files: Default::default(),
         };
         let bag = mapper.entity_to_foundry(&bare).expect("project");
         let obj = bag.as_object().unwrap();
