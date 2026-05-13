@@ -275,6 +275,9 @@ crate = "rustgate-operator"
 [[licenses.exceptions]]
 allow = ["LicenseRef-Proprietary"]
 crate = "rustgate-inference"
+[[licenses.exceptions]]
+allow = ["LicenseRef-Proprietary"]
+crate = "rustgate-codec-schema"
 
 [bans]
 multiple-versions = "warn"
