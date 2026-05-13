@@ -19,3 +19,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Schema-parity proptest in `tests/schema_parity.rs` builds a
+# `SchemaCodec` from `schemas/v1_header.yaml` and asserts byte-
+# equivalent round-trip against the hand-rolled v1 frame header
+# encoder. Not pulled into the production crate.
+rustgate-codec-schema = { workspace = true }
