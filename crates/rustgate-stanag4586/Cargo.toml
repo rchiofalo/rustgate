@@ -17,3 +17,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Used only by the schema-parity proptest in `tests/schema_parity.rs`
+# to assert that a `SchemaCodec` built from `schemas/vehicle_position.yaml`
+# is byte-equivalent to the hand-rolled `vehicle_position::encode` for
+# every arbitrary input proptest generates. Not pulled into the
+# production crate — the codec runtime stays hand-rolled.
+rustgate-codec-schema = { workspace = true }
