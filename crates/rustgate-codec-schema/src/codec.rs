@@ -147,6 +147,11 @@ impl SchemaCodec {
         entity: &Entity,
     ) -> Result<&MessageType, SchemaCodecError> {
         if self.schema.message_types.len() == 1 {
+            // justification: `Schema::validate` rejects empty
+            // `message_types`, so the single-entry path is
+            // guaranteed by the constructor invariant — expect()
+            // carries that invariant to the reader rather than
+            // burying it in an Option/unwrap chain.
             #[allow(clippy::expect_used)]
             return Ok(self
                 .schema
