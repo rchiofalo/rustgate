@@ -20,7 +20,7 @@
 //!   `Entity::attributes` with the key
 //!   `"schema.<message>.<field>"` so round-trips never lose data.
 //!
-//! ## What it does NOT support (v1)
+//! ## What it does NOT support
 //!
 //! - Fixed-length byte / UTF-8 string fields (`FieldType::Bytes` /
 //!   `FieldType::Utf8`) are parsed but not yet projected to
@@ -28,13 +28,19 @@
 //!   `Entity::attributes` as hex / string values.
 //! - Value mapping (enum-style raw → label) is parsed by the
 //!   schema layer but the runtime treats the raw integer as the
-//!   value. Real enum projection follows in a v2 PR.
-//! - Multi-message schemas (with `discriminator_offset`) are
-//!   **rejected** at schema-load time by [`Schema::validate`] until
-//!   v2 ships dispatch. The `discriminator_offset` field stays in
-//!   the grammar so v2 schemas don't need a wire-format change; the
-//!   call site splits multi-message protocols into N single-message
-//!   schemas it dispatches itself in the meantime.
+//!   value. Real enum projection follows in a follow-up.
+//!
+//! ## Multi-message dispatch (v2)
+//!
+//! Schemas with more than one `message-types` entry declare a
+//! 1-byte `discriminator_offset`. On decode, the runtime reads the
+//! byte at that offset and selects the message type whose `id`
+//! matches; the byte is round-tripped through
+//! `Entity::attributes` under
+//! `schema.<protocol>.__discriminator__` so a subsequent encode
+//! emits the same variant without the call site needing to track
+//! it externally. Each message type's `id` must be unique and fit
+//! in `0..=255`; `Schema::validate` rejects schemas that don't.
 
 use std::collections::BTreeMap;
 
@@ -85,19 +91,116 @@ impl SchemaCodec {
     }
 
     /// Choose the message type to apply for an inbound payload.
-    /// v1 schemas declare exactly one message type — multi-message
-    /// dispatch is deferred to v2 and rejected at parse time by
-    /// [`Schema::validate`]. This accessor therefore always returns
-    /// the sole entry.
-    fn select_message_type(&self) -> &MessageType {
-        // Safe — `Schema::validate` rejects empty and multi-message
-        // schemas. justification: validation guarantees exactly one
-        // entry; expect() carries the invariant to the reader.
+    /// Single-message schemas return the sole entry; multi-message
+    /// schemas read the byte at the schema's `discriminator_offset`
+    /// and look up the message type whose `id` matches that byte.
+    fn select_message_type_for_payload(
+        &self,
+        payload: &[u8],
+    ) -> Result<&MessageType, SchemaCodecError> {
+        if self.schema.message_types.len() == 1 {
+            // Safe — `Schema::validate` rejects empty
+            // message_types. justification: validation guarantees
+            // at least one entry; expect() carries the invariant
+            // to the reader.
+            #[allow(clippy::expect_used)]
+            return Ok(self
+                .schema
+                .message_types
+                .first()
+                .expect("validated schema has at least one message type"));
+        }
+        // Multi-message dispatch — `Schema::validate` guarantees a
+        // `discriminator_offset` is present and that each
+        // message-type carries a unique `id` in `0..=255`.
+        // justification: validation invariants, see `Schema::validate`.
         #[allow(clippy::expect_used)]
+        let off = self
+            .schema
+            .discriminator_offset
+            .expect("validated multi-message schema has discriminator_offset");
+        if off >= payload.len() {
+            return Err(SchemaCodecError::PayloadTooShort {
+                actual: payload.len(),
+                required: off + 1,
+            });
+        }
+        let discriminator = payload[off];
         self.schema
             .message_types
-            .first()
-            .expect("validated schema has exactly one message type")
+            .iter()
+            .find(|mt| mt.id == i64::from(discriminator))
+            .ok_or(SchemaCodecError::UnknownDiscriminator {
+                offset: off,
+                value: discriminator,
+            })
+    }
+
+    /// Encode-side variant of message-type selection. Multi-message
+    /// schemas round-trip the discriminator byte through
+    /// `Entity::attributes` under
+    /// `schema.<protocol>.__discriminator__` — decode writes it,
+    /// encode reads it back so the call site does not need a
+    /// separate API to declare which variant it is emitting.
+    fn select_message_type_for_entity(
+        &self,
+        entity: &Entity,
+    ) -> Result<&MessageType, SchemaCodecError> {
+        if self.schema.message_types.len() == 1 {
+            // justification: `Schema::validate` rejects empty
+            // `message_types`, so the single-entry path is
+            // guaranteed by the constructor invariant — expect()
+            // carries that invariant to the reader rather than
+            // burying it in an Option/unwrap chain.
+            #[allow(clippy::expect_used)]
+            return Ok(self
+                .schema
+                .message_types
+                .first()
+                .expect("validated schema has at least one message type"));
+        }
+        let key = self.discriminator_attribute_key();
+        let av = entity.attributes.get(&key).ok_or_else(|| {
+            SchemaCodecError::MissingRequiredEntityField {
+                field: "__discriminator__".into(),
+                path: key.clone(),
+            }
+        })?;
+        let discriminator = match av {
+            AttributeValue::Int(v) if (0..=255).contains(v) => *v as u8,
+            other => {
+                return Err(SchemaCodecError::OutOfRange {
+                    field: "__discriminator__".into(),
+                    value: format!("{other:?}"),
+                    type_name: "u8".into(),
+                });
+            }
+        };
+        self.schema
+            .message_types
+            .iter()
+            .find(|mt| mt.id == i64::from(discriminator))
+            .ok_or_else(|| {
+                // justification: the multi-message decode path
+                // writes the byte we just looked up, so an unknown
+                // value only happens when a caller hand-constructs
+                // the entity. Surface the same error class as
+                // decode for symmetry.
+                SchemaCodecError::UnknownDiscriminator {
+                    offset: self.schema.discriminator_offset.unwrap_or(0),
+                    value: discriminator,
+                }
+            })
+    }
+
+    /// Attribute key used to round-trip the discriminator byte for
+    /// multi-message schemas. Centralised so decode and encode stay
+    /// in lockstep when the key format ever needs to change.
+    fn discriminator_attribute_key(&self) -> String {
+        format!(
+            "schema.{}.__discriminator__",
+            self.schema.protocol_name.replace('-', "_")
+        )
     }
 
     /// Decode a single field at its declared offset.
@@ -295,7 +398,7 @@ impl EntityCodec for SchemaCodec {
     type Error = SchemaCodecError;
 
     fn to_entity(&self, payload: &[u8]) -> Result<Entity, Self::Error> {
-        let mt = self.select_message_type();
+        let mt = self.select_message_type_for_payload(payload)?;
         if payload.len() < mt.size_bytes {
             return Err(SchemaCodecError::PayloadTooShort {
                 actual: payload.len(),
@@ -311,6 +414,24 @@ impl EntityCodec for SchemaCodec {
         let mut speed: Option<f64> = None;
         let mut course: Option<f64> = None;
         let mut attrs: BTreeMap<String, AttributeValue> = BTreeMap::new();
+        // Multi-message schemas round-trip the discriminator byte
+        // through `Entity::attributes` so the encode side knows
+        // which variant the caller wants to emit. Single-message
+        // schemas skip this for cleanliness — there's nothing to
+        // disambiguate.
+        if self.schema.message_types.len() > 1 {
+            // justification: validate() guarantees discriminator_offset
+            // and that the byte is in range for every message_type.
+            #[allow(clippy::expect_used)]
+            let off = self
+                .schema
+                .discriminator_offset
+                .expect("validated multi-message schema has discriminator_offset");
+            let _ = attrs.insert(
+                self.discriminator_attribute_key(),
+                AttributeValue::Int(i64::from(payload[off])),
+            );
+        }
 
         for field in &mt.fields {
             let decoded = Self::decode_field(field, payload)?;
@@ -379,8 +500,29 @@ impl EntityCodec for SchemaCodec {
     }
 
     fn from_entity(&self, entity: &Entity) -> Result<Bytes, Self::Error> {
-        let mt = self.select_message_type();
+        let mt = self.select_message_type_for_entity(entity)?;
         let mut out = vec![0u8; mt.size_bytes];
+        // For multi-message schemas the encoder also writes the
+        // discriminator byte at the schema's `discriminator_offset`
+        // so the produced bytes round-trip exactly through a
+        // subsequent decode. Operators can declare their own
+        // `field-type: u8` field at the same offset if they want
+        // it surfaced under a friendlier attribute key — the byte
+        // simply gets written twice (same value, same address) and
+        // the human-friendly name wins on the attribute side.
+        if self.schema.message_types.len() > 1 {
+            // justification: validate() guarantees discriminator_offset
+            // is in range for every message_type.
+            #[allow(clippy::expect_used)]
+            let off = self
+                .schema
+                .discriminator_offset
+                .expect("validated multi-message schema has discriminator_offset");
+            // justification: validate() guarantees id in 0..=255.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let id_byte = mt.id as u8;
+            out[off] = id_byte;
+        }
         for field in &mt.fields {
             let value = lookup_encoded_value(entity, field, &self.schema.protocol_name)?;
             Self::check_range_on_encode(field, &value)?;
@@ -1242,6 +1384,141 @@ message-types:
         let SchemaCodecError::OutOfRange { .. } = err else {
             panic!("expected OutOfRange, got {err:?}");
         };
+    }
+
+    /// Two-message schema where the discriminator byte at offset 0
+    /// picks between a `Heartbeat` (id=1) variant and an `Alert`
+    /// (id=2) variant. The fields after the discriminator differ
+    /// per variant so we can prove the runtime actually decoded
+    /// the right one rather than reading the same offsets for both.
+    const MULTI_MESSAGE_SCHEMA: &str = r#"
+schema-version: "1"
+protocol-name: "test.multi"
+discriminator-offset: 0
+message-types:
+  - name: "Heartbeat"
+    id: 1
+    size-bytes: 5
+    fields:
+      - name: "tag"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "seq"
+        offset: 1
+        field-type: { kind: u32 }
+        endian: big
+  - name: "Alert"
+    id: 2
+    size-bytes: 5
+    fields:
+      - name: "tag"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "severity"
+        offset: 1
+        field-type: { kind: u8 }
+      - name: "code"
+        offset: 2
+        field-type: { kind: u16 }
+        endian: big
+"#;
+
+    #[test]
+    fn multi_message_decode_dispatches_by_discriminator_byte() {
+        let codec = SchemaCodec::from_schema_text(MULTI_MESSAGE_SCHEMA).unwrap();
+
+        // Heartbeat payload: tag=1, seq=42.
+        let mut heartbeat = vec![1u8, 0, 0, 0, 42];
+        heartbeat[1..5].copy_from_slice(&42u32.to_be_bytes());
+        let entity = codec.to_entity(&heartbeat).unwrap();
+        let Some(AttributeValue::Int(seq)) = entity.attributes.get("schema.test.multi.seq") else {
+            panic!("expected seq attribute, got: {:?}", entity.attributes);
+        };
+        assert_eq!(*seq, 42);
+
+        // Alert payload: tag=2, severity=5, code=0x1234.
+        let mut alert = vec![2u8, 5, 0, 0, 0];
+        alert[2..4].copy_from_slice(&0x1234u16.to_be_bytes());
+        let entity = codec.to_entity(&alert).unwrap();
+        let Some(AttributeValue::Int(code)) = entity.attributes.get("schema.test.multi.code")
+        else {
+            panic!("expected code attribute, got: {:?}", entity.attributes);
+        };
+        assert_eq!(*code, 0x1234);
+        // Heartbeat-specific `seq` attribute must NOT appear in
+        // an Alert decode — the runtime dispatched the right
+        // variant, not the first one.
+        assert!(!entity.attributes.contains_key("schema.test.multi.seq"));
+    }
+
+    #[test]
+    fn multi_message_unknown_discriminator_errors() {
+        let codec = SchemaCodec::from_schema_text(MULTI_MESSAGE_SCHEMA).unwrap();
+        // Discriminator byte 0xFF doesn't match any declared id.
+        let payload = vec![0xFFu8, 0, 0, 0, 0];
+        let err = codec.to_entity(&payload).unwrap_err();
+        let SchemaCodecError::UnknownDiscriminator { offset, value } = err else {
+            panic!("expected UnknownDiscriminator, got {err:?}");
+        };
+        assert_eq!(offset, 0);
+        assert_eq!(value, 0xFF);
+    }
+
+    #[test]
+    fn multi_message_decode_writes_discriminator_to_attributes() {
+        // The decode side stores the discriminator byte in
+        // attributes so a subsequent encode can pick the same
+        // variant without the call site having to track it
+        // externally.
+        let codec = SchemaCodec::from_schema_text(MULTI_MESSAGE_SCHEMA).unwrap();
+        let mut alert = vec![2u8, 5, 0, 0, 0];
+        alert[2..4].copy_from_slice(&0x1234u16.to_be_bytes());
+        let entity = codec.to_entity(&alert).unwrap();
+        let Some(AttributeValue::Int(disc)) =
+            entity.attributes.get("schema.test.multi.__discriminator__")
+        else {
+            panic!(
+                "expected __discriminator__ attribute, got: {:?}",
+                entity.attributes
+            );
+        };
+        assert_eq!(*disc, 2);
+    }
+
+    #[test]
+    fn multi_message_round_trips_byte_identically() {
+        let codec = SchemaCodec::from_schema_text(MULTI_MESSAGE_SCHEMA).unwrap();
+        for (name, payload) in [
+            ("heartbeat", vec![1u8, 0, 0, 0, 42]),
+            ("alert", vec![2u8, 5, 0x12, 0x34, 0]),
+        ] {
+            let mut payload = payload;
+            if name == "heartbeat" {
+                payload[1..5].copy_from_slice(&42u32.to_be_bytes());
+            }
+            let entity = codec.to_entity(&payload).unwrap();
+            let re_encoded = codec.from_entity(&entity).unwrap();
+            assert_eq!(
+                &re_encoded[..],
+                &payload[..],
+                "round-trip mismatch for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_message_encode_without_discriminator_attribute_errors() {
+        // If the call site builds an entity by hand without
+        // setting the discriminator attribute, encode must fail
+        // with a typed error pointing at the missing attribute
+        // rather than silently picking the first variant.
+        let codec = SchemaCodec::from_schema_text(MULTI_MESSAGE_SCHEMA).unwrap();
+        let entity = empty_entity();
+        let err = codec.from_entity(&entity).unwrap_err();
+        let SchemaCodecError::MissingRequiredEntityField { field, .. } = err else {
+            panic!("expected MissingRequiredEntityField, got {err:?}");
+        };
+        assert_eq!(field, "__discriminator__");
     }
 
     fn empty_entity() -> Entity {

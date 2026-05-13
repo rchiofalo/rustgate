@@ -393,20 +393,48 @@ impl Schema {
                 message: "schema must declare at least one message_types entry".to_string(),
             });
         }
-        // Multi-message dispatch is v2. The v1 codec runtime always
-        // selects the first message type, which would silently
-        // mis-decode payloads that match a non-first variant.
-        // Reject the schema at startup instead so operators see the
-        // gap during a schema-load step, not after the first payload
-        // surprises them. The `discriminator_offset` field stays in
-        // the grammar so v2 schemas don't need a wire-format change.
+        // Multi-message dispatch requires a `discriminator_offset`
+        // declaring where the runtime reads the 1-byte
+        // message-type tag, plus each message-type carrying a
+        // unique `id` in `0..=255`. Single-message schemas may
+        // omit the discriminator_offset.
         if self.message_types.len() > 1 {
-            return Err(SchemaError::Validation {
-                message: format!(
-                    "schema declares {} message types but multi-message dispatch is not yet implemented (v2); split into separate schemas dispatched at the call site",
-                    self.message_types.len()
-                ),
-            });
+            let Some(off) = self.discriminator_offset else {
+                return Err(SchemaError::Validation {
+                    message: format!(
+                        "schema declares {} message types but no discriminator_offset; multi-message dispatch needs the byte offset where the runtime reads the message-type tag",
+                        self.message_types.len()
+                    ),
+                });
+            };
+            let mut seen_ids: std::collections::BTreeMap<i64, &str> =
+                std::collections::BTreeMap::new();
+            for mt in &self.message_types {
+                if !(0..=255).contains(&mt.id) {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` has id {} but multi-message dispatch requires id in 0..=255 (1-byte discriminator)",
+                            mt.name, mt.id
+                        ),
+                    });
+                }
+                if let Some(prior) = seen_ids.insert(mt.id, mt.name.as_str()) {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` and message `{}` both declare id {}; multi-message discriminator ids must be unique",
+                            prior, mt.name, mt.id
+                        ),
+                    });
+                }
+                if off >= mt.size_bytes {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "discriminator_offset {} is outside message `{}` size {}",
+                            off, mt.name, mt.size_bytes
+                        ),
+                    });
+                }
+            }
         }
         for mt in &self.message_types {
             self.validate_message_type(mt)?;
@@ -635,14 +663,12 @@ message-types:
     }
 
     #[test]
-    fn rejects_multi_message_schemas() {
-        // v1 codec runtime always selects the first message type;
-        // accepting a multi-message schema would silently mis-decode
-        // payloads that match the non-first variant. `validate` must
-        // reject the schema at startup so the gap surfaces during
-        // schema-load, not on the first payload. Covers both the
-        // discriminator-present and discriminator-absent cases.
-        let with_discriminator = r#"
+    fn accepts_multi_message_with_discriminator_offset() {
+        // v2 multi-message dispatch: schema with N message-types
+        // plus a `discriminator-offset` validates cleanly. Each
+        // message-type carries a unique `id` byte; the codec reads
+        // the byte at the discriminator offset to pick the variant.
+        let yaml = r#"
 schema-version: "1"
 protocol-name: "test"
 discriminator-offset: 0
@@ -656,7 +682,18 @@ message-types:
     size-bytes: 4
     fields: []
 "#;
-        let without_discriminator = r#"
+        let schema = Schema::parse(yaml).unwrap();
+        schema
+            .validate()
+            .expect("multi-message schema must validate");
+    }
+
+    #[test]
+    fn rejects_multi_message_without_discriminator_offset() {
+        // Multi-message schemas MUST declare where the runtime
+        // reads the discriminator byte; otherwise dispatch is
+        // ambiguous and would silently mis-decode.
+        let yaml = r#"
 schema-version: "1"
 protocol-name: "test"
 message-types:
@@ -669,17 +706,70 @@ message-types:
     size-bytes: 4
     fields: []
 "#;
-        for yaml in [with_discriminator, without_discriminator] {
-            let schema = Schema::parse(yaml).unwrap();
-            let err = schema.validate().unwrap_err();
-            let SchemaError::Validation { message } = err else {
-                panic!("expected validation error");
-            };
-            assert!(
-                message.contains("multi-message dispatch is not yet implemented"),
-                "got: {message}"
-            );
-        }
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("no discriminator_offset"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_multi_message_with_duplicate_ids() {
+        // Two message-types claiming the same discriminator byte
+        // is unrecoverable — the runtime can't dispatch
+        // deterministically. Caught at schema-load, not on first
+        // payload.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+discriminator-offset: 0
+message-types:
+  - name: "A"
+    id: 1
+    size-bytes: 4
+    fields: []
+  - name: "B"
+    id: 1
+    size-bytes: 4
+    fields: []
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("must be unique"), "got: {message}");
+    }
+
+    #[test]
+    fn rejects_multi_message_with_id_outside_byte_range() {
+        // The runtime reads a single byte at the discriminator
+        // offset, so `id` values outside `0..=255` could never be
+        // matched. Catch the misconfiguration at schema-load.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+discriminator-offset: 0
+message-types:
+  - name: "A"
+    id: 1
+    size-bytes: 4
+    fields: []
+  - name: "B"
+    id: 300
+    size-bytes: 4
+    fields: []
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("0..=255"), "got: {message}");
     }
 
     #[test]
