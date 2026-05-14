@@ -40,11 +40,13 @@
 //!   v1.
 //! - Polynomial / spline calibration. Linear gets us 95% of
 //!   sensor wire formats.
-//! - Conditional / context-sensitive fields (field A is present
-//!   only when field B == 0x42). Real protocols use these
-//!   sparingly; v1 callers model alternatives at the
-//!   `MessageType` level (separate schemas dispatched by a
-//!   discriminator field).
+//! - Variable-shift conditional fields (the kind where the field
+//!   actually disappears from the wire when absent, and subsequent
+//!   offsets slide). The v3 grammar ships the sparse-projection
+//!   interpretation via [`schema::PresentIfSpec`]: the byte
+//!   range stays fixed-offset whether the field is "present" or
+//!   not, only the `Entity` projection is gated. Real variable-
+//!   shift semantics are a separate v4 feature.
 //! - Bit-packed fields. The existing hand-rolled `rustgate-vmf`
 //!   and `rustgate-link16` codecs use bit-level FPI / FRI / GPI
 //!   indicators that don't fit a fixed-offset / fixed-length
@@ -71,6 +73,6 @@ pub mod schema;
 pub use codec::SchemaCodec;
 pub use error::{SchemaCodecError, SchemaError};
 pub use schema::{
-    Calibration, Endian, FieldDef, FieldType, MessageType, Range, Schema, SchemaVersion,
-    ValueMapping,
+    Calibration, Endian, FieldDef, FieldType, MessageType, PresentIfSpec, Range, Schema,
+    SchemaVersion, ValueMapping,
 };
