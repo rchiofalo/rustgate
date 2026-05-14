@@ -75,6 +75,26 @@
 //! repetitive items, MAVLink v2 payloads, and Link 16 word-3
 //! extensions. Nested-typed-record schemas (where each element
 //! carries its own field list) are a v4 feature.
+//!
+//! ## Bit-packed sub-byte fields (v3)
+//!
+//! [`FieldDef::bit_offset`](crate::FieldDef::bit_offset) +
+//! [`FieldDef::bit_width`](crate::FieldDef::bit_width) declare a
+//! sub-byte field that occupies a contiguous bit range within ONE
+//! byte at the declared `offset`. On decode the runtime reads that
+//! byte, applies `(byte >> (8 - bit_offset - bit_width)) & ((1 <<
+//! bit_width) - 1)`, and projects the extracted integer as a
+//! `DecodedValue::U64`. On encode the symmetric path reads the
+//! integer value from the entity, shifts it into position, and
+//! OR-merges it into the byte at `field.offset` — critically
+//! **without** clobbering other bit-packed fields that share the
+//! same byte. The output buffer is pre-zeroed so the first
+//! bit-packed field at a given byte sees zero and only sets its
+//! own bits; subsequent sibling bit-fields read the in-progress
+//! byte and preserve already-written bits.
+//!
+//! Cross-byte bit-fields (e.g. a 12-bit value spanning byte N's low
+//! nibble and byte N+1's high nibble) are deferred to a v4 grammar.
 
 use std::collections::BTreeMap;
 
@@ -247,6 +267,24 @@ impl SchemaCodec {
         payload: &[u8],
         dyn_size: Option<usize>,
     ) -> Result<DecodedValue, SchemaCodecError> {
+        // Bit-packed fields short-circuit: read one byte at `offset`,
+        // shift / mask out the declared bit range, and project as
+        // `U64`. The validator guarantees `bit_offset + bit_width <=
+        // 8` and `field_type == U8`, so the extraction always fits
+        // in the byte and the integer projection fits in `u64`.
+        if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
+            if field.offset >= payload.len() {
+                return Err(SchemaCodecError::PayloadTooShort {
+                    actual: payload.len(),
+                    required: field.offset + 1,
+                });
+            }
+            let byte = payload[field.offset];
+            let shift = 8 - bit_offset - bit_width;
+            let mask = (1u16 << bit_width) - 1;
+            let extracted = u64::from((byte >> shift) & (mask as u8));
+            return Ok(DecodedValue::U64(extracted));
+        }
         let size = dyn_size.unwrap_or_else(|| {
             field
                 .field_type
@@ -301,6 +339,39 @@ impl SchemaCodec {
         out: &mut [u8],
         dyn_size: Option<usize>,
     ) -> Result<(), SchemaCodecError> {
+        // Bit-packed fields short-circuit: read the current byte at
+        // `offset`, clear only the bit range this field claims, OR
+        // in the new bits, write back. Critically, we MUST NOT
+        // clobber other bit-packed fields sharing the same byte —
+        // the validator allows them as long as their bit ranges
+        // don't overlap. Reading the byte first preserves any prior
+        // bits already written by sibling bit-packed fields earlier
+        // in the field list. The output buffer is pre-zeroed, so the
+        // first bit-packed field at a given byte sees zero and only
+        // sets its own bits.
+        if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
+            if field.offset >= out.len() {
+                return Err(SchemaCodecError::PayloadTooShort {
+                    actual: out.len(),
+                    required: field.offset + 1,
+                });
+            }
+            let raw = value.as_u64(field)?;
+            let max = (1u64 << bit_width) - 1;
+            if raw > max {
+                return Err(SchemaCodecError::OutOfRange {
+                    field: field.name.clone(),
+                    value: raw.to_string(),
+                    type_name: format!("u{bit_width} (bit-packed)"),
+                });
+            }
+            let shift = 8 - bit_offset - bit_width;
+            let mask: u8 = ((1u16 << bit_width) - 1) as u8;
+            let positioned: u8 = (raw as u8) << shift;
+            let preserve_mask = !(mask << shift);
+            out[field.offset] = (out[field.offset] & preserve_mask) | positioned;
+            return Ok(());
+        }
         let size = dyn_size.unwrap_or_else(|| {
             field
                 .field_type
@@ -2338,6 +2409,196 @@ message-types:
             );
         };
         assert_eq!(records, "0102030405060708090a");
+    }
+
+    /// v3 bit-packed sub-byte fields: a packed flag byte holds three
+    /// indicators (1-bit FPI, 1-bit FRI, 3-bit category, plus 3 bits
+    /// of padding). All three pack into the same byte at offset 0,
+    /// modelled on the VMF FPI/FRI/GPI shape.
+    const BIT_PACKED_SCHEMA: &str = r#"
+schema-version: "1"
+protocol-name: "test.bits"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "fpi"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 1
+        entity-path: "attributes.fpi"
+      - name: "fri"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 1
+        bit-width: 1
+        entity-path: "attributes.fri"
+      - name: "category"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 2
+        bit-width: 3
+        entity-path: "attributes.category"
+"#;
+
+    #[test]
+    fn bit_packed_decode_extracts_msb_one_bit_flag() {
+        // 1-bit flag at the MSB of the byte. Payload `0b1000_0000`
+        // decodes to `1`; payload `0b0000_0000` decodes to `0`.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "flag"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 1
+        entity-path: "attributes.flag"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let entity = codec.to_entity(&[0b1000_0000u8]).unwrap();
+        assert_eq!(
+            entity.attributes.get("attributes.flag"),
+            Some(&AttributeValue::Int(1))
+        );
+        let entity = codec.to_entity(&[0b0000_0000u8]).unwrap();
+        assert_eq!(
+            entity.attributes.get("attributes.flag"),
+            Some(&AttributeValue::Int(0))
+        );
+    }
+
+    #[test]
+    fn bit_packed_decode_extracts_three_bit_low_nibble_field() {
+        // 3-bit field at bit-offset 5 = low nibble's bottom 3 bits.
+        // Payload `0b0000_0101` (decimal 5) decodes to `5`; payload
+        // `0b1010_0010` (decimal 0xA2) also decodes to `2` for those
+        // same 3 bits regardless of the upper bits.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 5
+        bit-width: 3
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let entity = codec.to_entity(&[0b0000_0101u8]).unwrap();
+        assert_eq!(
+            entity.attributes.get("attributes.v"),
+            Some(&AttributeValue::Int(5))
+        );
+        let entity = codec.to_entity(&[0b1010_0010u8]).unwrap();
+        assert_eq!(
+            entity.attributes.get("attributes.v"),
+            Some(&AttributeValue::Int(2))
+        );
+    }
+
+    #[test]
+    fn bit_packed_round_trips_packed_byte_byte_identical() {
+        // Pack fpi=1, fri=0, category=5 into a single byte. The
+        // expected wire byte is 0b10000_101_xxx where the bottom 3
+        // bits are padding (zero from buffer pre-fill).
+        let codec = SchemaCodec::from_schema_text(BIT_PACKED_SCHEMA).unwrap();
+        // fpi=1 at bit 0 → 0b1000_0000
+        // fri=0 at bit 1 → 0b0000_0000
+        // category=5 at bits 2..=4 → 0b00101_000 → shifted to bits
+        //   2..=4 means MSB-first: bit2 is value 0x20, bit3 0x10,
+        //   bit4 0x08. category=5 = 0b101 → shift left by 3 (8 - 2
+        //   - 3) = bit positions 2..=4 → value 0x28.
+        // Combined: 0x80 | 0x00 | 0x28 = 0xA8 = 0b1010_1000.
+        let expected: u8 = 0b1010_1000;
+        let entity = codec.to_entity(&[expected]).unwrap();
+        assert_eq!(
+            entity.attributes.get("attributes.fpi"),
+            Some(&AttributeValue::Int(1))
+        );
+        assert_eq!(
+            entity.attributes.get("attributes.fri"),
+            Some(&AttributeValue::Int(0))
+        );
+        assert_eq!(
+            entity.attributes.get("attributes.category"),
+            Some(&AttributeValue::Int(5))
+        );
+        let re_encoded = codec.from_entity(&entity).unwrap();
+        assert_eq!(
+            &re_encoded[..],
+            &[expected],
+            "bit-packed round-trip must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn bit_packed_encode_shares_byte_without_clobber() {
+        // Two bit-packed fields at the same byte offset must each
+        // set ONLY their own bits without overwriting the other.
+        // The buffer is pre-zeroed so the first field at the byte
+        // sees 0 and ORs in its bits; the second reads the
+        // in-progress byte and preserves the first's bits.
+        let codec = SchemaCodec::from_schema_text(BIT_PACKED_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.fpi".into(), AttributeValue::Int(1));
+        let _ = entity
+            .attributes
+            .insert("attributes.fri".into(), AttributeValue::Int(1));
+        let _ = entity
+            .attributes
+            .insert("attributes.category".into(), AttributeValue::Int(7));
+        let bytes = codec.from_entity(&entity).unwrap();
+        // fpi=1 (bit 0): 0x80
+        // fri=1 (bit 1): 0x40
+        // category=7 (bits 2..=4): 0b111 << 3 = 0x38
+        // Combined: 0x80 | 0x40 | 0x38 = 0xF8 = 0b1111_1000.
+        assert_eq!(&bytes[..], &[0b1111_1000u8]);
+    }
+
+    #[test]
+    fn bit_packed_encode_rejects_value_exceeding_bit_width() {
+        // A 3-bit field cannot hold the value 8 (only `[0, 7]`). The
+        // encoder must reject this with OutOfRange rather than
+        // silently masking the high bits.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 3
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.v".into(), AttributeValue::Int(8));
+        let err = codec.from_entity(&entity).unwrap_err();
+        let SchemaCodecError::OutOfRange { type_name, .. } = err else {
+            panic!("expected OutOfRange, got {err:?}");
+        };
+        assert!(
+            type_name.contains("u3"),
+            "expected type label to mention bit-width, got: {type_name}"
+        );
     }
 
     fn empty_entity() -> Entity {
