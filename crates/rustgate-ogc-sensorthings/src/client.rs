@@ -265,6 +265,7 @@ mod tests {
             request_timeout_secs: 10,
             expand_location: true,
             subscriptions: vec![],
+            mqtt_push: None,
         }
     }
 
