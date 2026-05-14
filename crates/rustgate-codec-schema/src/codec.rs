@@ -57,6 +57,24 @@
 //! leaves the bytes at their pre-filled zero value. Variable-
 //! shift semantics (where the field actually disappears from the
 //! wire and subsequent offsets slide) are a separate v4 feature.
+//!
+//! ## Variable-length repeats (v3)
+//!
+//! [`FieldDef::repeat`](crate::FieldDef::repeat) makes a
+//! `Bytes`-typed field's wire span depend on the raw integer value
+//! of an earlier-decoded count field. On decode, the codec reads
+//! `record_size_bytes × count` bytes starting at `field.offset` and
+//! surfaces them as a single `DecodedValue::Bytes` slice — the
+//! consumer parses the inner record shape themselves. On encode,
+//! the same dynamic length governs how many bytes are pulled from
+//! the entity attribute (hex-string fallback included) and written
+//! back at `field.offset`. The output buffer grows as needed when
+//! the dynamic end exceeds `mt.size_bytes`, so operators can set
+//! `size_bytes` to the header length and produce wire-truthful
+//! variable payloads for DIS articulation params, ASTERIX
+//! repetitive items, MAVLink v2 payloads, and Link 16 word-3
+//! extensions. Nested-typed-record schemas (where each element
+//! carries its own field list) are a v4 feature.
 
 use std::collections::BTreeMap;
 
@@ -220,13 +238,23 @@ impl SchemaCodec {
     }
 
     /// Decode a single field at its declared offset.
-    fn decode_field(field: &FieldDef, payload: &[u8]) -> Result<DecodedValue, SchemaCodecError> {
-        let size = field
-            .field_type
-            .fixed_size()
-            .or(field.length_bytes)
-            .unwrap_or(0);
-        let end = field.offset + size;
+    ///
+    /// `dyn_size`, when `Some`, overrides the field's static size
+    /// computation — used by `repeat` fields whose wire span depends
+    /// on an earlier-decoded count.
+    fn decode_field(
+        field: &FieldDef,
+        payload: &[u8],
+        dyn_size: Option<usize>,
+    ) -> Result<DecodedValue, SchemaCodecError> {
+        let size = dyn_size.unwrap_or_else(|| {
+            field
+                .field_type
+                .fixed_size()
+                .or(field.length_bytes)
+                .unwrap_or(0)
+        });
+        let end = field.offset.saturating_add(size);
         if end > payload.len() {
             return Err(SchemaCodecError::PayloadTooShort {
                 actual: payload.len(),
@@ -263,17 +291,30 @@ impl SchemaCodec {
     /// Encode one field at its declared offset into a mutable
     /// buffer. The buffer is assumed to be pre-sized to
     /// `message_type.size_bytes` and pre-filled with zeros.
+    ///
+    /// `dyn_size`, when `Some`, overrides the field's static size
+    /// computation — used by `repeat` fields whose wire span depends
+    /// on an earlier-decoded count.
     fn encode_field(
         field: &FieldDef,
         value: &EncodedValue,
         out: &mut [u8],
+        dyn_size: Option<usize>,
     ) -> Result<(), SchemaCodecError> {
-        let size = field
-            .field_type
-            .fixed_size()
-            .or(field.length_bytes)
-            .unwrap_or(0);
-        let end = field.offset + size;
+        let size = dyn_size.unwrap_or_else(|| {
+            field
+                .field_type
+                .fixed_size()
+                .or(field.length_bytes)
+                .unwrap_or(0)
+        });
+        let end = field.offset.saturating_add(size);
+        if end > out.len() {
+            return Err(SchemaCodecError::PayloadTooShort {
+                actual: out.len(),
+                required: end,
+            });
+        }
         let slice = &mut out[field.offset..end];
         match field.field_type {
             FieldType::U8 => {
@@ -459,7 +500,15 @@ impl EntityCodec for SchemaCodec {
         // ever runs.
         let mut raw_ints_seen: BTreeMap<&str, i64> = BTreeMap::new();
         for field in &mt.fields {
-            let decoded = Self::decode_field(field, payload)?;
+            // `repeat` fields take a dynamic span derived from an
+            // earlier-decoded count. The validator guarantees the
+            // `count_from` field exists, is integer-typed, and sits
+            // at a strictly lower offset, so `raw_ints_seen` has the
+            // value populated before this branch evaluates. Out-of-
+            // bounds or negative counts surface as `PayloadTooShort`
+            // via the bounds check inside `decode_field`.
+            let dyn_size = Self::repeat_dyn_size(field, &raw_ints_seen)?;
+            let decoded = Self::decode_field(field, payload, dyn_size)?;
             // Conditional fields evaluate their predicate against
             // the already-decoded raw integer of the referenced
             // field. When the predicate does not match, we still
@@ -643,7 +692,29 @@ impl EntityCodec for SchemaCodec {
             // types are referenced by predicates so the skip never
             // matters).
             Self::record_raw_int_for_encode(&mut raw_ints_seen, field, &value);
-            Self::encode_field(field, &value, &mut out)?;
+            // Compute the dynamic span for `repeat` fields from the
+            // already-recorded count value. The validator guarantees
+            // `count_from` is a lower-offset integer field, so it
+            // appears in `raw_ints_seen` by the time we reach a
+            // repeat field.
+            let dyn_size = Self::repeat_dyn_size(field, &raw_ints_seen)?;
+            // For repeat fields, the dynamic end may exceed the
+            // statically-sized `out` buffer. Grow with zero-fill so
+            // the array fits — the wire payload for variable-size
+            // protocols (DIS articulation params, ASTERIX
+            // repetitive items, MAVLink v2 payloads) is dynamic and
+            // a fixed-size buffer would force operators to set
+            // `size_bytes` to the maximum and ship trailing zeros
+            // on every short payload. By growing on demand we let
+            // operators set `size_bytes` to the header size and
+            // produce wire-truthful variable payloads.
+            if let Some(span) = dyn_size {
+                let needed = field.offset.saturating_add(span);
+                if needed > out.len() {
+                    out.resize(needed, 0);
+                }
+            }
+            Self::encode_field(field, &value, &mut out, dyn_size)?;
         }
         Ok(Bytes::from(out))
     }
@@ -752,6 +823,50 @@ impl SchemaCodec {
             field: field.name.clone(),
             value: raw.to_string(),
         })
+    }
+
+    /// Compute the dynamic wire span of a `repeat` field from the
+    /// already-decoded value of its `count_from` reference. Returns
+    /// `None` for non-repeat fields (the caller falls back to the
+    /// field's static size). The validator guarantees `count_from`
+    /// exists as a lower-offset integer field, so a missing entry in
+    /// `raw_ints_seen` would indicate a runtime bug — surface it as
+    /// a typed error rather than a panic.
+    ///
+    /// Negative counts (a signed integer count carrying `< 0`) are
+    /// treated as zero — the wire layout for "the array is empty"
+    /// is exactly the same as a non-existent array, and a real-world
+    /// signed count carrying a negative value almost certainly
+    /// indicates a producer bug. The `record_size_bytes ×
+    /// usize::try_from(count)` saturates to 0 for negatives, which
+    /// makes the field zero-length and the dynamic bounds check in
+    /// `decode_field` / `encode_field` pass trivially.
+    fn repeat_dyn_size(
+        field: &FieldDef,
+        raw_ints_seen: &BTreeMap<&str, i64>,
+    ) -> Result<Option<usize>, SchemaCodecError> {
+        let Some(spec) = &field.repeat else {
+            return Ok(None);
+        };
+        // Validator pins `count_from` to a lower-offset integer field,
+        // so an absent entry here can only happen on a runtime bug. We
+        // surface it as `MissingRequiredEntityField` (the closest
+        // taxonomy match) pointing at the count field so an operator
+        // can correlate to the schema line.
+        let raw = raw_ints_seen.get(spec.count_from.as_str()).ok_or_else(|| {
+            SchemaCodecError::MissingRequiredEntityField {
+                field: field.name.clone(),
+                path: format!("repeat.count_from={}", spec.count_from),
+            }
+        })?;
+        // `i64 → usize`: negative counts saturate to zero (treat as
+        // empty array). Larger-than-`usize::MAX` counts cannot
+        // happen on 64-bit targets; on 32-bit they saturate to
+        // `usize::MAX` and the subsequent bounds check in
+        // {decode,encode}_field surfaces `PayloadTooShort`.
+        let count: usize = usize::try_from(*raw).unwrap_or(0);
+        let span = spec.record_size_bytes.saturating_mul(count);
+        Ok(Some(span))
     }
 
     /// Record the raw integer value of a freshly-decoded field in
@@ -2019,6 +2134,210 @@ message-types:
             &[0u8, 0u8],
             "predicate missed on decode — round-trip drops signature to zero"
         );
+    }
+
+    /// v3 variable-length repeats. `count` is a `u8` at offset 0,
+    /// `records` is a `Bytes` array starting at offset 1 with a 4-byte
+    /// record size driven by the count. Modelled on the
+    /// canonical "preceding count byte then N records" wire shape
+    /// (DIS articulation params, ASTERIX REP items, Link 16 word-3).
+    /// `size-bytes: 1` declares only the header byte; the codec
+    /// grows the output buffer to fit the dynamic array on encode.
+    const REPEAT_SCHEMA: &str = r#"
+schema-version: "1"
+protocol-name: "test.repeat"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "count"
+        offset: 0
+        field-type: { kind: u8 }
+        entity-path: "attributes.count"
+      - name: "records"
+        offset: 1
+        field-type: { kind: bytes }
+        repeat:
+          count-from: "count"
+          record-size-bytes: 4
+"#;
+
+    #[test]
+    fn repeat_decode_reads_count_times_record_size() {
+        // count = 3, record_size = 4 → 12 bytes of records.
+        // Payload: [03, 11 22 33 44, 55 66 77 88, 99 AA BB CC].
+        let codec = SchemaCodec::from_schema_text(REPEAT_SCHEMA).unwrap();
+        let payload = vec![
+            0x03, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        ];
+        let entity = codec.to_entity(&payload).unwrap();
+        // Count attribute projects via entity-path.
+        assert_eq!(
+            entity.attributes.get("attributes.count"),
+            Some(&AttributeValue::Int(3))
+        );
+        // Records land on the default attribute key as a hex string.
+        let Some(AttributeValue::Str(records)) =
+            entity.attributes.get("schema.test.repeat.records")
+        else {
+            panic!(
+                "expected records attribute, got: {:?}",
+                entity.attributes.keys().collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(records, "112233445566778899aabbcc");
+    }
+
+    #[test]
+    fn repeat_decode_with_zero_count_produces_empty_byte_slice() {
+        // count = 0 → zero record bytes. Payload is the single count
+        // byte (the codec accepts payloads >= `size_bytes` = 1).
+        // The records attribute should be present as an empty hex
+        // string, not absent, so a round-trip preserves the field
+        // even when no records were on the wire.
+        let codec = SchemaCodec::from_schema_text(REPEAT_SCHEMA).unwrap();
+        let payload = vec![0x00];
+        let entity = codec.to_entity(&payload).unwrap();
+        assert_eq!(
+            entity.attributes.get("attributes.count"),
+            Some(&AttributeValue::Int(0))
+        );
+        let Some(AttributeValue::Str(records)) =
+            entity.attributes.get("schema.test.repeat.records")
+        else {
+            panic!(
+                "expected records attribute even for count=0, got: {:?}",
+                entity.attributes.keys().collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(records, "", "zero count must project an empty byte slice");
+    }
+
+    #[test]
+    fn repeat_round_trips_byte_identically() {
+        // Decode → encode for a 3-record payload must reproduce the
+        // input bytes exactly. Pins the documented v3 semantics on
+        // both sides of the wire.
+        let codec = SchemaCodec::from_schema_text(REPEAT_SCHEMA).unwrap();
+        let payload = vec![
+            0x03, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        ];
+        let entity = codec.to_entity(&payload).unwrap();
+        let re_encoded = codec.from_entity(&entity).unwrap();
+        assert_eq!(
+            &re_encoded[..],
+            &payload[..],
+            "round-trip must be byte-identical for variable-length repeat"
+        );
+    }
+
+    #[test]
+    fn repeat_decode_rejects_truncated_payload() {
+        // count = 3 declares 12 record bytes but only 8 are
+        // available. The dynamic bounds check in `decode_field`
+        // surfaces `PayloadTooShort` against the actual length, not
+        // a panic.
+        let codec = SchemaCodec::from_schema_text(REPEAT_SCHEMA).unwrap();
+        // 1 count byte + 8 record bytes = 9 bytes; 12 expected.
+        let payload = vec![0x03, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let err = codec.to_entity(&payload).unwrap_err();
+        let SchemaCodecError::PayloadTooShort { actual, required } = err else {
+            panic!("expected PayloadTooShort, got {err:?}");
+        };
+        assert_eq!(actual, 9);
+        // 3 records × 4 bytes + 1 count byte = 13 required.
+        assert_eq!(required, 13);
+    }
+
+    #[test]
+    fn repeat_encode_grows_output_for_variable_payload() {
+        // size-bytes = 1 (header only) but count = 2 means encode
+        // produces 1 + 2*4 = 9 bytes. The codec grows the output
+        // buffer rather than capping at size_bytes so operators can
+        // emit wire-truthful variable payloads without setting
+        // size_bytes to the maximum.
+        let codec = SchemaCodec::from_schema_text(REPEAT_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.count".into(), AttributeValue::Int(2));
+        // The encoder reads records from the default attribute key.
+        let _ = entity.attributes.insert(
+            "schema.test.repeat.records".into(),
+            AttributeValue::Str("aabbccdd11223344".into()),
+        );
+        let bytes = codec.from_entity(&entity).unwrap();
+        assert_eq!(bytes.len(), 9, "output grew to fit count=2 records");
+        assert_eq!(bytes[0], 0x02);
+        assert_eq!(
+            &bytes[1..],
+            &[0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44]
+        );
+    }
+
+    #[test]
+    fn repeat_encode_with_zero_count_produces_header_only() {
+        // count = 0 means encode produces the single count byte and
+        // nothing else, regardless of whether the records attribute
+        // is present. Round-trip-compatible with a decoded zero-count
+        // payload.
+        let codec = SchemaCodec::from_schema_text(REPEAT_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.count".into(), AttributeValue::Int(0));
+        let _ = entity.attributes.insert(
+            "schema.test.repeat.records".into(),
+            AttributeValue::Str(String::new()),
+        );
+        let bytes = codec.from_entity(&entity).unwrap();
+        assert_eq!(&bytes[..], &[0x00], "count=0 produces header-only output");
+    }
+
+    #[test]
+    fn repeat_with_u16_count_decodes_large_array() {
+        // Exercises the `u16` count path: a 2-byte big-endian count
+        // followed by record_size_bytes × count bytes. Counts > 255
+        // would fail with a `u8` count; the u16 widening lets a
+        // schema declare arrays up to 65 535 records.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test.repeat16"
+message-types:
+  - name: "M"
+    size-bytes: 2
+    fields:
+      - name: "count"
+        offset: 0
+        field-type: { kind: u16 }
+        endian: big
+        entity-path: "attributes.count"
+      - name: "records"
+        offset: 2
+        field-type: { kind: bytes }
+        repeat:
+          count-from: "count"
+          record-size-bytes: 2
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        // count = 5, records = [01 02, 03 04, 05 06, 07 08, 09 0A].
+        let mut payload = vec![0u8; 2];
+        payload[..2].copy_from_slice(&5u16.to_be_bytes());
+        payload.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A]);
+        let entity = codec.to_entity(&payload).unwrap();
+        assert_eq!(
+            entity.attributes.get("attributes.count"),
+            Some(&AttributeValue::Int(5))
+        );
+        let Some(AttributeValue::Str(records)) =
+            entity.attributes.get("schema.test.repeat16.records")
+        else {
+            panic!(
+                "expected records attribute, got: {:?}",
+                entity.attributes.keys().collect::<Vec<_>>()
+            );
+        };
+        assert_eq!(records, "0102030405060708090a");
     }
 
     fn empty_entity() -> Entity {

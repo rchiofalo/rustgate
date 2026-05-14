@@ -263,6 +263,68 @@ pub struct ValueMapping {
     pub default_raw: Option<i64>,
 }
 
+/// Variable-length-array layout for a [`FieldDef`]. When set on a
+/// `Bytes`-typed field, the field's wire span becomes
+/// `record_size_bytes × <count>`, where `<count>` is the raw integer
+/// value of another field that decoded earlier in the same
+/// [`MessageType`] (named via [`RepeatSpec::count_from`]).
+///
+/// The v3.0 grammar surfaces the N records as a single
+/// [`crate::SchemaCodecError`]-free `Bytes` slice on the decoded
+/// `Entity`; the consumer is responsible for parsing the inner record
+/// shape. Nested typed-record schemas (where each record carries its
+/// own field list) are explicitly out of scope for v3 — that's a v4
+/// feature.
+///
+/// Real protocols use this for variable-length arrays whose count is
+/// carried in a preceding flag/length byte:
+///
+/// - DIS Entity State PDU `articulation_params_count` (u8 at offset
+///   132) preceding an array of 16-byte articulation records.
+/// - ASTERIX repetitive items: a 1-byte "REP" prefix preceding N
+///   copies of a fixed-size sub-record.
+/// - MAVLink v2 variable-length payload (`len` byte in the header
+///   driving 0..=255 payload bytes).
+/// - Link 16 word-3 extensions (a count byte preceding N extension
+///   words).
+///
+/// Mutually exclusive with [`FieldDef::length_bytes`]: a field is
+/// either fixed-length (the existing `length_bytes` path) or
+/// count-driven (this new `repeat` path), never both. The validator
+/// rejects schemas that declare both.
+///
+/// Example schema fragment — `articulation_params_count` (`u8` at
+/// offset 132) drives 16-byte articulation records starting at offset
+/// 133:
+///
+/// ```yaml
+/// - name: "articulation_params_count"
+///   offset: 132
+///   field-type: { kind: u8 }
+/// - name: "articulation_params"
+///   offset: 133
+///   field-type: { kind: bytes }
+///   repeat:
+///     count-from: "articulation_params_count"
+///     record-size-bytes: 16
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RepeatSpec {
+    /// Name of an earlier-parsed integer field that holds the record
+    /// count. Must reference another field in the same `MessageType`
+    /// declared at a STRICTLY LOWER offset (so the decoder has
+    /// already read it by the time the repeat field is evaluated)
+    /// and must be one of the integer types (`u8`..`u64`,
+    /// `i8`..`i64`).
+    pub count_from: String,
+    /// Size in bytes of EACH element. `record_size_bytes × <count>`
+    /// must fit inside the message's declared `size_bytes`. Must be
+    /// non-zero (a zero-size record schema has no semantic meaning
+    /// and would silently let the field alias subsequent offsets).
+    pub record_size_bytes: usize,
+}
+
 /// Predicate declaring that a field is present on the wire only when
 /// another field in the same `MessageType` carries a specific integer
 /// value. The first v3 grammar feature — call this *sparse projection*
@@ -373,6 +435,15 @@ pub struct FieldDef {
     /// for the fixed-offset (sparse-projection) interpretation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub present_if: Option<PresentIfSpec>,
+    /// Optional variable-length-array layout. When set on a `Bytes`
+    /// field, the field's wire span is `record_size_bytes × <count>`
+    /// where `<count>` is the raw integer value of another
+    /// earlier-decoded field named by [`RepeatSpec::count_from`].
+    /// Mutually exclusive with [`FieldDef::length_bytes`] and
+    /// restricted to `Bytes`-typed fields in v3 — see [`RepeatSpec`]
+    /// for the full semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<RepeatSpec>,
     /// Dotted path on the [`Entity`](rustgate_core::entity::Entity)
     /// shape the decoded value projects onto. Supported paths:
     /// `uid`, `callsign`, `mil_std_2525_sidc`, `position.lat`,
@@ -523,9 +594,63 @@ impl Schema {
         sorted.sort_by_key(|f| f.offset);
         let mut prev_end = 0usize;
         for f in &sorted {
-            let size = match f.field_type.fixed_size() {
-                Some(s) => s,
-                None => f.length_bytes.ok_or_else(|| SchemaError::Validation {
+            // `repeat` and `length_bytes` are mutually exclusive: a
+            // field is either fixed-length (`length_bytes`) or
+            // count-driven (`repeat`), never both. Catching this at
+            // schema-load avoids the runtime having to decide which
+            // wins, which it can't sensibly do.
+            if f.repeat.is_some() && f.length_bytes.is_some() {
+                return Err(SchemaError::Validation {
+                    message: format!(
+                        "message `{}` field `{}` declares both `length_bytes` and `repeat` (mutually exclusive)",
+                        mt.name, f.name
+                    ),
+                });
+            }
+            // v3 repeat is `Bytes`-only — nested typed-record arrays
+            // (each element with its own field list) are a v4
+            // feature. Surface the misconfiguration at schema-load
+            // rather than letting the decoder ignore a misplaced
+            // `repeat` on, say, a `u32` field.
+            if let Some(spec) = &f.repeat {
+                if !matches!(f.field_type, FieldType::Bytes) {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` type `{}` does not support `repeat` (v3 repeat requires `bytes` field type)",
+                            mt.name,
+                            f.name,
+                            f.field_type.as_str()
+                        ),
+                    });
+                }
+                if spec.record_size_bytes == 0 {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` repeat record-size-bytes must be > 0 (zero-size records have no semantic meaning)",
+                            mt.name, f.name
+                        ),
+                    });
+                }
+            }
+            let size = match (&f.repeat, f.field_type.fixed_size()) {
+                // Repeat fields: the dynamic span is unknown at
+                // validation time. The validator uses
+                // `record_size_bytes × max_count_for_field_type` as a
+                // conservative upper bound — `u8` → 255 records,
+                // `u16` → 65_535, etc. — so subsequent fields cannot
+                // alias the repeat region for any in-range count. The
+                // dynamic length check (`record_size_bytes × actual
+                // count ≤ remaining_bytes`) fires on every decode in
+                // `decode_field`.
+                (Some(spec), _) => {
+                    spec.record_size_bytes
+                        .saturating_mul(max_count_for_repeat_field(
+                            &mt.fields,
+                            spec.count_from.as_str(),
+                        ))
+                }
+                (None, Some(s)) => s,
+                (None, None) => f.length_bytes.ok_or_else(|| SchemaError::Validation {
                     message: format!(
                         "message `{}` field `{}` type `{}` requires `length_bytes`",
                         mt.name,
@@ -540,7 +665,14 @@ impl Schema {
             // `prev_end` does not advance, so the next field at the same
             // offset passes the `f.offset < prev_end` check and the runtime
             // accepts an aliased schema.
-            if size == 0 {
+            //
+            // `repeat` fields skip this check — a count of zero is
+            // semantically meaningful (the array is empty) and the
+            // field still has a documented offset. The
+            // `record_size_bytes == 0` guard above already rejects the
+            // pathological case where a "repeat" with no per-element
+            // size would alias subsequent fields.
+            if size == 0 && f.repeat.is_none() {
                 return Err(SchemaError::Validation {
                     message: format!(
                         "message `{}` field `{}` type `{}` declares zero size (length-bytes must be > 0 for variable-length fields)",
@@ -558,23 +690,52 @@ impl Schema {
                     ),
                 });
             }
-            let end = f
-                .offset
-                .checked_add(size)
-                .ok_or_else(|| SchemaError::Validation {
-                    message: format!(
-                        "message `{}` field `{}` size overflow at offset {}",
-                        mt.name, f.name, f.offset
-                    ),
-                })?;
-            if end > mt.size_bytes {
-                return Err(SchemaError::Validation {
-                    message: format!(
-                        "message `{}` field `{}` ends at byte {} but message size is {}",
-                        mt.name, f.name, end, mt.size_bytes
-                    ),
-                });
-            }
+            // For `repeat` fields, the per-payload end is dynamic
+            // (`record_size_bytes × actual_count`). The static check
+            // here only ensures the field can hold *something* —
+            // that its declared offset still lies inside `size_bytes`.
+            // The dynamic bound (`record_size_bytes × count ≤
+            // remaining`) is enforced on every decode in
+            // `decode_field`. Use saturating math when computing
+            // `prev_end` so a `u8`-count × 16-byte record (max-span
+            // 4080) does not wrap and falsely accept a later field
+            // that aliases the repeat region.
+            let end = if f.repeat.is_some() {
+                if f.offset > mt.size_bytes {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` offset {} is past message size {} (repeat field with zero count would still start past end)",
+                            mt.name, f.name, f.offset, mt.size_bytes
+                        ),
+                    });
+                }
+                // The max-possible span (`size`) is what blocks
+                // subsequent fields from aliasing the repeat region.
+                // Cap at `mt.size_bytes` so a generous count-type
+                // (u8 → 4080 byte max-span on a 16-byte record) does
+                // not reject every schema where the repeat is sized
+                // to be the message's tail.
+                f.offset.saturating_add(size).min(mt.size_bytes)
+            } else {
+                let end = f
+                    .offset
+                    .checked_add(size)
+                    .ok_or_else(|| SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` size overflow at offset {}",
+                            mt.name, f.name, f.offset
+                        ),
+                    })?;
+                if end > mt.size_bytes {
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` ends at byte {} but message size is {}",
+                            mt.name, f.name, end, mt.size_bytes
+                        ),
+                    });
+                }
+                end
+            };
             if let Some(cal) = &f.calibration {
                 if !cal.scale.is_finite() || !cal.offset.is_finite() {
                     return Err(SchemaError::Validation {
@@ -752,6 +913,58 @@ impl Schema {
                 });
             }
         }
+        // Third pass: validate `repeat` count-from references now
+        // that the per-field overlap loop has already accepted the
+        // wire layout. Each repeat's `count_from` must (a) exist in
+        // the same message-type, (b) sit at a STRICTLY lower offset
+        // (so the decoder has the raw count before it reads the
+        // array), and (c) be an integer type — floats / bytes / utf8
+        // cannot carry a meaningful array count. Mirrors the
+        // present-if second pass for shape and error vocabulary.
+        for f in &mt.fields {
+            let Some(spec) = &f.repeat else {
+                continue;
+            };
+            let referenced = mt
+                .fields
+                .iter()
+                .find(|other| other.name == spec.count_from)
+                .ok_or_else(|| SchemaError::Validation {
+                    message: format!(
+                        "message `{}` field `{}` repeat references unknown count_from field `{}`",
+                        mt.name, f.name, spec.count_from
+                    ),
+                })?;
+            if referenced.offset >= f.offset {
+                return Err(SchemaError::Validation {
+                    message: format!(
+                        "message `{}` field `{}` repeat count_from field `{}` at offset {} must precede field offset {} (count must be parsed earlier)",
+                        mt.name, f.name, spec.count_from, referenced.offset, f.offset
+                    ),
+                });
+            }
+            if !matches!(
+                referenced.field_type,
+                FieldType::U8
+                    | FieldType::U16
+                    | FieldType::U32
+                    | FieldType::U64
+                    | FieldType::I8
+                    | FieldType::I16
+                    | FieldType::I32
+                    | FieldType::I64
+            ) {
+                return Err(SchemaError::Validation {
+                    message: format!(
+                        "message `{}` field `{}` repeat count_from references field `{}` of type `{}` (integer types only)",
+                        mt.name,
+                        f.name,
+                        spec.count_from,
+                        referenced.field_type.as_str()
+                    ),
+                });
+            }
+        }
         if let Some(off) = self.discriminator_offset
             && off >= mt.size_bytes
         {
@@ -763,6 +976,43 @@ impl Schema {
             });
         }
         Ok(())
+    }
+}
+
+/// Upper bound on the count a `repeat.count_from` field can carry,
+/// derived from the field's wire type. Used by the first-pass overlap
+/// check in [`Schema::validate_message_type`]: a `u8` count caps the
+/// array at 255 records, a `u16` at 65 535, etc. The lookup is
+/// best-effort — when the named field is missing or non-integer (the
+/// second-pass loop rejects both), the function returns `0` so the
+/// overlap check leaves the repeat span empty (no false-positive
+/// rejections on schemas that will fail validation anyway).
+///
+/// Signed integer types use their `MAX` as the upper bound — a
+/// negative count is meaningless and would be rejected at decode
+/// time. The validator's job here is to bound the static layout, not
+/// to model the dynamic count behaviour.
+fn max_count_for_repeat_field(fields: &[FieldDef], count_from: &str) -> usize {
+    let Some(f) = fields.iter().find(|f| f.name == count_from) else {
+        return 0;
+    };
+    match f.field_type {
+        FieldType::U8 => u8::MAX as usize,
+        FieldType::U16 => u16::MAX as usize,
+        FieldType::U32 => u32::MAX as usize,
+        // `u64` and `i64` saturate at `usize::MAX` on 64-bit targets
+        // and at `u32::MAX` on 32-bit; both are larger than any real
+        // array fits in a packet so the cap on `size_bytes` already
+        // bounds the meaningful span.
+        FieldType::U64 => usize::MAX,
+        FieldType::I8 => i8::MAX as usize,
+        FieldType::I16 => i16::MAX as usize,
+        FieldType::I32 => i32::MAX as usize,
+        FieldType::I64 => usize::MAX,
+        // Non-integer types fail the second-pass check; return 0
+        // here so the overlap loop doesn't falsely accept the
+        // surrounding fields.
+        FieldType::F32 | FieldType::F64 | FieldType::Bytes | FieldType::Utf8 => 0,
     }
 }
 
@@ -1384,6 +1634,242 @@ message-types:
         };
         assert!(
             message.contains("cannot combine value-mapping with present-if"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn accepts_repeat_field_with_earlier_integer_count() {
+        // Positive case: a `Bytes` field with a `repeat` spec
+        // referencing an earlier `u8` count validates cleanly. Pins
+        // the happy path for the v3 grammar — modelled on the DIS
+        // articulation-parameter shape (u8 count at offset 0, 16-byte
+        // records starting at offset 1).
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "count"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "records"
+        offset: 1
+        field-type: { kind: bytes }
+        repeat:
+          count-from: "count"
+          record-size-bytes: 16
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        schema
+            .validate()
+            .expect("repeat with earlier u8 count must validate");
+    }
+
+    #[test]
+    fn rejects_repeat_on_non_bytes_field_type() {
+        // v3 repeat is `Bytes`-only — nested-typed record arrays
+        // are a v4 feature. A `repeat` declared on a non-`Bytes`
+        // field must fail at schema-load so operators don't ship a
+        // schema the runtime would silently mis-decode.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "count"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "records"
+        offset: 1
+        field-type: { kind: u32 }
+        repeat:
+          count-from: "count"
+          record-size-bytes: 16
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("does not support `repeat`"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_repeat_referencing_unknown_count_field() {
+        // Misspelled `count_from` references must fail at schema-load
+        // rather than producing a runtime "field not found" mystery
+        // on every payload.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "count"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "records"
+        offset: 1
+        field-type: { kind: bytes }
+        repeat:
+          count-from: "nope"
+          record-size-bytes: 16
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("repeat references unknown count_from field `nope`"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_repeat_referencing_non_integer_count_field() {
+        // A `count_from` field of type `f64` (or `bytes`/`utf8`) has
+        // no decidable raw-integer count. Caught at schema-load so the
+        // decoder never has to handle a "what count?" runtime error.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "count"
+        offset: 0
+        field-type: { kind: f64 }
+      - name: "records"
+        offset: 8
+        field-type: { kind: bytes }
+        repeat:
+          count-from: "count"
+          record-size-bytes: 16
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("integer types only"), "got: {message}");
+    }
+
+    #[test]
+    fn rejects_repeat_referencing_forward_count_field() {
+        // Forward references break the decoder: the repeat field is
+        // evaluated when the count hasn't been read yet. In the
+        // common case the repeat's max-span at offset 0 overlaps the
+        // forward `count_from` (the first-pass overlap check fires);
+        // for narrower repeats that don't overlap, the second-pass
+        // strict-less rule catches it. Either way the schema must
+        // fail to validate.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 2
+    fields:
+      - name: "trailer"
+        offset: 0
+        field-type: { kind: bytes }
+        repeat:
+          count-from: "trailer_count"
+          record-size-bytes: 1
+      - name: "trailer_count"
+        offset: 1
+        field-type: { kind: u8 }
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        // Accept either error message — both correctly catch the
+        // forward-reference bug. Operators see one or the other
+        // depending on whether the repeat span happens to cover the
+        // forward count field.
+        assert!(
+            message.contains("overlaps") || message.contains("must precede field offset"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_repeat_with_zero_record_size_bytes() {
+        // `record_size_bytes == 0` has no semantic meaning (every
+        // count maps to zero bytes) and breaks the overlap-detection
+        // loop. Surface at schema-load.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "count"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "records"
+        offset: 1
+        field-type: { kind: bytes }
+        repeat:
+          count-from: "count"
+          record-size-bytes: 0
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("record-size-bytes must be > 0"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_repeat_combined_with_length_bytes() {
+        // `length_bytes` and `repeat` are mutually exclusive — the
+        // wire layout is either fixed-length or count-driven, not
+        // both. Catching at schema-load avoids the runtime having to
+        // decide which wins.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "count"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "records"
+        offset: 1
+        field-type: { kind: bytes }
+        length-bytes: 16
+        repeat:
+          count-from: "count"
+          record-size-bytes: 16
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("declares both `length_bytes` and `repeat`"),
             "got: {message}"
         );
     }
