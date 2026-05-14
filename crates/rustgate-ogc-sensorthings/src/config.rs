@@ -164,6 +164,13 @@ impl MqttPushConfig {
     /// `v1.0/Datastreams(<N>)/Observations`. Exposed `pub(crate)`
     /// so the `mqtt_push` module and the tests below share one
     /// canonical formatter.
+    ///
+    /// Feature-gated: the no-features build of this crate does
+    /// not pull the `mqtt_push` module in, so the formatter is
+    /// only reachable when the `mqtt-push` feature is enabled.
+    /// Without the cfg gate, the no-features build trips the
+    /// `dead_code` lint (and CI's `-Dwarnings`).
+    #[cfg(feature = "mqtt-push")]
     #[must_use]
     pub(crate) fn datastream_topic(datastream_id: u64) -> String {
         format!("v1.0/Datastreams({datastream_id})/Observations")
