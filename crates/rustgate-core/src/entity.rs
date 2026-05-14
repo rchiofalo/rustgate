@@ -252,12 +252,12 @@ pub enum AttributeValue {
     Bool(bool),
 }
 
-/// Maximum byte length of [`Tasking::task_id`]. 256 mirrors
-/// [`crate::identity::MAX_CN_LENGTH`] (the same upper bound applied
-/// to every operator-facing string identifier rustgate accepts at
-/// the wire boundary). Producers that need longer ids should
-/// content-hash them down to a stable 256-byte prefix rather than
-/// the codec dropping or truncating arbitrarily.
+/// Maximum byte length of [`Tasking::task_id`]. 256 mirrors the
+/// `MAX_CN_LENGTH` cap in `crate::identity` (the same upper bound
+/// applied to every operator-facing string identifier rustgate
+/// accepts at the wire boundary). Producers that need longer ids
+/// should content-hash them down to a stable 256-byte prefix
+/// rather than the codec dropping or truncating arbitrarily.
 pub const MAX_TASK_ID_LEN: usize = 256;
 
 /// Maximum byte length of [`Tasking::name`].
