@@ -44,8 +44,8 @@
 //! Multiple interceptors compose in declaration order. The router
 //! holds the chain in a single [`arc_swap::ArcSwap`] for lock-free
 //! hot-reload — operators can swap the entire chain at runtime
-//! without re-creating the router. [`Router::with_interceptor`]
-//! appends at construction; [`Router::replace_interceptors`]
+//! without re-creating the router. [`crate::Router::with_interceptor`]
+//! appends at construction; [`crate::Router::replace_interceptors`]
 //! atomically swaps the whole chain.
 //!
 //! ## What is intentionally NOT in this SPI
