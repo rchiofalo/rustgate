@@ -17,7 +17,7 @@ default = []
 # Reuses the same `observation_to_entity` mapper as the polling
 # path. Off by default so the no-features build does not pull
 # `rumqttc` into the dep tree.
-mqtt-push = ["dep:rumqttc"]
+mqtt-push = ["dep:rumqttc", "dep:zeroize"]
 
 [dependencies]
 rustgate-core = { workspace = true }
@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing = { workspace = true }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

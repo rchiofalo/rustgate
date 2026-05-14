@@ -156,6 +156,29 @@ pub struct MqttPushConfig {
     /// 60 s is the SensorThings community default.
     #[serde(default = "default_mqtt_keepalive_secs")]
     pub keepalive_secs: u16,
+
+    /// Optional MQTT username. Brokers that require
+    /// username/password authentication (Mosquitto with a
+    /// password file, HiveMQ ACL plugin, EMQX built-in DB) read
+    /// this verbatim alongside the password loaded from
+    /// [`Self::password_path`]. When set, [`Self::password_path`]
+    /// must also be set; setting only one of the two is rejected
+    /// at startup. The username is configured inline because it
+    /// is not a secret in the same sense as the password (it
+    /// typically rides on the wire in plaintext as part of the
+    /// MQTT CONNECT packet anyway).
+    #[serde(default)]
+    pub username: Option<String>,
+
+    /// Path to a file holding the MQTT password. Mirrors
+    /// [`SensorThingsConfig::auth_token_path`] — the wiring task
+    /// loads the file, wraps it in `Zeroizing` so it's wiped on
+    /// drop, trims trailing whitespace, and hands it to
+    /// `MqttOptions::set_credentials` together with
+    /// [`Self::username`]. The schema only carries the path; the
+    /// password itself never lives in TOML on disk.
+    #[serde(default)]
+    pub password_path: Option<String>,
 }
 
 impl MqttPushConfig {

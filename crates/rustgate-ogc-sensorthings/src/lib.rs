@@ -57,12 +57,16 @@
 //!   chained GETs (`Observation` → `Datastream` → `Thing` →
 //!   `Locations`). This is the standard SensorThings pattern. See
 //!   [`client`] for how the expand mode is enabled.
-//! - **Authentication.** Bearer-token auth via a path-on-disk secret
-//!   (mode-checked + `Zeroizing` wrapped at load time) is the only
-//!   auth surface the MVP supports. mTLS, OAuth2, and API-key auth
-//!   are out of scope for this PR — the configuration schema reserves
-//!   the bearer-token slot under `auth-token-path` so a follow-up can
-//!   layer additional auth modes without churning operators'
+//! - **Authentication.** For the REST polling path, bearer-token
+//!   auth via a path-on-disk secret (mode-checked + `Zeroizing`
+//!   wrapped at load time) is the only mode supported. For the MQTT
+//!   push path, username/password authentication is supported via
+//!   the `username` (inline) + `password-path` (file on disk,
+//!   mode-checked + `Zeroizing`-wrapped) pair on
+//!   [`config::MqttPushConfig`]. mTLS, OAuth2, and API-key auth are
+//!   out of scope for this PR — the configuration schema reserves
+//!   the bearer-token slot under `auth-token-path` so a follow-up
+//!   can layer additional auth modes without churning operators'
 //!   `rustgate.toml`.
 //!
 //! # Round-trip discipline
