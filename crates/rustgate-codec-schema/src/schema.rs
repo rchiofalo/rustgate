@@ -46,10 +46,18 @@
 //!
 //! [`FieldType`] covers the primitive integer / float types plus
 //! fixed-length byte slices and fixed-length UTF-8 strings.
-//! Variable-length fields, bit-packed fields, nested containers,
-//! and conditional fields are intentionally out of scope for v1 —
-//! the goal is to make 80% of wire formats codable with 0% Rust per
-//! protocol, not to be a complete IDL.
+//! Variable-length fields and bit-packed fields are intentionally
+//! out of scope — the goal is to make 80% of wire formats codable
+//! with 0% Rust per protocol, not to be a complete IDL.
+//!
+//! ## Conditional fields (v3)
+//!
+//! [`PresentIfSpec`] on [`FieldDef::present_if`] lets a field's
+//! projection depend on the raw integer value of another field
+//! that decoded earlier in the same message. The wire bytes stay
+//! fixed-offset (so subsequent offsets never shift); only the
+//! projection onto [`Entity`](rustgate_core::entity::Entity) is
+//! gated. See the [`PresentIfSpec`] type for the full semantics.
 
 use std::collections::BTreeMap;
 
@@ -255,6 +263,66 @@ pub struct ValueMapping {
     pub default_raw: Option<i64>,
 }
 
+/// Predicate declaring that a field is present on the wire only when
+/// another field in the same `MessageType` carries a specific integer
+/// value. The first v3 grammar feature — call this *sparse projection*
+/// rather than the more familiar *variable-shift* semantics from
+/// hand-rolled codecs:
+///
+/// - The bytes at the conditional field's declared offset stay
+///   allocated whether or not the predicate matches (wire layout
+///   remains fixed-offset, so subsequent offsets never slide).
+/// - When the predicate matches, the field projects to
+///   `Entity::attributes` / the declared `entity_path` exactly like
+///   an unconditional field.
+/// - When the predicate does NOT match, decode skips the projection
+///   (no attribute written, no entity_path target updated) and encode
+///   leaves the offset bytes at their pre-filled zero value.
+///
+/// Real protocols use this for fields whose presence is gated on a
+/// preceding flag byte: DIS articulation parameters (present only
+/// when `articulation_params_count > 0`), MAVLink v2 signatures
+/// (present only when `incompat_flags & IFLAG_SIGNED`), ASTERIX FRNs
+/// (present only when the matching FSPEC bit is set). The fixed-
+/// offset interpretation here covers the cases where the
+/// conditional field occupies a reserved slot whether or not it is
+/// "used"; protocols where the field actually disappears from the
+/// wire (variable-shift) are a separate v4 feature.
+///
+/// Example schema fragment — a `signature` byte that is meaningful
+/// only when the preceding `flags` byte is `1`:
+///
+/// ```yaml
+/// - name: "flags"
+///   offset: 0
+///   field-type: { kind: u8 }
+///   entity-path: "attributes.flags"
+/// - name: "signature"
+///   offset: 1
+///   field-type: { kind: u8 }
+///   entity-path: "attributes.signature"
+///   present-if:
+///     field: "flags"
+///     value: 1
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PresentIfSpec {
+    /// Name of the field whose decoded raw integer value the
+    /// predicate compares against. Must reference another field in
+    /// the same `MessageType` declared at a STRICTLY LOWER offset
+    /// (so the decoder has already read it by the time the
+    /// conditional field is evaluated).
+    pub field: String,
+    /// Integer value the referenced field must equal for the
+    /// conditional field to project. Compared against the
+    /// referenced field's raw wire integer (NOT calibrated /
+    /// value-mapped) — the predicate operates on the byte-level
+    /// representation so the v3 grammar stays decidable without
+    /// modelling the runtime's projection pipeline.
+    pub value: i64,
+}
+
 /// One field in a [`MessageType`]'s payload. The runtime reads
 /// each field at the declared `offset` with the type-determined
 /// width, applies the optional calibration, and projects the
@@ -297,6 +365,14 @@ pub struct FieldDef {
     /// `u8` flag).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range: Option<Range>,
+    /// Optional conditional-projection predicate. When set, the
+    /// field is projected to `Entity` only when the referenced
+    /// field's raw integer value equals the declared value; the
+    /// wire bytes stay at the declared offset regardless. See
+    /// [`PresentIfSpec`] for the full semantics and the rationale
+    /// for the fixed-offset (sparse-projection) interpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_if: Option<PresentIfSpec>,
     /// Dotted path on the [`Entity`](rustgate_core::entity::Entity)
     /// shape the decoded value projects onto. Supported paths:
     /// `uid`, `callsign`, `mil_std_2525_sidc`, `position.lat`,
@@ -589,6 +665,22 @@ impl Schema {
                         ),
                     });
                 }
+                if f.present_if.is_some() {
+                    // Reject when both apply to the SAME field.
+                    // The field's projection is already conditional
+                    // via the mapping's default-raw / UnmappedValue
+                    // semantics; layering present-if on top muddies
+                    // which mechanism the operator expected to fire.
+                    // present-if referencing OTHER fields with
+                    // value-mapping is fine — the predicate
+                    // operates on the raw integer regardless.
+                    return Err(SchemaError::Validation {
+                        message: format!(
+                            "message `{}` field `{}` cannot combine value-mapping with present-if on the same field",
+                            mt.name, f.name
+                        ),
+                    });
+                }
                 if let Some(default_raw) = vm.default_raw
                     && !vm.entries.contains_key(&default_raw)
                 {
@@ -601,6 +693,64 @@ impl Schema {
                 }
             }
             prev_end = end;
+        }
+        // Second pass: validate present-if predicates now that we
+        // have the full set of field offsets resolved. Each
+        // predicate's referenced field must (a) exist in the same
+        // message-type, (b) sit at a STRICTLY lower offset (so the
+        // decoder has read it before the conditional field is
+        // evaluated), and (c) be an integer type — floats / bytes /
+        // utf8 have no decidable "equals this raw integer" test.
+        for f in &mt.fields {
+            let Some(predicate) = &f.present_if else {
+                continue;
+            };
+            let referenced = mt
+                .fields
+                .iter()
+                .find(|other| other.name == predicate.field)
+                .ok_or_else(|| SchemaError::Validation {
+                    message: format!(
+                        "message `{}` field `{}` present-if references unknown field `{}`",
+                        mt.name, f.name, predicate.field
+                    ),
+                })?;
+            if referenced.offset >= f.offset {
+                // Equal offsets are also rejected — the validator's
+                // overlap check already prevents two fields from
+                // sharing an offset for non-zero sizes, but the
+                // strict-less rule is the load-bearing one: the
+                // decoder reads fields in declared order, so a
+                // forward-referenced predicate would evaluate
+                // against bytes the decoder has not seen yet.
+                return Err(SchemaError::Validation {
+                    message: format!(
+                        "message `{}` field `{}` present-if references field `{}` at offset {} which must precede field offset {} (must be parsed earlier)",
+                        mt.name, f.name, predicate.field, referenced.offset, f.offset
+                    ),
+                });
+            }
+            if !matches!(
+                referenced.field_type,
+                FieldType::U8
+                    | FieldType::U16
+                    | FieldType::U32
+                    | FieldType::U64
+                    | FieldType::I8
+                    | FieldType::I16
+                    | FieldType::I32
+                    | FieldType::I64
+            ) {
+                return Err(SchemaError::Validation {
+                    message: format!(
+                        "message `{}` field `{}` present-if references field `{}` of type `{}` (integer types only)",
+                        mt.name,
+                        f.name,
+                        predicate.field,
+                        referenced.field_type.as_str()
+                    ),
+                });
+            }
         }
         if let Some(off) = self.discriminator_offset
             && off >= mt.size_bytes
@@ -1074,6 +1224,166 @@ message-types:
         };
         assert!(
             message.contains("default-raw 99 has no matching entry"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn accepts_present_if_referencing_earlier_integer_field() {
+        // Positive case: a conditional `signature` byte gated on an
+        // earlier `flags` byte (integer, lower offset) validates
+        // cleanly. Pins the happy path of the v3 grammar so
+        // subsequent refactors of validate_message_type can't
+        // silently regress to rejecting well-formed schemas.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 2
+    fields:
+      - name: "flags"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "signature"
+        offset: 1
+        field-type: { kind: u8 }
+        present-if:
+          field: "flags"
+          value: 1
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        schema
+            .validate()
+            .expect("present-if on earlier integer field must validate");
+    }
+
+    #[test]
+    fn rejects_present_if_referencing_unknown_field() {
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u8 }
+        present-if:
+          field: "nope"
+          value: 1
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("references unknown field `nope`"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_present_if_referencing_field_at_later_offset() {
+        // Forward references break the decoder: the conditional
+        // field is evaluated when the predicate's target hasn't
+        // been read yet. Equal offsets are also rejected here
+        // (the validator's strict-less rule).
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 2
+    fields:
+      - name: "early"
+        offset: 0
+        field-type: { kind: u8 }
+        present-if:
+          field: "late"
+          value: 1
+      - name: "late"
+        offset: 1
+        field-type: { kind: u8 }
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("must precede field offset"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_present_if_referencing_float_field() {
+        // Floats have no meaningful equality test for a wire
+        // predicate (NaN, signed zero, denormals all complicate
+        // the semantics). The validator rejects non-integer
+        // predicate targets at schema-load.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 12
+    fields:
+      - name: "x"
+        offset: 0
+        field-type: { kind: f64 }
+      - name: "y"
+        offset: 8
+        field-type: { kind: u32 }
+        present-if:
+          field: "x"
+          value: 0
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("integer types only"), "got: {message}");
+    }
+
+    #[test]
+    fn rejects_present_if_combined_with_value_mapping_on_same_field() {
+        // value-mapping already conditions the field's projection
+        // on its raw integer (via default-raw / UnmappedValue);
+        // layering present-if on top would muddy which mechanism
+        // the operator expected to fire. Rejected at schema-load.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 2
+    fields:
+      - name: "flags"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "status"
+        offset: 1
+        field-type: { kind: u8 }
+        present-if:
+          field: "flags"
+          value: 1
+        value-mapping:
+          entries:
+            0: "off"
+            1: "on"
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("cannot combine value-mapping with present-if"),
             "got: {message}"
         );
     }

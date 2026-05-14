@@ -41,6 +41,22 @@
 //! emits the same variant without the call site needing to track
 //! it externally. Each message type's `id` must be unique and fit
 //! in `0..=255`; `Schema::validate` rejects schemas that don't.
+//!
+//! ## Conditional fields (v3)
+//!
+//! [`FieldDef::present_if`](crate::FieldDef::present_if) lets a
+//! field's projection depend on the raw integer value of another
+//! field at a strictly lower offset. The runtime uses the
+//! **sparse-projection** interpretation: the bytes at the
+//! conditional field's offset stay reserved on the wire whether
+//! or not the predicate matches, but the field is only projected
+//! to `Entity` (decode) or read from `Entity` (encode) when the
+//! predicate's referenced field equals the declared value. When
+//! the predicate misses, decode skips the projection (no
+//! attribute write, no entity_path target update) and encode
+//! leaves the bytes at their pre-filled zero value. Variable-
+//! shift semantics (where the field actually disappears from the
+//! wire and subsequent offsets slide) are a separate v4 feature.
 
 use std::collections::BTreeMap;
 
@@ -433,9 +449,51 @@ impl EntityCodec for SchemaCodec {
             );
         }
 
+        // Raw integer values seen so far during this decode pass.
+        // Used by `present-if` predicates to compare against the
+        // referenced field's already-decoded raw value. The
+        // validator guarantees the referenced field exists at a
+        // strictly lower offset and is an integer type, so a hit
+        // here corresponds to one of these `DecodedValue::{U64,I64}`
+        // variants that we recorded BEFORE the conditional field
+        // ever runs.
+        let mut raw_ints_seen: BTreeMap<&str, i64> = BTreeMap::new();
         for field in &mt.fields {
             let decoded = Self::decode_field(field, payload)?;
+            // Conditional fields evaluate their predicate against
+            // the already-decoded raw integer of the referenced
+            // field. When the predicate does not match, we still
+            // had to read `decode_field` (so the payload-length
+            // check fires) but we MUST skip projection: no
+            // attribute write, no entity_path target update. The
+            // wire bytes are documented as remaining at the
+            // declared offset; the operator can use a
+            // `value-mapping` or sentinel value on a separate
+            // field if they need to distinguish "absent" from
+            // "zero" in the projected entity.
+            if let Some(predicate) = &field.present_if {
+                let matched = raw_ints_seen
+                    .get(predicate.field.as_str())
+                    .is_some_and(|raw| *raw == predicate.value);
+                if !matched {
+                    // Skip range check, value-mapping, and
+                    // projection entirely. The predicate field is
+                    // already validated at schema-load to be an
+                    // integer at a strictly lower offset, so the
+                    // miss here means "field is logically absent"
+                    // rather than "operator referenced an
+                    // undecoded field".
+                    Self::record_raw_int(&mut raw_ints_seen, field, &decoded);
+                    continue;
+                }
+            }
             Self::check_range_on_decode(field, &decoded)?;
+            // Record the raw integer BEFORE applying
+            // value-mapping. Subsequent present-if predicates
+            // compare against the raw wire integer (validator
+            // pins this so the predicate semantics stay
+            // decidable), not the projected label string.
+            Self::record_raw_int(&mut raw_ints_seen, field, &decoded);
             // Apply value-mapping if the field declares one. The
             // mapping replaces the decoded integer with the label
             // string from `entries`, falling back to `default_raw`
@@ -532,7 +590,36 @@ impl EntityCodec for SchemaCodec {
             let id_byte = mt.id as u8;
             out[off] = id_byte;
         }
+        // Mirror of the decode-side `raw_ints_seen` map. As we
+        // encode each integer field, record the raw integer the
+        // encoder is about to write so any later conditional
+        // field can check its predicate against the same value
+        // the wire byte will carry. The validator guarantees the
+        // referenced field is at a strictly lower offset and is
+        // an integer type, so this map is populated before the
+        // predicate ever reads it.
+        let mut raw_ints_seen: BTreeMap<&str, i64> = BTreeMap::new();
         for field in &mt.fields {
+            let predicate_matches = match &field.present_if {
+                Some(predicate) => raw_ints_seen
+                    .get(predicate.field.as_str())
+                    .is_some_and(|raw| *raw == predicate.value),
+                None => true,
+            };
+            if !predicate_matches {
+                // Skip the encode for this field — its declared
+                // bytes stay at the buffer's pre-filled zeros.
+                // Documented behaviour: the operator can declare
+                // an explicit `value-mapping` or a sentinel on a
+                // separate field if they need a non-zero "absent"
+                // marker. We do NOT record this field in
+                // `raw_ints_seen`: a conditional field that is
+                // logically absent cannot itself drive a
+                // downstream predicate, since its wire bytes are
+                // all zero and the "raw value" carries no
+                // semantic information.
+                continue;
+            }
             let mut value = lookup_encoded_value(entity, field, &self.schema.protocol_name)?;
             // Reverse value-mapping: if the field declares one and
             // the looked-up value is a string label, swap it for
@@ -548,6 +635,14 @@ impl EntityCodec for SchemaCodec {
                 value = EncodedValue::I64(raw);
             }
             Self::check_range_on_encode(field, &value)?;
+            // Record the raw integer for any downstream predicate
+            // BEFORE the per-type encoder runs. We use the same
+            // raw-integer view the decoder sees: integer types
+            // resolve to their `i64` representation, everything
+            // else is skipped (the validator ensures only integer
+            // types are referenced by predicates so the skip never
+            // matters).
+            Self::record_raw_int_for_encode(&mut raw_ints_seen, field, &value);
             Self::encode_field(field, &value, &mut out)?;
         }
         Ok(Bytes::from(out))
@@ -657,6 +752,68 @@ impl SchemaCodec {
             field: field.name.clone(),
             value: raw.to_string(),
         })
+    }
+
+    /// Record the raw integer value of a freshly-decoded field in
+    /// the `raw_ints_seen` map used to resolve later
+    /// `present-if` predicates. The validator guarantees a
+    /// referenced field is an integer type, so we only need to
+    /// capture integer variants (`U64` / `I64`); float / string /
+    /// bytes values cannot drive a predicate and are silently
+    /// skipped here.
+    fn record_raw_int<'a>(
+        seen: &mut BTreeMap<&'a str, i64>,
+        field: &'a FieldDef,
+        decoded: &DecodedValue,
+    ) {
+        let raw = match decoded {
+            // `u64` values up to `i64::MAX` round-trip exactly;
+            // values with the high bit set wrap to negative `i64`
+            // — that wrapping is fine for predicate comparison
+            // because the schema's predicate `value: i64` would
+            // have to match the same bit pattern, and the
+            // operator is comparing against a wire byte string in
+            // any case.
+            DecodedValue::U64(v) => *v as i64,
+            DecodedValue::I64(v) => *v,
+            DecodedValue::F64(_) | DecodedValue::Str(_) | DecodedValue::Bytes(_) => return,
+        };
+        let _ = seen.insert(field.name.as_str(), raw);
+    }
+
+    /// Encode-side variant of [`Self::record_raw_int`]. Reads the
+    /// raw integer value from an [`EncodedValue`] so subsequent
+    /// `present-if` predicates can be evaluated against the same
+    /// raw integer the encoder is about to write to the wire.
+    /// Non-integer values are skipped (the validator guarantees
+    /// referenced fields are integer-typed).
+    fn record_raw_int_for_encode<'a>(
+        seen: &mut BTreeMap<&'a str, i64>,
+        field: &'a FieldDef,
+        value: &EncodedValue,
+    ) {
+        // Only integer fields are valid predicate targets per the
+        // validator. Skip non-integer types so a predicate that
+        // somehow slipped past validation against, say, a `Bytes`
+        // field simply fails to match rather than panicking.
+        if !matches!(
+            field.field_type,
+            FieldType::U8
+                | FieldType::U16
+                | FieldType::U32
+                | FieldType::U64
+                | FieldType::I8
+                | FieldType::I16
+                | FieldType::I32
+                | FieldType::I64
+        ) {
+            return;
+        }
+        let raw = match value {
+            EncodedValue::I64(v) => *v,
+            EncodedValue::F64(_) | EncodedValue::Str(_) | EncodedValue::Bytes(_) => return,
+        };
+        let _ = seen.insert(field.name.as_str(), raw);
     }
 
     /// Reverse-lookup the raw integer for a string label via a
@@ -1734,6 +1891,134 @@ message-types:
         );
         let bytes = codec.from_entity(&entity).unwrap();
         assert_eq!(&bytes[..], &[0u8]);
+    }
+
+    /// v3 conditional fields: `signature` byte at offset 1 is
+    /// projected only when `flags` at offset 0 equals 1. Both
+    /// fields decode into `Entity::attributes` (no first-class
+    /// `entity_path` target) so the tests can assert on key
+    /// presence directly.
+    const PRESENT_IF_SCHEMA: &str = r#"
+schema-version: "1"
+protocol-name: "test.condfield"
+message-types:
+  - name: "M"
+    size-bytes: 2
+    fields:
+      - name: "flags"
+        offset: 0
+        field-type: { kind: u8 }
+        entity-path: "attributes.flags"
+      - name: "signature"
+        offset: 1
+        field-type: { kind: u8 }
+        entity-path: "attributes.signature"
+        present-if:
+          field: "flags"
+          value: 1
+"#;
+
+    #[test]
+    fn present_if_decode_projects_when_predicate_matches() {
+        // flags = 1 → signature attribute appears with its decoded
+        // byte value.
+        let codec = SchemaCodec::from_schema_text(PRESENT_IF_SCHEMA).unwrap();
+        let entity = codec.to_entity(&[1u8, 0xAB]).unwrap();
+        assert_eq!(
+            entity.attributes.get("attributes.flags"),
+            Some(&AttributeValue::Int(1))
+        );
+        assert_eq!(
+            entity.attributes.get("attributes.signature"),
+            Some(&AttributeValue::Int(0xAB)),
+            "predicate matched — signature must project"
+        );
+    }
+
+    #[test]
+    fn present_if_decode_skips_projection_when_predicate_misses() {
+        // flags = 0 → signature byte stays on the wire but does
+        // NOT land on `Entity::attributes`. The wire byte 0xAB at
+        // offset 1 is consumed (size check passes) but the
+        // operator's downstream code sees no `attributes.signature`
+        // entry, which is the v3 contract for "logically absent".
+        let codec = SchemaCodec::from_schema_text(PRESENT_IF_SCHEMA).unwrap();
+        let entity = codec.to_entity(&[0u8, 0xAB]).unwrap();
+        assert_eq!(
+            entity.attributes.get("attributes.flags"),
+            Some(&AttributeValue::Int(0))
+        );
+        assert!(
+            !entity.attributes.contains_key("attributes.signature"),
+            "predicate missed — signature must NOT project"
+        );
+    }
+
+    #[test]
+    fn present_if_encode_writes_bytes_when_predicate_matches() {
+        // Entity carries flags=1 and signature=0xAB → the encoder
+        // emits both bytes at their declared offsets. Symmetric to
+        // the positive decode case.
+        let codec = SchemaCodec::from_schema_text(PRESENT_IF_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.flags".into(), AttributeValue::Int(1));
+        let _ = entity
+            .attributes
+            .insert("attributes.signature".into(), AttributeValue::Int(0xAB));
+        let bytes = codec.from_entity(&entity).unwrap();
+        assert_eq!(&bytes[..], &[1u8, 0xAB]);
+    }
+
+    #[test]
+    fn present_if_encode_leaves_bytes_zero_when_predicate_misses() {
+        // Entity carries flags=0 and signature=0xAB → the encoder
+        // writes the flags byte but leaves the signature offset at
+        // its pre-filled zero. The operator can declare an
+        // explicit sentinel via value-mapping on a separate field
+        // if they need a non-zero "absent" marker.
+        let codec = SchemaCodec::from_schema_text(PRESENT_IF_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.flags".into(), AttributeValue::Int(0));
+        let _ = entity
+            .attributes
+            .insert("attributes.signature".into(), AttributeValue::Int(0xAB));
+        let bytes = codec.from_entity(&entity).unwrap();
+        assert_eq!(
+            &bytes[..],
+            &[0u8, 0u8],
+            "predicate missed — signature byte stays zero"
+        );
+    }
+
+    #[test]
+    fn present_if_round_trips_in_both_predicate_states() {
+        // Decode → encode round-trip must reproduce the input
+        // bytes when the predicate matches (signature carries
+        // through) and must clear the conditional bytes when it
+        // doesn't (signature was never on attributes, so encode
+        // leaves zeros). Pins the documented v3 semantics on both
+        // sides of the wire.
+        let codec = SchemaCodec::from_schema_text(PRESENT_IF_SCHEMA).unwrap();
+
+        let entity_present = codec.to_entity(&[1u8, 0xAB]).unwrap();
+        let re_encoded_present = codec.from_entity(&entity_present).unwrap();
+        assert_eq!(
+            &re_encoded_present[..],
+            &[1u8, 0xAB],
+            "predicate matched on decode — round-trip preserves signature"
+        );
+
+        let entity_absent = codec.to_entity(&[0u8, 0xAB]).unwrap();
+        let re_encoded_absent = codec.from_entity(&entity_absent).unwrap();
+        assert_eq!(
+            &re_encoded_absent[..],
+            &[0u8, 0u8],
+            "predicate missed on decode — round-trip drops signature to zero"
+        );
     }
 
     fn empty_entity() -> Entity {
