@@ -31,6 +31,7 @@ pub mod cjadc2;
 pub mod dedup;
 pub mod egress;
 pub mod filter;
+pub mod interceptor;
 pub mod obligations;
 pub mod quota;
 pub mod repeater;
@@ -48,6 +49,7 @@ pub use dedup::{
 };
 pub use egress::{EgressEnvelope, EgressError, RecipientClass};
 pub use filter::{GeoBounds, MessageFilter};
+pub use interceptor::{InterceptorContext, InterceptorVerdict, MessageInterceptor};
 pub use quota::{
     DEFAULT_TENANT_KEY, OnTenantThroughputConsumed, OnTenantThroughputRejection, QuotaConfig,
     TenantQuota, TenantQuotaTracker, TenantThroughputRejection,

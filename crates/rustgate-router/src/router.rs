@@ -55,6 +55,7 @@ use crate::egress::{
     EgressContext, EgressEnvelope, EgressError, EnvelopeEvaluator, RecipientClass,
     prepare_egress_envelope,
 };
+use crate::interceptor::{InterceptorContext, InterceptorVerdict, MessageInterceptor};
 use crate::obligations::{
     ObligationRateLimiter, UnknownObligationPolicy, apply_obligations_with_limiter,
     obligations_mutate_payload,
@@ -1216,6 +1217,18 @@ pub struct Router {
     /// stream catalog under `--features video`) install without
     /// colliding with the rebroadcast hook. Default `None`. Closes #862.
     on_routed: ArcSwap<Option<OnRouted>>,
+    /// Pre-routing interceptor chain. Fires inside
+    /// [`Self::route_for_egress`] after tenant-stamping and
+    /// before ACL / dedup / PEP / fanout. The chain runs in
+    /// declaration order; the first
+    /// [`crate::InterceptorVerdict::Drop`] terminates the route,
+    /// [`crate::InterceptorVerdict::Modify`] replaces the
+    /// in-flight message for every subsequent interceptor in the
+    /// same evaluation. Hot-reloadable via
+    /// [`Self::replace_interceptors`]. Default `Vec::new()` — the
+    /// hot path on the uninstalled (default) build is a single
+    /// `ArcSwap::load` + `is_empty()` check.
+    interceptors: ArcSwap<Vec<MessageInterceptor>>,
     /// Optional registry mapping `metadata.source_protocol` to the
     /// `DynEntityCodec` that decodes its wire format into the canonical
     /// [`rustgate_core::entity::Entity`] shape.
@@ -1348,6 +1361,7 @@ impl Default for Router {
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
+            interceptors: ArcSwap::from_pointee(Vec::new()),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1414,6 +1428,7 @@ impl Router {
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
+            interceptors: ArcSwap::from_pointee(Vec::new()),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1469,6 +1484,7 @@ impl Router {
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
+            interceptors: ArcSwap::from_pointee(Vec::new()),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1527,6 +1543,7 @@ impl Router {
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
+            interceptors: ArcSwap::from_pointee(Vec::new()),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -2058,6 +2075,53 @@ impl Router {
     /// restarting the routing pipeline.
     pub fn set_on_routed(&self, cb: Option<OnRouted>) {
         self.on_routed.store(Arc::new(cb));
+    }
+
+    /// Append an interceptor to the router's pre-routing chain.
+    ///
+    /// Interceptors fire inside [`Self::route_for_egress`] after
+    /// tenant-stamping and before ACL / dedup / PEP / fanout, in
+    /// declaration order. Each [`MessageInterceptor`] is a
+    /// [`MessageInterceptor`] closure that returns an
+    /// [`crate::InterceptorVerdict`]:
+    ///
+    /// - [`crate::InterceptorVerdict::Allow`] — pass through;
+    ///   chain continues to the next interceptor.
+    /// - [`crate::InterceptorVerdict::Drop`] — terminate the
+    ///   route immediately with a static reason; the
+    ///   per-tenant `on_dropped_by_tenant` callback fires with
+    ///   the synthetic `interceptor` label.
+    /// - [`crate::InterceptorVerdict::Modify`] — replace the
+    ///   in-flight message for every subsequent interceptor
+    ///   in the same evaluation.
+    ///
+    /// Builder-style (consumes + returns `Self`) so call sites
+    /// can chain multiple interceptors during router
+    /// construction:
+    ///
+    /// ```ignore
+    /// let router = Router::new()
+    ///     .with_interceptor(redact_callsign)
+    ///     .with_interceptor(tenant_audit);
+    /// ```
+    ///
+    /// For runtime hot-add use [`Self::replace_interceptors`].
+    #[must_use]
+    pub fn with_interceptor(self, interceptor: MessageInterceptor) -> Self {
+        let mut chain: Vec<MessageInterceptor> = self.interceptors.load().as_ref().clone();
+        chain.push(interceptor);
+        self.interceptors.store(Arc::new(chain));
+        self
+    }
+
+    /// Atomically replace the entire interceptor chain. Hot-
+    /// reloadable via [`arc_swap::ArcSwap`] so operators can swap
+    /// the whole chain at runtime without re-creating the router.
+    /// Passing an empty vector disables interception entirely (the
+    /// hot path collapses to a single `ArcSwap::load` +
+    /// `is_empty()` check, same as the uninstalled default).
+    pub fn replace_interceptors(&self, chain: Vec<MessageInterceptor>) {
+        self.interceptors.store(Arc::new(chain));
     }
 
     /// Install (or replace) the per-kind routed-message observer.
@@ -2664,6 +2728,39 @@ impl Router {
         {
             msg.metadata.tenant_id = Some(t.clone());
         }
+
+        // Pre-routing interceptor chain. Fires AFTER tenant-stamping
+        // (above) and BEFORE ACL / dedup / PEP / fanout (in
+        // `route_inner`). The chain runs in declaration order;
+        // `InterceptorVerdict::Drop(reason)` terminates the route
+        // immediately and emits a `dropped_by_tenant` audit/metric
+        // with the synthetic reason `interceptor:<reason>`;
+        // `InterceptorVerdict::Modify(new)` replaces the in-flight
+        // message for every subsequent interceptor in the same
+        // evaluation. Hot path on the uninstalled (default) build
+        // is a single `ArcSwap::load` + `is_empty()` check.
+        let interceptors_guard = self.interceptors.load();
+        if !interceptors_guard.is_empty() {
+            for interceptor in interceptors_guard.iter() {
+                let verdict = interceptor(InterceptorContext::new(&msg));
+                match verdict {
+                    InterceptorVerdict::Allow => {}
+                    InterceptorVerdict::Drop(reason) => {
+                        let dropped_tenant = msg.metadata.tenant_id().map(str::to_string);
+                        self.emit_dropped_by_tenant("interceptor", dropped_tenant.as_deref());
+                        tracing::debug!(
+                            target: "router",
+                            reason = %reason,
+                            source_cn = %hash_cn(&msg.source.cn),
+                            "interceptor dropped message",
+                        );
+                        return None;
+                    }
+                    InterceptorVerdict::Modify(new) => msg = *new,
+                }
+            }
+        }
+        drop(interceptors_guard);
 
         // Capture the resolved tenant + destination kind BEFORE moving
         // `msg` into `route_inner` — the per-tenant metric callbacks
@@ -8423,5 +8520,157 @@ mod tests {
             "UNKNOWN_ENTITY_KIND_LABEL constant must match \
              EntityKind::Unknown::as_str() — keep them in sync",
         );
+    }
+
+    // --- Interceptor SPI tests (closes interceptor module rollout) ---
+
+    #[tokio::test]
+    async fn interceptor_allow_passes_message_through_unchanged() {
+        // Sanity baseline: a chain of one Allow-returning
+        // interceptor must not affect routing behaviour.
+        let fired = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&fired);
+        let router = Router::new().with_interceptor(Arc::new(move |_ctx| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            InterceptorVerdict::Allow
+        }));
+        let alice = make_identity("alice", &["g1"]);
+        let bob = make_identity("bob", &["g1"]);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, mut nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        // bob receives the chat.
+        let _ = nrx_b.try_recv().expect("subscriber receives");
+    }
+
+    #[tokio::test]
+    async fn interceptor_drop_terminates_route_with_audit_metric() {
+        // Drop verdict must terminate the route immediately so
+        // the subscriber does NOT see the message, and the
+        // per-tenant dropped callback must fire with the
+        // "interceptor" reason.
+        let dropped: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let dropped_clone: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::clone(&dropped);
+        let router = Router::new()
+            .with_interceptor(Arc::new(|_ctx| InterceptorVerdict::Drop("test-reject")));
+        router.set_on_dropped_by_tenant(Some(Arc::new(move |reason, tenant| {
+            dropped_clone.lock().push((reason, tenant));
+        })));
+        let alice = make_identity("alice", &["g1"]);
+        let bob = make_identity("bob", &["g1"]);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, mut nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        // bob must NOT receive — channel is empty.
+        assert!(nrx_b.try_recv().is_err());
+        let log = dropped.lock();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].0, "interceptor");
+    }
+
+    #[tokio::test]
+    async fn interceptor_modify_replaces_payload_seen_by_subscribers() {
+        // Modify verdict swaps the in-flight message; the
+        // delivered payload should be the modified form.
+        let router = Router::new().with_interceptor(Arc::new(|ctx| {
+            let mut replaced = ctx.message.clone();
+            replaced.payload = Bytes::from_static(b"<rewritten/>");
+            InterceptorVerdict::Modify(Box::new(replaced))
+        }));
+        let alice = make_identity("alice", &["g1"]);
+        let bob = make_identity("bob", &["g1"]);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, mut nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        let delivered = nrx_b.try_recv().expect("subscriber receives");
+        assert_eq!(delivered.payload.as_ref(), b"<rewritten/>");
+    }
+
+    #[tokio::test]
+    async fn interceptor_chain_runs_in_declaration_order_and_first_drop_wins() {
+        // Two interceptors: first records its invocation and
+        // allows; second drops. Third interceptor would record
+        // its invocation but must NEVER fire because the second
+        // dropped first.
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let log1 = Arc::clone(&order);
+        let log3 = Arc::clone(&order);
+        let router = Router::new()
+            .with_interceptor(Arc::new(move |_| {
+                log1.lock().push("first");
+                InterceptorVerdict::Allow
+            }))
+            .with_interceptor(Arc::new(|_| InterceptorVerdict::Drop("second-says-no")))
+            .with_interceptor(Arc::new(move |_| {
+                log3.lock().push("third");
+                InterceptorVerdict::Allow
+            }));
+        let alice = make_identity("alice", &["g1"]);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        let order = order.lock().clone();
+        assert_eq!(order, vec!["first"], "third must not fire after drop");
+    }
+
+    #[tokio::test]
+    async fn interceptor_replace_swaps_chain_atomically() {
+        // Hot-swap the chain mid-flight: install an
+        // always-drop, route a message (expected: dropped),
+        // then `replace_interceptors(Vec::new())` and route
+        // again (expected: delivered).
+        let router = Arc::new(
+            Router::new().with_interceptor(Arc::new(|_| InterceptorVerdict::Drop("always"))),
+        );
+        let alice = make_identity("alice", &["g1"]);
+        let bob = make_identity("bob", &["g1"]);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _prx_b, mut nrx_b) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+            .await;
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        assert!(nrx_b.try_recv().is_err(), "first route must be dropped");
+        router.replace_interceptors(Vec::new());
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        let _ = nrx_b
+            .try_recv()
+            .expect("after replace, message must deliver");
     }
 }
