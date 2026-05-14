@@ -1,0 +1,66 @@
+# MAVLink v1 frame header (MAVLink v1.0 spec).
+#
+# A MAVLink v1 frame is `[header (6 bytes)] [payload (len bytes)]
+# [crc (2 bytes)]`. The header layout is fixed regardless of msgid;
+# the payload shape is `msgid`-dependent and out of scope for the
+# schema vocabulary (per-message shapes need their own schemas
+# dispatched by `msgid` at the call site).
+#
+# Wire layout (little-endian — MAVLink is CPU-native LE):
+#
+# offset │ size │ field    │ notes
+# ───────┼──────┼──────────┼───────────────────────────────────────
+#   0    │  1   │ magic    │ always 0xFE (`MAVLINK_V1_MAGIC`)
+#   1    │  1   │ len      │ payload length in bytes (0..=255)
+#   2    │  1   │ seq      │ wrapping per-(sysid,compid) sequence
+#   3    │  1   │ sysid    │ source system id
+#   4    │  1   │ compid   │ source component id
+#   5    │  1   │ msgid    │ MAVLink message id
+#
+# What this schema does NOT carry today:
+#
+# - The MAVLink message-id enum vocabulary. MAVLink defines several
+#   hundred message types and the enumeration evolves as new
+#   dialects (Common, ArduPilotMega, …) ship. The parity test
+#   below carries `msgid` as a raw u8; a companion non-parity test
+#   demonstrates v2 `value-mapping` for the canonical HEARTBEAT
+#   message (msgid = 0).
+# - The payload + CRC trailer. Those need msg-id-specific schemas
+#   dispatched after the header (multi-message dispatch via #1368
+#   handles the dispatcher pattern, but each msgid's payload shape
+#   needs its own schema; out of scope for the header parity).
+# - The magic byte's `0xFE` constant value. The schema declares it
+#   as a u8 field so byte-equivalent round-trip holds for any
+#   wire byte, but it would be reasonable for a future
+#   `value-mapping` overlay schema to constrain it to `0xFE`
+#   only and reject other magic bytes as not-MAVLink-v1.
+#
+# Provenance: byte layout cross-checked against
+# `crates/rustgate-mavlink/src/frame.rs` (`v1_frame` helper +
+# `MAVLINK_V1_HEADER_LEN`). The `schema_parity` proptest asserts
+# byte-identical round-trip for every arbitrary 6-byte header
+# proptest generates.
+schema-version: "1"
+protocol-name: "mavlink.v1_header"
+message-types:
+  - name: "V1Header"
+    size-bytes: 6
+    fields:
+      - name: "magic"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "len"
+        offset: 1
+        field-type: { kind: u8 }
+      - name: "seq"
+        offset: 2
+        field-type: { kind: u8 }
+      - name: "sysid"
+        offset: 3
+        field-type: { kind: u8 }
+      - name: "compid"
+        offset: 4
+        field-type: { kind: u8 }
+      - name: "msgid"
+        offset: 5
+        field-type: { kind: u8 }
