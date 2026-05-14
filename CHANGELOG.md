@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
   Pre-existing defect; closes a CI-only red flag that would have surfaced as soon as any contributor ran the canonical workspace check locally.
 
+### Changed
+
+- **`Entity` `Tasking` / `FileRef` review polish (closes #1376)** — three follow-up fixes from the review of #1358:
+  - `TaskingState` and `TaskingRole` switched from `rename_all = "kebab-case"` to `rename_all = "snake_case"` to match the sibling closed-vocabulary enums on `Entity` (`EntityKind`, `AttributeValue`). Every variant in the current vocabulary is single-word so the wire bytes are identical today, but a future `InProgress`-style addition would have silently split the wire form across sibling enums.
+  - Added byte-length cap constants (`MAX_TASK_ID_LEN = 256`, `MAX_TASKING_NAME_LEN = 256`, `MAX_FILE_REF_URI_LEN = 4 KiB`, `MAX_FILE_REF_LABEL_LEN = 256`, `MAX_FILE_REF_MIME_LEN = 256`, `MAX_FILE_HASH_ALGORITHM_LEN = 32`, `MAX_FILE_HASH_HEX_LEN = 512`) and `Tasking::validate` / `FileRef::validate` / `FileHash::validate` defensive checks operators can call on inbound values before storing them. Mirrors the `MAX_CN_LENGTH = 256` / `MAX_ATTR_BAG_BYTES = 4 KiB` precedent.
+  - Field docstrings now point operators at `crate::sanitize::sanitize_for_log` for the operator-facing strings (`Tasking::task_id`, `Tasking::name`, `FileRef::uri`, `FileRef::label`) — those carry caller-supplied bytes that can include CR/LF and need scrubbing before structured-tracing inclusion.
+  - 6 new tests: wire-form pinning (`"acknowledged"` / `"subject"` JSON regression), unknown-variant rejection for both enums (`"bogus"` → `unknown variant` error), and oversize-string rejection for `Tasking` / `FileRef` / `FileHash`.
+
 ### Added
 
 - **MAVLink v1 header schema-parity test** — third cross-protocol confidence test for the declarative XTCE-style schema vocabulary (after STANAG 4586 in #1365 and DIS in #1373). Ships `crates/rustgate-mavlink/schemas/v1_header.yaml` describing the 6-byte v1 frame header (magic `0xFE` + len + seq + sysid + compid + msgid, all `u8`) and a `tests/schema_parity.rs` proptest asserting byte-identical round-trip for every arbitrary input, plus a companion smoke test demonstrating v2 `value-mapping` projection on `msgid = 0` → `"HEARTBEAT"`. Hand-rolled v1/v2 frame codec stays in place; v2 (10-byte header + signature trailer) and per-msgid payload schemas remain follow-ups.
