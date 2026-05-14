@@ -47,6 +47,13 @@
 //!   range stays fixed-offset whether the field is "present" or
 //!   not, only the `Entity` projection is gated. Real variable-
 //!   shift semantics are a separate v4 feature.
+//! - Nested typed-record arrays. v3 ships
+//!   [`schema::RepeatSpec`] for count-driven byte arrays
+//!   (`Bytes`-only, surfaced as a single byte slice the consumer
+//!   parses themselves) — enough for DIS articulation params,
+//!   ASTERIX repetitive items, MAVLink v2 payloads, and Link 16
+//!   word-3 extensions. Per-record field-list schemas where each
+//!   element carries its own decode pipeline are a v4 feature.
 //! - Bit-packed fields. The existing hand-rolled `rustgate-vmf`
 //!   and `rustgate-link16` codecs use bit-level FPI / FRI / GPI
 //!   indicators that don't fit a fixed-offset / fixed-length
@@ -73,6 +80,6 @@ pub mod schema;
 pub use codec::SchemaCodec;
 pub use error::{SchemaCodecError, SchemaError};
 pub use schema::{
-    Calibration, Endian, FieldDef, FieldType, MessageType, PresentIfSpec, Range, Schema,
-    SchemaVersion, ValueMapping,
+    Calibration, Endian, FieldDef, FieldType, MessageType, PresentIfSpec, Range, RepeatSpec,
+    Schema, SchemaVersion, ValueMapping,
 };
