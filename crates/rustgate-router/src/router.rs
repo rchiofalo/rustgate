@@ -138,6 +138,34 @@ rustgate_core::on_callback!(
 );
 
 rustgate_core::on_callback!(
+    /// Callback invoked once per [`crate::MessageInterceptor`]
+    /// invocation in [`Router::route_for_egress`]. The single
+    /// argument is the small fixed-vocabulary verdict label drawn
+    /// from the closed [`crate::InterceptorVerdict`] enum:
+    /// `"allow"`, `"drop"`, or `"modify"`. Fires once per
+    /// interceptor in the chain — a chain of three interceptors
+    /// where all return `Allow` produces three callback firings;
+    /// a chain where the second returns `Drop` produces two
+    /// firings (`"allow"` then `"drop"`) because the third never
+    /// runs.
+    ///
+    /// Wired by the server binary under
+    /// `#[cfg(feature = "metrics")]` to feed
+    /// `rustgate_router_interceptor_verdict_total{verdict}`.
+    /// Hot-reloadable via [`ArcSwap`]; default `None` keeps the
+    /// uninstalled hot path at a single `ArcSwap::load` +
+    /// `is_none()` check per interceptor firing. The label
+    /// vocabulary is closed by the [`crate::InterceptorVerdict`]
+    /// enum so cardinality is bounded at three. Operators today
+    /// have no way to observe whether interceptors are firing or
+    /// what verdicts they return — this callback closes that
+    /// gap without forcing `rustgate-router` to take a
+    /// `prometheus` dependency.
+    pub OnInterceptorVerdict,
+    &'static str
+);
+
+rustgate_core::on_callback!(
     /// Callback invoked once per Send and Receive PEP evaluation by the
     /// router. Arguments are the small fixed-vocabulary direction label
     /// (`"send"` or `"receive"`), the decision label (`"allow"`, `"deny"`,
@@ -1229,6 +1257,16 @@ pub struct Router {
     /// hot path on the uninstalled (default) build is a single
     /// `ArcSwap::load` + `is_empty()` check.
     interceptors: ArcSwap<Vec<MessageInterceptor>>,
+    /// Optional callback fired once per
+    /// [`crate::MessageInterceptor`] invocation with the verdict
+    /// label drawn from the closed [`crate::InterceptorVerdict`]
+    /// vocabulary (`"allow"`, `"drop"`, `"modify"`). Wired by the
+    /// server binary under `#[cfg(feature = "metrics")]` to feed
+    /// `rustgate_router_interceptor_verdict_total{verdict}`.
+    /// Hot-reloadable via `ArcSwap`; default `None` keeps the
+    /// un-wired hot path at a single `ArcSwap::load` +
+    /// `is_none()` check per interceptor firing.
+    on_interceptor_verdict: ArcSwap<Option<OnInterceptorVerdict>>,
     /// Optional registry mapping `metadata.source_protocol` to the
     /// `DynEntityCodec` that decodes its wire format into the canonical
     /// [`rustgate_core::entity::Entity`] shape.
@@ -1325,6 +1363,10 @@ impl std::fmt::Debug for Router {
                 &(**self.on_routed_by_kind.load()).is_some(),
             )
             .field(
+                "on_interceptor_verdict_installed",
+                &(**self.on_interceptor_verdict.load()).is_some(),
+            )
+            .field(
                 "require_classification_marking",
                 &self.require_classification_marking,
             )
@@ -1362,6 +1404,7 @@ impl Default for Router {
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
             interceptors: ArcSwap::from_pointee(Vec::new()),
+            on_interceptor_verdict: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1429,6 +1472,7 @@ impl Router {
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
             interceptors: ArcSwap::from_pointee(Vec::new()),
+            on_interceptor_verdict: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1485,6 +1529,7 @@ impl Router {
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
             interceptors: ArcSwap::from_pointee(Vec::new()),
+            on_interceptor_verdict: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -1544,6 +1589,7 @@ impl Router {
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
             interceptors: ArcSwap::from_pointee(Vec::new()),
+            on_interceptor_verdict: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
             on_routed_by_kind: ArcSwap::from_pointee(None),
             require_classification_marking: false,
@@ -2124,6 +2170,19 @@ impl Router {
         self.interceptors.store(Arc::new(chain));
     }
 
+    /// Install (or replace) the per-interceptor-verdict observer.
+    ///
+    /// The callback fires once per [`crate::MessageInterceptor`]
+    /// invocation inside [`Self::route_for_egress`] with the verdict
+    /// label drawn from the closed [`crate::InterceptorVerdict`]
+    /// vocabulary (`"allow"`, `"drop"`, `"modify"`). Wired by the
+    /// server binary under `#[cfg(feature = "metrics")]` to feed
+    /// `rustgate_router_interceptor_verdict_total{verdict}`.
+    /// Hot-reloadable via `ArcSwap`. Default `None`.
+    pub fn set_on_interceptor_verdict(&self, cb: Option<OnInterceptorVerdict>) {
+        self.on_interceptor_verdict.store(Arc::new(cb));
+    }
+
     /// Install (or replace) the per-kind routed-message observer.
     ///
     /// When installed, the callback fires once per admitted message
@@ -2145,6 +2204,21 @@ impl Router {
         let guard = self.on_routed_by_kind.load();
         if let Some(cb) = (**guard).as_ref() {
             cb(kind, protocol);
+        }
+    }
+
+    /// Internal helper — invoke the per-interceptor-verdict callback
+    /// if installed. `verdict` is one of `"allow"`, `"drop"`,
+    /// `"modify"` drawn from the closed
+    /// [`crate::InterceptorVerdict`] vocabulary. Fires once per
+    /// interceptor invocation in
+    /// [`Self::route_for_egress`]; the hot path on the un-installed
+    /// (default) build is a single `ArcSwap::load` + `is_none()`
+    /// check per interceptor in the chain.
+    fn emit_interceptor_verdict(&self, verdict: &'static str) {
+        let guard = self.on_interceptor_verdict.load();
+        if let Some(cb) = (**guard).as_ref() {
+            cb(verdict);
         }
     }
 
@@ -2743,6 +2817,21 @@ impl Router {
         if !interceptors_guard.is_empty() {
             for interceptor in interceptors_guard.iter() {
                 let verdict = interceptor(InterceptorContext::new(&msg));
+                // Fire the verdict observation BEFORE acting on the
+                // verdict — operators want to see the "drop"
+                // increment regardless of any side effect the
+                // match-arm produces (early return, payload
+                // swap), and a panic in the bridge closure must
+                // not leave the metric unincremented for an
+                // already-decided verdict. Verdict label drawn
+                // from the closed `InterceptorVerdict`
+                // vocabulary so cardinality is bounded at three.
+                let verdict_label: &'static str = match &verdict {
+                    InterceptorVerdict::Allow => "allow",
+                    InterceptorVerdict::Drop(_) => "drop",
+                    InterceptorVerdict::Modify(_) => "modify",
+                };
+                self.emit_interceptor_verdict(verdict_label);
                 match verdict {
                     InterceptorVerdict::Allow => {}
                     InterceptorVerdict::Drop(reason) => {
@@ -8672,5 +8761,107 @@ mod tests {
         let _ = nrx_b
             .try_recv()
             .expect("after replace, message must deliver");
+    }
+
+    // --- Interceptor verdict observer tests ---
+
+    #[tokio::test]
+    async fn interceptor_verdict_callback_fires_once_with_allow_label() {
+        // A chain of one Allow-returning interceptor must fire
+        // the verdict callback once with the `"allow"` label.
+        // Regression guard against the bridge silently dropping
+        // the Allow arm (the dominant production cadence).
+        let labels: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&labels);
+        let router = Router::new().with_interceptor(Arc::new(|_ctx| InterceptorVerdict::Allow));
+        router.set_on_interceptor_verdict(Some(Arc::new(move |label| {
+            captured.lock().push(label);
+        })));
+        let alice = make_identity("alice", &["g1"]);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        let captured = labels.lock().clone();
+        assert_eq!(captured, vec!["allow"]);
+    }
+
+    #[tokio::test]
+    async fn interceptor_verdict_callback_fires_once_with_drop_label() {
+        // Drop verdict must fire the verdict callback with the
+        // `"drop"` label exactly once — the route then
+        // terminates so no subsequent label can be observed.
+        let labels: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&labels);
+        let router = Router::new().with_interceptor(Arc::new(|_| InterceptorVerdict::Drop("test")));
+        router.set_on_interceptor_verdict(Some(Arc::new(move |label| {
+            captured.lock().push(label);
+        })));
+        let alice = make_identity("alice", &["g1"]);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        let captured = labels.lock().clone();
+        assert_eq!(captured, vec!["drop"]);
+    }
+
+    #[tokio::test]
+    async fn interceptor_verdict_callback_fires_once_with_modify_label() {
+        // Modify verdict must fire the verdict callback with
+        // the `"modify"` label exactly once per interceptor.
+        let labels: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&labels);
+        let router = Router::new().with_interceptor(Arc::new(|ctx| {
+            let mut replaced = ctx.message.clone();
+            replaced.payload = Bytes::from_static(b"<rewritten/>");
+            InterceptorVerdict::Modify(Box::new(replaced))
+        }));
+        router.set_on_interceptor_verdict(Some(Arc::new(move |label| {
+            captured.lock().push(label);
+        })));
+        let alice = make_identity("alice", &["g1"]);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        let captured = labels.lock().clone();
+        assert_eq!(captured, vec!["modify"]);
+    }
+
+    #[tokio::test]
+    async fn interceptor_verdict_callback_fires_per_chain_member_on_all_allow() {
+        // A chain of three Allow-returning interceptors must
+        // fire the verdict callback three times — one
+        // observation per chain member. Confirms the emission
+        // is per-interceptor, not per-message.
+        let labels: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&labels);
+        let router = Router::new()
+            .with_interceptor(Arc::new(|_| InterceptorVerdict::Allow))
+            .with_interceptor(Arc::new(|_| InterceptorVerdict::Allow))
+            .with_interceptor(Arc::new(|_| InterceptorVerdict::Allow));
+        router.set_on_interceptor_verdict(Some(Arc::new(move |label| {
+            captured.lock().push(label);
+        })));
+        let alice = make_identity("alice", &["g1"]);
+        let (ptx_a, ntx_a, _prx_a, _nrx_a) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+            .await;
+        router
+            .route(make_chat(&alice, Destination::Group("g1".into())))
+            .await;
+        let captured = labels.lock().clone();
+        assert_eq!(captured, vec!["allow", "allow", "allow"]);
     }
 }
