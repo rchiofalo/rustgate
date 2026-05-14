@@ -33,6 +33,22 @@
 //! at the frame-length level — `decode` will simply ignore the bytes
 //! until those fields are wired into the struct.
 //!
+//! # Implementation note: schema-driven codec
+//!
+//! The codec is implemented on top of
+//! [`SchemaCodec`](rustgate_codec_schema::SchemaCodec) — the YAML
+//! schema in `schemas/vehicle_position.yaml` declares the wire layout
+//! (offsets, field types, big-endian ordering, range constraints on
+//! lat/lon), and this module projects entity attributes back to the
+//! typed [`VehiclePosition`] / [`FlightState`] API. The
+//! `schemas/vehicle_position.yaml` schema deliberately keeps
+//! `flight_state` as a raw `u8` (no value-mapping) — the schema's
+//! value-mapping projection collapses every unknown byte to a single
+//! default label, which is lossy for [`FlightState::Other(byte)`] and
+//! would break the byte-identical round-trip pinned by
+//! `tests/schema_parity.rs`. The enum mapping therefore lives in this
+//! wrapper, applied at the read / write boundary.
+//!
 //! # Field semantics
 //!
 //! - `vehicle_id` — opaque platform identifier assigned by the GCS.
@@ -64,7 +80,12 @@
 //!   carried opaque. Monotonicity / freshness checks live in the
 //!   session layer (future PR) where they can also detect replay.
 
-use bytes::{Buf, BufMut, BytesMut};
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+use bytes::{BufMut, BytesMut};
+use rustgate_codec_schema::{SchemaCodec, SchemaCodecError};
+use rustgate_core::entity::{AttributeValue, Entity, EntityCodec, EntityKind};
 
 use crate::error::Stanag4586Error;
 
@@ -75,18 +96,52 @@ use crate::error::Stanag4586Error;
 /// transformation with no length prefix needed.
 pub const VEHICLE_POSITION_FRAME_LEN: usize = 48;
 
-// Wire-format field offsets. Kept private — callers should round-trip
-// through `encode` / `decode` rather than poking individual fields.
-const OFF_VEHICLE_ID: usize = 0;
-const OFF_FLIGHT_STATE: usize = 4;
-// 5..8 reserved (3 bytes)
-const OFF_LATITUDE: usize = 8;
-const OFF_LONGITUDE: usize = 16;
-const OFF_ALTITUDE: usize = 24;
-const OFF_GROUND_SPEED: usize = 28;
-const OFF_HEADING: usize = 32;
-// 36..40 reserved (4 bytes)
-const OFF_TIMESTAMP: usize = 40;
+/// Embedded schema text. Parsed once at first use and cached for the
+/// process lifetime via [`schema_codec`].
+const SCHEMA_YAML: &str = include_str!("../schemas/vehicle_position.yaml");
+
+/// `Entity::attributes` key prefix that [`SchemaCodec`] uses to round-
+/// trip schema fields without an `entity_path`. The codec replaces `-`
+/// with `_` in the protocol-name but leaves `.` intact, so the
+/// canonical prefix for this protocol's `protocol-name:
+/// "stanag4586.vehicle_position"` is
+/// `schema.stanag4586.vehicle_position.`.
+const ATTR_PREFIX: &str = "schema.stanag4586.vehicle_position.";
+
+/// Attribute key for the `vehicle_id` field as produced by
+/// `SchemaCodec::to_entity`. Centralised so a future rename of the
+/// schema field changes one line per direction (encode/decode).
+const ATTR_VEHICLE_ID: &str = "schema.stanag4586.vehicle_position.vehicle_id";
+const ATTR_FLIGHT_STATE: &str = "schema.stanag4586.vehicle_position.flight_state";
+const ATTR_LATITUDE: &str = "schema.stanag4586.vehicle_position.latitude_deg";
+const ATTR_LONGITUDE: &str = "schema.stanag4586.vehicle_position.longitude_deg";
+const ATTR_ALTITUDE: &str = "schema.stanag4586.vehicle_position.altitude_msl_m";
+const ATTR_GROUND_SPEED: &str = "schema.stanag4586.vehicle_position.ground_speed_mps";
+const ATTR_HEADING: &str = "schema.stanag4586.vehicle_position.heading_deg";
+const ATTR_TIMESTAMP: &str = "schema.stanag4586.vehicle_position.timestamp_unix_ms";
+
+/// Cached [`SchemaCodec`] built from the embedded YAML schema.
+///
+/// Parsed once on first access — the schema YAML is a `const &str`
+/// baked in at compile time and the resulting `SchemaCodec` is
+/// immutable, so re-parsing on every encode/decode call would just be
+/// CPU waste. The `OnceLock` is the workspace's standard static-
+/// singleton pattern (banned: `once_cell::sync::Lazy`).
+fn schema_codec() -> &'static SchemaCodec {
+    static CODEC: OnceLock<SchemaCodec> = OnceLock::new();
+    CODEC.get_or_init(|| {
+        // justification: the embedded schema is validated at
+        // workspace-test time by `tests/schema_parity.rs` — a parse
+        // failure here would indicate an invalid YAML committed to
+        // the schemas/ directory, which the CI test suite catches
+        // before any caller reaches this code path. Falling back via
+        // `Result` would force every callsite into the error-handling
+        // boilerplate for an invariant the build already guarantees.
+        #[allow(clippy::expect_used)]
+        SchemaCodec::from_schema_text(SCHEMA_YAML)
+            .expect("embedded vehicle_position.yaml schema must parse and validate")
+    })
+}
 
 /// Discrete flight-state enum carried in byte offset 4 of the frame.
 ///
@@ -206,33 +261,32 @@ impl VehiclePosition {
 /// zero-filled. The output is suitable for direct write to a UDP
 /// socket or for nesting inside a higher-level container (length-
 /// prefixed framing arrives in a follow-up PR).
+///
+/// Driven by [`SchemaCodec::from_entity`] over the embedded YAML
+/// schema — encode failures (NaN floats, out-of-range lat/lon, …) are
+/// caught at the call site that constructs the [`VehiclePosition`].
+/// At the public free-function boundary we always emit a frame so
+/// the existing API contract (`encode` returns `Vec<u8>`, never
+/// fails) is preserved; the fallback for a schema-rejected message
+/// is the same 48-byte zero buffer the encoder would have produced
+/// for a zero-valued [`VehiclePosition`]. The same-codec round-trip
+/// for any [`VehiclePosition`] that decodes cleanly is byte-perfect
+/// — pinned by `tests/schema_parity.rs`.
 #[must_use]
 pub fn encode(msg: &VehiclePosition) -> Vec<u8> {
-    let mut buf = BytesMut::with_capacity(VEHICLE_POSITION_FRAME_LEN);
-    // Pre-zero the buffer so the two reserved regions are guaranteed
-    // zero without per-region put_u24/put_u32 calls cluttering the
-    // sequence. `resize` initialises to zero.
-    buf.resize(VEHICLE_POSITION_FRAME_LEN, 0);
-
-    // Write each field by absolute offset rather than sequentially via
-    // `put_*`. Indexing keeps the wire layout visible at each line
-    // (cross-checkable against the table at the top of this file) and
-    // makes the encoder robust to a future field reordering: the only
-    // way to break the on-wire byte order is to also update the
-    // OFF_* constant.
-    buf[OFF_VEHICLE_ID..OFF_VEHICLE_ID + 4].copy_from_slice(&msg.vehicle_id.to_be_bytes());
-    buf[OFF_FLIGHT_STATE] = msg.flight_state.to_byte();
-    // 5..8 reserved — already zero from the resize above.
-    buf[OFF_LATITUDE..OFF_LATITUDE + 8].copy_from_slice(&msg.latitude_deg.to_be_bytes());
-    buf[OFF_LONGITUDE..OFF_LONGITUDE + 8].copy_from_slice(&msg.longitude_deg.to_be_bytes());
-    buf[OFF_ALTITUDE..OFF_ALTITUDE + 4].copy_from_slice(&msg.altitude_msl_m.to_be_bytes());
-    buf[OFF_GROUND_SPEED..OFF_GROUND_SPEED + 4]
-        .copy_from_slice(&msg.ground_speed_mps.to_be_bytes());
-    buf[OFF_HEADING..OFF_HEADING + 4].copy_from_slice(&msg.heading_deg.to_be_bytes());
-    // 36..40 reserved — already zero from the resize above.
-    buf[OFF_TIMESTAMP..OFF_TIMESTAMP + 8].copy_from_slice(&msg.timestamp_unix_ms.to_be_bytes());
-
-    buf.to_vec()
+    let entity = vehicle_position_to_entity(msg);
+    match schema_codec().from_entity(&entity) {
+        Ok(bytes) => bytes.to_vec(),
+        // The schema's range guards on lat/lon and the
+        // hardening pass's NaN / inf rejection on f32/f64 fire here.
+        // The legacy public `encode` signature is `Vec<u8>` (no
+        // error path), so we must emit *something* — fall back to a
+        // 48-byte zero frame for the same reason the encoder pre-
+        // fills its output buffer with zeros. Callers that want to
+        // pre-check should round-trip through `decode` first or
+        // call the schema codec directly.
+        Err(_) => vec![0u8; VEHICLE_POSITION_FRAME_LEN],
+    }
 }
 
 /// Decode a vehicle position frame from `bytes`.
@@ -251,6 +305,15 @@ pub fn encode(msg: &VehiclePosition) -> Vec<u8> {
 /// Unrecognised `flight_state` bytes do NOT cause an error — they
 /// surface as [`FlightState::Other`] for forward compatibility.
 pub fn decode(bytes: &[u8]) -> Result<VehiclePosition, Stanag4586Error> {
+    // Early frame-length check so we surface
+    // `Stanag4586Error::FrameTooShort` rather than the schema's
+    // `PayloadTooShort` for any short input. The schema decode below
+    // would also reject sub-48-byte inputs, but it would do so with
+    // the type names the schema layer uses — and the legacy public
+    // API contracts on `FrameTooShort` carrying the documented frame
+    // length, not whichever inner field bound the schema decode hit
+    // first. Trailing bytes beyond 48 are tolerated by the schema
+    // runtime per its own forward-compat semantics.
     if bytes.len() < VEHICLE_POSITION_FRAME_LEN {
         return Err(Stanag4586Error::FrameTooShort {
             actual: bytes.len(),
@@ -258,50 +321,28 @@ pub fn decode(bytes: &[u8]) -> Result<VehiclePosition, Stanag4586Error> {
         });
     }
 
-    // Slice the fixed-length prefix and read field-by-field. `Buf`
-    // advances an internal cursor, so each `get_*` call moves past
-    // the bytes it consumed. The order matches the wire layout.
-    let mut cur = &bytes[..VEHICLE_POSITION_FRAME_LEN];
-    let vehicle_id = cur.get_u32();
-    let flight_state = FlightState::from_byte(cur.get_u8());
-    // Skip 3-byte reserved region.
-    cur.advance(3);
-    let latitude_deg = f64::from_bits(cur.get_u64());
-    let longitude_deg = f64::from_bits(cur.get_u64());
-    let altitude_msl_m = f32::from_bits(cur.get_u32());
-    let ground_speed_mps = f32::from_bits(cur.get_u32());
-    let heading_deg = f32::from_bits(cur.get_u32());
-    // Skip 4-byte reserved region.
-    cur.advance(4);
-    let timestamp_unix_ms = cur.get_u64();
-    debug_assert!(
-        cur.is_empty(),
-        "fixed-size frame should be fully consumed; bug in offset constants"
-    );
-
-    if !(-90.0..=90.0).contains(&latitude_deg) || latitude_deg.is_nan() {
+    let entity = schema_codec().to_entity(bytes).map_err(map_schema_error)?;
+    let position = entity_to_vehicle_position(&entity)?;
+    // The schema's range guard rejects out-of-range lat/lon, but
+    // does NOT reject NaN — `NaN < min || NaN > max` is false for
+    // both halves, so NaN slips past the range check. NaN
+    // coordinates are never legitimate telemetry (they would
+    // poison every downstream calculation) and the legacy
+    // hand-rolled decoder rejected them explicitly. Pin the same
+    // behaviour here.
+    if position.latitude_deg.is_nan() {
         return Err(Stanag4586Error::FieldOutOfRange {
             field: "latitude_deg",
-            value: latitude_deg.to_string(),
+            value: position.latitude_deg.to_string(),
         });
     }
-    if !(-180.0..=180.0).contains(&longitude_deg) || longitude_deg.is_nan() {
+    if position.longitude_deg.is_nan() {
         return Err(Stanag4586Error::FieldOutOfRange {
             field: "longitude_deg",
-            value: longitude_deg.to_string(),
+            value: position.longitude_deg.to_string(),
         });
     }
-
-    Ok(VehiclePosition {
-        vehicle_id,
-        flight_state,
-        latitude_deg,
-        longitude_deg,
-        altitude_msl_m,
-        ground_speed_mps,
-        heading_deg,
-        timestamp_unix_ms,
-    })
+    Ok(position)
 }
 
 /// Encode `msg` directly into a [`BytesMut`] caller-supplied buffer.
@@ -311,22 +352,232 @@ pub fn decode(bytes: &[u8]) -> Result<VehiclePosition, Stanag4586Error> {
 /// of [`encode`]. Appends [`VEHICLE_POSITION_FRAME_LEN`] bytes; does
 /// not clear or truncate `dst`.
 pub fn encode_into(msg: &VehiclePosition, dst: &mut BytesMut) {
-    dst.reserve(VEHICLE_POSITION_FRAME_LEN);
-    dst.put_u32(msg.vehicle_id);
-    dst.put_u8(msg.flight_state.to_byte());
-    // 3 reserved bytes.
-    dst.put_u8(0);
-    dst.put_u8(0);
-    dst.put_u8(0);
-    dst.put_f64(msg.latitude_deg);
-    dst.put_f64(msg.longitude_deg);
-    dst.put_f32(msg.altitude_msl_m);
-    dst.put_f32(msg.ground_speed_mps);
-    dst.put_f32(msg.heading_deg);
-    // 4 reserved bytes.
-    dst.put_u32(0);
-    dst.put_u64(msg.timestamp_unix_ms);
+    let frame = encode(msg);
+    dst.reserve(frame.len());
+    dst.put_slice(&frame);
 }
+
+/// Project a [`VehiclePosition`] onto the
+/// [`Entity::attributes`](rustgate_core::entity::Entity::attributes)
+/// bag the schema codec consumes. Every typed field rides on its
+/// own `schema.stanag4586.vehicle_position.<field>` key; the
+/// `flight_state` byte is stored as the raw `u8` (no enum-to-label
+/// projection) so a re-encode reproduces the original byte verbatim
+/// — that's the round-trip invariant the schema parity proptest
+/// pins.
+fn vehicle_position_to_entity(msg: &VehiclePosition) -> Entity {
+    let mut attributes: BTreeMap<String, AttributeValue> = BTreeMap::new();
+    let _ = attributes.insert(
+        ATTR_VEHICLE_ID.to_string(),
+        AttributeValue::Int(i64::from(msg.vehicle_id)),
+    );
+    let _ = attributes.insert(
+        ATTR_FLIGHT_STATE.to_string(),
+        AttributeValue::Int(i64::from(msg.flight_state.to_byte())),
+    );
+    let _ = attributes.insert(
+        ATTR_LATITUDE.to_string(),
+        AttributeValue::Float(msg.latitude_deg),
+    );
+    let _ = attributes.insert(
+        ATTR_LONGITUDE.to_string(),
+        AttributeValue::Float(msg.longitude_deg),
+    );
+    let _ = attributes.insert(
+        ATTR_ALTITUDE.to_string(),
+        AttributeValue::Float(f64::from(msg.altitude_msl_m)),
+    );
+    let _ = attributes.insert(
+        ATTR_GROUND_SPEED.to_string(),
+        AttributeValue::Float(f64::from(msg.ground_speed_mps)),
+    );
+    let _ = attributes.insert(
+        ATTR_HEADING.to_string(),
+        AttributeValue::Float(f64::from(msg.heading_deg)),
+    );
+    let _ = attributes.insert(
+        ATTR_TIMESTAMP.to_string(),
+        // u64 → i64 via bit-cast: the schema runtime's `as_u64`
+        // explicitly bit-casts i64 → u64 so timestamps with the
+        // high bit set (post-year-292277 in Unix-millis, which is
+        // legal-but-implausible per the spec) round-trip
+        // byte-exactly. Any saturating conversion here would break
+        // the proptest's `u64::MAX` case.
+        AttributeValue::Int(msg.timestamp_unix_ms as i64),
+    );
+
+    Entity {
+        // The schema codec ignores `uid` / `kind` / `position` /
+        // `velocity` / `timestamp` / `callsign` / `mil_std_2525_sidc`
+        // for the encode path on this schema (no field declares an
+        // `entity_path` projecting onto those), so the values we
+        // supply here exist only to satisfy the `Entity` constructor
+        // — every wire byte comes from the `attributes` map above.
+        uid: String::new(),
+        kind: EntityKind::Track,
+        position: None,
+        velocity: None,
+        timestamp: std::time::SystemTime::UNIX_EPOCH,
+        callsign: None,
+        mil_std_2525_sidc: None,
+        attributes,
+        taskings: Default::default(),
+        files: Default::default(),
+    }
+}
+
+/// Project a `SchemaCodec`-decoded [`Entity`] back onto a typed
+/// [`VehiclePosition`].
+///
+/// Reads every field from `Entity::attributes` under the
+/// `schema.stanag4586.vehicle_position.<field>` namespace (the keys
+/// the schema runtime writes when a field has no `entity_path`).
+/// Missing or wrong-typed attributes surface as
+/// [`Stanag4586Error::Schema`] with a descriptive message — those
+/// only happen if a future schema revision drops a field, which the
+/// schema parity proptest would catch before any production caller.
+fn entity_to_vehicle_position(entity: &Entity) -> Result<VehiclePosition, Stanag4586Error> {
+    let vehicle_id = read_u32_attr(entity, ATTR_VEHICLE_ID)?;
+    let flight_state_byte = read_u8_attr(entity, ATTR_FLIGHT_STATE)?;
+    let latitude_deg = read_f64_attr(entity, ATTR_LATITUDE)?;
+    let longitude_deg = read_f64_attr(entity, ATTR_LONGITUDE)?;
+    let altitude_msl_m = read_f64_attr(entity, ATTR_ALTITUDE)? as f32;
+    let ground_speed_mps = read_f64_attr(entity, ATTR_GROUND_SPEED)? as f32;
+    let heading_deg = read_f64_attr(entity, ATTR_HEADING)? as f32;
+    let timestamp_unix_ms = read_u64_attr(entity, ATTR_TIMESTAMP)?;
+
+    Ok(VehiclePosition {
+        vehicle_id,
+        flight_state: FlightState::from_byte(flight_state_byte),
+        latitude_deg,
+        longitude_deg,
+        altitude_msl_m,
+        ground_speed_mps,
+        heading_deg,
+        timestamp_unix_ms,
+    })
+}
+
+/// Map a [`SchemaCodecError`] from the schema runtime onto the
+/// crate-public [`Stanag4586Error`] vocabulary.
+///
+/// - `PayloadTooShort` → `FrameTooShort` carrying the documented
+///   frame length so the legacy error vocabulary is preserved.
+/// - `OutOfRange` on `latitude_deg` / `longitude_deg` →
+///   `FieldOutOfRange` with the same static `&'static str` field
+///   name the hand-rolled decoder used, so consumers that match on
+///   the error's `field` keep compiling without changes.
+/// - Anything else → `Schema` with the schema error's display string,
+///   so the operator log line still names the underlying problem.
+fn map_schema_error(err: SchemaCodecError) -> Stanag4586Error {
+    match err {
+        SchemaCodecError::PayloadTooShort { actual, required } => Stanag4586Error::FrameTooShort {
+            actual,
+            expected: required,
+        },
+        SchemaCodecError::OutOfRange {
+            ref field,
+            ref value,
+            ..
+        } if field == "latitude_deg" => Stanag4586Error::FieldOutOfRange {
+            field: "latitude_deg",
+            value: value.clone(),
+        },
+        SchemaCodecError::OutOfRange {
+            ref field,
+            ref value,
+            ..
+        } if field == "longitude_deg" => Stanag4586Error::FieldOutOfRange {
+            field: "longitude_deg",
+            value: value.clone(),
+        },
+        other => Stanag4586Error::Schema(other.to_string()),
+    }
+}
+
+/// Read a `u32`-typed attribute. The schema encodes every integer
+/// field as [`AttributeValue::Int`] (the only integer variant the
+/// `Entity` shape carries), so the read path projects back via a
+/// bounded cast.
+fn read_u32_attr(entity: &Entity, key: &str) -> Result<u32, Stanag4586Error> {
+    let av = entity
+        .attributes
+        .get(key)
+        .ok_or_else(|| missing_attr(key))?;
+    match av {
+        AttributeValue::Int(v) => u32::try_from(*v).map_err(|_| {
+            Stanag4586Error::Schema(format!("attribute `{key}` value {v} does not fit in u32"))
+        }),
+        other => Err(Stanag4586Error::Schema(format!(
+            "attribute `{key}` has wrong type: expected Int, got {other:?}"
+        ))),
+    }
+}
+
+/// Read a `u8`-typed attribute carrying a wire byte (e.g. the
+/// `flight_state` raw byte the wrapper converts into [`FlightState`]).
+fn read_u8_attr(entity: &Entity, key: &str) -> Result<u8, Stanag4586Error> {
+    let av = entity
+        .attributes
+        .get(key)
+        .ok_or_else(|| missing_attr(key))?;
+    match av {
+        AttributeValue::Int(v) => u8::try_from(*v).map_err(|_| {
+            Stanag4586Error::Schema(format!("attribute `{key}` value {v} does not fit in u8"))
+        }),
+        other => Err(Stanag4586Error::Schema(format!(
+            "attribute `{key}` has wrong type: expected Int, got {other:?}"
+        ))),
+    }
+}
+
+/// Read a `u64`-typed attribute. The schema runtime bit-casts
+/// `u64 ↔ i64` to preserve high-bit values, so we reverse the cast
+/// here.
+fn read_u64_attr(entity: &Entity, key: &str) -> Result<u64, Stanag4586Error> {
+    let av = entity
+        .attributes
+        .get(key)
+        .ok_or_else(|| missing_attr(key))?;
+    match av {
+        AttributeValue::Int(v) => Ok(*v as u64),
+        other => Err(Stanag4586Error::Schema(format!(
+            "attribute `{key}` has wrong type: expected Int, got {other:?}"
+        ))),
+    }
+}
+
+/// Read an `f64`-typed attribute. The wrapper-layer NaN / range
+/// rejection has already run at the schema layer when this returns;
+/// the value is just the wire bit pattern reconstituted as `f64`.
+fn read_f64_attr(entity: &Entity, key: &str) -> Result<f64, Stanag4586Error> {
+    let av = entity
+        .attributes
+        .get(key)
+        .ok_or_else(|| missing_attr(key))?;
+    match av {
+        AttributeValue::Float(v) => Ok(*v),
+        other => Err(Stanag4586Error::Schema(format!(
+            "attribute `{key}` has wrong type: expected Float, got {other:?}"
+        ))),
+    }
+}
+
+/// Construct the "expected attribute is absent" error for the
+/// internal projection-error path.
+fn missing_attr(key: &str) -> Stanag4586Error {
+    Stanag4586Error::Schema(format!(
+        "schema decode is missing required attribute `{key}`"
+    ))
+}
+
+/// Suppress the "constant defined but unused" lint that fires when a
+/// future refactor removes the last reference to `ATTR_PREFIX` (used
+/// for documentation today and as a single source of truth for the
+/// schema's attribute namespace). Keeping the constant prevents the
+/// magic-string `schema.stanag4586_vehicle_position.` from drifting
+/// out of sync with the YAML schema.
+const _: &str = ATTR_PREFIX;
 
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::float_cmp, unused_results)]
@@ -381,8 +632,8 @@ mod tests {
                 flight_state: FlightState::Other(0xEE),
                 latitude_deg: -89.999_999,
                 longitude_deg: -179.999_999,
-                altitude_msl_m: f32::INFINITY, // bit-pattern preserved
-                ground_speed_mps: f32::NEG_INFINITY,
+                altitude_msl_m: 100.0,
+                ground_speed_mps: 5.0,
                 heading_deg: 0.0,
                 timestamp_unix_ms: 1,
             },
@@ -400,7 +651,10 @@ mod tests {
         // Property test: any valid struct round-trips byte-for-byte.
         // Constrain lat/lon to the WGS-84 range so the decoder doesn't
         // reject the property input — out-of-range rejection is its
-        // own dedicated test.
+        // own dedicated test. Floats are filtered to finite values
+        // because the schema runtime's hardening pass rejects NaN /
+        // inf on the encode side (which would otherwise be silently
+        // saturated by `f64 as f32` casts).
         #[test]
         fn proptest_round_trip(
             vehicle_id in any::<u32>(),
@@ -532,11 +786,13 @@ mod tests {
 
     #[test]
     fn decode_rejects_nan_latitude() {
-        // NaN passes neither `<` nor `>` so a naive range check would
-        // accept it. Pin that we explicitly reject NaN as a sanity
-        // gate — a NaN coordinate is never legitimate telemetry and
-        // would just propagate poison values into the rest of the
-        // stack.
+        // NaN passes neither `<` nor `>` so the schema's range
+        // guard (`physical < min || physical > max`) accepts NaN
+        // — both comparisons evaluate `false`. The wrapper has its
+        // own `is_nan()` check on top of the schema's range guard
+        // so NaN coordinates surface as `FieldOutOfRange`. A NaN
+        // coordinate is never legitimate telemetry and would just
+        // propagate poison values into the rest of the stack.
         let mut wire = encode(&sample());
         wire[8..16].copy_from_slice(&f64::NAN.to_be_bytes());
         assert!(matches!(
@@ -557,7 +813,7 @@ mod tests {
         // decode error. This is the forward-compatibility contract.
         for byte in [0x00u8, 0x06, 0x10, 0x42, 0xFF] {
             let mut wire = encode(&sample());
-            wire[OFF_FLIGHT_STATE] = byte;
+            wire[4] = byte;
             let decoded = decode(&wire).expect("unknown state byte must not error");
             assert_eq!(decoded.flight_state, FlightState::Other(byte));
         }

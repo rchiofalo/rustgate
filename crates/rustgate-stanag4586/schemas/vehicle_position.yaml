@@ -20,20 +20,21 @@
 # zero on encode (matches the hand-rolled `vehicle_position::encode`
 # behaviour, which also resizes its buffer to zeros).
 #
-# What this schema does NOT carry today (v1 limitations):
+# # Why `flight_state` stays a raw `u8` (not value-mapping)
 #
-# - The `FlightState` enum byte → typed-variant mapping. v1 schemas
-#   have a `value-mapping` grammar but the runtime treats the raw
-#   integer as the value; the typed `FlightState::LaunchPreparation`
-#   / `::Loiter` / `::Transit` / `::ReturnToBase` / `::Landed`
-#   / `::Other(u8)` projection is a v2 feature. The byte appears in
-#   `Entity::attributes` under `schema.stanag4586_vehicle_position.flight_state`.
-# - The lat ∈ [-90, 90] / lon ∈ [-180, 180] range guards from the
-#   hand-rolled decoder. v1 schemas have no range-constraint
-#   grammar; the schema parity test below only exercises in-range
-#   inputs so byte-equivalence holds. A v2 schema feature for
-#   range constraints would let us re-add these as a parse-time
-#   error rather than carrying them in a wrapper layer.
+# The v2 `value-mapping` grammar could project the wire byte to a
+# typed label (`0x01` → `"LaunchPreparation"`, …, with `default_raw`
+# folding unrecognised bytes into a single fallback label). That
+# projection is **lossy**: `FlightState::Other(0x42)` and
+# `FlightState::Other(0xFF)` both collapse to the same default label
+# and re-encode to the same byte, breaking the byte-perfect
+# round-trip the parity proptest contracts on. The typed
+# `FlightState::LaunchPreparation` / `::Loiter` / `::Transit` /
+# `::ReturnToBase` / `::Landed` / `::Other(u8)` mapping is therefore
+# handled in the Rust wrapper (`vehicle_position.rs`) rather than the
+# schema — the schema carries the raw byte verbatim under
+# `schema.stanag4586.vehicle_position.flight_state` and the wrapper
+# converts on the read/write boundary.
 #
 # Provenance: byte layout cross-checked against
 # `crates/rustgate-stanag4586/src/vehicle_position.rs` — the
@@ -59,10 +60,12 @@ message-types:
         offset: 8
         field-type: { kind: f64 }
         endian: big
+        range: { min: -90.0, max: 90.0 }
       - name: "longitude_deg"
         offset: 16
         field-type: { kind: f64 }
         endian: big
+        range: { min: -180.0, max: 180.0 }
       - name: "altitude_msl_m"
         offset: 24
         field-type: { kind: f32 }
