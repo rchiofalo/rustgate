@@ -156,6 +156,25 @@ pub struct MqttPushConfig {
     /// 60 s is the SensorThings community default.
     #[serde(default = "default_mqtt_keepalive_secs")]
     pub keepalive_secs: u16,
+
+    /// Optional path to a PEM-encoded CA bundle used to verify
+    /// the broker's server certificate when the broker URI scheme
+    /// is `mqtts://`. When unset, the system root certificate
+    /// store is used (via `rustls-native-certs`) — the right
+    /// answer for brokers presenting publicly-trusted
+    /// certificates. Set this when the broker is behind a
+    /// private CA (e.g. a tactical deployment with an internal
+    /// PKI). Ignored entirely for plaintext `mqtt://` URIs.
+    ///
+    /// The file is loaded via the shared
+    /// [`rustgate_core::secrets::read_secret_file`] helper at
+    /// startup, which enforces a strict mode-0o077 permissions
+    /// gate, a 32 KiB size cap, and wraps the contents in
+    /// `Zeroizing<String>` (CA bundles are public material, but
+    /// routing through the same hardened reader unifies the
+    /// loading discipline across the workspace).
+    #[serde(default)]
+    pub ca_bundle_path: Option<String>,
 }
 
 impl MqttPushConfig {

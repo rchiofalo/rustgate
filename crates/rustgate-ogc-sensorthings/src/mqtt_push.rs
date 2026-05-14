@@ -50,19 +50,38 @@
 //!   given the explicit subscribe set, but the runtime guard is
 //!   cheap).
 //!
+//! ## TLS (`mqtts://`)
+//!
+//! `mqtts://` URIs are supported via rumqttc's `rustls`-backed
+//! [`rumqttc::Transport::tls_with_config`]. When
+//! [`crate::config::MqttPushConfig::ca_bundle_path`] is unset,
+//! the subscriber uses the system root certificate store (via
+//! `rustls-native-certs`, the default of
+//! [`rumqttc::TlsConfiguration::default`]) — the right answer
+//! for brokers presenting publicly-trusted certificates. When
+//! the operator supplies a CA bundle path, the PEM is loaded via
+//! the shared [`rustgate_core::secrets::read_secret_file`]
+//! helper (mode-0o077 permissions gate, 32 KiB size cap,
+//! `Zeroizing` wrap) and handed to
+//! [`rumqttc::TlsConfiguration::Simple`] as the `ca` field;
+//! `alpn` and `client_auth` are both `None` (no SNI override, no
+//! client certificate). Workspace policy bans `native-tls`
+//! (see `deny.toml`), so the only TLS backend wired here is
+//! rustls.
+//!
 //! ## What is intentionally NOT here yet
 //!
-//! - **TLS configuration.** rumqttc's `rustls`-backed
-//!   `MqttOptions::set_transport(Transport::tls_with_config(...))`
-//!   accepts a custom `rustls::ClientConfig` for CA pinning,
-//!   client certs, and SNI override. The MVP wires the default
-//!   `mqtts://` transport when the scheme is `mqtts` and
-//!   plaintext when it is `mqtt`; advanced TLS knobs come in a
-//!   follow-up once a deployment actually needs them.
+//! - **mTLS (client_auth)**. The TLS path verifies the broker's
+//!   server certificate but does not present a client
+//!   certificate. Operators that need mutual TLS will get
+//!   `client-cert-path` / `client-key-path` config fields in a
+//!   follow-up — the `TlsConfiguration::Simple.client_auth`
+//!   slot is already wired through `None` so the change is
+//!   additive.
 //! - **Auth (username / password / OAuth)**. SensorThings does
-//!   not pin an auth scheme for the MQTT push transport; bearer-
-//!   over-MQTT and PSK are both encountered in the wild.
-//!   Deferred to the same follow-up as TLS.
+//!   not pin an auth scheme for the MQTT push transport;
+//!   bearer-over-MQTT and PSK are both encountered in the wild.
+//!   Deferred to its own follow-up.
 //! - **QoS configuration.** Subscribes are issued at QoS 1
 //!   ("at-least-once") to match the SensorThings community
 //!   default. QoS 0 ("fire-and-forget") and QoS 2
@@ -76,9 +95,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS, TlsConfiguration, Transport};
 use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+use rustgate_core::secrets::{SecretFileOpts, read_secret_file};
 use rustgate_core::tasks::{SubsystemHandle, spawn_background};
 use rustgate_router::Router;
 use tokio::sync::Notify;
@@ -196,27 +216,66 @@ async fn run_subscriber(
     });
 }
 
+/// Maximum CA-bundle size in bytes. 32 KiB comfortably covers a
+/// PEM bundle of dozens of root certificates (a single PEM-encoded
+/// CA cert is ~1.5 KiB); the cap exists to bound RAM if the
+/// configured path is mis-pointed at a log file.
+const MAX_CA_BUNDLE_BYTES: u64 = 32 * 1024;
+
 fn build_mqtt_options(mqtt: &MqttPushConfig) -> Result<MqttOptions, String> {
     // Parse the broker URI; rumqttc's MqttOptions does not accept
     // a URI directly so we extract host / port / TLS-or-not.
     let url = url_lite::parse(&mqtt.broker_uri).map_err(|e| e.to_string())?;
-    if url.tls {
-        // MVP shipped without TLS knobs; rumqttc's
-        // `TlsConfiguration::Simple` + system-CA path lands in
-        // the follow-up that also adds the CA-pin / mTLS
-        // configuration (see module docs "What is intentionally
-        // NOT here yet"). Reject `mqtts://` explicitly rather
-        // than silently downgrading to plaintext, so operators
-        // see the gap at startup instead of on the wire.
-        return Err(
-            "mqtts:// (TLS) is not yet supported; use mqtt:// for now or wait for the TLS follow-up".to_string(),
-        );
-    }
     let mut opts = MqttOptions::new(&mqtt.client_id, &url.host, url.port);
     let _ = opts.set_keep_alive(std::time::Duration::from_secs(u64::from(
         mqtt.keepalive_secs,
     )));
+    if url.tls {
+        let tls = build_tls_configuration(mqtt.ca_bundle_path.as_deref())?;
+        let _ = opts.set_transport(Transport::tls_with_config(tls));
+    }
     Ok(opts)
+}
+
+/// Build the rumqttc TLS configuration for the broker connection.
+///
+/// - `None` → [`TlsConfiguration::default`], which loads the
+///   system root certificate store via `rustls-native-certs`.
+///   The right answer for brokers behind a publicly-trusted CA.
+/// - `Some(path)` → load the PEM bundle via
+///   [`rustgate_core::secrets::read_secret_file`] (mode-0o077
+///   perm gate, 32 KiB size cap, `Zeroizing` wrap) and pass the
+///   bytes to [`TlsConfiguration::Simple`] with `alpn = None`
+///   and `client_auth = None`. mTLS is deferred — see module
+///   docs.
+///
+/// Returns a human-readable error string on failure (file
+/// missing, permissions too open, oversized, etc.) so the
+/// subscriber-startup warn log keeps the operator-facing
+/// diagnostic shape that already existed for "broker URI
+/// invalid".
+fn build_tls_configuration(ca_bundle_path: Option<&str>) -> Result<TlsConfiguration, String> {
+    let Some(path) = ca_bundle_path else {
+        // System roots: rumqttc's Default impl wraps a rustls
+        // ClientConfig built with `load_native_certs()`.
+        return Ok(TlsConfiguration::default());
+    };
+    // Widen the size cap from the 8 KiB default — CA bundles
+    // commonly carry multiple roots and exceed the token-sized
+    // default. The Zeroizing wrap is overkill for a public-key
+    // PEM, but using the shared reader keeps the mode-0o077 gate
+    // and unifies the loading discipline with every other
+    // on-disk material in the workspace.
+    let pem = read_secret_file(path, &SecretFileOpts::with_max_bytes(MAX_CA_BUNDLE_BYTES))
+        .map_err(|e| format!("failed to load ca-bundle-path `{path}`: {e}"))?;
+    Ok(TlsConfiguration::Simple {
+        // `Vec<u8>` consumes the bytes; the Zeroizing<String>
+        // wiped on drop holds the only other copy, so taking a
+        // fresh allocation here is fine.
+        ca: pem.as_bytes().to_vec(),
+        alpn: None,
+        client_auth: None,
+    })
 }
 
 async fn handle_publish(
@@ -417,5 +476,62 @@ mod tests {
             MqttPushConfig::datastream_topic(42),
             "v1.0/Datastreams(42)/Observations"
         );
+    }
+
+    #[test]
+    fn build_mqtt_options_accepts_mqtts_with_default_roots() {
+        // `mqtts://` with no ca-bundle-path uses
+        // `TlsConfiguration::default()` (system roots). The
+        // option construction must succeed — the actual TLS
+        // handshake is a runtime concern beyond unit-test scope.
+        let cfg = MqttPushConfig {
+            broker_uri: "mqtts://broker.example.org:8883".into(),
+            client_id: "rustgate-test".into(),
+            keepalive_secs: 60,
+            ca_bundle_path: None,
+        };
+        let opts = build_mqtt_options(&cfg).expect("mqtts:// with default roots");
+        assert_eq!(opts.broker_address(), ("broker.example.org".into(), 8883));
+    }
+
+    #[test]
+    fn build_mqtt_options_still_works_for_plaintext() {
+        // The TLS branch must not regress the plaintext path —
+        // `mqtt://` URIs continue to skip transport configuration
+        // and use rumqttc's default plaintext TCP.
+        let cfg = MqttPushConfig {
+            broker_uri: "mqtt://broker.example.org:1883".into(),
+            client_id: "rustgate-test".into(),
+            keepalive_secs: 60,
+            ca_bundle_path: None,
+        };
+        let opts = build_mqtt_options(&cfg).expect("mqtt:// must still build");
+        assert_eq!(opts.broker_address(), ("broker.example.org".into(), 1883));
+    }
+
+    #[test]
+    fn ca_bundle_path_round_trips_through_serde() {
+        // The new field must accept the kebab-case TOML form and
+        // round-trip back. Pins the schema name so a future
+        // rename surfaces as a test failure rather than an
+        // operator-facing config break.
+        let toml_str = r#"
+            broker-uri = "mqtts://broker.example.org:8883"
+            client-id = "rustgate-test"
+            keepalive-secs = 60
+            ca-bundle-path = "/etc/rustgate/sensorthings-broker-ca.pem"
+        "#;
+        let cfg: MqttPushConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            cfg.ca_bundle_path.as_deref(),
+            Some("/etc/rustgate/sensorthings-broker-ca.pem")
+        );
+        // Default (omitted) must remain `None` so existing
+        // configs stay forward-compatible.
+        let toml_default = r#"
+            broker-uri = "mqtt://broker.example.org:1883"
+        "#;
+        let cfg2: MqttPushConfig = toml::from_str(toml_default).expect("parse");
+        assert!(cfg2.ca_bundle_path.is_none());
     }
 }
