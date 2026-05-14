@@ -105,6 +105,77 @@ pub struct SensorThingsConfig {
     /// on shutdown).
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
+
+    /// Optional MQTT push configuration. When set and the
+    /// `mqtt-push` Cargo feature is enabled, the wiring layer
+    /// spawns an MQTT subscriber task that connects to the
+    /// configured broker and listens on
+    /// `v1.0/Datastreams(<N>)/Observations` for each entry in
+    /// [`Self::subscriptions`]. Push and polling are not
+    /// mutually exclusive — operators that want belt-and-
+    /// suspenders coverage can run both; the router's existing
+    /// dedup catches duplicate observation deliveries.
+    ///
+    /// `None` (default) disables MQTT push entirely. The polling
+    /// path is unaffected by this field.
+    #[serde(default)]
+    pub mqtt_push: Option<MqttPushConfig>,
+}
+
+/// MQTT push subscriber configuration for the OGC SensorThings
+/// adapter. When present, the wiring layer spawns an MQTT client
+/// that connects to a remote broker and subscribes to each
+/// configured datastream's `v1.0/Datastreams(<N>)/Observations`
+/// topic, decodes incoming JSON payloads, and routes them through
+/// the same projection as the polling path.
+///
+/// SensorThings v1.0 §10 mandates the MQTT topic shape for push
+/// — the broker URI is operator-supplied because the protocol
+/// does not pin a default port or scheme. `mqtts://` (TLS) is
+/// strongly recommended for any deployment that touches public
+/// networks; the underlying MQTT client uses `rustls` for TLS
+/// (workspace policy bans `native-tls`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct MqttPushConfig {
+    /// Broker URI, e.g. `mqtts://broker.example.org:8883` or
+    /// `mqtt://broker.example.org:1883`. The scheme picks TLS
+    /// on / off and the port defaults to MQTT standard 8883
+    /// (TLS) / 1883 (plaintext) when omitted.
+    pub broker_uri: String,
+
+    /// MQTT client id. Per the MQTT 5.0 spec, two simultaneous
+    /// connections with the same client id from different IPs
+    /// will cause the broker to disconnect whichever connected
+    /// first — operators must pick a unique value per rustgate
+    /// instance.
+    #[serde(default = "default_mqtt_client_id")]
+    pub client_id: String,
+
+    /// Keep-alive in seconds. Mirrors the MQTT `keepalive` knob;
+    /// 60 s is the SensorThings community default.
+    #[serde(default = "default_mqtt_keepalive_secs")]
+    pub keepalive_secs: u16,
+}
+
+impl MqttPushConfig {
+    /// Construct an MQTT topic filter for a given datastream id,
+    /// matching the SensorThings v1.0 §10 grammar
+    /// `v1.0/Datastreams(<N>)/Observations`. Exposed `pub(crate)`
+    /// so the `mqtt_push` module and the tests below share one
+    /// canonical formatter.
+    #[must_use]
+    pub(crate) fn datastream_topic(datastream_id: u64) -> String {
+        format!("v1.0/Datastreams({datastream_id})/Observations")
+    }
+}
+
+fn default_mqtt_client_id() -> String {
+    "rustgate-sensorthings".to_string()
+}
+
+fn default_mqtt_keepalive_secs() -> u16 {
+    60
 }
 
 /// One entry in the subscription list. Each entry binds a
@@ -462,6 +533,7 @@ mod tests {
             request_timeout_secs: 10,
             expand_location: true,
             subscriptions: vec![],
+            mqtt_push: None,
         };
         let with_override = Subscription {
             datastream_id: 42,
@@ -496,6 +568,7 @@ mod tests {
             request_timeout_secs: 10,
             expand_location: true,
             subscriptions: vec![],
+            mqtt_push: None,
         };
         assert_eq!(
             cfg.normalised_endpoint(),

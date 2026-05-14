@@ -124,12 +124,16 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod mapper;
+#[cfg(feature = "mqtt-push")]
+pub mod mqtt_push;
 pub mod types;
 pub mod wiring;
 
 pub use client::SensorThingsClient;
-pub use config::{EntityKindTag, SensorThingsConfig, Subscription};
+pub use config::{EntityKindTag, MqttPushConfig, SensorThingsConfig, Subscription};
 pub use error::SensorThingsError;
 pub use mapper::observation_to_entity;
+#[cfg(feature = "mqtt-push")]
+pub use mqtt_push::spawn_mqtt_push_task;
 pub use types::{Datastream, Location, Observation, ObservationsPage, Thing};
 pub use wiring::{SOURCE_OGC_SENSORTHINGS, spawn_polling_task};

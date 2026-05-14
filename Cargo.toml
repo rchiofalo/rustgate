@@ -224,6 +224,15 @@ rustdds = "0.11"
 # convention (`rt/<topic>`) so a rustgate-published message is
 # visible to `ros2 topic echo`.
 ros2-client = "0.8"
+# MQTT v3.1 / v5 client used by `rustgate-ogc-sensorthings` behind
+# the `mqtt-push` feature flag to subscribe to remote SensorThings
+# brokers (the v1.0/Datastreams(N)/Observations push topic).
+# `default-features = false` + `use-rustls` is mandatory — the
+# default feature set includes `use-native-tls` which trips the
+# `deny.toml` ban on `native-tls` (rustls is the sole TLS provider
+# workspace-wide). Pure-Rust path is `#![forbid(unsafe_code)]`
+# compatible.
+rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }
