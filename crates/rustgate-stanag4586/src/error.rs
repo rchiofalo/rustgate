@@ -44,6 +44,22 @@ pub enum Stanag4586Error {
         /// alive in the error chain.
         value: String,
     },
+
+    /// Catch-all for errors surfaced by the schema-driven codec runtime
+    /// that the wire-format error vocabulary above does not have a
+    /// dedicated variant for.
+    ///
+    /// The wrapped string carries the underlying
+    /// [`rustgate_codec_schema::SchemaCodecError`] display form so
+    /// operator logs name the root cause (typically a missing /
+    /// wrong-typed attribute on the round-trip path, which only
+    /// happens if a future schema revision drops a field).
+    /// `FrameTooShort` and `FieldOutOfRange` (the operationally
+    /// common rejects) are mapped to their dedicated variants first;
+    /// `Schema` captures the long tail without growing the public
+    /// API surface for one-off schema-internal errors.
+    #[error("STANAG 4586 schema codec error: {0}")]
+    Schema(String),
 }
 
 impl From<Stanag4586Error> for io::Error {
@@ -113,6 +129,19 @@ mod tests {
             }
             .source()
             .is_none()
+        );
+        assert!(Stanag4586Error::Schema("test".into()).source().is_none());
+    }
+
+    #[test]
+    fn schema_variant_display_quotes_inner_message() {
+        // Pin the wrapped-error display so any future refactor that
+        // changes the prefix string regenerates this assertion at
+        // the same time. Operator log readers grep on the prefix.
+        let err = Stanag4586Error::Schema("payload too short".into());
+        assert_eq!(
+            err.to_string(),
+            "STANAG 4586 schema codec error: payload too short"
         );
     }
 }

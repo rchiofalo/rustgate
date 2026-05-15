@@ -12,14 +12,16 @@ workspace = true
 
 [dependencies]
 rustgate-core = { workspace = true }
+# `vehicle_position` is implemented on top of `SchemaCodec`: the YAML
+# schema in `schemas/vehicle_position.yaml` declares the wire layout,
+# and the wrapper in `src/vehicle_position.rs` projects entity
+# attributes back to the typed `VehiclePosition` / `FlightState` API.
+# The schema-parity proptest in `tests/schema_parity.rs` pins the
+# byte-identical round-trip against the original hand-rolled encoder
+# referenced in the git history.
+rustgate-codec-schema = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-# Used only by the schema-parity proptest in `tests/schema_parity.rs`
-# to assert that a `SchemaCodec` built from `schemas/vehicle_position.yaml`
-# is byte-equivalent to the hand-rolled `vehicle_position::encode` for
-# every arbitrary input proptest generates. Not pulled into the
-# production crate — the codec runtime stays hand-rolled.
-rustgate-codec-schema = { workspace = true }
