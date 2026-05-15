@@ -54,11 +54,14 @@
 //!   ASTERIX repetitive items, MAVLink v2 payloads, and Link 16
 //!   word-3 extensions. Per-record field-list schemas where each
 //!   element carries its own decode pipeline are a v4 feature.
-//! - Bit-packed fields. The existing hand-rolled `rustgate-vmf`
-//!   and `rustgate-link16` codecs use bit-level FPI / FRI / GPI
-//!   indicators that don't fit a fixed-offset / fixed-length
-//!   model. Schema-driven ports of those codecs land after we
-//!   add bit-field support.
+//! - Cross-byte bit-packed fields. The v3 grammar adds
+//!   [`schema::FieldDef::bit_offset`] / [`schema::FieldDef::bit_width`]
+//!   for fixed sub-byte fields that fit entirely within ONE byte
+//!   (`bit_offset + bit_width <= 8`) — enough to schema-fy 1-bit
+//!   flags and small packed enums (VMF FPI / FRI / GPI indicators,
+//!   ASTERIX FSPEC bitmaps, Link 16 J-series sub-words). Bit-packed
+//!   fields whose width spans byte boundaries — the canonical Link 16
+//!   word-level packing case — remain a separate v4 feature.
 //!
 //! ## Two-PR rollout
 //!
