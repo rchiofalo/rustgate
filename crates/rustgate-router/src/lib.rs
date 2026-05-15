@@ -58,10 +58,10 @@ pub use repeater::EmergencyRepeater;
 pub use replay::ReplayFilter;
 pub use router::{
     ACCESS_LOG_TARGET, AuthzEvent, AuthzObserver, NORMAL_CHANNEL_CAPACITY, OnAuthzInFlightChanged,
-    OnDropped, OnDroppedByTenant, OnFanout, OnFanoutByTenant, OnMessageDelivered, OnMessageDropped,
-    OnMulticastForward, OnMulticastOversizeDropped, OnObligationApplied, OnPepDecision, OnRouted,
-    OnRoutedByKind, PRIORITY_CHANNEL_CAPACITY, PendingAudit, PendingDelivery,
-    PositionReplayLimitConfig, RoutedMessage, Router, SessionHandle,
+    OnDropped, OnDroppedByTenant, OnFanout, OnFanoutByTenant, OnInterceptorVerdict,
+    OnMessageDelivered, OnMessageDropped, OnMulticastForward, OnMulticastOversizeDropped,
+    OnObligationApplied, OnPepDecision, OnRouted, OnRoutedByKind, PRIORITY_CHANNEL_CAPACITY,
+    PendingAudit, PendingDelivery, PositionReplayLimitConfig, RoutedMessage, Router, SessionHandle,
 };
 pub use store_forward::{
     ClientQueue, DEFAULT_CLIENT_QUEUE_MAX_BYTES, OnDrainObservation, QueueStats, StoreForwardError,

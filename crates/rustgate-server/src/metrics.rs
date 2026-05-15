@@ -186,6 +186,11 @@ static PEP_RECEIVE_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
 static PEP_EVALUATION_SECONDS: OnceLock<HistogramVec> = OnceLock::new();
 static OBLIGATION_APPLIED_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static OBLIGATION_FAILURES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+// Per-verdict MessageInterceptor SPI counter. Label vocabulary is
+// closed by the `rustgate_router::InterceptorVerdict` enum (allow,
+// drop, modify), so cardinality is bounded at three regardless of
+// chain length or message volume.
+static ROUTER_INTERCEPTOR_VERDICT_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static CRL_AGE_SECONDS: OnceLock<IntGauge> = OnceLock::new();
@@ -1341,6 +1346,23 @@ pub fn init() -> prometheus::Result<()> {
     registry.register(Box::new(obligation_failures_total.clone()))?;
     let _ = OBLIGATION_FAILURES_TOTAL.set(obligation_failures_total);
 
+    // Per-verdict MessageInterceptor SPI counter. Operators today have
+    // no way to observe whether their installed interceptors are
+    // firing or what verdicts they return — this closes that gap.
+    // Label cardinality is bounded at three by the closed
+    // `rustgate_router::InterceptorVerdict` enum, so the metric is
+    // safe to enable in every deployment regardless of chain length
+    // or message volume.
+    let router_interceptor_verdict_total = IntCounterVec::new(
+        Opts::new(
+            "rustgate_router_interceptor_verdict_total",
+            "MessageInterceptor verdicts by label",
+        ),
+        &["verdict"],
+    )?;
+    registry.register(Box::new(router_interceptor_verdict_total.clone()))?;
+    let _ = ROUTER_INTERCEPTOR_VERDICT_TOTAL.set(router_interceptor_verdict_total);
+
     #[cfg(all(feature = "jemalloc", not(target_os = "windows")))]
     {
         let jemalloc_resident = IntGauge::with_opts(Opts::new(
@@ -1778,6 +1800,36 @@ pub fn router_pep_decision_callback() -> rustgate_router::OnPepDecision {
 pub fn router_obligation_applied_callback() -> rustgate_router::OnObligationApplied {
     Arc::new(|kind: &'static str| {
         obligation_applied_total().with_label_values(&[kind]).inc();
+    })
+}
+
+/// Per-verdict MessageInterceptor SPI counter. Wired by the server
+/// binary at startup via
+/// [`rustgate_router::Router::set_on_interceptor_verdict`] under
+/// `#[cfg(feature = "metrics")]`. Label vocabulary is closed by the
+/// [`rustgate_router::InterceptorVerdict`] enum so cardinality is
+/// bounded at three (`allow`, `drop`, `modify`).
+pub fn router_interceptor_verdict_total() -> &'static IntCounterVec {
+    ROUTER_INTERCEPTOR_VERDICT_TOTAL.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_router_interceptor_verdict_total",
+            "fallback",
+            &["verdict"],
+        )
+    })
+}
+
+/// Build the [`rustgate_router::OnInterceptorVerdict`] callback that
+/// feeds the `rustgate_router_interceptor_verdict_total{verdict}`
+/// counter. Fires once per interceptor invocation in
+/// [`rustgate_router::Router::route_for_egress`]; a chain of N
+/// interceptors that all return `Allow` produces N increments on
+/// the `allow` label per routed message.
+pub fn router_interceptor_verdict_callback() -> rustgate_router::OnInterceptorVerdict {
+    Arc::new(|verdict: &'static str| {
+        router_interceptor_verdict_total()
+            .with_label_values(&[verdict])
+            .inc();
     })
 }
 
@@ -4615,6 +4667,64 @@ mod tests {
                 .get();
             assert_eq!(mp_after - mp_before, 2);
             assert_eq!(mp_payload_after - mp_payload_before, 1);
+        }
+
+        #[test]
+        fn router_interceptor_verdict_total_registered_with_verdict_label() {
+            // Pin the metric name and label arity. Operators
+            // dashboard this on `verdict=` — a rename or accidental
+            // label rewrite would silently break alerting.
+            ensure_init();
+            router_interceptor_verdict_total()
+                .with_label_values(&["allow"])
+                .inc_by(0);
+            let mf = family("rustgate_router_interceptor_verdict_total")
+                .expect("rustgate_router_interceptor_verdict_total must be registered");
+            assert_eq!(mf.get_field_type(), prometheus::proto::MetricType::COUNTER);
+            let labels: Vec<&str> = mf
+                .get_metric()
+                .first()
+                .map(|m| m.get_label().iter().map(|l| l.name()).collect())
+                .unwrap_or_default();
+            assert!(
+                labels.contains(&"verdict"),
+                "must carry `verdict` label, got {labels:?}"
+            );
+        }
+
+        #[test]
+        fn router_interceptor_verdict_callback_increments_per_verdict_label() {
+            // Three distinct verdicts must increment independently —
+            // collapsing them would cost operators the ability to
+            // distinguish a normal pass-through (`allow`) from a
+            // policy override (`drop` / `modify`).
+            ensure_init();
+            let cb = router_interceptor_verdict_callback();
+            let allow_before = router_interceptor_verdict_total()
+                .with_label_values(&["allow"])
+                .get();
+            let drop_before = router_interceptor_verdict_total()
+                .with_label_values(&["drop"])
+                .get();
+            let modify_before = router_interceptor_verdict_total()
+                .with_label_values(&["modify"])
+                .get();
+            cb("allow");
+            cb("allow");
+            cb("drop");
+            cb("modify");
+            let allow_after = router_interceptor_verdict_total()
+                .with_label_values(&["allow"])
+                .get();
+            let drop_after = router_interceptor_verdict_total()
+                .with_label_values(&["drop"])
+                .get();
+            let modify_after = router_interceptor_verdict_total()
+                .with_label_values(&["modify"])
+                .get();
+            assert_eq!(allow_after - allow_before, 2);
+            assert_eq!(drop_after - drop_before, 1);
+            assert_eq!(modify_after - modify_before, 1);
         }
     }
 }

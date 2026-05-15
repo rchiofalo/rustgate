@@ -1076,6 +1076,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         // Fires once per admitted message (not per recipient), with
         // `kind` drawn from the closed `EntityKind::as_str` vocabulary.
         router.set_on_routed_by_kind(Some(metrics::router_routed_by_kind_callback()));
+        // MessageInterceptor SPI observability — feeds
+        // `rustgate_router_interceptor_verdict_total{verdict}`. Fires
+        // once per interceptor invocation; the closed
+        // `InterceptorVerdict` enum bounds cardinality at three
+        // (`allow`, `drop`, `modify`).
+        router.set_on_interceptor_verdict(Some(metrics::router_interceptor_verdict_callback()));
     }
 
     // Closes #854. Per-recipient delivery audit is opt-in because a
