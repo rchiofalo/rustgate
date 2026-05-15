@@ -44,7 +44,7 @@
 //! `schemas/vehicle_position.yaml` schema deliberately keeps
 //! `flight_state` as a raw `u8` (no value-mapping) — the schema's
 //! value-mapping projection collapses every unknown byte to a single
-//! default label, which is lossy for [`FlightState::Other(byte)`] and
+//! default label, which is lossy for [`FlightState::Other`] and
 //! would break the byte-identical round-trip pinned by
 //! `tests/schema_parity.rs`. The enum mapping therefore lives in this
 //! wrapper, applied at the read / write boundary.
