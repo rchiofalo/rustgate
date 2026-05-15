@@ -36,7 +36,7 @@
 //! # Implementation note: schema-driven codec
 //!
 //! The codec is implemented on top of
-//! [`SchemaCodec`](rustgate_codec_schema::SchemaCodec) — the YAML
+//! [`SchemaCodec`] — the YAML
 //! schema in `schemas/vehicle_position.yaml` declares the wire layout
 //! (offsets, field types, big-endian ordering, range constraints on
 //! lat/lon), and this module projects entity attributes back to the
