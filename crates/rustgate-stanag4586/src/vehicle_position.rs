@@ -80,12 +80,11 @@
 //!   carried opaque. Monotonicity / freshness checks live in the
 //!   session layer (future PR) where they can also detect replay.
 
-use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use bytes::{BufMut, BytesMut};
 use rustgate_codec_schema::{SchemaCodec, SchemaCodecError};
-use rustgate_core::entity::{AttributeValue, Entity, EntityCodec, EntityKind};
+use rustgate_core::entity::{AttributeValue, Entity, EntityCodec};
 
 use crate::error::Stanag4586Error;
 
@@ -262,31 +261,49 @@ impl VehiclePosition {
 /// socket or for nesting inside a higher-level container (length-
 /// prefixed framing arrives in a follow-up PR).
 ///
-/// Driven by [`SchemaCodec::from_entity`] over the embedded YAML
-/// schema — encode failures (NaN floats, out-of-range lat/lon, …) are
-/// caught at the call site that constructs the [`VehiclePosition`].
-/// At the public free-function boundary we always emit a frame so
-/// the existing API contract (`encode` returns `Vec<u8>`, never
-/// fails) is preserved; the fallback for a schema-rejected message
-/// is the same 48-byte zero buffer the encoder would have produced
-/// for a zero-valued [`VehiclePosition`]. The same-codec round-trip
-/// for any [`VehiclePosition`] that decodes cleanly is byte-perfect
-/// — pinned by `tests/schema_parity.rs`.
+/// **Why hand-rolled rather than driven by [`SchemaCodec`]:** the
+/// decode-side docstring explicitly allows `NaN` in
+/// `altitude_msl_m`, `ground_speed_mps`, and `heading_deg` — senders
+/// transmit signed / unwrapped values during in-flight calibration,
+/// and the legacy contract is to round-trip those byte-for-byte.
+/// The schema runtime's `f32` / `f64` encoder rejects non-finite
+/// values with `OutOfRange` (introduced in #1362's hardening pass)
+/// because for *most* protocols `NaN` on the wire indicates a
+/// calibration bug. STANAG 4586 is the exception. To keep the
+/// legacy round-trip contract intact, the wrapper bypasses
+/// `SchemaCodec::from_entity` for the encode path and writes the
+/// bytes directly at the offsets the schema YAML declares.
+/// [`SchemaCodec`] still drives the **decode** path (where its
+/// lat / lon range guards are useful and the NaN-tolerance for
+/// alt / speed / heading is the runtime's existing behaviour).
+///
+/// The fuzz target `fuzz/fuzz_targets/stanag4586_vehicle_position.rs`
+/// surfaced the regression where the previous SchemaCodec-driven
+/// encode silently fell back to a 48-byte zero buffer when the
+/// encoder rejected NaN in alt / speed / heading, discarding the
+/// entire message including the (perfectly valid) `vehicle_id`,
+/// `flight_state`, `latitude_deg`, `longitude_deg`, and
+/// `timestamp_unix_ms` fields. The hand-rolled encode below
+/// preserves every byte the legacy codec preserved.
 #[must_use]
 pub fn encode(msg: &VehiclePosition) -> Vec<u8> {
-    let entity = vehicle_position_to_entity(msg);
-    match schema_codec().from_entity(&entity) {
-        Ok(bytes) => bytes.to_vec(),
-        // The schema's range guards on lat/lon and the
-        // hardening pass's NaN / inf rejection on f32/f64 fire here.
-        // The legacy public `encode` signature is `Vec<u8>` (no
-        // error path), so we must emit *something* — fall back to a
-        // 48-byte zero frame for the same reason the encoder pre-
-        // fills its output buffer with zeros. Callers that want to
-        // pre-check should round-trip through `decode` first or
-        // call the schema codec directly.
-        Err(_) => vec![0u8; VEHICLE_POSITION_FRAME_LEN],
-    }
+    // Hand-rolled write. The offsets MUST stay in lockstep with
+    // `schemas/vehicle_position.yaml` — the schema-parity proptest
+    // (decode bytes via SchemaCodec → encode via this function →
+    // decode again) is the contract that pins them. Any offset
+    // drift here lights up the proptest immediately.
+    let mut buf = vec![0u8; VEHICLE_POSITION_FRAME_LEN];
+    buf[0..4].copy_from_slice(&msg.vehicle_id.to_be_bytes());
+    buf[4] = msg.flight_state.to_byte();
+    // 5..8 reserved — stay zero.
+    buf[8..16].copy_from_slice(&msg.latitude_deg.to_be_bytes());
+    buf[16..24].copy_from_slice(&msg.longitude_deg.to_be_bytes());
+    buf[24..28].copy_from_slice(&msg.altitude_msl_m.to_be_bytes());
+    buf[28..32].copy_from_slice(&msg.ground_speed_mps.to_be_bytes());
+    buf[32..36].copy_from_slice(&msg.heading_deg.to_be_bytes());
+    // 36..40 reserved — stay zero.
+    buf[40..48].copy_from_slice(&msg.timestamp_unix_ms.to_be_bytes());
+    buf
 }
 
 /// Decode a vehicle position frame from `bytes`.
@@ -355,75 +372,6 @@ pub fn encode_into(msg: &VehiclePosition, dst: &mut BytesMut) {
     let frame = encode(msg);
     dst.reserve(frame.len());
     dst.put_slice(&frame);
-}
-
-/// Project a [`VehiclePosition`] onto the
-/// [`Entity::attributes`](rustgate_core::entity::Entity::attributes)
-/// bag the schema codec consumes. Every typed field rides on its
-/// own `schema.stanag4586.vehicle_position.<field>` key; the
-/// `flight_state` byte is stored as the raw `u8` (no enum-to-label
-/// projection) so a re-encode reproduces the original byte verbatim
-/// — that's the round-trip invariant the schema parity proptest
-/// pins.
-fn vehicle_position_to_entity(msg: &VehiclePosition) -> Entity {
-    let mut attributes: BTreeMap<String, AttributeValue> = BTreeMap::new();
-    let _ = attributes.insert(
-        ATTR_VEHICLE_ID.to_string(),
-        AttributeValue::Int(i64::from(msg.vehicle_id)),
-    );
-    let _ = attributes.insert(
-        ATTR_FLIGHT_STATE.to_string(),
-        AttributeValue::Int(i64::from(msg.flight_state.to_byte())),
-    );
-    let _ = attributes.insert(
-        ATTR_LATITUDE.to_string(),
-        AttributeValue::Float(msg.latitude_deg),
-    );
-    let _ = attributes.insert(
-        ATTR_LONGITUDE.to_string(),
-        AttributeValue::Float(msg.longitude_deg),
-    );
-    let _ = attributes.insert(
-        ATTR_ALTITUDE.to_string(),
-        AttributeValue::Float(f64::from(msg.altitude_msl_m)),
-    );
-    let _ = attributes.insert(
-        ATTR_GROUND_SPEED.to_string(),
-        AttributeValue::Float(f64::from(msg.ground_speed_mps)),
-    );
-    let _ = attributes.insert(
-        ATTR_HEADING.to_string(),
-        AttributeValue::Float(f64::from(msg.heading_deg)),
-    );
-    let _ = attributes.insert(
-        ATTR_TIMESTAMP.to_string(),
-        // u64 → i64 via bit-cast: the schema runtime's `as_u64`
-        // explicitly bit-casts i64 → u64 so timestamps with the
-        // high bit set (post-year-292277 in Unix-millis, which is
-        // legal-but-implausible per the spec) round-trip
-        // byte-exactly. Any saturating conversion here would break
-        // the proptest's `u64::MAX` case.
-        AttributeValue::Int(msg.timestamp_unix_ms as i64),
-    );
-
-    Entity {
-        // The schema codec ignores `uid` / `kind` / `position` /
-        // `velocity` / `timestamp` / `callsign` / `mil_std_2525_sidc`
-        // for the encode path on this schema (no field declares an
-        // `entity_path` projecting onto those), so the values we
-        // supply here exist only to satisfy the `Entity` constructor
-        // — every wire byte comes from the `attributes` map above.
-        uid: String::new(),
-        kind: EntityKind::Track,
-        position: None,
-        velocity: None,
-        timestamp: std::time::SystemTime::UNIX_EPOCH,
-        callsign: None,
-        mil_std_2525_sidc: None,
-        attributes,
-        taskings: Default::default(),
-        files: Default::default(),
-    }
 }
 
 /// Project a `SchemaCodec`-decoded [`Entity`] back onto a typed
@@ -645,6 +593,49 @@ mod tests {
             let decoded = decode(&bytes).expect("round-trip decode");
             assert_eq!(decoded, original, "round trip mismatch");
         }
+    }
+
+    #[test]
+    fn encode_preserves_vehicle_id_when_altitude_is_nan() {
+        // Regression test for the fuzz finding (weekly-fuzz #25951309559)
+        // on the SchemaCodec-driven encode path: the schema's f32/f64
+        // encoder rejects non-finite floats with `OutOfRange` (correct
+        // behaviour for most protocols), but `altitude_msl_m`,
+        // `ground_speed_mps`, and `heading_deg` are documented as
+        // NaN-tolerant on this codec (in-flight calibration ships
+        // signed / unwrapped values). The previous encode implementation
+        // caught the schema rejection and silently fell back to a 48-byte
+        // ZERO buffer, discarding every other field including the
+        // perfectly-valid `vehicle_id`. The fuzz harness surfaced this
+        // as `vehicle_id 770 → encode → decode → vehicle_id 0`.
+        //
+        // The hand-rolled encode this test pins writes bytes directly
+        // at the schema's declared offsets and does not invoke
+        // SchemaCodec's f32/f64 finite-check, so NaN passes through.
+        let msg = VehiclePosition {
+            vehicle_id: 770,
+            flight_state: FlightState::LaunchPreparation,
+            latitude_deg: 38.5,
+            longitude_deg: -77.0,
+            altitude_msl_m: f32::NAN,
+            ground_speed_mps: 0.0,
+            heading_deg: 0.0,
+            timestamp_unix_ms: 0,
+        };
+        let bytes = encode(&msg);
+        assert_eq!(bytes.len(), VEHICLE_POSITION_FRAME_LEN);
+        let decoded = decode(&bytes).expect("round-trip decode with NaN altitude");
+        assert_eq!(
+            decoded.vehicle_id, 770,
+            "vehicle_id must survive NaN-altitude encode"
+        );
+        assert_eq!(decoded.flight_state, FlightState::LaunchPreparation);
+        // NaN bit-pattern survives — IEEE-754 NaN != NaN so compare
+        // via `is_nan()`, matching the fuzz harness's pattern.
+        assert!(
+            decoded.altitude_msl_m.is_nan(),
+            "altitude must round-trip as NaN, not zero"
+        );
     }
 
     proptest! {
