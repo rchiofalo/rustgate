@@ -1,0 +1,155 @@
+# IEEE 1278.1 Entity State PDU body, clause 5.3.3.1.
+#
+# Carries the body that rides after the 12-byte common header
+# (`schemas/pdu_header.yaml`) when `pdu_type = 0x01`. This schema
+# covers ONLY the body bytes — the header is dispatched in front of
+# it by the caller. Total wire size is `132 + 16 × N` where `N` is
+# the count carried in the `num_articulation_parameters` byte at
+# body offset 7.
+#
+# Wire layout (body offsets, relative to start of body — the 12-byte
+# header sits at PDU offsets 0..12 and is encoded separately):
+#
+# offset │ size │ field                       │ type
+# ───────┼──────┼─────────────────────────────┼─────────────────────────
+#    0   │  6   │ entity_id                   │ bytes  (site / app / entity, 3×u16 BE)
+#    6   │  1   │ force_id                    │ u8     (1 Friendly, 2 Opposing, …)
+#    7   │  1   │ num_articulation_parameters │ u8     (count for the tail repeat)
+#    8   │  8   │ entity_type                 │ bytes  (kind / domain / country BE / category / subcategory / specific / extra)
+#   16   │  8   │ alternative_entity_type     │ bytes  (same shape as entity_type)
+#   24   │ 12   │ linear_velocity             │ bytes  (3×f32 BE — m/s)
+#   36   │ 24   │ location_ecef               │ bytes  (3×f64 BE — ECEF metres)
+#   60   │ 12   │ orientation                 │ bytes  (3×f32 BE — Euler psi/theta/phi rad)
+#   72   │  4   │ appearance                  │ u32 BE (appearance bitfield)
+#   76   │ 40   │ dead_reckoning              │ bytes  (1 algorithm + 15 opaque + 3×f32 acc + 3×f32 angvel)
+#  116   │  1   │ marking_charset             │ u8     (1 ASCII, 2 Army marking, 3 Digit Chevron)
+#  117   │ 11   │ marking                     │ bytes  (11 ASCII bytes, NUL-padded by the typed wrapper)
+#  128   │  4   │ capabilities                │ u32 BE (capabilities bitfield)
+#  132   │ N×16 │ articulation_parameters     │ bytes  (variable repeat, count-from offset 7)
+#
+# # Why composite fields stay as `bytes` blobs (not primitive splits)
+#
+# Each composite (entity_id, entity_type, dead_reckoning, …) is a
+# typed sub-struct in the Rust wrapper at `src/entity_state.rs`
+# (`EntityId { site, application, entity }`, `EntityType { kind,
+# domain, country, … }`, `DeadReckoningParameters { algorithm,
+# other_parameters, linear_acceleration, angular_velocity }`). The
+# schema runtime would happily project each composite into its
+# primitive children (3×u16 for entity_id, 7 primitives for
+# entity_type, …) — but the parity contract here is **byte-
+# identical round-trip**, and the f32/f64 encoder in the schema
+# runtime now rejects non-finite values per the #1362 hardening
+# pass. Proptest generates NaN bit patterns in `[u8; 4]` arrays the
+# composite-field strategy would otherwise produce, so the parity
+# assertion would have to filter every float component upfront.
+# Treating the composite as an opaque `bytes` blob bypasses that
+# filter — the bit pattern travels verbatim through the schema
+# attribute store and round-trips byte-equal even for NaN, just as
+# the production codec does (which copies the wire bytes through
+# `[f32; 3]` arrays that the Rust standard library preserves
+# bit-exactly).
+#
+# A future schema feature ("nested-record" / "submessage") will
+# carry the typed projection in the schema itself. Until then, the
+# Rust wrapper at `src/entity_state.rs` owns the typed inner-struct
+# vocabulary and this schema owns the wire-format layout.
+#
+# # Why `marking` stays a raw 11-byte blob (not Utf8)
+#
+# The production codec at `src/entity_state.rs::encode_marking` /
+# `decode_marking` strips trailing NULs on decode and re-pads on
+# encode. That round-trip is **lossy** for any 11-byte wire that
+# carries non-trailing internal NULs followed by ASCII — the decode
+# step truncates at the first NUL even when the wire intended the
+# byte after it as marking data, and re-encoding re-pads with NULs
+# at the wrong index. The schema-parity test asserts BYTE-identical
+# round-trip, so the schema carries the 11 bytes verbatim and the
+# Rust wrapper layers its NUL semantics on top.
+#
+# # Why `articulation_parameters` is one repeat (not a per-record
+# # nested schema)
+#
+# IEEE 1278.1 § 5.3.3.1.5 defines an articulation parameter as a
+# typed 16-byte record (parameter type designator, change
+# indicator, articulation ID, articulation type, parameter value).
+# The schema-parity test's contract is byte-equivalence, not typed
+# projection — the production codec preserves each 16-byte record
+# as a raw `[u8; 16]` for round-trip fidelity (see the
+# `ArticulationParameter` struct in `src/entity_state.rs`). The
+# v3 `repeat` grammar (`count-from` + `record-size-bytes`) is what
+# unlocks the variable-length tail; per-record typed projection
+# lands when the schema grows nested-record support.
+#
+# # Provenance
+#
+# Byte layout cross-checked against
+# `crates/rustgate-dis/src/entity_state.rs::EntityStatePdu::{decode,encode}`.
+# The schema-parity proptest in
+# `tests/schema_parity_entity_state.rs` asserts byte-identical
+# round-trip for every arbitrary `(entity_id, force_id, … ,
+# articulation_parameters: Vec<[u8; 16]>)` proptest generates.
+schema-version: "1"
+protocol-name: "dis.entity_state"
+message-types:
+  - name: "EntityStateBody"
+    # `size-bytes` is the FIXED prefix; the `articulation_parameters`
+    # repeat extends past this and the runtime grows the output
+    # buffer accordingly. Validated by codec-schema's
+    # `repeat_dyn_size` check.
+    size-bytes: 132
+    fields:
+      - name: "entity_id"
+        offset: 0
+        field-type: { kind: bytes }
+        length-bytes: 6
+      - name: "force_id"
+        offset: 6
+        field-type: { kind: u8 }
+      - name: "num_articulation_parameters"
+        offset: 7
+        field-type: { kind: u8 }
+      - name: "entity_type"
+        offset: 8
+        field-type: { kind: bytes }
+        length-bytes: 8
+      - name: "alternative_entity_type"
+        offset: 16
+        field-type: { kind: bytes }
+        length-bytes: 8
+      - name: "linear_velocity"
+        offset: 24
+        field-type: { kind: bytes }
+        length-bytes: 12
+      - name: "location_ecef"
+        offset: 36
+        field-type: { kind: bytes }
+        length-bytes: 24
+      - name: "orientation"
+        offset: 60
+        field-type: { kind: bytes }
+        length-bytes: 12
+      - name: "appearance"
+        offset: 72
+        field-type: { kind: u32 }
+        endian: big
+      - name: "dead_reckoning"
+        offset: 76
+        field-type: { kind: bytes }
+        length-bytes: 40
+      - name: "marking_charset"
+        offset: 116
+        field-type: { kind: u8 }
+      - name: "marking"
+        offset: 117
+        field-type: { kind: bytes }
+        length-bytes: 11
+      - name: "capabilities"
+        offset: 128
+        field-type: { kind: u32 }
+        endian: big
+      - name: "articulation_parameters"
+        offset: 132
+        field-type: { kind: bytes }
+        repeat:
+          count-from: "num_articulation_parameters"
+          record-size-bytes: 16
