@@ -3,28 +3,54 @@
 //! Schema-parity test for the MAVLink v1 frame header.
 //!
 //! Validates that a [`SchemaCodec`] built from
-//! `schemas/v1_header.yaml` produces byte-identical encodings to a
-//! manually-built MAVLink v1 frame header for every arbitrary
-//! input proptest generates. Third cross-protocol confidence test
-//! for the declarative XTCE-style schema vocabulary in
-//! `rustgate-codec-schema` (after STANAG 4586 in #1365 and DIS in
-//! #1372).
+//! `schemas/v1_header.yaml` produces byte-identical encodings to
+//! an **inline hand-rolled reference encoder** defined in this
+//! test file for every arbitrary input proptest generates. Third
+//! cross-protocol confidence test for the declarative XTCE-style
+//! schema vocabulary in `rustgate-codec-schema` (after STANAG 4586
+//! in #1365 and DIS in #1372).
+//!
+//! ## Why the reference encoder lives in the test file
+//!
+//! Tactical regression discipline (#1394): the parity test must
+//! round-trip the schema runtime against an **independent**
+//! reference implementation. If the test re-used the production
+//! codec's encoder, a future port that switched the production
+//! encoder to a `SchemaCodec`-driven path (as STANAG 4586 did in
+//! #1390) would silently turn the parity test into a
+//! `SchemaCodec`-vs-`SchemaCodec` round-trip — encoder bugs that
+//! lose data symmetrically (e.g. buffer zeroing on finite-float
+//! rejection, the #1393 STANAG regression) would pass trivially.
+//!
+//! `rustgate-mavlink` is the easy case here: the production
+//! `MavlinkFrameCodec` operates on raw [`BytesMut`] and exposes no
+//! typed v1-header struct, so there is no production typed encoder
+//! the test could accidentally reuse. The inline
+//! [`v1_reference_encode`] below is the schema's reference
+//! implementation by construction.
+//!
+//! Future scope: if a typed `V1Header { magic, len, seq, sysid,
+//! compid, msgid }` struct ever lands with its own `encode_into` /
+//! `decode` methods, add a third proptest mirroring the public-API
+//! round-trip in `rustgate-stanag4586::schema_parity::
+//! public_api_round_trip_preserves_typed_fields` and
+//! `rustgate-dis::schema_parity::public_api_round_trip_preserves_typed_fields`.
 //!
 //! ## What this proves
 //!
 //! 1. **Encode parity** — `SchemaCodec::from_entity(entity)` yields
-//!    the same 6 bytes the hand-rolled `frame.rs::v1_frame` helper
-//!    writes (magic + len + seq + sysid + compid + msgid).
+//!    the same 6 bytes the inline reference encoder produces
+//!    (magic + len + seq + sysid + compid + msgid).
 //! 2. **Decode parity** — `SchemaCodec::to_entity(payload)`
-//!    recovers all six fields from the wire bytes, and a
-//!    subsequent re-encode round-trips byte-equal.
+//!    recovers all six fields from the wire bytes, and a subsequent
+//!    re-encode round-trips byte-equal.
 //!
 //! ## What this does NOT prove
 //!
 //! - Full MAVLink message-id vocabulary. MAVLink defines several
 //!   hundred message types across multiple dialects (Common,
-//!   ArduPilotMega, …); the parity-test schema carries `msgid`
-//!   as a raw u8. A companion non-parity test demonstrates v2
+//!   ArduPilotMega, …); the parity-test schema carries `msgid` as
+//!   a raw u8. A companion non-parity test demonstrates v2
 //!   `value-mapping` projection for the canonical `HEARTBEAT`
 //!   message (`msgid = 0`).
 //! - The payload + CRC trailer. Per-msgid payload shapes need
@@ -51,18 +77,35 @@ fn schema_codec() -> SchemaCodec {
     SchemaCodec::from_schema_text(SCHEMA_YAML).expect("schema must parse + validate")
 }
 
-/// Hand-rolled MAVLink v1 header bytes for the given field values.
-/// Mirrors the `frame.rs::v1_frame` helper minus the payload + CRC
-/// trailer (the parity test cares about the 6-byte header only).
-fn v1_header_bytes(magic: u8, len: u8, seq: u8, sysid: u8, compid: u8, msgid: u8) -> Vec<u8> {
+/// **Inline, independent** reference encoder for the MAVLink v1
+/// header. Lives in the test file so the parity assertion remains a
+/// genuine cross-implementation comparison even if a future
+/// refactor introduces a typed `V1Header` struct with its own
+/// `encode_into` method (see module-level rationale on #1394).
+///
+/// Byte layout (lock-step with `schemas/v1_header.yaml`):
+///
+/// ```text
+/// offset │ size │ field  │ type
+/// ───────┼──────┼────────┼──────
+///   0    │  1   │ magic  │ u8
+///   1    │  1   │ len    │ u8
+///   2    │  1   │ seq    │ u8
+///   3    │  1   │ sysid  │ u8
+///   4    │  1   │ compid │ u8
+///   5    │  1   │ msgid  │ u8
+/// ```
+fn v1_reference_encode(magic: u8, len: u8, seq: u8, sysid: u8, compid: u8, msgid: u8) -> Vec<u8> {
     vec![magic, len, seq, sysid, compid, msgid]
 }
 
 proptest! {
-    /// Arbitrary 6-byte v1 header → `SchemaCodec` decode →
-    /// `SchemaCodec` re-encode must produce the same 6 bytes.
+    /// **Path (a)** — Reference encoder → `SchemaCodec` decode →
+    /// `SchemaCodec` re-encode must produce the same 6 bytes the
+    /// reference encoder emitted. Wire-format invariant: offsets are
+    /// stable, byte ordering is correct.
     #[test]
-    fn schema_codec_byte_identical_to_hand_rolled(
+    fn schema_codec_byte_identical_to_reference(
         magic in any::<u8>(),
         len in any::<u8>(),
         seq in any::<u8>(),
@@ -70,13 +113,13 @@ proptest! {
         compid in any::<u8>(),
         msgid in any::<u8>(),
     ) {
-        let hand_rolled = v1_header_bytes(magic, len, seq, sysid, compid, msgid);
-        prop_assert_eq!(hand_rolled.len(), V1_HEADER_LEN);
+        let reference = v1_reference_encode(magic, len, seq, sysid, compid, msgid);
+        prop_assert_eq!(reference.len(), V1_HEADER_LEN);
 
         let codec = schema_codec();
-        let entity = codec.to_entity(&hand_rolled).expect("schema decode");
+        let entity = codec.to_entity(&reference).expect("schema decode");
         let re_encoded = codec.from_entity(&entity).expect("schema encode");
-        prop_assert_eq!(&re_encoded[..], &hand_rolled[..]);
+        prop_assert_eq!(&re_encoded[..], &reference[..]);
     }
 }
 
@@ -122,7 +165,7 @@ message-types:
           default-raw: 0
 "#;
     let codec = SchemaCodec::from_schema_text(yaml).expect("typed schema must parse");
-    let wire = v1_header_bytes(V1_MAGIC, 9, 42, 1, 1, HEARTBEAT_MSGID);
+    let wire = v1_reference_encode(V1_MAGIC, 9, 42, 1, 1, HEARTBEAT_MSGID);
     let entity = codec.to_entity(&wire).expect("typed schema decode");
     let Some(AttributeValue::Str(label)) = entity.attributes.get("attributes.msgid") else {
         panic!(
