@@ -14,3 +14,11 @@ workspace = true
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Schema-parity test: the K05.1 body schema-parity proptest lives
+# under `tests/schema_parity_k05_1.rs` and exercises the v3/v4/v4.1/v5
+# grammar features on the K05.1 wire layout. Dev-only — the
+# production codec at `src/k05_1.rs` stays hand-rolled.
+rustgate-codec-schema = { workspace = true }
+proptest = { workspace = true }
