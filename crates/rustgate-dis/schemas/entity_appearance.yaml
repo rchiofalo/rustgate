@@ -1,0 +1,214 @@
+# IEEE 1278.1 Entity Appearance bitfield, clause 5.3.3.1.6 (Land
+# Platform variant).
+#
+# Carries a typed projection of the 32-bit Entity Appearance field
+# that sits at body offset 72..76 of an Entity State PDU. The
+# production codec at `crates/rustgate-dis/src/entity_state.rs`
+# stores this as an opaque `u32` today — this schema is a
+# **declarative pin** of what those bits mean per IEEE 1278.1
+# Land Platform layout, and it is the first cross-protocol
+# confidence test exercising the v3 bit-packing grammar from
+# #1389 on a real protocol's wire-format bit layout.
+#
+# Wire layout (4 bytes, big-endian — the standard u32 wire form):
+#
+# The IEEE 1278.1 bit-numbering convention is **LSB-first within
+# the u32**: bit 0 is the LSB of the LSB byte (offset 3); bit 31
+# is the MSB of the MSB byte (offset 0). The v3 grammar's
+# `bit-offset` counts from MSB **within each byte** (0 = byte's
+# MSB, 7 = byte's LSB). Mapping IEEE bit B to (byte, bit-offset):
+#
+#   byte_offset    = 3 - (B / 8)
+#   v3 bit-offset  = 7 - (B % 8)
+#
+# # IEEE 1278.1 § 5.3.3.1.6 Land Platform bit table
+#
+# offset │ bit-offset │ bit-width │ IEEE bits │ field
+# ───────┼────────────┼───────────┼───────────┼─────────────────────
+#   3    │    7       │     1     │     0     │ paint_scheme
+#   3    │    6       │     1     │     1     │ mobility_kill
+#   3    │    5       │     1     │     2     │ firepower_kill
+#   3    │    3       │     2     │   3..4    │ damage
+#   3    │    1       │     2     │   5..6    │ smoke
+#   3    │    0       │     1     │     7     │ trailing_effects
+#   2    │    5       │     3     │   8..10   │ hatch
+#   2    │    4       │     1     │    11     │ head_lights
+#   2    │    3       │     1     │    12     │ tail_lights
+#   2    │    2       │     1     │    13     │ brake_lights
+#   2    │    1       │     1     │    14     │ flaming
+#   2    │    0       │     1     │    15     │ launcher
+#   1    │    6       │     2     │  16..17   │ camouflage_type
+#   1    │    5       │     1     │    18     │ concealed
+#   1    │    4       │     1     │    19     │ frozen
+#   1    │    3       │     1     │    20     │ power_plant
+#   1    │    2       │     1     │    21     │ state
+#   1    │    1       │     1     │    22     │ tent
+#   1    │    0       │     1     │    23     │ ramp
+#   0    │    -       │     -     │  24..31   │ reserved_msb (u8)
+#
+# Field semantics per IEEE 1278.1:
+#
+# - `paint_scheme`           — 0 = uniform, 1 = camouflage
+# - `mobility_kill`          — 0 = no mobility kill, 1 = mobility kill
+# - `firepower_kill`         — 0 = no firepower kill, 1 = firepower kill
+# - `damage`                 — 0 none, 1 slight, 2 moderate, 3 destroyed
+# - `smoke`                  — 0 none, 1 emitting, 2 engine smoke, 3 both
+# - `trailing_effects`       — 0 = none, 1 = dust trail effects
+# - `hatch`                  — 0 closed, 1 popped, 2 popped + soldier
+#                              visible, 3 open, 4 open + soldier,
+#                              5-7 reserved
+# - `head_lights`            — 0 = off, 1 = on
+# - `tail_lights`            — 0 = off, 1 = on
+# - `brake_lights`           — 0 = off, 1 = on
+# - `flaming`                — 0 = not flaming, 1 = flames visible
+# - `launcher`               — 0 = not raised, 1 = raised
+# - `camouflage_type`        — 0 desert, 1 winter, 2 forest, 3 other
+# - `concealed`              — 0 = not concealed, 1 = concealed
+# - `frozen`                 — 0 = not frozen, 1 = frozen (paused)
+# - `power_plant`            — 0 = off, 1 = on
+# - `state`                  — 0 = active, 1 = deactivated
+# - `tent`                   — 0 = not extended, 1 = extended
+# - `ramp`                   − 0 = not extended, 1 = extended
+# - `reserved_msb`           — IEEE bits 24..31, carry verbatim
+#                              (Blackout Lights / Blackout Brake /
+#                              Spot Lights / Interior Lights are
+#                              defined in later spec revisions but
+#                              this schema declares the whole byte
+#                              opaque so a future schema version
+#                              can decompose it without changing
+#                              the byte layout the parity test
+#                              pins today.)
+#
+# # Why this is the right v3 demo (after #1396 surfaced VMF's
+# # cross-byte blocker)
+#
+# Every field in the table above fits within a single byte:
+# `damage` (bits 3..4) stays in byte 3, `hatch` (bits 8..10) stays
+# in byte 2, `camouflage_type` (bits 16..17) stays in byte 1. No
+# field crosses a byte boundary. The v3 grammar's
+# `bit_offset + bit_width <= 8` validator passes uniformly.
+# Multi-field-per-byte packing is exercised end-to-end — byte 3
+# alone carries six declared fields. #1399 tracks the v4 grammar
+# extension (cross-byte bit spans) that would unblock VMF /
+# ASTERIX FSPEC chains.
+#
+# # Provenance
+#
+# Bit table cross-referenced against the public IEEE 1278.1-2012
+# § 5.3.3.1.6 Land Platform layout. The schema-parity proptest in
+# `tests/schema_parity_entity_appearance.rs` asserts byte-identical
+# round-trip for every arbitrary combination of bit-field values
+# proptest generates (each within its declared `bit-width` range).
+schema-version: "1"
+protocol-name: "dis.entity_appearance"
+message-types:
+  - name: "LandPlatformAppearance"
+    size-bytes: 4
+    fields:
+      # ---- Byte 3 (LSB of big-endian u32, IEEE bits 0..7) ----
+      - name: "paint_scheme"
+        offset: 3
+        field-type: { kind: u8 }
+        bit-offset: 7
+        bit-width: 1
+      - name: "mobility_kill"
+        offset: 3
+        field-type: { kind: u8 }
+        bit-offset: 6
+        bit-width: 1
+      - name: "firepower_kill"
+        offset: 3
+        field-type: { kind: u8 }
+        bit-offset: 5
+        bit-width: 1
+      - name: "damage"
+        offset: 3
+        field-type: { kind: u8 }
+        bit-offset: 3
+        bit-width: 2
+      - name: "smoke"
+        offset: 3
+        field-type: { kind: u8 }
+        bit-offset: 1
+        bit-width: 2
+      - name: "trailing_effects"
+        offset: 3
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 1
+      # ---- Byte 2 (IEEE bits 8..15) ----
+      - name: "hatch"
+        offset: 2
+        field-type: { kind: u8 }
+        bit-offset: 5
+        bit-width: 3
+      - name: "head_lights"
+        offset: 2
+        field-type: { kind: u8 }
+        bit-offset: 4
+        bit-width: 1
+      - name: "tail_lights"
+        offset: 2
+        field-type: { kind: u8 }
+        bit-offset: 3
+        bit-width: 1
+      - name: "brake_lights"
+        offset: 2
+        field-type: { kind: u8 }
+        bit-offset: 2
+        bit-width: 1
+      - name: "flaming"
+        offset: 2
+        field-type: { kind: u8 }
+        bit-offset: 1
+        bit-width: 1
+      - name: "launcher"
+        offset: 2
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 1
+      # ---- Byte 1 (IEEE bits 16..23) ----
+      - name: "camouflage_type"
+        offset: 1
+        field-type: { kind: u8 }
+        bit-offset: 6
+        bit-width: 2
+      - name: "concealed"
+        offset: 1
+        field-type: { kind: u8 }
+        bit-offset: 5
+        bit-width: 1
+      - name: "frozen"
+        offset: 1
+        field-type: { kind: u8 }
+        bit-offset: 4
+        bit-width: 1
+      - name: "power_plant"
+        offset: 1
+        field-type: { kind: u8 }
+        bit-offset: 3
+        bit-width: 1
+      - name: "state"
+        offset: 1
+        field-type: { kind: u8 }
+        bit-offset: 2
+        bit-width: 1
+      - name: "tent"
+        offset: 1
+        field-type: { kind: u8 }
+        bit-offset: 1
+        bit-width: 1
+      - name: "ramp"
+        offset: 1
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 1
+      # ---- Byte 0 (MSB of big-endian u32, IEEE bits 24..31) ----
+      # Declared as opaque u8 — IEEE 1278.1-2012 reserves these bits
+      # for spec-version extension (Blackout Lights, Blackout Brake,
+      # Spot Lights, Interior Lights in later revisions). The
+      # parity test carries them verbatim; a future schema revision
+      # can decompose this byte without changing the byte layout.
+      - name: "reserved_msb"
+        offset: 0
+        field-type: { kind: u8 }
