@@ -267,22 +267,24 @@ impl SchemaCodec {
         payload: &[u8],
         dyn_size: Option<usize>,
     ) -> Result<DecodedValue, SchemaCodecError> {
-        // Bit-packed fields short-circuit: read one byte at `offset`,
-        // shift / mask out the declared bit range, and project as
-        // `U64`. The validator guarantees `bit_offset + bit_width <=
-        // 8` and `field_type == U8`, so the extraction always fits
-        // in the byte and the integer projection fits in `u64`.
+        // Bit-packed fields short-circuit. The validator guarantees
+        // (a) `bit_offset ∈ [0, 7]`, (b) `bit_width ∈ [1, 64]`, and
+        // (c) the bit span `offset * 8 + bit_offset + bit_width`
+        // fits inside `size_bytes * 8`. The runtime reads the
+        // touched byte range MSB-first into a `u64`; v3 single-byte
+        // fields (`bit_offset + bit_width ≤ 8`) take the same path
+        // and produce identical bytes, so the v4 lift is fully
+        // backward-compatible.
         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
-            if field.offset >= payload.len() {
+            let bytes_touched = bit_packed_bytes_touched(bit_offset, bit_width);
+            let end = field.offset + bytes_touched;
+            if end > payload.len() {
                 return Err(SchemaCodecError::PayloadTooShort {
                     actual: payload.len(),
-                    required: field.offset + 1,
+                    required: end,
                 });
             }
-            let byte = payload[field.offset];
-            let shift = 8 - bit_offset - bit_width;
-            let mask = (1u16 << bit_width) - 1;
-            let extracted = u64::from((byte >> shift) & (mask as u8));
+            let extracted = read_bit_span(payload, field.offset, bit_offset, bit_width);
             return Ok(DecodedValue::U64(extracted));
         }
         let size = dyn_size.unwrap_or_else(|| {
@@ -350,14 +352,25 @@ impl SchemaCodec {
         // first bit-packed field at a given byte sees zero and only
         // sets its own bits.
         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
-            if field.offset >= out.len() {
+            let bytes_touched = bit_packed_bytes_touched(bit_offset, bit_width);
+            let end = field.offset + bytes_touched;
+            if end > out.len() {
                 return Err(SchemaCodecError::PayloadTooShort {
                     actual: out.len(),
-                    required: field.offset + 1,
+                    required: end,
                 });
             }
             let raw = value.as_u64(field)?;
-            let max = (1u64 << bit_width) - 1;
+            // Range guard: a `bit_width`-bit unsigned value can hold
+            // `2^bit_width - 1`. The validator already constrained
+            // `bit_width ∈ [1, 64]`, but `1 << 64` overflows a
+            // `u64`, so guard the `bit_width == 64` case explicitly
+            // (any `u64` value is in-range).
+            let max = if bit_width == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bit_width) - 1
+            };
             if raw > max {
                 return Err(SchemaCodecError::OutOfRange {
                     field: field.name.clone(),
@@ -365,11 +378,7 @@ impl SchemaCodec {
                     type_name: format!("u{bit_width} (bit-packed)"),
                 });
             }
-            let shift = 8 - bit_offset - bit_width;
-            let mask: u8 = ((1u16 << bit_width) - 1) as u8;
-            let positioned: u8 = (raw as u8) << shift;
-            let preserve_mask = !(mask << shift);
-            out[field.offset] = (out[field.offset] & preserve_mask) | positioned;
+            write_bit_span(out, field.offset, bit_offset, bit_width, raw);
             return Ok(());
         }
         let size = dyn_size.unwrap_or_else(|| {
@@ -1400,6 +1409,160 @@ fn trim_trailing_nuls(slice: &[u8]) -> &[u8] {
         end -= 1;
     }
     &slice[..end]
+}
+
+/// Number of bytes a bit-packed field touches when starting at the
+/// given byte-relative `bit_offset` for `bit_width` bits.
+///
+/// `(bit_offset + bit_width + 7) / 8` rounds up. For v3 single-byte
+/// fields where `bit_offset + bit_width ≤ 8` this returns `1`,
+/// matching the existing behavior. For v4 cross-byte spans (e.g.
+/// `bit_offset = 4`, `bit_width = 12`) this returns `2` (4 bits in
+/// byte 0, 8 bits in byte 1 — total span 16 bits = 2 bytes).
+fn bit_packed_bytes_touched(bit_offset: u8, bit_width: u8) -> usize {
+    let total_bits = (bit_offset as usize) + (bit_width as usize);
+    total_bits.div_ceil(8)
+}
+
+/// Read a `bit_width`-bit MSB-first big-endian bit stream from
+/// `payload` starting at byte `byte_offset`, bit position
+/// `bit_offset` (where bit_offset = 0 is the byte's MSB).
+///
+/// The caller MUST have already verified the bit span fits inside
+/// `payload` — the validator does this at schema-load time and the
+/// decode path verifies again with [`bit_packed_bytes_touched`]
+/// before calling.
+///
+/// The bit stream walks left-to-right across bytes, packing each
+/// extracted chunk into the low bits of the accumulator. For a
+/// 12-bit field at `bit_offset = 4` over bytes `[0xAB, 0xCD]`:
+///   - Byte 0 contributes the low 4 bits (`0xB`) at positions 8..11
+///     of the result.
+///   - Byte 1 contributes all 8 bits (`0xCD`) at positions 0..7.
+///
+/// Result: `0xBCD`.
+///
+/// The v3 single-byte path is a special case (`bytes_touched == 1`,
+/// inner loop iterates once) and produces byte-identical output to
+/// the original `(byte >> shift) & mask` formulation.
+fn read_bit_span(payload: &[u8], byte_offset: usize, bit_offset: u8, bit_width: u8) -> u64 {
+    let mut value: u64 = 0;
+    let mut bits_remaining = bit_width as usize;
+    let mut cur_byte = byte_offset;
+    let mut cur_bit = bit_offset as usize;
+
+    while bits_remaining > 0 {
+        let byte = u64::from(payload[cur_byte]);
+        let bits_in_this_byte = (8 - cur_bit).min(bits_remaining);
+        // Shift this byte right so the chunk's LSB lands at bit 0,
+        // then mask to keep only the chunk's bits. For the first
+        // byte this strips bits above the field's start; for the
+        // last byte it strips bits below the field's end; for
+        // middle bytes (always full 8-bit chunks) the shift is 0
+        // and the mask is `0xFF`.
+        let shift = 8 - cur_bit - bits_in_this_byte;
+        let mask = (1u64 << bits_in_this_byte) - 1;
+        let chunk = (byte >> shift) & mask;
+
+        // Pack the chunk into the accumulator's low bits, shifting
+        // the previous accumulated bits left to make room.
+        value = (value << bits_in_this_byte) | chunk;
+
+        bits_remaining -= bits_in_this_byte;
+        cur_bit = 0;
+        cur_byte += 1;
+    }
+
+    value
+}
+
+/// Write a `bit_width`-bit value to `out` starting at byte
+/// `byte_offset`, bit position `bit_offset`. Mirror of
+/// [`read_bit_span`]: MSB-first big-endian bit stream order,
+/// preserves sibling bits outside the claimed range via
+/// mask-and-OR per affected byte.
+///
+/// The caller MUST have already verified the bit span fits inside
+/// `out` and that `value` fits in `bit_width` bits.
+///
+/// Each affected byte is read first (so any prior bit-packed field
+/// at that byte stays intact), the field's bits are cleared via an
+/// inverse mask, and the new bits are OR'd in. Cross-byte spans
+/// therefore preserve sibling fields at every touched byte, not
+/// just the starting byte.
+fn write_bit_span(out: &mut [u8], byte_offset: usize, bit_offset: u8, bit_width: u8, value: u64) {
+    let mut bits_remaining = bit_width as usize;
+    let mut cur_byte = byte_offset;
+    let mut cur_bit = bit_offset as usize;
+
+    while bits_remaining > 0 {
+        let bits_in_this_byte = (8 - cur_bit).min(bits_remaining);
+        // Take the highest `bits_in_this_byte` bits of the
+        // remaining value — MSB-first wire order means the first
+        // chunk we write is the value's high end.
+        let value_shift = bits_remaining - bits_in_this_byte;
+        let chunk_mask = (1u64 << bits_in_this_byte) - 1;
+        // justification: `bits_in_this_byte ≤ 8` so the chunk
+        // fits in a u8 without truncation; the mask already
+        // constrains the value.
+        #[allow(clippy::cast_possible_truncation)]
+        let chunk = ((value >> value_shift) & chunk_mask) as u8;
+
+        // Position the chunk at the right LSB index within the
+        // byte. `bit_offset = 0` (byte's MSB) means LSB-position
+        // `8 - bits_in_this_byte`; `bit_offset = 7` (byte's LSB)
+        // with `bit_width = 1` means LSB-position 0.
+        let position_shift = 8 - cur_bit - bits_in_this_byte;
+        let positioned = chunk << position_shift;
+        // justification: `chunk_mask ≤ 0xFF` since
+        // `bits_in_this_byte ≤ 8`.
+        #[allow(clippy::cast_possible_truncation)]
+        let byte_mask = (chunk_mask as u8) << position_shift;
+
+        // Clear only this field's bits; preserve any prior bits
+        // (other bit-packed sibling fields written earlier).
+        out[cur_byte] = (out[cur_byte] & !byte_mask) | positioned;
+
+        bits_remaining -= bits_in_this_byte;
+        cur_bit = 0;
+        cur_byte += 1;
+    }
+}
+
+/// Iterator yielding `(byte_offset, bit_mask)` pairs for every byte
+/// a bit-packed field touches. Used by the schema validator's
+/// overlap check to flag two bit-packed fields whose bit ranges
+/// intersect across one or more shared bytes.
+///
+/// Each yielded `bit_mask` has 1-bits at the positions the field
+/// claims within `byte_offset`. For a 12-bit field at
+/// `byte_offset = 0`, `bit_offset = 4`:
+///   - Yields `(0, 0b0000_1111)` — the low 4 bits of byte 0.
+///   - Yields `(1, 0b1111_1111)` — all of byte 1.
+pub(crate) fn bit_packed_byte_masks(
+    byte_offset: usize,
+    bit_offset: u8,
+    bit_width: u8,
+) -> impl Iterator<Item = (usize, u8)> {
+    let mut bits_remaining = bit_width as usize;
+    let mut cur_byte = byte_offset;
+    let mut cur_bit = bit_offset as usize;
+    std::iter::from_fn(move || {
+        if bits_remaining == 0 {
+            return None;
+        }
+        let bits_in_this_byte = (8 - cur_bit).min(bits_remaining);
+        let shift = 8 - cur_bit - bits_in_this_byte;
+        // justification: `bits_in_this_byte ≤ 8`, so the
+        // `(1u16 << bits_in_this_byte) - 1` fits in a u8.
+        #[allow(clippy::cast_possible_truncation)]
+        let mask = (((1u16 << bits_in_this_byte) - 1) as u8) << shift;
+        let byte = cur_byte;
+        cur_byte += 1;
+        bits_remaining -= bits_in_this_byte;
+        cur_bit = 0;
+        Some((byte, mask))
+    })
 }
 
 #[cfg(test)]
@@ -2598,6 +2761,244 @@ message-types:
         assert!(
             type_name.contains("u3"),
             "expected type label to mention bit-width, got: {type_name}"
+        );
+    }
+
+    // ----------------- v4 cross-byte bit spans (#1399) -----------------
+
+    #[test]
+    fn read_bit_span_zero_or_eight_bits_matches_v3_behaviour() {
+        // Smoke check that the new multi-byte bit stream reader
+        // produces identical bytes to the old single-byte
+        // `(byte >> shift) & mask` formulation for every v3-style
+        // single-byte field. Pins backward compatibility at the
+        // helper-function level.
+        let payload = [0b1010_1100_u8];
+        // bit-offset 0, width 1 → MSB → 1
+        assert_eq!(read_bit_span(&payload, 0, 0, 1), 1);
+        // bit-offset 0, width 4 → 0b1010 → 10
+        assert_eq!(read_bit_span(&payload, 0, 0, 4), 0b1010);
+        // bit-offset 4, width 4 → 0b1100 → 12
+        assert_eq!(read_bit_span(&payload, 0, 4, 4), 0b1100);
+        // bit-offset 0, width 8 → full byte
+        assert_eq!(read_bit_span(&payload, 0, 0, 8), 0b1010_1100);
+    }
+
+    #[test]
+    fn read_bit_span_twelve_bits_across_two_bytes() {
+        // 12-bit field at bit_offset = 4 over bytes [0xAB, 0xCD]:
+        //   byte 0 low nibble = 0xB (4 bits)
+        //   byte 1 all 8 bits = 0xCD
+        // Result: 0xBCD = 3021
+        let payload = [0xAB, 0xCD];
+        assert_eq!(read_bit_span(&payload, 0, 4, 12), 0x0BCD);
+    }
+
+    #[test]
+    fn read_bit_span_twenty_five_bits_across_four_bytes() {
+        // 25-bit field at bit_offset = 0 starting at byte 0.
+        // Source: [0xFF, 0xFF, 0xFF, 0x80] → bits 0..=24 are
+        // 0b1111_1111_1111_1111_1111_1111_1 (25 ones).
+        // Result: (1 << 25) - 1 = 0x1FF_FFFF.
+        let payload = [0xFF, 0xFF, 0xFF, 0x80];
+        assert_eq!(read_bit_span(&payload, 0, 0, 25), 0x01FF_FFFF);
+    }
+
+    #[test]
+    fn write_bit_span_round_trips_through_read() {
+        // Property pin (manual): every (bit_offset, bit_width,
+        // value) combo we write must read back the same value.
+        // Cover a representative cross-section of widths.
+        let cases: &[(u8, u8, u64)] = &[
+            (0, 1, 1),
+            (4, 8, 0xAB),
+            (4, 12, 0x0BCD),
+            (0, 16, 0xABCD),
+            (3, 13, 0x1ABC),
+            (0, 25, 0x01FF_FFFF),
+            (5, 32, 0xDEAD_BEEF),
+            (7, 17, 0x0001_FFFF),
+        ];
+        for &(bit_offset, bit_width, value) in cases {
+            let bytes = bit_packed_bytes_touched(bit_offset, bit_width);
+            let mut buf = vec![0u8; bytes];
+            write_bit_span(&mut buf, 0, bit_offset, bit_width, value);
+            let read_back = read_bit_span(&buf, 0, bit_offset, bit_width);
+            assert_eq!(
+                read_back, value,
+                "(bit_offset={bit_offset}, bit_width={bit_width}, value={value:#x}) failed round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn write_bit_span_preserves_sibling_bits_outside_field() {
+        // A bit-packed field MUST NOT clobber bits outside its
+        // declared range. Pre-fill the buffer with `0xFF`s,
+        // write a value of 0 into a 4-bit field at bit_offset=2,
+        // and confirm only those 4 bits got cleared.
+        let mut buf = [0xFFu8, 0xFF];
+        // Write 0 into 4 bits at byte 0, bit_offset 2. Position
+        // 2..=5 (MSB-indexed) maps to LSB-position 2..=5 → mask
+        // 0b0011_1100.
+        write_bit_span(&mut buf, 0, 2, 4, 0);
+        assert_eq!(buf[0], 0b1100_0011);
+        // Byte 1 untouched.
+        assert_eq!(buf[1], 0xFF);
+    }
+
+    #[test]
+    fn write_bit_span_preserves_sibling_bits_in_middle_byte() {
+        // Cross-byte case: a 16-bit field at bit_offset = 4
+        // touches bytes 0, 1, 2 with span 4 + 8 + 4 bits — low
+        // nibble of byte 0, all of byte 1, high nibble of byte 2.
+        // Pre-fill all three bytes with `0xFF`, write a value of
+        // 0, and confirm only the field's bits cleared. This is
+        // the load-bearing demonstration that the encoder's
+        // mask-and-OR runs per touched byte and preserves
+        // sibling bits at BOTH the head and tail edges, not just
+        // the starting byte.
+        let mut buf = [0xFFu8, 0xFF, 0xFF];
+        write_bit_span(&mut buf, 0, 4, 16, 0);
+        // Byte 0: high nibble preserved, low nibble cleared.
+        assert_eq!(buf[0], 0b1111_0000);
+        // Byte 1: fully claimed by the field, cleared to 0.
+        assert_eq!(buf[1], 0x00);
+        // Byte 2: high nibble cleared, low nibble preserved.
+        assert_eq!(buf[2], 0b0000_1111);
+    }
+
+    #[test]
+    fn cross_byte_bit_span_round_trips_through_schema_codec() {
+        // End-to-end: a 12-bit `u16` field at bit_offset = 4
+        // encodes → decodes → re-encodes byte-identical via the
+        // full schema runtime. This is the load-bearing v4
+        // assertion — single-byte v3 schemas continue to work,
+        // and the new cross-byte path works alongside them.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 2
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u16 }
+        bit-offset: 4
+        bit-width: 12
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        // Build a wire payload where the 12-bit field at bits 4..=15
+        // carries 0xABC.
+        // Byte 0 low nibble = 0xA, byte 1 all 8 bits = 0xBC → bytes
+        // are [0x0A, 0xBC].
+        let wire = [0x0A, 0xBC];
+        let entity = codec.to_entity(&wire).expect("schema decode");
+        let Some(AttributeValue::Int(decoded)) = entity.attributes.get("attributes.v") else {
+            panic!(
+                "expected attributes.v as Int, got {:?}",
+                entity.attributes.get("attributes.v")
+            );
+        };
+        assert_eq!(*decoded, 0x0ABC);
+        let re_encoded = codec.from_entity(&entity).expect("schema encode");
+        assert_eq!(&re_encoded[..], &wire);
+    }
+
+    #[test]
+    fn cross_byte_bit_span_preserves_neighbour_bit_packed_field() {
+        // The defining v4 case: two bit-packed fields share a
+        // byte boundary. Field `flag` is a 1-bit MSB flag in
+        // byte 0; field `value` is a 15-bit u16 starting at
+        // bit_offset = 1, spanning the low 7 bits of byte 0 plus
+        // all of byte 1. Encoding both fields must NOT clobber
+        // either one — the cross-byte path's
+        // mask-and-OR-per-touched-byte logic is the load-bearing
+        // mechanism.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 2
+    fields:
+      - name: "flag"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 1
+        entity-path: "attributes.flag"
+      - name: "value"
+        offset: 0
+        field-type: { kind: u16 }
+        bit-offset: 1
+        bit-width: 15
+        entity-path: "attributes.value"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.flag".into(), AttributeValue::Int(1));
+        let _ = entity
+            .attributes
+            .insert("attributes.value".into(), AttributeValue::Int(0x1234));
+        let wire = codec.from_entity(&entity).expect("schema encode");
+        // Expected wire: bit 0 = 1 (flag), bits 1..=15 = 0x1234
+        // (value). MSB-first: byte 0 = (1 << 7) | (0x1234 >> 8) =
+        // 0x80 | 0x24 = 0xA4 — wait, 0x1234 >> 8 = 0x12, so 0x80 |
+        // 0x12 = 0x92. Byte 1 = 0x1234 & 0xFF = 0x34.
+        assert_eq!(wire, vec![0x92, 0x34]);
+        // Round-trip: decode the wire and confirm both fields
+        // recover their values.
+        let recovered = codec.to_entity(&wire).expect("schema decode");
+        assert_eq!(
+            recovered.attributes.get("attributes.flag"),
+            Some(&AttributeValue::Int(1))
+        );
+        assert_eq!(
+            recovered.attributes.get("attributes.value"),
+            Some(&AttributeValue::Int(0x1234))
+        );
+    }
+
+    #[test]
+    fn cross_byte_bit_span_round_trips_64_bit_full_width() {
+        // The widest cross-byte case: a 64-bit `u64` field at
+        // bit_offset = 0, spanning all 8 bytes of the message.
+        // The validator's `bit_width = 64` path uses `u64::MAX`
+        // as the encode-side range guard rather than the
+        // overflowing `1 << 64`.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u64 }
+        bit-offset: 0
+        bit-width: 64
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity.attributes.insert(
+            "attributes.v".into(),
+            // i64 carries u64::MAX as -1; the bit-packed encoder
+            // bitcasts back to u64 before writing.
+            AttributeValue::Int(-1i64),
+        );
+        let wire = codec.from_entity(&entity).expect("schema encode");
+        assert_eq!(wire, vec![0xFF; 8]);
+        let recovered = codec.to_entity(&wire).expect("schema decode");
+        assert_eq!(
+            recovered.attributes.get("attributes.v"),
+            Some(&AttributeValue::Int(-1i64))
         );
     }
 
