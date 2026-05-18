@@ -31,7 +31,27 @@
 //!   `Entity::attributes` under a `schema.<message-type>.<field>`
 //!   key).
 //!
-//! ## Out of scope (for now)
+//! ## Grammar overview
+//!
+//! See [`docs/codec-schema-grammar.md`][grammar-docs] for the single-
+//! reference guide to every grammar feature. Brief summary of what
+//! the runtime accepts today:
+//!
+//! - **v1** (#1352): Fixed-offset primitives + linear calibration +
+//!   range guards + `entity-path` projection.
+//! - **v2** (#1370): Multi-message dispatch via a discriminator byte;
+//!   `value-mapping` (typed enum projection).
+//! - **v3** (#1383 / #1385 / #1387 / #1389): `present-if` sparse-
+//!   projection; `repeat` count-driven byte arrays; bit-packed sub-
+//!   byte fields constrained to one byte.
+//! - **v4** (#1402): Cross-byte bit spans (`bit_offset + bit_width >
+//!   8` now legal) and bit-packed `u16` / `u32` / `u64`.
+//! - **v4.1** (#1404): Signed bit-packed types (`i8` / `i16` / `i32`
+//!   / `i64`) with two's-complement sign-extension on decode.
+//!
+//! [grammar-docs]: ../../docs/codec-schema-grammar.md
+//!
+//! ## Out of scope (tracked)
 //!
 //! - XML-shaped wire formats (NFFI, raw CoT XML, OGC SensorThings
 //!   responses). Those need a richer schema grammar with
@@ -40,28 +60,24 @@
 //!   v1.
 //! - Polynomial / spline calibration. Linear gets us 95% of
 //!   sensor wire formats.
-//! - Variable-shift conditional fields (the kind where the field
+//! - **Variable-shift conditional fields** (the kind where the field
 //!   actually disappears from the wire when absent, and subsequent
-//!   offsets slide). The v3 grammar ships the sparse-projection
-//!   interpretation via [`schema::PresentIfSpec`]: the byte
-//!   range stays fixed-offset whether the field is "present" or
-//!   not, only the `Entity` projection is gated. Real variable-
-//!   shift semantics are a separate v4 feature.
-//! - Nested typed-record arrays. v3 ships
-//!   [`schema::RepeatSpec`] for count-driven byte arrays
-//!   (`Bytes`-only, surfaced as a single byte slice the consumer
-//!   parses themselves) — enough for DIS articulation params,
-//!   ASTERIX repetitive items, MAVLink v2 payloads, and Link 16
-//!   word-3 extensions. Per-record field-list schemas where each
-//!   element carries its own decode pipeline are a v4 feature.
-//! - Cross-byte bit-packed fields. The v3 grammar adds
-//!   [`schema::FieldDef::bit_offset`] / [`schema::FieldDef::bit_width`]
-//!   for fixed sub-byte fields that fit entirely within ONE byte
-//!   (`bit_offset + bit_width <= 8`) — enough to schema-fy 1-bit
-//!   flags and small packed enums (VMF FPI / FRI / GPI indicators,
-//!   ASTERIX FSPEC bitmaps, Link 16 J-series sub-words). Bit-packed
-//!   fields whose width spans byte boundaries — the canonical Link 16
-//!   word-level packing case — remain a separate v4 feature.
+//!   offsets slide). The current `present-if` ships the sparse-
+//!   projection interpretation via [`schema::PresentIfSpec`]: the
+//!   byte range stays fixed-offset whether the field is "present"
+//!   or not, only the `Entity` projection is gated. Real variable-
+//!   shift semantics — needed for VMF K05.1's FPI cascade
+//!   (#1396) — are a separate v5 feature.
+//! - Nested typed-record arrays. [`schema::RepeatSpec`] handles
+//!   count-driven byte arrays (`Bytes`-only, surfaced as a single
+//!   byte slice the consumer parses themselves) — enough for DIS
+//!   articulation params, ASTERIX repetitive items, MAVLink v2
+//!   payloads, and Link 16 word-3 extensions. Per-record field-list
+//!   schemas where each element carries its own decode pipeline are
+//!   a v6 feature.
+//! - Schema chaining (one schema dispatching into another based on a
+//!   discriminator). Compose at the call site in the wrapper until
+//!   the grammar grows native support.
 //!
 //! ## Two-PR rollout
 //!
