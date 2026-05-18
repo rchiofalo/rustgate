@@ -116,4 +116,27 @@ pub enum SchemaCodecError {
         /// Byte value that did not match any declared `id`.
         value: u8,
     },
+
+    /// A byte-aligned field follows a v5 [`ShiftMode::CollapseWhenAbsent`]
+    /// bit-packed field whose absence left the bit cursor on a
+    /// non-byte-aligned position. The schema is inherently broken for
+    /// the actual data: a byte field cannot start mid-byte.
+    ///
+    /// The schema author should either:
+    /// - Ensure every collapse-when-absent bit-packed field's
+    ///   `bit_width` is a multiple of 8 (so the shift stays
+    ///   byte-aligned), or
+    /// - Move byte fields ahead of the collapse-when-absent section.
+    ///
+    /// [`ShiftMode::CollapseWhenAbsent`]: crate::ShiftMode::CollapseWhenAbsent
+    #[error(
+        "byte-aligned field `{field}` cannot follow a bit-packed collapse-when-absent field that left a non-byte-aligned bit-cursor offset ({bit_shift} bits)"
+    )]
+    BitCursorMisalignment {
+        /// The byte-aligned field whose offset cannot be resolved.
+        field: String,
+        /// Bits of shift accumulated from earlier collapse-when-absent
+        /// fields; not a multiple of 8.
+        bit_shift: usize,
+    },
 }

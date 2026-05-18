@@ -102,7 +102,7 @@ use bytes::Bytes;
 use rustgate_core::entity::{AttributeValue, Entity, EntityCodec, EntityKind, Position, Velocity};
 
 use crate::error::{SchemaCodecError, SchemaError};
-use crate::schema::{Calibration, Endian, FieldDef, FieldType, MessageType, Schema};
+use crate::schema::{Calibration, Endian, FieldDef, FieldType, MessageType, Schema, ShiftMode};
 
 /// Schema-driven codec — a single instance implements
 /// [`EntityCodec`] for the entire protocol the schema describes.
@@ -257,15 +257,30 @@ impl SchemaCodec {
         )
     }
 
-    /// Decode a single field at its declared offset.
+    /// Decode a single field at its declared offset, optionally
+    /// shifted by `bit_shift` bits (v5 variable-shift `present-if`).
     ///
     /// `dyn_size`, when `Some`, overrides the field's static size
     /// computation — used by `repeat` fields whose wire span depends
     /// on an earlier-decoded count.
+    ///
+    /// `bit_shift` is the accumulated bit-cursor offset from earlier
+    /// fields that collapsed (v5 #1407 `CollapseWhenAbsent` mode).
+    /// For schemas without any collapsed fields, `bit_shift` is
+    /// always 0 and the read happens at the field's declared
+    /// `offset` (v3 / v4 / v4.1 backward-compat path). For bit-
+    /// packed fields the shift is subtracted from the field's
+    /// total bit position; for byte fields the shift must be
+    /// byte-aligned (a runtime invariant the loop preserves by
+    /// only allowing `CollapseWhenAbsent` on bit-packed fields per
+    /// schema validation, then accumulating bit-widths in
+    /// multiples of 8 OR ending the message before a byte field
+    /// would see a fractional shift).
     fn decode_field(
         field: &FieldDef,
         payload: &[u8],
         dyn_size: Option<usize>,
+        bit_shift: usize,
     ) -> Result<DecodedValue, SchemaCodecError> {
         // Bit-packed fields short-circuit. The validator guarantees
         // (a) `bit_offset ∈ [0, 7]`, (b) `bit_width ∈ [1, 64]`, and
@@ -280,15 +295,26 @@ impl SchemaCodec {
         // `sign_extend_bit_span`. Unsigned types take the original
         // `DecodedValue::U64` path unchanged.
         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
-            let bytes_touched = bit_packed_bytes_touched(bit_offset, bit_width);
-            let end = field.offset + bytes_touched;
+            // Apply v5 `bit_shift`: the field's "declared bit
+            // position" is `field.offset * 8 + bit_offset`; the
+            // actual wire position is that minus the accumulated
+            // shift from any earlier collapsed (absent) fields.
+            let declared_bit_pos = field.offset * 8 + bit_offset as usize;
+            let actual_bit_pos = declared_bit_pos.saturating_sub(bit_shift);
+            let actual_byte = actual_bit_pos / 8;
+            // justification: `actual_bit_pos % 8` is in `[0, 7]`,
+            // fits in u8 by construction.
+            #[allow(clippy::cast_possible_truncation)]
+            let actual_bit_within_byte = (actual_bit_pos % 8) as u8;
+            let bytes_touched = bit_packed_bytes_touched(actual_bit_within_byte, bit_width);
+            let end = actual_byte + bytes_touched;
             if end > payload.len() {
                 return Err(SchemaCodecError::PayloadTooShort {
                     actual: payload.len(),
                     required: end,
                 });
             }
-            let extracted = read_bit_span(payload, field.offset, bit_offset, bit_width);
+            let extracted = read_bit_span(payload, actual_byte, actual_bit_within_byte, bit_width);
             return Ok(match field.field_type {
                 FieldType::I8 | FieldType::I16 | FieldType::I32 | FieldType::I64 => {
                     DecodedValue::I64(sign_extend_bit_span(extracted, bit_width))
@@ -303,14 +329,28 @@ impl SchemaCodec {
                 .or(field.length_bytes)
                 .unwrap_or(0)
         });
-        let end = field.offset.saturating_add(size);
+        // Byte fields: `bit_shift` MUST be byte-aligned for a byte
+        // field to land on a defined wire position. The validator
+        // doesn't (yet) reject schemas that mix `CollapseWhenAbsent`
+        // bit-packed fields with later byte fields where the
+        // accumulated shift could end up non-aligned — this runtime
+        // check catches that invalid composition with a typed
+        // error rather than silently reading the wrong bytes.
+        if !bit_shift.is_multiple_of(8) {
+            return Err(SchemaCodecError::BitCursorMisalignment {
+                field: field.name.clone(),
+                bit_shift,
+            });
+        }
+        let actual_offset = field.offset.saturating_sub(bit_shift / 8);
+        let end = actual_offset.saturating_add(size);
         if end > payload.len() {
             return Err(SchemaCodecError::PayloadTooShort {
                 actual: payload.len(),
                 required: end,
             });
         }
-        let slice = &payload[field.offset..end];
+        let slice = &payload[actual_offset..end];
         let raw = match field.field_type {
             FieldType::U8 => DecodedValue::U64(u64::from(slice[0])),
             FieldType::I8 => DecodedValue::I64(i64::from(slice[0] as i8)),
@@ -349,6 +389,7 @@ impl SchemaCodec {
         value: &EncodedValue,
         out: &mut [u8],
         dyn_size: Option<usize>,
+        bit_shift: usize,
     ) -> Result<(), SchemaCodecError> {
         // Bit-packed fields short-circuit: read the current byte at
         // `offset`, clear only the bit range this field claims, OR
@@ -360,9 +401,20 @@ impl SchemaCodec {
         // in the field list. The output buffer is pre-zeroed, so the
         // first bit-packed field at a given byte sees zero and only
         // sets its own bits.
+        //
+        // `bit_shift` is the v5 #1407 accumulated cursor offset from
+        // earlier `CollapseWhenAbsent` fields. For v3 / v4 / v4.1
+        // schemas it stays 0 and the path produces byte-identical
+        // output to the previous behaviour.
         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
-            let bytes_touched = bit_packed_bytes_touched(bit_offset, bit_width);
-            let end = field.offset + bytes_touched;
+            let declared_bit_pos = field.offset * 8 + bit_offset as usize;
+            let actual_bit_pos = declared_bit_pos.saturating_sub(bit_shift);
+            let actual_byte = actual_bit_pos / 8;
+            // justification: `actual_bit_pos % 8 ∈ [0, 7]` fits in u8.
+            #[allow(clippy::cast_possible_truncation)]
+            let actual_bit_within_byte = (actual_bit_pos % 8) as u8;
+            let bytes_touched = bit_packed_bytes_touched(actual_bit_within_byte, bit_width);
+            let end = actual_byte + bytes_touched;
             if end > out.len() {
                 return Err(SchemaCodecError::PayloadTooShort {
                     actual: out.len(),
@@ -426,7 +478,7 @@ impl SchemaCodec {
                     raw
                 }
             };
-            write_bit_span(out, field.offset, bit_offset, bit_width, raw);
+            write_bit_span(out, actual_byte, actual_bit_within_byte, bit_width, raw);
             return Ok(());
         }
         let size = dyn_size.unwrap_or_else(|| {
@@ -436,14 +488,24 @@ impl SchemaCodec {
                 .or(field.length_bytes)
                 .unwrap_or(0)
         });
-        let end = field.offset.saturating_add(size);
+        // Byte field path: v5 `bit_shift` must be byte-aligned, or
+        // the schema is inherently broken — see decode-side error
+        // for the same reasoning.
+        if !bit_shift.is_multiple_of(8) {
+            return Err(SchemaCodecError::BitCursorMisalignment {
+                field: field.name.clone(),
+                bit_shift,
+            });
+        }
+        let actual_offset = field.offset.saturating_sub(bit_shift / 8);
+        let end = actual_offset.saturating_add(size);
         if end > out.len() {
             return Err(SchemaCodecError::PayloadTooShort {
                 actual: out.len(),
                 required: end,
             });
         }
-        let slice = &mut out[field.offset..end];
+        let slice = &mut out[actual_offset..end];
         match field.field_type {
             FieldType::U8 => {
                 let v = value.as_u64(field)?;
@@ -584,7 +646,21 @@ impl EntityCodec for SchemaCodec {
 
     fn to_entity(&self, payload: &[u8]) -> Result<Entity, Self::Error> {
         let mt = self.select_message_type_for_payload(payload)?;
-        if payload.len() < mt.size_bytes {
+        // Initial bounds check: payload must be at least
+        // `size_bytes` long, EXCEPT when the schema contains any
+        // v5 #1407 `CollapseWhenAbsent` fields — in that case the
+        // wire size is variable and the per-field decode bounds
+        // checks fire on too-short input. Skipping the fast-path
+        // check for collapse-capable schemas lets the runtime
+        // accept a wire payload that's shorter than the
+        // all-fields-present max.
+        let has_collapse_fields = mt.fields.iter().any(|f| {
+            matches!(
+                f.present_if.as_ref().map(|p| p.shift_mode),
+                Some(ShiftMode::CollapseWhenAbsent)
+            )
+        });
+        if !has_collapse_fields && payload.len() < mt.size_bytes {
             return Err(SchemaCodecError::PayloadTooShort {
                 actual: payload.len(),
                 required: mt.size_bytes,
@@ -627,7 +703,44 @@ impl EntityCodec for SchemaCodec {
         // variants that we recorded BEFORE the conditional field
         // ever runs.
         let mut raw_ints_seen: BTreeMap<&str, i64> = BTreeMap::new();
+        // v5 #1407 bit-cursor offset accumulator. Each
+        // `ShiftMode::CollapseWhenAbsent` field whose predicate
+        // misses contributes its `bit_width` here, shifting all
+        // subsequent fields' effective wire positions toward the
+        // start. For v3 / v4 / v4.1 schemas without any
+        // collapse-when-absent fields this stays 0 and the loop
+        // produces byte-identical output to the previous behaviour.
+        let mut bit_shift: usize = 0;
         for field in &mt.fields {
+            // v5 collapse-when-absent: evaluate the predicate BEFORE
+            // calling decode_field so we can skip the read entirely
+            // when the field is absent on the wire. The default
+            // ShiftMode::Reserve (v3 sparse-projection) keeps the
+            // legacy flow where we always decode and only gate the
+            // entity projection.
+            let predicate_matches = match &field.present_if {
+                Some(predicate) => raw_ints_seen
+                    .get(predicate.field.as_str())
+                    .is_some_and(|raw| *raw == predicate.value),
+                None => true,
+            };
+            let is_collapse_when_absent = matches!(
+                field.present_if.as_ref().map(|p| p.shift_mode),
+                Some(ShiftMode::CollapseWhenAbsent)
+            );
+            if is_collapse_when_absent && !predicate_matches {
+                // The validator constrains CollapseWhenAbsent to
+                // bit-packed fields, so bit_width is always Some
+                // here. Accumulate the shift and skip the field
+                // entirely — no decode call, no projection.
+                // justification: validator guarantees this.
+                #[allow(clippy::expect_used)]
+                let bw = field
+                    .bit_width
+                    .expect("validator guarantees CollapseWhenAbsent only on bit-packed fields");
+                bit_shift += bw as usize;
+                continue;
+            }
             // `repeat` fields take a dynamic span derived from an
             // earlier-decoded count. The validator guarantees the
             // `count_from` field exists, is integer-typed, and sits
@@ -636,33 +749,22 @@ impl EntityCodec for SchemaCodec {
             // bounds or negative counts surface as `PayloadTooShort`
             // via the bounds check inside `decode_field`.
             let dyn_size = Self::repeat_dyn_size(field, &raw_ints_seen)?;
-            let decoded = Self::decode_field(field, payload, dyn_size)?;
-            // Conditional fields evaluate their predicate against
-            // the already-decoded raw integer of the referenced
-            // field. When the predicate does not match, we still
-            // had to read `decode_field` (so the payload-length
-            // check fires) but we MUST skip projection: no
-            // attribute write, no entity_path target update. The
-            // wire bytes are documented as remaining at the
-            // declared offset; the operator can use a
-            // `value-mapping` or sentinel value on a separate
-            // field if they need to distinguish "absent" from
-            // "zero" in the projected entity.
-            if let Some(predicate) = &field.present_if {
-                let matched = raw_ints_seen
-                    .get(predicate.field.as_str())
-                    .is_some_and(|raw| *raw == predicate.value);
-                if !matched {
-                    // Skip range check, value-mapping, and
-                    // projection entirely. The predicate field is
-                    // already validated at schema-load to be an
-                    // integer at a strictly lower offset, so the
-                    // miss here means "field is logically absent"
-                    // rather than "operator referenced an
-                    // undecoded field".
-                    Self::record_raw_int(&mut raw_ints_seen, field, &decoded);
-                    continue;
-                }
+            let decoded = Self::decode_field(field, payload, dyn_size, bit_shift)?;
+            // Conditional fields with the default `Reserve` shift-
+            // mode evaluate their predicate AFTER decoding (the
+            // bytes are on the wire either way). The
+            // collapse-when-absent path above already handled the
+            // v5 case; here we just preserve the v3 sparse-
+            // projection behaviour for `Reserve` (default) mode.
+            if !predicate_matches {
+                // Skip range check, value-mapping, and projection
+                // entirely. The predicate field is already
+                // validated at schema-load to be an integer at a
+                // strictly lower offset, so the miss here means
+                // "field is logically absent" rather than "operator
+                // referenced an undecoded field".
+                Self::record_raw_int(&mut raw_ints_seen, field, &decoded);
+                continue;
             }
             Self::check_range_on_decode(field, &decoded)?;
             // Record the raw integer BEFORE applying
@@ -776,6 +878,12 @@ impl EntityCodec for SchemaCodec {
         // an integer type, so this map is populated before the
         // predicate ever reads it.
         let mut raw_ints_seen: BTreeMap<&str, i64> = BTreeMap::new();
+        // v5 #1407 bit-cursor offset accumulator (mirror of the
+        // decode loop). Each `ShiftMode::CollapseWhenAbsent` field
+        // whose predicate misses contributes its `bit_width` here,
+        // shifting all subsequent fields' wire write positions
+        // toward the start.
+        let mut bit_shift: usize = 0;
         for field in &mt.fields {
             let predicate_matches = match &field.present_if {
                 Some(predicate) => raw_ints_seen
@@ -783,18 +891,32 @@ impl EntityCodec for SchemaCodec {
                     .is_some_and(|raw| *raw == predicate.value),
                 None => true,
             };
+            let is_collapse_when_absent = matches!(
+                field.present_if.as_ref().map(|p| p.shift_mode),
+                Some(ShiftMode::CollapseWhenAbsent)
+            );
             if !predicate_matches {
-                // Skip the encode for this field — its declared
-                // bytes stay at the buffer's pre-filled zeros.
-                // Documented behaviour: the operator can declare
-                // an explicit `value-mapping` or a sentinel on a
-                // separate field if they need a non-zero "absent"
-                // marker. We do NOT record this field in
-                // `raw_ints_seen`: a conditional field that is
-                // logically absent cannot itself drive a
-                // downstream predicate, since its wire bytes are
-                // all zero and the "raw value" carries no
-                // semantic information.
+                if is_collapse_when_absent {
+                    // v5 collapse-when-absent on encode: don't write
+                    // the field's bytes AND advance the cursor so
+                    // subsequent fields' write positions shift up.
+                    // justification: validator guarantees
+                    // CollapseWhenAbsent only on bit-packed fields.
+                    #[allow(clippy::expect_used)]
+                    let bw = field.bit_width.expect(
+                        "validator guarantees CollapseWhenAbsent only on bit-packed fields",
+                    );
+                    bit_shift += bw as usize;
+                }
+                // For both shift modes: skip encoding this field.
+                // Reserve (default v3) leaves the bytes at zero in
+                // the pre-zeroed buffer; CollapseWhenAbsent
+                // additionally advanced `bit_shift` above so the
+                // next iteration writes at the shifted position.
+                // We do NOT record this field in `raw_ints_seen`:
+                // a conditional field that is logically absent
+                // cannot itself drive a downstream predicate, since
+                // its wire bytes carry no semantic information.
                 continue;
             }
             let mut value = lookup_encoded_value(entity, field, &self.schema.protocol_name)?;
@@ -842,7 +964,21 @@ impl EntityCodec for SchemaCodec {
                     out.resize(needed, 0);
                 }
             }
-            Self::encode_field(field, &value, &mut out, dyn_size)?;
+            Self::encode_field(field, &value, &mut out, dyn_size, bit_shift)?;
+        }
+        // v5: when one or more `CollapseWhenAbsent` fields fired,
+        // the encoded payload is shorter than the schema's declared
+        // `size_bytes`. Truncate the trailing all-zero bytes that
+        // came from the pre-zeroed buffer at indices the cursor
+        // didn't reach. The truncation length is the schema's
+        // declared size minus `bit_shift / 8` full bytes; we also
+        // need to handle a non-byte-aligned shift (round down to
+        // the last full byte the cursor reached). For v3 / v4 /
+        // v4.1 schemas this is a no-op (`bit_shift` is always 0).
+        if bit_shift > 0 {
+            let truncate_bytes = bit_shift / 8;
+            let new_len = out.len().saturating_sub(truncate_bytes);
+            out.truncate(new_len);
         }
         Ok(Bytes::from(out))
     }
@@ -2457,6 +2593,305 @@ message-types:
             &[0u8, 0u8],
             "predicate missed on decode — round-trip drops signature to zero"
         );
+    }
+
+    // ----------------- v5 collapse-when-absent (#1407) -----------------
+
+    /// Synthetic FPI-cascade schema mirroring the VMF K05.1 FPI
+    /// pattern: a flag bit gates an 8-bit "payload" field that
+    /// disappears from the wire when the flag is 0. A trailing
+    /// "tail" field anchors to the position AFTER the payload —
+    /// when the payload is absent (flag = 0), the tail shifts up
+    /// by 8 bits.
+    ///
+    /// Wire layout (all-fields-present case, 4 bytes):
+    ///   byte 0: flag (1 bit at MSB) + 7 reserved bits
+    ///   byte 1: payload (8 bits, gated by flag)
+    ///   byte 2: tail (8 bits)
+    ///   byte 3: padding
+    ///
+    /// When flag = 0, the payload disappears and the tail moves
+    /// from byte 2 to byte 1, producing a 3-byte payload (the
+    /// trailing byte 3 also gets dropped via truncation).
+    const COLLAPSE_SCHEMA: &str = r#"
+schema-version: "1"
+protocol-name: "test.collapse"
+message-types:
+  - name: "M"
+    size-bytes: 4
+    fields:
+      - name: "flag"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 1
+        entity-path: "attributes.flag"
+      - name: "payload"
+        offset: 1
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 8
+        entity-path: "attributes.payload"
+        present-if:
+          field: "flag"
+          value: 1
+          shift-mode: collapse-when-absent
+      - name: "tail"
+        offset: 2
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 8
+        entity-path: "attributes.tail"
+"#;
+
+    #[test]
+    fn collapse_when_absent_predicate_match_keeps_wire_layout_full_size() {
+        // When the flag bit is 1, the payload field is present on
+        // wire and the layout matches the all-fields-present
+        // declaration: 4 bytes.
+        let codec = SchemaCodec::from_schema_text(COLLAPSE_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.flag".into(), AttributeValue::Int(1));
+        let _ = entity
+            .attributes
+            .insert("attributes.payload".into(), AttributeValue::Int(0xAB));
+        let _ = entity
+            .attributes
+            .insert("attributes.tail".into(), AttributeValue::Int(0xCD));
+        let wire = codec.from_entity(&entity).unwrap();
+        // Byte 0: flag bit 1 at MSB → 0x80
+        // Byte 1: payload 0xAB
+        // Byte 2: tail 0xCD
+        // Byte 3: padding (truncation didn't happen, no fields collapsed)
+        assert_eq!(&wire[..], &[0x80, 0xAB, 0xCD, 0x00]);
+        // Decode round-trips.
+        let decoded = codec.to_entity(&wire).unwrap();
+        assert_eq!(
+            decoded.attributes.get("attributes.flag"),
+            Some(&AttributeValue::Int(1))
+        );
+        assert_eq!(
+            decoded.attributes.get("attributes.payload"),
+            Some(&AttributeValue::Int(0xAB))
+        );
+        assert_eq!(
+            decoded.attributes.get("attributes.tail"),
+            Some(&AttributeValue::Int(0xCD))
+        );
+    }
+
+    #[test]
+    fn collapse_when_absent_predicate_miss_drops_field_from_wire_and_shifts_subsequent() {
+        // When the flag bit is 0, the payload field is ABSENT on
+        // wire. The tail field shifts up 8 bits (from offset 2 to
+        // offset 1), and the overall encoded payload shrinks by
+        // 1 byte (from 4 to 3).
+        let codec = SchemaCodec::from_schema_text(COLLAPSE_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.flag".into(), AttributeValue::Int(0));
+        // No "attributes.payload" — predicate misses anyway.
+        let _ = entity
+            .attributes
+            .insert("attributes.tail".into(), AttributeValue::Int(0xCD));
+        let wire = codec.from_entity(&entity).unwrap();
+        // Byte 0: flag bit 0 at MSB → 0x00
+        // Byte 1: tail 0xCD (shifted up from byte 2)
+        // Byte 2: padding (truncated — the original size_bytes=4
+        //         minus 1 byte collapsed = 3 byte payload)
+        // Encoded len is 3 (8 bits collapsed = 1 full byte truncated).
+        assert_eq!(&wire[..], &[0x00, 0xCD, 0x00]);
+        // Decode also handles the shifted layout.
+        let decoded = codec.to_entity(&wire).unwrap();
+        assert_eq!(
+            decoded.attributes.get("attributes.flag"),
+            Some(&AttributeValue::Int(0))
+        );
+        // payload field had no projection because the predicate missed.
+        assert!(!decoded.attributes.contains_key("attributes.payload"));
+        // tail recovers from the shifted position.
+        assert_eq!(
+            decoded.attributes.get("attributes.tail"),
+            Some(&AttributeValue::Int(0xCD))
+        );
+    }
+
+    #[test]
+    fn collapse_when_absent_round_trips_in_both_predicate_states() {
+        // Decode wire → re-encode produces the same wire in both
+        // predicate states. Pins the encode/decode symmetry that
+        // is the load-bearing invariant for v5 (#1407).
+        let codec = SchemaCodec::from_schema_text(COLLAPSE_SCHEMA).unwrap();
+        // Flag = 1: full 4-byte wire.
+        let wire_full = [0x80, 0xAB, 0xCD, 0x00];
+        let entity_full = codec.to_entity(&wire_full).unwrap();
+        let re_encoded_full = codec.from_entity(&entity_full).unwrap();
+        assert_eq!(&re_encoded_full[..], &wire_full[..]);
+        // Flag = 0: collapsed 3-byte wire.
+        let wire_collapsed = [0x00, 0xCD, 0x00];
+        let entity_collapsed = codec.to_entity(&wire_collapsed).unwrap();
+        let re_encoded_collapsed = codec.from_entity(&entity_collapsed).unwrap();
+        assert_eq!(&re_encoded_collapsed[..], &wire_collapsed[..]);
+    }
+
+    #[test]
+    fn collapse_when_absent_rejected_on_non_bit_packed_field() {
+        // Validator constraint: shift-mode: collapse-when-absent
+        // only works on bit-packed fields in this revision. A
+        // byte field with the same shift-mode declaration must
+        // fail at schema-load.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 2
+    fields:
+      - name: "flag"
+        offset: 0
+        field-type: { kind: u8 }
+        entity-path: "attributes.flag"
+      - name: "payload"
+        offset: 1
+        field-type: { kind: u8 }
+        entity-path: "attributes.payload"
+        present-if:
+          field: "flag"
+          value: 1
+          shift-mode: collapse-when-absent
+"#;
+        let err = SchemaCodec::from_schema_text(yaml).unwrap_err();
+        let crate::SchemaError::Validation { message } = err else {
+            panic!("expected Validation error, got {err:?}");
+        };
+        assert!(
+            message.contains("collapse-when-absent"),
+            "expected error to mention shift-mode constraint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn cascade_of_two_collapse_when_absent_fields() {
+        // The load-bearing case for VMF K05.1: a CASCADE of
+        // collapse-when-absent fields. Two flags each gate their
+        // own payload; when both flags miss, two payloads
+        // disappear and the trailing field shifts up by both.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test.cascade"
+message-types:
+  - name: "M"
+    size-bytes: 5
+    fields:
+      - name: "flag_a"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 1
+        entity-path: "attributes.flag_a"
+      - name: "flag_b"
+        offset: 0
+        field-type: { kind: u8 }
+        bit-offset: 1
+        bit-width: 1
+        entity-path: "attributes.flag_b"
+      - name: "payload_a"
+        offset: 1
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 8
+        entity-path: "attributes.payload_a"
+        present-if:
+          field: "flag_a"
+          value: 1
+          shift-mode: collapse-when-absent
+      - name: "payload_b"
+        offset: 2
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 8
+        entity-path: "attributes.payload_b"
+        present-if:
+          field: "flag_b"
+          value: 1
+          shift-mode: collapse-when-absent
+      - name: "tail"
+        offset: 3
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 8
+        entity-path: "attributes.tail"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+
+        // Case 1: both flags set, full 4-byte payload (5th byte
+        // pre-zeroed and stays).
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.flag_a".into(), AttributeValue::Int(1));
+        let _ = entity
+            .attributes
+            .insert("attributes.flag_b".into(), AttributeValue::Int(1));
+        let _ = entity
+            .attributes
+            .insert("attributes.payload_a".into(), AttributeValue::Int(0xAA));
+        let _ = entity
+            .attributes
+            .insert("attributes.payload_b".into(), AttributeValue::Int(0xBB));
+        let _ = entity
+            .attributes
+            .insert("attributes.tail".into(), AttributeValue::Int(0xCC));
+        let wire = codec.from_entity(&entity).unwrap();
+        // Byte 0: flag_a (MSB) | flag_b (next) → 0b1100_0000 = 0xC0
+        // Byte 1: payload_a 0xAA
+        // Byte 2: payload_b 0xBB
+        // Byte 3: tail 0xCC
+        // Byte 4: padding 0x00
+        assert_eq!(&wire[..], &[0xC0, 0xAA, 0xBB, 0xCC, 0x00]);
+
+        // Case 2: both flags 0, both payloads collapsed (16 bits =
+        // 2 bytes truncated from the end).
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.flag_a".into(), AttributeValue::Int(0));
+        let _ = entity
+            .attributes
+            .insert("attributes.flag_b".into(), AttributeValue::Int(0));
+        let _ = entity
+            .attributes
+            .insert("attributes.tail".into(), AttributeValue::Int(0xCC));
+        let wire = codec.from_entity(&entity).unwrap();
+        // Byte 0: flag_a=0 + flag_b=0 → 0x00
+        // Byte 1: tail 0xCC (shifted up from byte 3 by 16 bits)
+        // Byte 2: padding (1 of 2 truncated bytes; second was past size_bytes anyway)
+        assert_eq!(&wire[..], &[0x00, 0xCC, 0x00]);
+
+        // Case 3: flag_a set but flag_b cleared — payload_a
+        // present, payload_b absent. Tail shifts up by 8 bits.
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.flag_a".into(), AttributeValue::Int(1));
+        let _ = entity
+            .attributes
+            .insert("attributes.flag_b".into(), AttributeValue::Int(0));
+        let _ = entity
+            .attributes
+            .insert("attributes.payload_a".into(), AttributeValue::Int(0xAA));
+        let _ = entity
+            .attributes
+            .insert("attributes.tail".into(), AttributeValue::Int(0xCC));
+        let wire = codec.from_entity(&entity).unwrap();
+        // Byte 0: flag_a=1 + flag_b=0 → 0b1000_0000 = 0x80
+        // Byte 1: payload_a 0xAA
+        // Byte 2: tail 0xCC (shifted up from byte 3 by 8 bits)
+        // Byte 3: padding (1 byte truncated)
+        assert_eq!(&wire[..], &[0x80, 0xAA, 0xCC, 0x00]);
     }
 
     /// v3 variable-length repeats. `count` is a `u8` at offset 0,

@@ -381,6 +381,38 @@ pub struct RepeatSpec {
 ///     field: "flags"
 ///     value: 1
 /// ```
+/// When the predicate of a [`PresentIfSpec`] misses, what does the
+/// runtime do with the gated field's wire bytes?
+///
+/// Two semantically distinct interpretations exist; v3 shipped only
+/// [`ShiftMode::Reserve`], v5 (#1407) adds
+/// [`ShiftMode::CollapseWhenAbsent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShiftMode {
+    /// **v3 sparse-projection** (default, backward-compatible). The
+    /// gated field's bytes / bits stay reserved on the wire whether
+    /// or not the predicate matches; only the `Entity` projection
+    /// is gated. The message's wire size is fixed regardless of
+    /// which predicates fire. This matches the "fixed-shape header
+    /// where some fields are sometimes valid" pattern.
+    #[default]
+    Reserve,
+    /// **v5 variable-shift** (#1407). When the predicate misses, the
+    /// gated field genuinely disappears from the wire and
+    /// subsequent fields' positions slide toward the start by the
+    /// gated field's natural bit-width. This is the load-bearing
+    /// VMF K05.1 FPI cascade pattern: each FPI bit gates the next
+    /// field, and an absent gate-and-payload pair contributes zero
+    /// bits to the wire.
+    ///
+    /// **Scope (this revision)**: only supported on bit-packed
+    /// fields (the `bit_offset` / `bit_width` family). Byte-aligned
+    /// collapse (e.g. MAVLink v2's 13-byte optional signature
+    /// trailer) is a v5.1 follow-up.
+    CollapseWhenAbsent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PresentIfSpec {
@@ -397,6 +429,13 @@ pub struct PresentIfSpec {
     /// representation so the v3 grammar stays decidable without
     /// modelling the runtime's projection pipeline.
     pub value: i64,
+    /// What happens to the gated field's wire bytes when the
+    /// predicate misses. See [`ShiftMode`] for the two options.
+    /// Defaults to [`ShiftMode::Reserve`] (v3 sparse-projection)
+    /// for backward compatibility — every existing schema that
+    /// doesn't declare `shift-mode` continues to behave identically.
+    #[serde(default)]
+    pub shift_mode: ShiftMode,
 }
 
 /// One field in a [`MessageType`]'s payload. The runtime reads
@@ -1165,6 +1204,23 @@ impl Schema {
                         f.name,
                         predicate.field,
                         referenced.field_type.as_str()
+                    ),
+                });
+            }
+            // v5 (#1407) variable-shift constraint: the
+            // `CollapseWhenAbsent` shift-mode is only supported on
+            // bit-packed fields in this revision. Byte-aligned
+            // collapse — needed for MAVLink v2's optional signature
+            // trailer, ASTERIX repetitive items, etc. — is a v5.1
+            // follow-up. The bit-packed-only restriction keeps the
+            // runtime's bit-cursor bookkeeping simple (cursor is
+            // tracked in bits; byte fields would also need
+            // alignment checks).
+            if predicate.shift_mode == ShiftMode::CollapseWhenAbsent && !f.is_bit_packed() {
+                return Err(SchemaError::Validation {
+                    message: format!(
+                        "message `{}` field `{}` declares `shift-mode: collapse-when-absent` but is not bit-packed (v5 byte-aligned collapse is a v5.1 follow-up — declare bit-offset + bit-width or use the default `shift-mode: reserve`)",
+                        mt.name, f.name
                     ),
                 });
             }

@@ -100,5 +100,5 @@ pub use codec::SchemaCodec;
 pub use error::{SchemaCodecError, SchemaError};
 pub use schema::{
     Calibration, Endian, FieldDef, FieldType, MessageType, PresentIfSpec, Range, RepeatSpec,
-    Schema, SchemaVersion, ValueMapping,
+    Schema, SchemaVersion, ShiftMode, ValueMapping,
 };
