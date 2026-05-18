@@ -160,6 +160,11 @@ path = "fuzz_targets/vmf_decode.rs"
 doc = false
 
 [[bin]]
+name = "vmf_k05_1"
+path = "fuzz_targets/vmf_k05_1.rs"
+doc = false
+
+[[bin]]
 name = "dis_entity_state"
 path = "fuzz_targets/dis_entity_state.rs"
 doc = false
