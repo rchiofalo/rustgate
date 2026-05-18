@@ -1171,18 +1171,25 @@ impl Schema {
                         mt.name, f.name, predicate.field
                     ),
                 })?;
-            if referenced.offset >= f.offset {
-                // Equal offsets are also rejected — the validator's
-                // overlap check already prevents two fields from
-                // sharing an offset for non-zero sizes, but the
-                // strict-less rule is the load-bearing one: the
-                // decoder reads fields in declared order, so a
-                // forward-referenced predicate would evaluate
-                // against bytes the decoder has not seen yet.
+            // Compare BIT positions, not byte offsets. For non-bit-
+            // packed fields, the bit position is `offset * 8`; for
+            // bit-packed fields it's `offset * 8 + bit_offset`. This
+            // lets a bit-packed FPI sibling at the same byte offset
+            // (but lower bit position) precede a bit-packed gated
+            // field — the load-bearing case for VMF K05.1's FPI
+            // cascade where `altitude_fpi` at byte 9 bit_offset 3
+            // gates `altitude` at byte 9 bit_offset 4. The strict-
+            // less-than rule still applies (the predicate field
+            // must be EARLIER in the bit stream, not the same
+            // position).
+            let referenced_bit_pos =
+                referenced.offset * 8 + referenced.bit_offset.unwrap_or(0) as usize;
+            let field_bit_pos = f.offset * 8 + f.bit_offset.unwrap_or(0) as usize;
+            if referenced_bit_pos >= field_bit_pos {
                 return Err(SchemaError::Validation {
                     message: format!(
-                        "message `{}` field `{}` present-if references field `{}` at offset {} which must precede field offset {} (must be parsed earlier)",
-                        mt.name, f.name, predicate.field, referenced.offset, f.offset
+                        "message `{}` field `{}` present-if references field `{}` at bit position {} which must precede field bit position {} (must be parsed earlier)",
+                        mt.name, f.name, predicate.field, referenced_bit_pos, field_bit_pos
                     ),
                 });
             }
@@ -1876,7 +1883,7 @@ message-types:
             panic!("expected validation error");
         };
         assert!(
-            message.contains("must precede field offset"),
+            message.contains("must precede field bit position"),
             "got: {message}"
         );
     }

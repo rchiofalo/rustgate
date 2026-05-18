@@ -1,0 +1,158 @@
+# VMF K05.1 Position Report body (MIL-STD-6017 K05.1).
+#
+# VMF's Position Location Information (PLI) message — the Army/USMC
+# equivalent of CoT's `<event type="a-f-G-U-C">` PLI. Every Blue
+# Force Tracker position update on a SINCGARS-ASIP or EPLRS radio
+# is a K05.1.
+#
+# # Bit-level wire layout (all-fields-present case)
+#
+# Fields are bit-packed end-to-end and gated by Field Presence
+# Indicators (FPIs). When an FPI bit is 0, the gated field is
+# **absent on the wire** and subsequent fields slide toward the
+# start — variable-shift `present-if` (v5 grammar from #1407).
+#
+# bit position │ width │ field            │ notes
+# ─────────────┼───────┼──────────────────┼─────────────────────────────
+#       0      │  24   │ reporting_urn    │ u32 (v4 cross-byte span)
+#      24      │  25   │ latitude         │ i32 (v4.1 signed bit-packed)
+#      49      │  26   │ longitude        │ i32 (v4.1 signed bit-packed)
+#      75      │   1   │ altitude_fpi     │ u8 (v3 single-byte bit-packing)
+#      76      │  16   │ altitude         │ i32, present-if altitude_fpi=1, collapse-when-absent
+#      92      │   1   │ speed_fpi        │ u8
+#      93      │  12   │ speed            │ u32, present-if speed_fpi=1, collapse-when-absent
+#     105      │   1   │ course_fpi       │ u8
+#     106      │   9   │ course           │ u32, present-if course_fpi=1, collapse-when-absent
+#     115      │   1   │ unit_id_fpi      │ u8
+#     116      │  56   │ unit_identifier  │ u64 (7-byte ASCII as 56-bit blob),
+#                                          present-if unit_id_fpi=1, collapse-when-absent
+#
+# All-fields-present total = 172 bits = 21.5 bytes; the schema's
+# `size-bytes: 22` rounds up. When all four FPIs are 0, the actual
+# wire collapses to 79 bits ≈ 10 bytes (the encoder truncates to
+# `size_bytes - bit_shift / 8` = `22 - 93 / 8` = 11 bytes; the
+# trailing byte is zero padding the runtime cannot avoid without a
+# bit-granular output buffer). This is a `byte-identical-via-schema`
+# parity contract, not a wire-byte-truthful one — see the parity
+# test for the round-trip discipline.
+#
+# # Grammar features exercised
+#
+# - **v3** (#1389): single-byte bit-packing — every FPI bit, the
+#   `course` 9-bit and `speed` 12-bit fields when they cross
+#   byte boundaries with their FPI siblings.
+# - **v4** (#1402): cross-byte bit spans — the 24-bit URN spans
+#   bytes 0..3; 25-bit latitude spans bytes 3..7; 26-bit longitude
+#   spans bytes 6..10; 56-bit unit_identifier spans bytes 14..22.
+# - **v4.1** (#1404): signed bit-packed types — latitude (i32, 25
+#   bits) and longitude (i32, 26 bits) sign-extend through
+#   `sign_extend_bit_span`.
+# - **v5** (#1407): variable-shift `present-if` with `shift-mode:
+#   collapse-when-absent` — each FPI bit gates the following field,
+#   and an absent gated field shifts the subsequent fields toward
+#   the start by the absent field's `bit_width`. The FOUR-LEVEL
+#   FPI cascade (altitude → speed → course → unit_identifier) is
+#   the load-bearing test of the v5 runtime threading.
+#
+# # What this schema does NOT carry today
+#
+# - The position-quality / accuracy fields. Carried under the
+#   `vmf.k05_1.*` Entity attribute namespace by encoder consumers
+#   when present; this schema is the MVP subset that the production
+#   codec at `src/k05_1.rs` ships.
+# - Multi-position fan-out (FRI repetition). MIL-STD-6017 K05.1 may
+#   carry multiple position updates for a sub-unit; the MVP body
+#   schema decodes only the first.
+# - Latitude / longitude calibration (raw → degrees). The schema
+#   carries the raw signed bit pattern; the integration layer at
+#   `src/k05_1.rs` applies `raw / 2^24 * 90` (lat) and `raw / 2^25
+#   * 180` (lon) on the decode boundary. Combining bit-packing
+#   with linear calibration is a follow-up grammar feature.
+# - The unit_identifier ASCII sanitization. The production codec
+#   maps non-printable bytes to `'?'` on decode and trims trailing
+#   whitespace; the schema carries the raw 56-bit blob and the
+#   sanitization stays in the wrapper.
+#
+# Provenance: bit layout cross-checked against
+# `crates/rustgate-vmf/src/k05_1.rs::K051PositionReport::{decode,encode}`.
+# The schema-parity proptest at
+# `tests/schema_parity_k05_1.rs` asserts byte-identical round-trip
+# via SchemaCodec against an inline reference encoder, in every
+# combination of the four FPI bits proptest generates.
+schema-version: "1"
+protocol-name: "vmf.k05_1"
+message-types:
+  - name: "K051PositionReport"
+    size-bytes: 22
+    fields:
+      - name: "reporting_urn"
+        offset: 0
+        field-type: { kind: u32 }
+        bit-offset: 0
+        bit-width: 24
+      - name: "latitude"
+        offset: 3
+        field-type: { kind: i32 }
+        bit-offset: 0
+        bit-width: 25
+      - name: "longitude"
+        offset: 6
+        field-type: { kind: i32 }
+        bit-offset: 1
+        bit-width: 26
+      - name: "altitude_fpi"
+        offset: 9
+        field-type: { kind: u8 }
+        bit-offset: 3
+        bit-width: 1
+      - name: "altitude"
+        offset: 9
+        field-type: { kind: i32 }
+        bit-offset: 4
+        bit-width: 16
+        present-if:
+          field: "altitude_fpi"
+          value: 1
+          shift-mode: collapse-when-absent
+      - name: "speed_fpi"
+        offset: 11
+        field-type: { kind: u8 }
+        bit-offset: 4
+        bit-width: 1
+      - name: "speed"
+        offset: 11
+        field-type: { kind: u32 }
+        bit-offset: 5
+        bit-width: 12
+        present-if:
+          field: "speed_fpi"
+          value: 1
+          shift-mode: collapse-when-absent
+      - name: "course_fpi"
+        offset: 13
+        field-type: { kind: u8 }
+        bit-offset: 1
+        bit-width: 1
+      - name: "course"
+        offset: 13
+        field-type: { kind: u32 }
+        bit-offset: 2
+        bit-width: 9
+        present-if:
+          field: "course_fpi"
+          value: 1
+          shift-mode: collapse-when-absent
+      - name: "unit_id_fpi"
+        offset: 14
+        field-type: { kind: u8 }
+        bit-offset: 3
+        bit-width: 1
+      - name: "unit_identifier"
+        offset: 14
+        field-type: { kind: u64 }
+        bit-offset: 4
+        bit-width: 56
+        present-if:
+          field: "unit_id_fpi"
+          value: 1
+          shift-mode: collapse-when-absent
