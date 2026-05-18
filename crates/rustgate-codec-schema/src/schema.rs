@@ -678,36 +678,50 @@ impl Schema {
                 if bo >= 8 {
                     return Err(SchemaError::Validation {
                         message: format!(
-                            "message `{}` field `{}` bit_offset {bo} must be in `[0, 7]` (single-byte limit)",
+                            "message `{}` field `{}` bit_offset {bo} must be in `[0, 7]` (the byte-relative starting position)",
                             mt.name, f.name
                         ),
                     });
                 }
-                if bw == 0 || bw > 8 {
+                // v4: `bit_width` extends from `[1, 8]` (v3) to
+                // `[1, 64]` — the maximum integer width the runtime
+                // projects to (`u64`). Cross-byte spans land in v4
+                // (#1399); v3 schemas with `bit_offset + bit_width ≤
+                // 8` continue to validate exactly as before.
+                if bw == 0 || bw > 64 {
                     return Err(SchemaError::Validation {
                         message: format!(
-                            "message `{}` field `{}` bit_width {bw} must be in `[1, 8]`",
+                            "message `{}` field `{}` bit_width {bw} must be in `[1, 64]`",
                             mt.name, f.name
                         ),
                     });
                 }
-                if (bo as u16) + (bw as u16) > 8 {
+                // Pair bit_width with the declared field type's
+                // natural width. A u8 cannot carry more than 8 bits;
+                // u16 16, u32 32, u64 64. Bit-packed fields all
+                // project to `DecodedValue::U64`, so signed types
+                // (i8/i16/i32/i64) would need sign-extension on
+                // decode — that's tracked as v4.1 follow-up (#TBD).
+                let max_bits_for_type = match f.field_type {
+                    FieldType::U8 => 8u8,
+                    FieldType::U16 => 16u8,
+                    FieldType::U32 => 32u8,
+                    FieldType::U64 => 64u8,
+                    _ => {
+                        return Err(SchemaError::Validation {
+                            message: format!(
+                                "message `{}` field `{}` type `{}` does not support bit-packing (requires u8 / u16 / u32 / u64)",
+                                mt.name,
+                                f.name,
+                                f.field_type.as_str()
+                            ),
+                        });
+                    }
+                };
+                if bw > max_bits_for_type {
                     return Err(SchemaError::Validation {
                         message: format!(
-                            "message `{}` field `{}` bit_offset {bo} + bit_width {bw} > 8 (cross-byte bit fields are a v4 feature)",
-                            mt.name, f.name
-                        ),
-                    });
-                }
-                // Bit-packed fields read ONE byte and project an
-                // integer subrange — the field_type must be `u8`. Any
-                // other primitive width would be incoherent (a `u16`
-                // bit-packed field would either ignore the second byte
-                // or silently widen the extraction, both surprises).
-                if !matches!(f.field_type, FieldType::U8) {
-                    return Err(SchemaError::Validation {
-                        message: format!(
-                            "message `{}` field `{}` type `{}` does not support bit-packing (v3 bit-packed fields require `u8` field type)",
+                            "message `{}` field `{}` bit_width {bw} exceeds field type `{}` capacity ({max_bits_for_type} bits)",
                             mt.name,
                             f.name,
                             f.field_type.as_str()
@@ -823,6 +837,27 @@ impl Schema {
                             spec.count_from.as_str(),
                         ))
                 }
+                // Bit-packed fields override the typed fixed-size
+                // with the actual touched-byte count. A v3
+                // `u8` bit-packed field touches 1 byte (matching
+                // `fixed_size`); a v4 12-bit `u16` field at
+                // `bit_offset = 4` touches 2 bytes (NOT the u16's
+                // typed fixed_size of 2 by coincidence — at
+                // `bit_offset = 0, bit_width = 16` it would touch
+                // 2 bytes; at `bit_offset = 4, bit_width = 16` it
+                // would touch 3 bytes). `prev_end` must reflect the
+                // bytes the field actually claims, not the typed
+                // primitive's natural width.
+                (None, Some(_)) if f.is_bit_packed() => {
+                    let bo = f
+                        .bit_offset
+                        .expect("is_bit_packed guarantees bit_offset is Some");
+                    let bw = f
+                        .bit_width
+                        .expect("is_bit_packed guarantees bit_width is Some");
+                    let total_bits = (bo as usize) + (bw as usize);
+                    total_bits.div_ceil(8)
+                }
                 (None, Some(s)) => s,
                 (None, None) => f.length_bytes.ok_or_else(|| SchemaError::Validation {
                     message: format!(
@@ -856,17 +891,28 @@ impl Schema {
                     ),
                 });
             }
-            // Byte-range overlap check. Bit-packed fields sharing the
-            // same byte offset are LEGAL — multiple bit-fields packing
-            // a single byte is the canonical shape this feature
-            // unlocks. For that case the check is deferred to the
-            // bit-range overlap test below (which examines
-            // `bit_usage`). The standard byte-range overlap still
-            // fires when a bit-packed field collides with a wider
-            // non-bit-packed field, or when one bit-packed field's
-            // byte sits inside another field's byte range.
-            let byte_shared_with_bit_packed_neighbour =
-                f.is_bit_packed() && bit_usage.contains_key(&f.offset);
+            // Byte-range overlap check. Bit-packed fields sharing
+            // any of their touched bytes with a prior bit-packed
+            // field are LEGAL — multiple bit-fields packing a byte
+            // (canonical FPI / FRI / GPI pattern) or chained across
+            // bytes (#1399's load-bearing v4 unblock for VMF /
+            // ASTERIX FSPEC) is exactly what this feature exists
+            // for. For that case the check is deferred to the
+            // bit-range overlap test below. The standard byte-range
+            // overlap still fires when a bit-packed field collides
+            // with a wider non-bit-packed field, or when one
+            // bit-packed field's byte range sits inside another
+            // non-bit-packed field's byte range.
+            let byte_shared_with_bit_packed_neighbour = f.is_bit_packed() && {
+                let bo = f
+                    .bit_offset
+                    .expect("is_bit_packed guarantees bit_offset is Some");
+                let bw = f
+                    .bit_width
+                    .expect("is_bit_packed guarantees bit_width is Some");
+                crate::codec::bit_packed_byte_masks(f.offset, bo, bw)
+                    .any(|(byte, _)| bit_usage.contains_key(&byte))
+            };
             if f.offset < prev_end && !byte_shared_with_bit_packed_neighbour {
                 return Err(SchemaError::Validation {
                     message: format!(
@@ -876,26 +922,28 @@ impl Schema {
                 });
             }
             // Bit-range overlap check. For each bit-packed field,
-            // build the bitmask of bit positions it claims (MSB =
-            // bit 0) and confirm no prior bit-packed field at the
-            // same byte already claimed any of those bits. The
-            // `bit_usage` map is the per-message tracker the loop
-            // accumulates as it walks sorted fields.
+            // walk every byte the field touches and verify no prior
+            // bit-packed field already claimed any of the same bits
+            // within those bytes. The `bit_usage` map is the
+            // per-message tracker accumulated as the loop walks
+            // sorted fields; for v4 cross-byte spans, a single field
+            // produces multiple `bit_usage` entries (one per touched
+            // byte). v3 single-byte fields produce one entry and
+            // walk this loop exactly once, preserving the original
+            // behaviour bit-for-bit.
             if let (Some(bo), Some(bw)) = (f.bit_offset, f.bit_width) {
-                // Safe: bw is in [1, 8], so the shift-by-bw can
-                // produce up to 256 — fits in `u16`. Cast back to
-                // `u8` after subtracting 1.
-                let mask = (((1u16 << bw) - 1) as u8) << (8 - bo - bw);
-                let used = bit_usage.entry(f.offset).or_insert(0);
-                if (*used & mask) != 0 {
-                    return Err(SchemaError::Validation {
-                        message: format!(
-                            "message `{}` field `{}` bit_offset {bo}+bit_width {bw} overlaps prior bit-packed field at byte offset {} (claimed bits 0b{:08b}, new bits 0b{mask:08b})",
-                            mt.name, f.name, f.offset, *used
-                        ),
-                    });
+                for (byte, mask) in crate::codec::bit_packed_byte_masks(f.offset, bo, bw) {
+                    let used = bit_usage.entry(byte).or_insert(0);
+                    if (*used & mask) != 0 {
+                        return Err(SchemaError::Validation {
+                            message: format!(
+                                "message `{}` field `{}` bit_offset {bo}+bit_width {bw} overlaps prior bit-packed field at byte offset {byte} (claimed bits 0b{:08b}, new bits 0b{mask:08b})",
+                                mt.name, f.name, *used
+                            ),
+                        });
+                    }
+                    *used |= mask;
                 }
-                *used |= mask;
             }
             // For `repeat` fields, the per-payload end is dynamic
             // (`record_size_bytes × actual_count`). The static check
@@ -2216,30 +2264,89 @@ message-types:
     }
 
     #[test]
-    fn rejects_bit_offset_plus_width_exceeds_byte() {
-        // `bit_offset + bit_width <= 8` is the load-bearing v3
-        // single-byte limit. A field declaring `bit_offset=5,
-        // bit_width=4` would span bits 5..=8 — into the next byte
-        // — and is a v4 feature.
+    fn accepts_cross_byte_bit_span_v4() {
+        // v4 (#1399) lifts the single-byte `bit_offset + bit_width
+        // ≤ 8` validation, so a 12-bit `u16` field starting at
+        // `bit_offset = 4` (touches the low nibble of byte 0 plus
+        // all of byte 1) now validates. The field type must be
+        // wide enough — a u8 here would fail with the
+        // `bit_width exceeds field type capacity` check below.
         let yaml = r#"
 schema-version: "1"
 protocol-name: "test"
 message-types:
   - name: "M"
-    size-bytes: 1
+    size-bytes: 2
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u16 }
+        bit-offset: 4
+        bit-width: 12
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        schema
+            .validate()
+            .expect("cross-byte bit span on u16 must validate");
+    }
+
+    #[test]
+    fn rejects_bit_width_exceeding_u8_capacity() {
+        // v4 (#1399): even with cross-byte spans now allowed, the
+        // declared field type must be wide enough to carry the
+        // declared `bit_width`. A `u8` field cannot carry more
+        // than 8 bits.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 2
     fields:
       - name: "v"
         offset: 0
         field-type: { kind: u8 }
-        bit-offset: 5
-        bit-width: 4
+        bit-offset: 4
+        bit-width: 12
 "#;
         let schema = Schema::parse(yaml).unwrap();
         let err = schema.validate().unwrap_err();
         let SchemaError::Validation { message } = err else {
             panic!("expected validation error");
         };
-        assert!(message.contains("cross-byte bit fields"), "got: {message}");
+        assert!(
+            message.contains("bit_width 12 exceeds field type `u8` capacity"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_bit_width_above_64() {
+        // `bit_width` caps at 64 — the runtime projects every
+        // bit-packed field to `DecodedValue::U64`, so `bit_width =
+        // 65` could not be represented.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 9
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: u64 }
+        bit-offset: 0
+        bit-width: 65
+"#;
+        let schema = Schema::parse(yaml).unwrap();
+        let err = schema.validate().unwrap_err();
+        let SchemaError::Validation { message } = err else {
+            panic!("expected validation error");
+        };
+        assert!(
+            message.contains("bit_width 65 must be in `[1, 64]`"),
+            "got: {message}"
+        );
     }
 
     #[test]
@@ -2341,32 +2448,66 @@ message-types:
     }
 
     #[test]
-    fn rejects_bit_packed_on_non_u8_field_type() {
-        // v3 bit-packed grammar is `u8`-only: the runtime reads
-        // exactly one byte and projects an integer sub-range. Wider
-        // field types would either ignore the second byte or
-        // silently widen the extraction — both surprises.
-        let yaml = r#"
+    fn accepts_bit_packed_on_unsigned_wider_types_v4() {
+        // v4 (#1399) extends bit-packing from `u8`-only to
+        // `u8/u16/u32/u64`. Each type's max `bit_width` matches
+        // its natural width: u16 ≤ 16, u32 ≤ 32, u64 ≤ 64. A
+        // 1-bit u16 is a valid (if redundant) declaration.
+        for (kind, width) in [("u16", 16u8), ("u32", 32u8), ("u64", 64u8)] {
+            let yaml = format!(
+                r#"
 schema-version: "1"
 protocol-name: "test"
 message-types:
   - name: "M"
-    size-bytes: 2
+    size-bytes: 8
     fields:
       - name: "v"
         offset: 0
-        field-type: { kind: u16 }
+        field-type: {{ kind: {kind} }}
         bit-offset: 0
-        bit-width: 1
-"#;
-        let schema = Schema::parse(yaml).unwrap();
-        let err = schema.validate().unwrap_err();
-        let SchemaError::Validation { message } = err else {
-            panic!("expected validation error");
-        };
-        assert!(
-            message.contains("require `u8` field type"),
-            "got: {message}"
-        );
+        bit-width: {width}
+"#
+            );
+            let schema = Schema::parse(&yaml).unwrap();
+            schema
+                .validate()
+                .unwrap_or_else(|e| panic!("{kind} max-width bit-packed must validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn rejects_bit_packed_on_signed_or_float_field_type() {
+        // v4 (#1399) bit-packing still requires an unsigned field
+        // type — signed types would need sign-extension on decode
+        // (tracked as a follow-up to #1399) and floats are
+        // fundamentally bit-pattern types, not sub-range
+        // projections.
+        for kind in ["i16", "i32", "f32", "f64", "bytes"] {
+            let yaml = format!(
+                r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: {{ kind: {kind} }}
+        bit-offset: 0
+        bit-width: 4
+"#
+            );
+            let schema = Schema::parse(&yaml).unwrap();
+            let err = schema.validate().unwrap_err();
+            let SchemaError::Validation { message } = err else {
+                panic!("expected validation error for kind {kind}");
+            };
+            assert!(
+                message.contains("does not support bit-packing"),
+                "for kind {kind}, got: {message}"
+            );
+        }
     }
 }
