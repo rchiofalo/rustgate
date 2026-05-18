@@ -273,8 +273,12 @@ impl SchemaCodec {
         // fits inside `size_bytes * 8`. The runtime reads the
         // touched byte range MSB-first into a `u64`; v3 single-byte
         // fields (`bit_offset + bit_width ≤ 8`) take the same path
-        // and produce identical bytes, so the v4 lift is fully
-        // backward-compatible.
+        // and produce identical bytes.
+        //
+        // Signed types (v4.1) sign-extend the raw bit pattern
+        // before projecting as `DecodedValue::I64` — see
+        // `sign_extend_bit_span`. Unsigned types take the original
+        // `DecodedValue::U64` path unchanged.
         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
             let bytes_touched = bit_packed_bytes_touched(bit_offset, bit_width);
             let end = field.offset + bytes_touched;
@@ -285,7 +289,12 @@ impl SchemaCodec {
                 });
             }
             let extracted = read_bit_span(payload, field.offset, bit_offset, bit_width);
-            return Ok(DecodedValue::U64(extracted));
+            return Ok(match field.field_type {
+                FieldType::I8 | FieldType::I16 | FieldType::I32 | FieldType::I64 => {
+                    DecodedValue::I64(sign_extend_bit_span(extracted, bit_width))
+                }
+                _ => DecodedValue::U64(extracted),
+            });
         }
         let size = dyn_size.unwrap_or_else(|| {
             field
@@ -360,24 +369,63 @@ impl SchemaCodec {
                     required: end,
                 });
             }
-            let raw = value.as_u64(field)?;
-            // Range guard: a `bit_width`-bit unsigned value can hold
-            // `2^bit_width - 1`. The validator already constrained
-            // `bit_width ∈ [1, 64]`, but `1 << 64` overflows a
-            // `u64`, so guard the `bit_width == 64` case explicitly
-            // (any `u64` value is in-range).
-            let max = if bit_width == 64 {
-                u64::MAX
-            } else {
-                (1u64 << bit_width) - 1
+            // Signed types (v4.1): range-check against the
+            // two's-complement domain `[-2^(N-1), 2^(N-1) - 1]`,
+            // then bitcast to u64 and mask to the bit_width so the
+            // shared `write_bit_span` path writes only the field's
+            // bits. Unsigned types take the original v4 path.
+            let raw = match field.field_type {
+                FieldType::I8 | FieldType::I16 | FieldType::I32 | FieldType::I64 => {
+                    let signed = value.as_i64(field)?;
+                    // bit_width == 64 special case: full i64 range
+                    // is `[i64::MIN, i64::MAX]`, every value fits.
+                    if bit_width < 64 {
+                        let half_range = 1i64 << (bit_width - 1);
+                        if signed < -half_range || signed >= half_range {
+                            return Err(SchemaCodecError::OutOfRange {
+                                field: field.name.clone(),
+                                value: signed.to_string(),
+                                type_name: format!("i{bit_width} (bit-packed)"),
+                            });
+                        }
+                    }
+                    // Bitcast to u64 and mask to `bit_width` so
+                    // negative values' sign-extended high bits
+                    // (when they exist) don't leak past the field.
+                    // justification: signed-to-unsigned bit-cast is the
+                    // standard two's-complement marshaling pattern.
+                    #[allow(clippy::cast_sign_loss)]
+                    let bitcast = signed as u64;
+                    let mask = if bit_width == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << bit_width) - 1
+                    };
+                    bitcast & mask
+                }
+                _ => {
+                    let raw = value.as_u64(field)?;
+                    // Range guard: a `bit_width`-bit unsigned value
+                    // can hold `2^bit_width - 1`. The validator
+                    // already constrained `bit_width ∈ [1, 64]`, but
+                    // `1 << 64` overflows a `u64`, so guard the
+                    // `bit_width == 64` case explicitly (any `u64`
+                    // value is in-range).
+                    let max = if bit_width == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << bit_width) - 1
+                    };
+                    if raw > max {
+                        return Err(SchemaCodecError::OutOfRange {
+                            field: field.name.clone(),
+                            value: raw.to_string(),
+                            type_name: format!("u{bit_width} (bit-packed)"),
+                        });
+                    }
+                    raw
+                }
             };
-            if raw > max {
-                return Err(SchemaCodecError::OutOfRange {
-                    field: field.name.clone(),
-                    value: raw.to_string(),
-                    type_name: format!("u{bit_width} (bit-packed)"),
-                });
-            }
             write_bit_span(out, field.offset, bit_offset, bit_width, raw);
             return Ok(());
         }
@@ -1526,6 +1574,47 @@ fn write_bit_span(out: &mut [u8], byte_offset: usize, bit_offset: u8, bit_width:
         bits_remaining -= bits_in_this_byte;
         cur_bit = 0;
         cur_byte += 1;
+    }
+}
+
+/// Sign-extend a `bit_width`-bit raw bit pattern read out of the
+/// wire into a 64-bit signed value. Used by `decode_field` after
+/// `read_bit_span` for signed bit-packed field types (v4.1).
+///
+/// For `bit_width = 64` the raw pattern is already the full u64
+/// — bitcast directly to i64 (no extension needed). For narrower
+/// widths the MSB-position of the field carries the sign bit; if
+/// set, fill the high bits above `bit_width` with 1s so the
+/// resulting i64 has the correct two's-complement representation.
+///
+/// Examples (bit_width = 4):
+///   - raw `0b0111` → 7 (positive, MSB is 0)
+///   - raw `0b1000` → -8 (MSB is 1; sign-extend → `0xFFFFFFFF_FFFFFFF8`)
+///   - raw `0b1111` → -1 (sign-extend → `0xFFFFFFFF_FFFFFFFF`)
+fn sign_extend_bit_span(raw: u64, bit_width: u8) -> i64 {
+    if bit_width == 64 {
+        // justification: full-width bitcast — same bit pattern,
+        // signed interpretation.
+        #[allow(clippy::cast_possible_wrap)]
+        return raw as i64;
+    }
+    let sign_bit = 1u64 << (bit_width - 1);
+    if raw & sign_bit != 0 {
+        // Negative — extend high bits above `bit_width` to 1.
+        let extension = !((1u64 << bit_width) - 1);
+        // justification: standard two's-complement extension; the
+        // result fits in i64 because we're filling bits the value
+        // would otherwise leave at 0.
+        #[allow(clippy::cast_possible_wrap)]
+        let extended = (raw | extension) as i64;
+        extended
+    } else {
+        // Positive — direct cast (high bits are 0, no extension).
+        // justification: value's MSB is 0, so the result is
+        // non-negative and the cast is total.
+        #[allow(clippy::cast_possible_wrap)]
+        let positive = raw as i64;
+        positive
     }
 }
 
@@ -2962,6 +3051,220 @@ message-types:
             recovered.attributes.get("attributes.value"),
             Some(&AttributeValue::Int(0x1234))
         );
+    }
+
+    // ----------------- v4.1 signed bit-packed types (#1403) -----------------
+
+    #[test]
+    fn sign_extend_bit_span_handles_positive_negative_and_zero() {
+        // 4-bit signed: domain is [-8, 7].
+        //   raw 0b0000 → 0
+        //   raw 0b0001 → 1
+        //   raw 0b0111 → 7 (max positive)
+        //   raw 0b1000 → -8 (min negative)
+        //   raw 0b1111 → -1
+        assert_eq!(sign_extend_bit_span(0b0000, 4), 0);
+        assert_eq!(sign_extend_bit_span(0b0001, 4), 1);
+        assert_eq!(sign_extend_bit_span(0b0111, 4), 7);
+        assert_eq!(sign_extend_bit_span(0b1000, 4), -8);
+        assert_eq!(sign_extend_bit_span(0b1111, 4), -1);
+
+        // 25-bit signed (VMF latitude representative): domain is
+        // [-2^24, 2^24 - 1] = [-16_777_216, 16_777_215].
+        //   raw 0x00FFFFFF → 16_777_215 (max positive)
+        //   raw 0x01000000 → -16_777_216 (min negative, MSB is bit 24)
+        //   raw 0x01FFFFFF → -1 (all 25 bits set)
+        assert_eq!(sign_extend_bit_span(0x00FF_FFFF, 25), 16_777_215);
+        assert_eq!(sign_extend_bit_span(0x0100_0000, 25), -16_777_216);
+        assert_eq!(sign_extend_bit_span(0x01FF_FFFF, 25), -1);
+
+        // 64-bit: full bitcast, no extension.
+        assert_eq!(sign_extend_bit_span(0, 64), 0);
+        assert_eq!(sign_extend_bit_span(u64::MAX, 64), -1);
+        assert_eq!(sign_extend_bit_span(1u64 << 63, 64), i64::MIN);
+        assert_eq!(sign_extend_bit_span((1u64 << 63) - 1, 64), i64::MAX);
+    }
+
+    #[test]
+    fn signed_bit_packed_round_trips_through_schema_codec() {
+        // End-to-end signed round-trip on a 25-bit i32 field —
+        // representative of VMF K05.1 latitude. The wire pattern
+        // `[0x01, 0x00, 0x00, 0x00]` carries bits 0..=24 of
+        // `0b0_0000_0010_0000_0000_0000_0000_0000_0000` shifted
+        // to fit the schema's bit_offset = 0 start.
+        // For simplicity, pick a representable value: -1 (all 25
+        // bits set → wire `[0xFF, 0xFF, 0xFF, 0x80]` with high
+        // byte's low 7 bits unused).
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 4
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: i32 }
+        bit-offset: 0
+        bit-width: 25
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        // Encode -1: all 25 bits should be 1.
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.v".into(), AttributeValue::Int(-1));
+        let wire = codec.from_entity(&entity).expect("schema encode signed");
+        // 25 bits all 1 starting at bit-offset 0 of byte 0:
+        // bytes [0xFF, 0xFF, 0xFF, 0x80] (last byte has only
+        // bit 0 — MSB — set; bits 1..=7 are zero).
+        assert_eq!(wire, vec![0xFF, 0xFF, 0xFF, 0x80]);
+        let decoded = codec.to_entity(&wire).expect("schema decode signed");
+        assert_eq!(
+            decoded.attributes.get("attributes.v"),
+            Some(&AttributeValue::Int(-1))
+        );
+
+        // Encode -16_777_216 (min for 25-bit signed): wire pattern
+        // is `0x0100_0000` at the 25-bit field's position →
+        // bytes [0x80, 0x00, 0x00, 0x00].
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.v".into(), AttributeValue::Int(-16_777_216));
+        let wire = codec.from_entity(&entity).expect("encode min");
+        assert_eq!(wire, vec![0x80, 0x00, 0x00, 0x00]);
+        let decoded = codec.to_entity(&wire).expect("decode min");
+        assert_eq!(
+            decoded.attributes.get("attributes.v"),
+            Some(&AttributeValue::Int(-16_777_216))
+        );
+    }
+
+    #[test]
+    fn signed_bit_packed_rejects_value_outside_two_s_complement_range() {
+        // An i8 with bit_width = 8 has domain [-128, 127]. Trying
+        // to encode 128 must fail with OutOfRange — the value
+        // doesn't fit in the signed domain.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: i8 }
+        bit-offset: 0
+        bit-width: 8
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.v".into(), AttributeValue::Int(128));
+        let err = codec.from_entity(&entity).unwrap_err();
+        let SchemaCodecError::OutOfRange { type_name, .. } = err else {
+            panic!("expected OutOfRange, got {err:?}");
+        };
+        assert!(
+            type_name.contains("i8 (bit-packed)"),
+            "expected type label `i8 (bit-packed)`, got: {type_name}"
+        );
+
+        // -129 is also out of range (one below i8::MIN).
+        let _ = entity
+            .attributes
+            .insert("attributes.v".into(), AttributeValue::Int(-129));
+        let err = codec.from_entity(&entity).unwrap_err();
+        let SchemaCodecError::OutOfRange { value, .. } = err else {
+            panic!("expected OutOfRange for negative overflow, got {err:?}");
+        };
+        assert_eq!(value, "-129");
+    }
+
+    #[test]
+    fn signed_bit_packed_full_width_i64_round_trips_i64_min_max() {
+        // bit_width = 64 on an i64 covers the full domain
+        // [i64::MIN, i64::MAX] — the range check is skipped (any
+        // value fits) and the bitcast→u64 path writes raw bits.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: i64 }
+        bit-offset: 0
+        bit-width: 64
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        for value in [0i64, 1, -1, i64::MIN, i64::MAX, 0x0123_4567_89AB_CDEFi64] {
+            let mut entity = empty_entity();
+            let _ = entity
+                .attributes
+                .insert("attributes.v".into(), AttributeValue::Int(value));
+            let wire = codec.from_entity(&entity).expect("encode");
+            let recovered = codec.to_entity(&wire).expect("decode");
+            assert_eq!(
+                recovered.attributes.get("attributes.v"),
+                Some(&AttributeValue::Int(value)),
+                "value {value:#x} failed round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_bit_packed_one_bit_carries_zero_and_minus_one() {
+        // A 1-bit signed value can only represent {0, -1} —
+        // domain is [-2^0, 2^0 - 1] = [-1, 0]. Verify both
+        // values round-trip; the value 1 must reject.
+        let yaml = r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 1
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: { kind: i8 }
+        bit-offset: 7
+        bit-width: 1
+        entity-path: "attributes.v"
+"#;
+        let codec = SchemaCodec::from_schema_text(yaml).unwrap();
+        for (value, expected_wire) in [(0i64, 0x00u8), (-1, 0x01)] {
+            let mut entity = empty_entity();
+            let _ = entity
+                .attributes
+                .insert("attributes.v".into(), AttributeValue::Int(value));
+            let wire = codec.from_entity(&entity).expect("encode 1-bit signed");
+            assert_eq!(wire, vec![expected_wire], "value {value} → wire");
+            let recovered = codec.to_entity(&wire).expect("decode 1-bit signed");
+            assert_eq!(
+                recovered.attributes.get("attributes.v"),
+                Some(&AttributeValue::Int(value))
+            );
+        }
+        // Value 1 must fail — it's outside the 1-bit signed
+        // domain {-1, 0}.
+        let mut entity = empty_entity();
+        let _ = entity
+            .attributes
+            .insert("attributes.v".into(), AttributeValue::Int(1));
+        let err = codec.from_entity(&entity).unwrap_err();
+        let SchemaCodecError::OutOfRange { type_name, .. } = err else {
+            panic!("expected OutOfRange, got {err:?}");
+        };
+        assert!(type_name.contains("i1 (bit-packed)"), "got: {type_name}");
     }
 
     #[test]
