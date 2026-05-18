@@ -697,20 +697,21 @@ impl Schema {
                     });
                 }
                 // Pair bit_width with the declared field type's
-                // natural width. A u8 cannot carry more than 8 bits;
-                // u16 16, u32 32, u64 64. Bit-packed fields all
-                // project to `DecodedValue::U64`, so signed types
-                // (i8/i16/i32/i64) would need sign-extension on
-                // decode — that's tracked as v4.1 follow-up (#TBD).
+                // natural width. v4 added unsigned u8/u16/u32/u64;
+                // v4.1 (#1403) extends to signed i8/i16/i32/i64
+                // with the same per-type width caps. Signed fields
+                // sign-extend on decode (see `sign_extend_bit_span`
+                // in `codec.rs`) and project as
+                // `DecodedValue::I64` rather than `U64`.
                 let max_bits_for_type = match f.field_type {
-                    FieldType::U8 => 8u8,
-                    FieldType::U16 => 16u8,
-                    FieldType::U32 => 32u8,
-                    FieldType::U64 => 64u8,
+                    FieldType::U8 | FieldType::I8 => 8u8,
+                    FieldType::U16 | FieldType::I16 => 16u8,
+                    FieldType::U32 | FieldType::I32 => 32u8,
+                    FieldType::U64 | FieldType::I64 => 64u8,
                     _ => {
                         return Err(SchemaError::Validation {
                             message: format!(
-                                "message `{}` field `{}` type `{}` does not support bit-packing (requires u8 / u16 / u32 / u64)",
+                                "message `{}` field `{}` type `{}` does not support bit-packing (requires u8/i8/u16/i16/u32/i32/u64/i64)",
                                 mt.name,
                                 f.name,
                                 f.field_type.as_str()
@@ -2477,13 +2478,43 @@ message-types:
     }
 
     #[test]
-    fn rejects_bit_packed_on_signed_or_float_field_type() {
-        // v4 (#1399) bit-packing still requires an unsigned field
-        // type — signed types would need sign-extension on decode
-        // (tracked as a follow-up to #1399) and floats are
-        // fundamentally bit-pattern types, not sub-range
-        // projections.
-        for kind in ["i16", "i32", "f32", "f64", "bytes"] {
+    fn accepts_bit_packed_on_signed_integer_types_v4_1() {
+        // v4.1 (#1403) extends bit-packing from unsigned-only to
+        // signed integer types as well. Each pairs with the same
+        // max bit_width as its unsigned counterpart.
+        for (kind, width) in [("i8", 8u8), ("i16", 16u8), ("i32", 32u8), ("i64", 64u8)] {
+            let yaml = format!(
+                r#"
+schema-version: "1"
+protocol-name: "test"
+message-types:
+  - name: "M"
+    size-bytes: 8
+    fields:
+      - name: "v"
+        offset: 0
+        field-type: {{ kind: {kind} }}
+        bit-offset: 0
+        bit-width: {width}
+"#
+            );
+            let schema = Schema::parse(&yaml).unwrap();
+            schema
+                .validate()
+                .unwrap_or_else(|e| panic!("{kind} max-width bit-packed must validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn rejects_bit_packed_on_float_or_bytes_field_type() {
+        // v4.1 (#1403) bit-packing accepts integer types
+        // (signed and unsigned) but still rejects floats —
+        // a 4-bit f32 would have to truncate the IEEE-754
+        // representation in a way that has no standard
+        // interpretation — and bytes (which represent a
+        // variable-length span, incompatible with bit-packing's
+        // sub-range projection).
+        for kind in ["f32", "f64", "bytes"] {
             let yaml = format!(
                 r#"
 schema-version: "1"
