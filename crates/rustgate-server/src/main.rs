@@ -617,6 +617,44 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // CNSA 2.0 scaffolding flag (#504). The full convergence is
+    // blocked on aws-lc-rs resolving its FIPS / ML-DSA mutual
+    // exclusion ([aws-lc-rs #964]); this flag's runtime behavior
+    // today is limited to (a) validating the build has the
+    // post-quantum feature compiled in, and (b) logging the
+    // phased-readiness state so operators understand what they
+    // actually get versus the full CNSA 2.0 target.
+    //
+    // [aws-lc-rs #964]: https://github.com/aws/aws-lc-rs/issues/964
+    if cli.cnsa2 {
+        #[cfg(not(feature = "post-quantum"))]
+        {
+            tracing::error!(
+                "--cnsa2 requires the post-quantum feature to be compiled in; \
+                 rebuild with --features post-quantum (and --features fips when \
+                 aws-lc-rs #964 ships)"
+            );
+            return Err(anyhow::anyhow!(
+                "--cnsa2 requires --features post-quantum at build time"
+            ));
+        }
+        #[cfg(feature = "post-quantum")]
+        {
+            // Log the gap between "operator asked for CNSA 2.0" and
+            // "this build can actually deliver". The targets come
+            // from the NSA CNSA 2.0 algorithm suite; the "available
+            // today" column is the workspace's current reality.
+            tracing::warn!(
+                "--cnsa2 enabled (scaffolding mode). CNSA 2.0 target: \
+                 ML-KEM-1024 (NIST L5) + ML-DSA-87 (NIST L5) + TLS 1.3. \
+                 Available today: X25519MLKEM768 (NIST L3 hybrid) + \
+                 classical certs. Full CNSA 2.0 blocks on rustls / \
+                 aws-lc-rs ML-DSA + FIPS convergence. See \
+                 docs/adr/0019-cnsa2-hybrid-mldsa.md and #504."
+            );
+        }
+    }
+
     tracing::info!(bind = %cli.bind, "rustgate starting");
     audit::server_started(&cli.bind, env!("CARGO_PKG_VERSION"));
 
