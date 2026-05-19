@@ -175,6 +175,130 @@ The workspace is organized as independent crates under `crates/`:
 5. Add a `[[licenses.exceptions]]` entry in `deny.toml` for the proprietary license
 6. Add a `description` field for the crate
 
+## Adding a new protocol schema-parity test
+
+Every tactical-protocol crate ships a YAML schema and a `schema-parity`
+proptest alongside the hand-rolled codec. The schema is a **declarative pin**
+of the wire layout; the proptest asserts byte-identical round-trip between
+the hand-rolled codec and the SchemaCodec runtime. See
+[ADR 0018](docs/adr/0018-schema-first-codec-design.md) for the rationale and
+[`docs/codec-schema-grammar.md`](docs/codec-schema-grammar.md) for the full
+grammar reference.
+
+**When to skip this step**: XML-based formats (CoT, NFFI) and protobuf-based
+formats (SAPIENT, Meshtastic) are not amenable to the codec-schema vocabulary
+— it targets fixed-offset binary wire formats only. Skip the schema YAML and
+parity test for those; the hand-rolled codec carries the full discipline on
+its own.
+
+### Recipe (binary fixed-offset protocols)
+
+1. **Add the schema YAML** at `crates/<crate>/schemas/<message>.yaml`.
+   Start with the wire-layout table from the production codec's `decode` /
+   `encode_into` source as the docstring. Cite the spec section. Use the
+   smallest grammar version that expresses the layout (v1 for simple
+   primitives, v3 for bit-packing, v5 for FX-continuation cascades — see the
+   table in [`docs/codec-schema-grammar.md`](docs/codec-schema-grammar.md)).
+
+2. **Promote `rustgate-codec-schema` to a dev-dep** in the crate's
+   `Cargo.toml`. If the production codec is being migrated to use SchemaCodec
+   at runtime (rare today — only STANAG 4586 vehicle_position decode has
+   done this), make it a regular `[dependencies]` entry instead. Most new
+   schemas should stay dev-only.
+
+   ```toml
+   [dev-dependencies]
+   proptest = { workspace = true }
+   # Schema-parity proptest pins byte-identical round-trip between
+   # the hand-rolled codec and SchemaCodec.
+   rustgate-codec-schema = { workspace = true }
+   ```
+
+3. **Add the parity test** at
+   `crates/<crate>/tests/schema_parity_<message>.rs`. Use the inline
+   reference-encoder pattern — **do not call the production codec for the
+   reference side**. This is the load-bearing #1394 fix; an earlier
+   iteration of the test pattern used `production::encode` for one half of
+   the round-trip and missed the #1393 STANAG NaN regression because both
+   halves shared the broken implementation.
+
+   ```rust
+   #![cfg(test)]
+   #![allow(clippy::panic, clippy::unwrap_used)]
+
+   use proptest::prelude::*;
+   use rustgate_codec_schema::SchemaCodec;
+   use rustgate_core::entity::EntityCodec;
+
+   const SCHEMA_YAML: &str = include_str!("../schemas/<message>.yaml");
+
+   fn schema_codec() -> SchemaCodec {
+       SchemaCodec::from_schema_text(SCHEMA_YAML).expect("schema must parse + validate")
+   }
+
+   // Hand-coded reference encoder — does NOT call the production codec.
+   fn reference_encode(input: &<Input>) -> Vec<u8> { /* ... byte-level writes ... */ }
+
+   proptest! {
+       #[test]
+       fn schema_codec_byte_identical_to_reference(input in <strategy>()) {
+           let reference = reference_encode(&input);
+           let codec = schema_codec();
+           let entity = codec.to_entity(&reference).expect("schema decode");
+           let re_encoded = codec.from_entity(&entity).expect("schema encode");
+           prop_assert_eq!(&re_encoded[..], &reference[..]);
+       }
+   }
+   ```
+
+   Optional but recommended:
+   - A **public-API round-trip proptest** that exercises `production::encode`
+     → `production::decode` and asserts every typed field. Catches
+     field-zeroing regressions the schema parity test misses by construction
+     (since the reference encoder is independent).
+   - A **golden fixture** that pins a known wire byte pattern against a
+     known logical input. Catches off-by-one regressions even if the proptest
+     happens to skip the specific combination.
+
+4. **Add a `### Added` entry to `CHANGELOG.md`** under `[Unreleased]`. Note
+   the grammar features the schema exercises so the version arc stays
+   discoverable.
+
+5. **Add a row to the reference protocols table** in the workspace
+   [`README.md`](README.md#schema-driven-codecs). Format follows the
+   existing rows: protocol name, schema YAML link, parity test link, grammar
+   features used.
+
+### Quality gates
+
+```bash
+cargo nextest run -p rustgate-<crate> --test schema_parity_<message>
+cargo +nightly fmt --all
+cargo clippy --locked -p rustgate-<crate> --all-targets
+```
+
+### When the grammar genuinely cannot express the layout
+
+If the schema validator rejects your YAML with an error you cannot work
+around, **first check whether the layout fits one of the deferred grammar
+features** (cross-byte spans, signed bit-packed, variable-shift `present-if`,
+schema chaining — see the version table in
+[`docs/architecture.md`](docs/architecture.md#when-to-add-a-new-grammar-feature)).
+
+If a real protocol needs a feature that does not exist yet:
+
+1. File an issue describing the layout and what grammar feature would
+   unblock it. Include a wire-format snippet and the validator error.
+2. Decide whether to add the grammar feature (a separate PR following
+   ADR 0018's three bars — real protocol forcing function, existing grammar
+   genuinely cannot express, backward-compatible) or skip the parity test
+   for this protocol and document the gap.
+
+The fallback is always "ship the hand-rolled codec without a parity test"
+— that is the same situation every CoT / NFFI / SAPIENT / Meshtastic codec
+is in today, and no codec has been blocked from landing because it could
+not be schemed.
+
 ## Commit Messages
 
 Follow [Conventional Commits](https://www.conventionalcommits.org/):
