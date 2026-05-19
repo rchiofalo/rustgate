@@ -1,6 +1,19 @@
 # Deployment
 
-rustgate supports three deployment modes: standalone binary, Docker Compose, and Kubernetes with Helm.
+This page covers the **primary deployment modes**: standalone binary,
+Docker Compose, and Kubernetes with the in-tree Helm chart. These work
+on any cluster / host with no platform-specific dependencies.
+
+**Two additional opt-in paths** exist for specialised environments:
+
+- **Zarf package** for airgapped Kubernetes (no outbound internet)
+- **UDS bundle** for the Defense Unicorns UDS Core platform (Istio
+  mTLS mesh, Pepr admission, monitoring stack)
+
+Both are documented in [`docs/uds-deployment.md`](uds-deployment.md);
+neither is required to run rustgate. If your target cluster has
+outbound internet to `ghcr.io` and you don't need UDS Core, this page
+is the right reference and you can skip the UDS doc entirely.
 
 ## Quick Reference
 
