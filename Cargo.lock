@@ -4689,6 +4689,8 @@ name = "rustgate-link16"
 version = "0.9.0"
 dependencies = [
  "bytes",
+ "proptest",
+ "rustgate-codec-schema",
  "rustgate-core",
  "thiserror 2.0.18",
 ]

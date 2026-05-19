@@ -1,0 +1,104 @@
+# Link 16 JREAP-C frame header (STANAG 5518).
+#
+# JREAP-C is the IP-encapsulation transport for Link 16 J-series
+# tactical data. Every JREAP-C frame on the wire starts with a
+# fixed 16-byte big-endian header followed by a body whose shape
+# depends on `message_type`. This schema covers the **header
+# only** — per-message-type body schemas (J2.2 PPLI, J3.x track
+# data, J7.x indirect coordinate, J12.x mission management, …)
+# ride on follow-up schemas dispatched at the call site by the
+# header's `message_type` field, the same pattern STANAG 4586,
+# DIS, and MAVLink follow.
+#
+# # Wire layout (16 bytes, big-endian, 32-bit-aligned)
+#
+# offset │ size │ field        │ notes
+# ───────┼──────┼──────────────┼─────────────────────────────────
+#   0    │  1   │ version      │ JREAP-C is `0x03`; JREAP-A
+#                                 (legacy serial, `0x01`) is
+#                                 rejected at decode by the typed
+#                                 wrapper
+#   1    │  1   │ message_type │ See `JreapMessageType` —
+#                                 J2.2 = `0x01`, every other byte
+#                                 surfaces as `Other(byte)` for
+#                                 forward-compat
+#   2    │  1   │ exercise_id  │ Coalition exercise group id
+#   3    │  1   │ reserved     │ Spec-defined zero-padding;
+#                                 preserved verbatim on round-trip
+#                                 so a future revision that
+#                                 allocates the byte stays
+#                                 backward-compatible
+#   4    │  4   │ sequence     │ Monotonic per-connection counter;
+#                                 receivers use it to detect drops
+#   8    │  4   │ timestamp    │ Seconds since Unix epoch (sender
+#                                 clock — the schema preserves it
+#                                 opaque; freshness checks live in
+#                                 the session layer)
+#  12    │  4   │ body_length  │ Bytes following the 16-byte
+#                                 header (the integration layer
+#                                 frames `&buf[16..16+body_length]`
+#                                 as the body)
+#
+# # What this schema does NOT carry
+#
+# - The `JreapMessageType` enum vocabulary. The schema carries
+#   the raw byte; the Rust wrapper at `src/header.rs` projects
+#   `0x01` to `JseriesData` and unknown bytes to `Other(byte)`.
+#   v2 `value-mapping` could encode the dispatch (decode
+#   `0x01` → `"JseriesData"`, encode reverse) but the wrapper-
+#   side `Other(byte)` arm is lossy-by-design for unknown bytes,
+#   which `value-mapping` can't preserve without enumerating
+#   every byte value. The wrapper's typed-projection layer
+#   handles this without the lossiness.
+# - The `version: 0x03` constraint. The schema declares
+#   `version` as a u8 so byte-equivalent round-trip holds for
+#   every wire byte; the wrapper-side `JreapFrame::decode`
+#   enforces `version == 0x03` (JREAP-A is rejected). A future
+#   `value-mapping` overlay could constrain the schema-level
+#   accept to `0x03` only and reject other versions as not-
+#   JREAP-C.
+# - Per-`message_type` body shapes. J2.2 PPLI / J3.x track /
+#   J7.x indirect / J12.x mission management each have their
+#   own body shape; those need their own schemas dispatched by
+#   the wrapper after the header decodes.
+#
+# # Provenance
+#
+# Byte layout cross-checked against
+# `crates/rustgate-link16/src/header.rs::JreapFrame::{decode,encode_into}`
+# (the `JREAP_HEADER_LEN = 16` constant, the four u32 big-endian
+# field reads at offsets 4 / 8 / 12, and the four u8 fields at
+# offsets 0 / 1 / 2 / 3). The schema-parity proptest in
+# `tests/schema_parity_jreap_header.rs` asserts byte-identical
+# round-trip for every arbitrary 16-byte header proptest
+# generates.
+schema-version: "1"
+protocol-name: "link16.jreap_header"
+message-types:
+  - name: "JreapHeader"
+    size-bytes: 16
+    fields:
+      - name: "version"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "message_type"
+        offset: 1
+        field-type: { kind: u8 }
+      - name: "exercise_id"
+        offset: 2
+        field-type: { kind: u8 }
+      - name: "reserved"
+        offset: 3
+        field-type: { kind: u8 }
+      - name: "sequence"
+        offset: 4
+        field-type: { kind: u32 }
+        endian: big
+      - name: "timestamp"
+        offset: 8
+        field-type: { kind: u32 }
+        endian: big
+      - name: "body_length"
+        offset: 12
+        field-type: { kind: u32 }
+        endian: big
