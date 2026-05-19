@@ -47,6 +47,7 @@ does.
 | [0015](0015-encrypted-archives-chacha20-poly1305.md) | ChaCha20-Poly1305 with per-chunk AAD for archive encryption | Accepted |
 | [0016](0016-on-callback-macro-for-typed-aliases.md) | `on_callback!` macro for `Arc<dyn Fn>` callback aliases | Accepted |
 | [0017](0017-workspace-dependency-inheritance.md) | Workspace dependency inheritance for every crate | Accepted |
+| [0018](0018-schema-first-codec-design.md) | Schema-first codec design for tactical wire formats | Accepted |
 
 ## Authoring a new ADR
 
