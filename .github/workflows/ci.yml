@@ -1133,6 +1133,17 @@ jobs:
           # Dependabot's `docker` ecosystem (see .github/dependabot.yml)
           # rotates these weekly. `FROM scratch` is allowed since it
           # is a zero-byte fixed base image.
+          #
+          # Exemption: `Dockerfile.ironbank` references the Iron Bank
+          # `registry1.dso.mil` mirror, which requires CAC/PIV
+          # authentication and is not reachable from public CI. DoD
+          # operators who consume this Dockerfile pin the digest in
+          # their own CI based on what their accessible registry
+          # mirror serves. The `:9-latest` tag on the in-tree file
+          # is a placeholder the consumer replaces — see the header
+          # comment in `Dockerfile.ironbank` for the operator
+          # procedure. Public-network Dockerfiles (`Dockerfile`,
+          # `Dockerfile.operator`, …) are still strictly checked.
           set -euo pipefail
           bad=0
           while IFS= read -r file; do
@@ -1145,13 +1156,13 @@ jobs:
                 }
               }
             ' "$file" || bad=$((bad+1))
-          done < <(git ls-files '*Dockerfile*' | grep -v '^\.claude/')
+          done < <(git ls-files '*Dockerfile*' | grep -v '^\.claude/' | grep -v '^Dockerfile\.ironbank$')
           if [ "$bad" -gt 0 ]; then
             echo "::error::${bad} Dockerfile(s) contain FROM lines without @sha256 digest pinning."
             echo "::error::Resolve with: docker buildx imagetools inspect <image>:<tag>  → copy the top-level Digest, then pin as 'FROM <image>:<tag>@sha256:<digest>'."
             exit 1
           fi
-          echo "All FROM lines are pinned to @sha256 digests."
+          echo "All FROM lines are pinned to @sha256 digests (Dockerfile.ironbank exempt — DoD-restricted registry; operators re-pin in their own CI)."
 
       - name: Check for Docker-relevant changes
         uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
