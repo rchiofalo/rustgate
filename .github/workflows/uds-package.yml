@@ -41,8 +41,17 @@ permissions:
 jobs:
   # ------------------------------------------------------------------
   # Job 1: Version triangle. Cheapest check; runs in <5 seconds.
-  # Fails the build immediately if the three deployment artifacts
-  # disagree on what version of rustgate they're packaging.
+  # Fails the build if the three deployment artifacts disagree on
+  # what version of rustgate they're packaging.
+  #
+  # Tolerates missing files: a PR that touches only `helm/` (without
+  # zarf/ or bundle/) — or only zarf/ without bundle/ — gets a pass
+  # rather than a hard fail. The check only fires when all three
+  # artifacts exist (the on-main steady state). This is the
+  # chicken-and-egg accommodation for the H1–H5 PR sequence: each PR
+  # in batch H lands its own slice of the deployment surface, and
+  # the workflow needs to be friendly to that incremental landing
+  # pattern as well as to future PRs that touch only one slice.
   # ------------------------------------------------------------------
   version-triangle:
     name: Deployment version triangle
@@ -51,7 +60,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check which deployment artifacts are present
+        id: artifacts
+        run: |
+          set -euo pipefail
+          has_helm=0
+          has_zarf=0
+          has_bundle=0
+          [ -f helm/Chart.yaml ] && has_helm=1
+          [ -f zarf/zarf.yaml ] && has_zarf=1
+          [ -f bundle/uds-bundle.yaml ] && has_bundle=1
+          echo "has_helm=${has_helm}" >> "$GITHUB_OUTPUT"
+          echo "has_zarf=${has_zarf}" >> "$GITHUB_OUTPUT"
+          echo "has_bundle=${has_bundle}" >> "$GITHUB_OUTPUT"
+          echo "helm: ${has_helm}, zarf: ${has_zarf}, bundle: ${has_bundle}"
+
       - name: Check helm / zarf / bundle agree on version
+        if: steps.artifacts.outputs.has_helm == '1' && steps.artifacts.outputs.has_zarf == '1' && steps.artifacts.outputs.has_bundle == '1'
         run: |
           set -euo pipefail
 
@@ -77,6 +102,7 @@ jobs:
           fi
 
       - name: Check zarf images match helm values
+        if: steps.artifacts.outputs.has_helm == '1' && steps.artifacts.outputs.has_zarf == '1'
         run: |
           set -euo pipefail
 
@@ -107,11 +133,21 @@ jobs:
               exit 1
           fi
 
+      - name: Skip notice (incomplete deployment surface on this branch)
+        if: steps.artifacts.outputs.has_zarf == '0' || steps.artifacts.outputs.has_bundle == '0'
+        run: |
+          echo "::notice::Skipped version-triangle check — this branch does not have the"
+          echo "::notice::full helm/ + zarf/ + bundle/ surface yet. The check fires when"
+          echo "::notice::all three exist on the same branch (the on-main steady state)."
+
   # ------------------------------------------------------------------
   # Job 2: Zarf package builds. Validates `zarf/zarf.yaml` parses,
   # the referenced Helm chart resolves, and all declared images can
   # be pulled. ~3-4 minutes on the GitHub runner; the image pulls
   # dominate the wall time.
+  #
+  # Skips on branches that don't yet have `zarf/zarf.yaml` (same
+  # incremental-landing tolerance as `version-triangle`).
   # ------------------------------------------------------------------
   zarf-create:
     name: zarf package create
@@ -121,15 +157,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check whether zarf/zarf.yaml exists
+        id: check
+        run: |
+          if [ -f zarf/zarf.yaml ]; then
+              echo "exists=1" >> "$GITHUB_OUTPUT"
+          else
+              echo "exists=0" >> "$GITHUB_OUTPUT"
+              echo "::notice::Skipping — zarf/zarf.yaml not present on this branch."
+          fi
+
       - name: Install Zarf
+        if: steps.check.outputs.exists == '1'
         uses: defenseunicorns/setup-zarf@main
 
       - name: zarf package create (rustgate)
+        if: steps.check.outputs.exists == '1'
         working-directory: zarf
         run: |
           zarf package create --confirm --output ../
 
       - name: Upload Zarf package as artifact
+        if: steps.check.outputs.exists == '1'
         uses: actions/upload-artifact@v4
         with:
           name: rustgate-zarf-package
@@ -137,10 +186,13 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # Job 3: UDS bundle builds. Validates `bundle/uds-bundle.yaml` parses
-  # and composes the Zarf package from job 2 with the UDS Core init
-  # package. Pulls the UDS Core init package over the network — this
-  # is the only job that needs outbound internet to ghcr.io.
+  # Job 3: UDS bundle builds. Validates `bundle/uds-bundle.yaml`
+  # parses and composes the Zarf package from job 2 with the UDS
+  # Core init package. Pulls the UDS Core init package over the
+  # network.
+  #
+  # Skips on branches without both `zarf/zarf.yaml` and
+  # `bundle/uds-bundle.yaml` — the bundle composition needs both.
   # ------------------------------------------------------------------
   uds-create:
     name: uds bundle create
@@ -150,24 +202,39 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check whether zarf and bundle files both exist
+        id: check
+        run: |
+          if [ -f zarf/zarf.yaml ] && [ -f bundle/uds-bundle.yaml ]; then
+              echo "exists=1" >> "$GITHUB_OUTPUT"
+          else
+              echo "exists=0" >> "$GITHUB_OUTPUT"
+              echo "::notice::Skipping — full zarf/ + bundle/ surface not on this branch."
+          fi
+
       - name: Install Zarf
+        if: steps.check.outputs.exists == '1'
         uses: defenseunicorns/setup-zarf@main
 
       - name: Install UDS CLI
+        if: steps.check.outputs.exists == '1'
         uses: defenseunicorns/setup-uds@main
 
       - name: Download Zarf package from job 2
+        if: steps.check.outputs.exists == '1'
         uses: actions/download-artifact@v5
         with:
           name: rustgate-zarf-package
           path: ./
 
       - name: uds create (composes UDS Core + rustgate)
+        if: steps.check.outputs.exists == '1'
         working-directory: bundle
         run: |
           uds create --confirm --output ../
 
       - name: Upload UDS bundle as artifact
+        if: steps.check.outputs.exists == '1'
         uses: actions/upload-artifact@v4
         with:
           name: rustgate-uds-bundle
@@ -188,13 +255,25 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check whether uds-package.yaml exists
+        id: check
+        run: |
+          if [ -f bundle/uds-package.yaml ]; then
+              echo "exists=1" >> "$GITHUB_OUTPUT"
+          else
+              echo "exists=0" >> "$GITHUB_OUTPUT"
+              echo "::notice::Skipping — bundle/uds-package.yaml not on this branch."
+          fi
+
       - name: Install kubeconform
+        if: steps.check.outputs.exists == '1'
         run: |
           curl -fsSL -o /tmp/kubeconform.tar.gz \
               https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
           tar -xzf /tmp/kubeconform.tar.gz -C /usr/local/bin/
 
       - name: Validate uds-package.yaml against UDS Core schema
+        if: steps.check.outputs.exists == '1'
         # Failure is non-blocking until the UDS Core schema is
         # published to a public OCI registry kubeconform can reach
         # without auth — track upstream at
