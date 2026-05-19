@@ -270,6 +270,40 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_KX_GROUPS")]
     pub(crate) kx_groups: Option<String>,
 
+    /// Run in CNSA 2.0 compliance mode. **Scaffolding flag — not yet
+    /// fully functional**; the convergence work tracked in #504
+    /// blocks on aws-lc-rs resolving the FIPS / ML-DSA mutual
+    /// exclusion ([aws-lc-rs #964]).
+    ///
+    /// What this flag eventually configures (per NSA CNSA 2.0):
+    ///
+    ///   - ML-KEM-1024 key exchange (NIST Level 5)
+    ///   - ML-DSA-87 digital signatures (NIST Level 5)
+    ///   - TLS 1.3 minimum
+    ///   - AES-256 symmetric (already TLS 1.3 default)
+    ///   - SHA-384+ hashing (already used)
+    ///
+    /// What it does today:
+    ///
+    ///   - Validates that --features post-quantum is compiled in
+    ///     (errors otherwise; clear pointer to the required build
+    ///     profile)
+    ///   - Logs the phased-readiness state at startup so operators
+    ///     understand the gap between "I asked for CNSA 2.0" and
+    ///     "what the build actually delivers"
+    ///   - Does NOT yet override --kx-groups or --tls-min-version —
+    ///     those still come from their dedicated flags. Future work
+    ///     (the sub-issues at #500/#501/#502/#503) will wire those
+    ///     overrides as each phase lands.
+    ///
+    /// See [`docs/adr/0019-cnsa2-hybrid-mldsa.md`] for the design
+    /// rationale and timeline.
+    ///
+    /// [aws-lc-rs #964]: https://github.com/aws/aws-lc-rs/issues/964
+    /// [`docs/adr/0019-cnsa2-hybrid-mldsa.md`]: ../../docs/adr/0019-cnsa2-hybrid-mldsa.md
+    #[arg(long, default_value_t = false, env = "RUSTGATE_CNSA2")]
+    pub(crate) cnsa2: bool,
+
     /// Interval in seconds to check for certificate file changes.
     /// When set to a value > 0, the server periodically polls the --cert and
     /// --key files and hot-reloads them on change (zero-downtime rotation).
@@ -2128,6 +2162,7 @@ define_config_file! {
     air_gap: bool,
     prefer_post_quantum: bool,
     kx_groups: Option<String>,
+    cnsa2: bool,
     cert_reload_interval: u64,
     ocsp_stapling: bool,
     spiffe: bool,
