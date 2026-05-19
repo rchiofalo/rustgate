@@ -92,6 +92,7 @@
 #![forbid(unsafe_code)]
 #![doc(html_no_source)]
 
+pub mod bitstream;
 pub mod codec;
 pub mod error;
 pub mod schema;
