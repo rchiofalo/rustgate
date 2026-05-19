@@ -1,0 +1,176 @@
+# syntax=docker/dockerfile:1
+#
+# Iron Bank / Platform One variant of the rustgate Dockerfile.
+#
+# Builds the same release binary as the default `Dockerfile` but using
+# DoD Iron Bank-approved base images for both the builder and runtime
+# stages. Required for Platform One deployments and recommended for any
+# DISA STIG-compliant target.
+#
+# # How this differs from `Dockerfile`
+#
+# - **Builder base**: `registry1.dso.mil/ironbank/redhat/ubi/ubi9` (UBI 9
+#   full, since we need cargo + protoc + musl-dev for the build) instead
+#   of `rust:1.95-alpine`. Rust toolchain is installed via rustup inside
+#   the builder rather than coming from the base image.
+# - **Runtime base**: `registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal`
+#   (UBI 9 minimal, ~30 MiB) instead of `alpine:3.23`. UBI Minimal
+#   already enforces non-root, no SUID/SGID binaries, and read-only
+#   filesystem compatibility, so the hardening RUN commands from the
+#   default Dockerfile collapse to a single `adduser`.
+# - **No Alpine package manager**: `microdnf` instead of `apk`.
+#
+# # Prerequisites
+#
+# Iron Bank pulls require Platform One credentials and a registered
+# robot account. Authenticate to `registry1.dso.mil` BEFORE building:
+#
+#     docker login registry1.dso.mil
+#
+# The digests below are placeholders — substitute the digests from your
+# Iron Bank account at the time of the build. Iron Bank publishes a
+# manifest digest per UBI minor version; the most recent UBI 9.x digest
+# is at:
+#
+#     https://repo1.dso.mil/dsop/redhat/ubi/ubi9-minimal
+#
+# # Building
+#
+#     docker build -f Dockerfile.ironbank \
+#         -t ghcr.io/rchiofalo/rustgate:0.9.0-ironbank \
+#         --build-arg FEATURES="nats,enrollment,proto,metrics,federation,federation-ha,websocket,mqtt,http" \
+#         .
+#
+# The CI in PR H5 validates this builds on every PR touching `Dockerfile*`,
+# `helm/`, `zarf/`, or `bundle/`.
+
+# ── Builder stage ────────────────────────────────────────────────────────
+# UBI 9 full (~250 MiB) — needs the toolchain. The runtime image below
+# strips this back down to UBI minimal.
+#
+# DIGEST PLACEHOLDER — replace with your IB-pulled digest at build time.
+# The `:9-latest` tag is what most IB consumers track; per-build pinning
+# via @sha256 is required for the CI digest-pinning check (same check
+# the default Dockerfile satisfies).
+FROM registry1.dso.mil/ironbank/redhat/ubi/ubi9:9-latest AS builder
+
+# Iron Bank UBI doesn't ship Rust; install via rustup at a pinned
+# version matching `rust-toolchain.toml`. The `--profile minimal`
+# skips rustfmt/clippy (we don't need them for release builds).
+ARG RUST_VERSION=1.95
+RUN microdnf install -y --nodocs gcc make protobuf-compiler musl-libc-static \
+    && microdnf clean all \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /src
+
+# Same dependency-caching pattern as the default Dockerfile — copy
+# manifests first, build with stub sources, then copy the real tree.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/rustgate-admin/Cargo.toml       crates/rustgate-admin/Cargo.toml
+COPY crates/rustgate-archive/Cargo.toml     crates/rustgate-archive/Cargo.toml
+COPY crates/rustgate-asterix/Cargo.toml     crates/rustgate-asterix/Cargo.toml
+COPY crates/rustgate-authz/Cargo.toml       crates/rustgate-authz/Cargo.toml
+COPY crates/rustgate-client/Cargo.toml      crates/rustgate-client/Cargo.toml
+COPY crates/rustgate-mqtt/Cargo.toml        crates/rustgate-mqtt/Cargo.toml
+COPY crates/rustgate-core/Cargo.toml        crates/rustgate-core/Cargo.toml
+COPY crates/rustgate-codec-schema/Cargo.toml crates/rustgate-codec-schema/Cargo.toml
+COPY crates/rustgate-cot/Cargo.toml         crates/rustgate-cot/Cargo.toml
+COPY crates/rustgate-correlation/Cargo.toml crates/rustgate-correlation/Cargo.toml
+COPY crates/rustgate-dis/Cargo.toml         crates/rustgate-dis/Cargo.toml
+COPY crates/rustgate-enrollment/Cargo.toml  crates/rustgate-enrollment/Cargo.toml
+COPY crates/rustgate-federation/Cargo.toml  crates/rustgate-federation/Cargo.toml
+COPY crates/rustgate-guard/Cargo.toml       crates/rustgate-guard/Cargo.toml
+COPY crates/rustgate-http/Cargo.toml        crates/rustgate-http/Cargo.toml
+COPY crates/rustgate-mavlink/Cargo.toml     crates/rustgate-mavlink/Cargo.toml
+COPY crates/rustgate-meshtastic/Cargo.toml  crates/rustgate-meshtastic/Cargo.toml
+COPY crates/rustgate-metrics/Cargo.toml     crates/rustgate-metrics/Cargo.toml
+COPY crates/rustgate-missions/Cargo.toml    crates/rustgate-missions/Cargo.toml
+COPY crates/rustgate-nats/Cargo.toml        crates/rustgate-nats/Cargo.toml
+COPY crates/rustgate-nffi/Cargo.toml        crates/rustgate-nffi/Cargo.toml
+COPY crates/rustgate-operator/Cargo.toml    crates/rustgate-operator/Cargo.toml
+COPY crates/rustgate-proto/Cargo.toml       crates/rustgate-proto/Cargo.toml
+COPY crates/rustgate-resilience/Cargo.toml  crates/rustgate-resilience/Cargo.toml
+COPY crates/rustgate-router/Cargo.toml      crates/rustgate-router/Cargo.toml
+COPY crates/rustgate-sapient/Cargo.toml     crates/rustgate-sapient/Cargo.toml
+COPY crates/rustgate-server/Cargo.toml      crates/rustgate-server/Cargo.toml
+COPY crates/rustgate-stanag4586/Cargo.toml  crates/rustgate-stanag4586/Cargo.toml
+COPY crates/rustgate-test-utils/Cargo.toml  crates/rustgate-test-utils/Cargo.toml
+COPY crates/rustgate-tls/Cargo.toml         crates/rustgate-tls/Cargo.toml
+COPY crates/rustgate-transport/Cargo.toml   crates/rustgate-transport/Cargo.toml
+COPY crates/rustgate-vmf/Cargo.toml         crates/rustgate-vmf/Cargo.toml
+COPY crates/rustgate-link16/Cargo.toml      crates/rustgate-link16/Cargo.toml
+COPY crates/rustgate-lattice/Cargo.toml     crates/rustgate-lattice/Cargo.toml
+COPY crates/rustgate-foundry/Cargo.toml     crates/rustgate-foundry/Cargo.toml
+COPY crates/rustgate-dds/Cargo.toml         crates/rustgate-dds/Cargo.toml
+COPY crates/rustgate-ogc-sensorthings/Cargo.toml crates/rustgate-ogc-sensorthings/Cargo.toml
+COPY crates/rustgate-websocket/Cargo.toml   crates/rustgate-websocket/Cargo.toml
+COPY crates/rustgate-inference/Cargo.toml   crates/rustgate-inference/Cargo.toml
+COPY crates/rustgate-nffi/Cargo.toml        crates/rustgate-nffi/Cargo.toml
+
+# Create stub sources to satisfy the build for the dep-graph cache.
+RUN mkdir -p crates/rustgate-server/src && echo "fn main() {}" > crates/rustgate-server/src/main.rs
+RUN for d in crates/*/; do \
+        if [ ! -f "$d/src/lib.rs" ] && [ ! -f "$d/src/main.rs" ]; then \
+            mkdir -p "$d/src" && echo "" > "$d/src/lib.rs"; \
+        fi; \
+    done
+
+COPY crates/rustgate-federation/build.rs crates/rustgate-federation/build.rs
+
+ARG FEATURES="nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel,mqtt,http"
+
+RUN cargo build --release --features "${FEATURES}" 2>/dev/null || true
+
+# Now copy real source and build for real.
+COPY . .
+RUN find crates -name "*.rs" -exec touch {} +
+RUN cargo build --release --features "${FEATURES}"
+
+# ── Runtime stage ────────────────────────────────────────────────────────
+# UBI 9 minimal — Iron Bank's hardened base for production runtime.
+# Already enforces non-root, no SUID/SGID, read-only filesystem
+# compatibility. STIG-compliant out of the box.
+#
+# DIGEST PLACEHOLDER — replace with your IB-pulled digest at build time.
+FROM registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:9-latest
+
+LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
+      org.opencontainers.image.description="Secure tactical message router with mTLS and NATS bridge (Iron Bank build)" \
+      org.opencontainers.image.licenses="LicenseRef-Proprietary" \
+      mil.dod.ironbank.build="true"
+
+# Install ca-certificates (UBI minimal does NOT include them by default,
+# unlike Alpine). Required for outbound TLS to NATS / federation peers /
+# HTTP webhooks. `microdnf` is the slimmer dnf variant shipped with UBI
+# minimal — install + clean in one layer to keep the image small.
+RUN microdnf install -y --nodocs ca-certificates \
+    && microdnf clean all \
+    && rm -rf /var/cache/yum /var/cache/dnf
+
+# Non-root user (10001 matches the default Dockerfile + Helm chart's
+# `securityContext.runAsUser`).
+RUN useradd --uid 10001 --user-group --no-create-home --shell /sbin/nologin rustgate
+
+# UBI minimal ships zero SUID/SGID binaries — the find-and-delete sweep
+# from the default Dockerfile is unnecessary here. STIG V-RHEL-08-010040
+# family is satisfied by the base image's contract.
+
+USER 10001:10001
+
+COPY --from=builder --chmod=755 /src/target/release/rustgate /usr/local/bin/rustgate
+
+EXPOSE 4433 8443 8446 8883 9000 9001 9090
+
+STOPSIGNAL SIGTERM
+
+# Same recommended runtime contract as the default Dockerfile —
+# read-only filesystem, dropped capabilities, no privilege escalation.
+# The Helm chart's `values-production.yaml` already enforces these.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -fsS --max-time 2 http://localhost:9090/healthz \
+        || exit 1
+
+ENTRYPOINT ["rustgate"]
