@@ -14,3 +14,12 @@ workspace = true
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# Schema-parity proptest in `tests/schema_parity_jreap_header.rs`
+# pins byte-identical round-trip between the hand-rolled JREAP
+# frame header codec and `SchemaCodec` over the embedded
+# `schemas/jreap_header.yaml`. Dev-only — the production codec
+# stays hand-rolled (mirrors STANAG/DIS/MAVLink/VMF approach).
+rustgate-codec-schema = { workspace = true }
