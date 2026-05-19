@@ -124,6 +124,49 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 
 For detailed architecture documentation see [docs/architecture.md](docs/architecture.md).
 
+## Schema-Driven Codecs
+
+Tactical wire formats (STANAG 4586, IEEE 1278.1 DIS, MAVLink, VMF, ASTERIX, Link 16
+JREAP-C) are well-defined fixed-offset binary structures. Writing a hand-rolled Rust
+codec per protocol means maintaining parallel implementations of identical patterns —
+big-endian integer reads, bit-packed flag fields, FX-continuation chains, variable-
+length tails. The [`rustgate-codec-schema`](crates/rustgate-codec-schema/README.md) crate
+declares a YAML grammar for these wire formats and the shared `SchemaCodec` runtime
+drives every protocol from one declaration.
+
+The grammar (full reference: [`docs/codec-schema-grammar.md`](docs/codec-schema-grammar.md))
+ships v1 → v5 today:
+
+- **v1**: Fixed-offset primitives + linear calibration + range guards + `entity-path` projection.
+- **v2**: Multi-message dispatch via discriminator byte; typed enum projection via `value-mapping`.
+- **v3**: `present-if` sparse-projection; `repeat` count-driven byte arrays; bit-packed sub-byte fields.
+- **v4**: Cross-byte bit spans; bit-packed `u16` / `u32` / `u64`.
+- **v4.1**: Signed bit-packed types (`i8` / `i16` / `i32` / `i64`) with two's-complement sign-extension.
+- **v5**: Variable-shift `present-if` (`shift-mode: collapse-when-absent`) for FPI cascades and FX continuation chains.
+
+Each tactical-protocol crate gets a **schema-parity proptest** that pins byte-identical
+round-trip between its hand-rolled codec and the schema runtime. The schema YAML is the
+declarative source of truth for the wire layout; the test catches any drift between the
+two implementations.
+
+| Protocol | Schema | Parity test | Grammar features |
+|---|---|---|---|
+| STANAG 4586 vehicle position | [`vehicle_position.yaml`](crates/rustgate-stanag4586/schemas/vehicle_position.yaml) | [`schema_parity.rs`](crates/rustgate-stanag4586/tests/schema_parity.rs) | Fixed offsets, big-endian, range |
+| DIS PDU common header | [`pdu_header.yaml`](crates/rustgate-dis/schemas/pdu_header.yaml) | [`schema_parity.rs`](crates/rustgate-dis/tests/schema_parity.rs) | Multi-message dispatch, `value-mapping` |
+| DIS Entity State body | [`entity_state.yaml`](crates/rustgate-dis/schemas/entity_state.yaml) | [`schema_parity_entity_state.rs`](crates/rustgate-dis/tests/schema_parity_entity_state.rs) | v3 `repeat` (count-from articulation tail) |
+| DIS Entity Appearance | [`entity_appearance.yaml`](crates/rustgate-dis/schemas/entity_appearance.yaml) | [`schema_parity_entity_appearance.rs`](crates/rustgate-dis/tests/schema_parity_entity_appearance.rs) | v3 single-byte bit-packing |
+| MAVLink v1 header | [`v1_header.yaml`](crates/rustgate-mavlink/schemas/v1_header.yaml) | [`schema_parity.rs`](crates/rustgate-mavlink/tests/schema_parity.rs) | Fixed offsets, `value-mapping` smoke test |
+| MAVLink v2 header | [`v2_header.yaml`](crates/rustgate-mavlink/schemas/v2_header.yaml) | [`schema_parity_v2_header.rs`](crates/rustgate-mavlink/tests/schema_parity_v2_header.rs) | Fixed offsets + 24-bit little-endian msgid |
+| VMF K05.1 body | [`k05_1.yaml`](crates/rustgate-vmf/schemas/k05_1.yaml) | [`schema_parity_k05_1.rs`](crates/rustgate-vmf/tests/schema_parity_k05_1.rs) | v3 + v4 cross-byte + v4.1 signed + v5 FPI cascade |
+| Link 16 JREAP-C header | [`jreap_header.yaml`](crates/rustgate-link16/schemas/jreap_header.yaml) | [`schema_parity_jreap_header.rs`](crates/rustgate-link16/tests/schema_parity_jreap_header.rs) | Fixed offsets, public-API round-trip |
+| ASTERIX datablock + FSPEC | [`datablock_fspec.yaml`](crates/rustgate-asterix/schemas/datablock_fspec.yaml) | [`schema_parity_fspec.rs`](crates/rustgate-asterix/tests/schema_parity_fspec.rs) | v3 bit-packing + v5 FX-continuation cascade |
+
+Adding a new protocol's schema-parity test follows a 3-step recipe in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#adding-a-new-protocol-schema-parity-test):
+schema YAML → inline reference encoder → proptest. The schema-parity tests do not
+replace the production codec — they pin the wire layout as a declarative source of
+truth and catch any drift between the two implementations.
+
 ## Features
 
 ### Transport & Routing
