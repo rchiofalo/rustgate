@@ -1,0 +1,155 @@
+# ASTERIX datablock envelope + FSPEC chain (Eurocontrol).
+#
+# Every ASTERIX datablock starts with a 3-byte header:
+#
+#   offset │ size │ field   │ notes
+#   ───────┼──────┼─────────┼───────────────────────────────────
+#     0    │  1   │ cat     │ Category byte (e.g. 0x15 CAT-021)
+#     1    │  2   │ length  │ Total datablock length in bytes,
+#                              big-endian, INCLUDES the 3-byte
+#                              header
+#
+# Each record within the datablock starts with a variable-length
+# **FSPEC** (Field SPECification) chain. Each FSPEC octet is:
+#
+#   bit position │ width │ field             │ notes
+#   ─────────────┼───────┼───────────────────┼───────────────────
+#       0..6     │   7   │ frn_data          │ FRNs 1..7 (oct 1),
+#                                              FRNs 8..14 (oct 2),
+#                                              FRNs 15..21 (oct 3),
+#                                              etc.
+#       7        │   1   │ fx                │ FX continuation flag:
+#                                              1 ⇒ next octet
+#                                              follows on wire,
+#                                              0 ⇒ chain terminates
+#
+# **In v3 bit-numbering (MSB-first within byte): bit position 0
+# is the MSB, bit position 7 is the LSB.** The ASTERIX spec uses
+# the same MSB-first convention but typically describes the FX
+# bit as "bit 1" (1-indexed from LSB). They refer to the same
+# physical bit — the byte's LSB — declared here as `bit-offset:
+# 7, bit-width: 1`.
+#
+# # Why this schema only covers up to 3 FSPEC octets
+#
+# CAT-021 / CAT-048 / CAT-062 all top out at 21 fields in their
+# MVP profiles, fitting in 3 FSPEC octets (3 octets × 7 data bits
+# = 21 FRNs). A future schema extension can grow the chain by
+# adding more `present-if collapse-when-absent` octets — the
+# pattern is mechanical. Three octets is enough to exercise the
+# v5 cascade end-to-end (each octet's FX bit independently
+# decides whether the next octet appears on the wire).
+#
+# # Grammar features exercised
+#
+# - **v3** (#1389): single-byte bit-packing — each FSPEC octet's
+#   `frn_data` (7 bits) + `fx` (1 bit) cleanly fits within one byte.
+# - **v5** (#1407): variable-shift `present-if` — each FSPEC
+#   octet after the first is gated by the previous octet's FX
+#   bit. When FX=0 on octet 1, the rest of the FSPEC chain is
+#   absent from the wire and the schema runtime shrinks the
+#   output accordingly.
+#
+# This is the second protocol to exercise v5 variable-shift after
+# VMF K05.1 (#1396) — and unlike VMF (where the cascade is
+# float/integer payload fields), here the cascade is on bit-flag
+# bytes themselves. Establishes that v5 handles BOTH "absent
+# scalar payload" (VMF) and "absent flag byte that itself gates
+# more flag bytes" (ASTERIX) cases.
+#
+# # What this schema does NOT carry
+#
+# - Per-category record bodies (data items). CAT-021 / CAT-048 /
+#   CAT-062 each define different field formats after the FSPEC;
+#   those need per-category body schemas dispatched at the call
+#   site by the `cat` byte. This schema covers the **envelope
+#   only** — proving the FSPEC chain itself round-trips byte-
+#   identically through SchemaCodec is the load-bearing v5
+#   demonstration on a real protocol.
+# - The semantic mapping FRN → field. FRN 1 means different
+#   things in CAT-021 (data source ID) than in CAT-048 or
+#   CAT-062. The schema carries the FRN bits as opaque
+#   `frn_data` integers (0..=127); the wrapper layer's
+#   per-category decoder interprets the bits per the relevant
+#   FRN table.
+# - Multi-record datablocks. The `length` field declares total
+#   bytes including potentially-multiple records; this schema
+#   covers the envelope + ONE record's FSPEC. Multi-record
+#   handling lives in the wrapper.
+#
+# # Provenance
+#
+# FSPEC bit layout cross-checked against
+# `crates/rustgate-asterix/src/cat021.rs::parse_fspec` (lines
+# 238-260 of the implementation): the `(byte >> shift) & 0x01`
+# loop with `shift in (1..=7).rev()` reads the 7 data bits
+# MSB-first, then the termination check `byte & 0x01 == 0`
+# inspects the LSB FX bit. The schema-parity proptest in
+# `tests/schema_parity_fspec.rs` asserts byte-identical
+# round-trip for every (cat, length, FSPEC chain length 1..=3)
+# proptest generates.
+schema-version: "1"
+protocol-name: "asterix.datablock_fspec"
+message-types:
+  - name: "DatablockEnvelope"
+    # All-fields-present max: 3-byte header + 3 FSPEC octets = 6.
+    # When FX-bits terminate the chain early, the v5 runtime
+    # truncates the trailing zero bytes.
+    size-bytes: 6
+    fields:
+      - name: "cat"
+        offset: 0
+        field-type: { kind: u8 }
+      - name: "length"
+        offset: 1
+        field-type: { kind: u16 }
+        endian: big
+      # ---- FSPEC octet 1 (always present) ----
+      - name: "frn_data_1"
+        offset: 3
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 7
+      - name: "fx_1"
+        offset: 3
+        field-type: { kind: u8 }
+        bit-offset: 7
+        bit-width: 1
+      # ---- FSPEC octet 2 (present iff fx_1 == 1) ----
+      - name: "frn_data_2"
+        offset: 4
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 7
+        present-if:
+          field: "fx_1"
+          value: 1
+          shift-mode: collapse-when-absent
+      - name: "fx_2"
+        offset: 4
+        field-type: { kind: u8 }
+        bit-offset: 7
+        bit-width: 1
+        present-if:
+          field: "fx_1"
+          value: 1
+          shift-mode: collapse-when-absent
+      # ---- FSPEC octet 3 (present iff fx_2 == 1) ----
+      - name: "frn_data_3"
+        offset: 5
+        field-type: { kind: u8 }
+        bit-offset: 0
+        bit-width: 7
+        present-if:
+          field: "fx_2"
+          value: 1
+          shift-mode: collapse-when-absent
+      - name: "fx_3"
+        offset: 5
+        field-type: { kind: u8 }
+        bit-offset: 7
+        bit-width: 1
+        present-if:
+          field: "fx_2"
+          value: 1
+          shift-mode: collapse-when-absent
