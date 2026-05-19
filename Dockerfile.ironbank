@@ -27,10 +27,34 @@
 #
 #     docker login registry1.dso.mil
 #
-# The digests below are placeholders — substitute the digests from your
-# Iron Bank account at the time of the build. Iron Bank publishes a
-# manifest digest per UBI minor version; the most recent UBI 9.x digest
-# is at:
+# # Why the FROM lines use `:9-latest` instead of `@sha256` digests
+#
+# `registry1.dso.mil` is a DoD-restricted Iron Bank registry that
+# requires CAC/PIV authentication. Public CI cannot reach it to
+# resolve digests, so the in-tree `FROM` lines carry a tag-only
+# placeholder. This means the rustgate workspace CI `Validate
+# Dockerfile FROM digest pinning` check explicitly EXEMPTS
+# `Dockerfile.ironbank` from the workspace-wide digest-pin rule
+# (see `.github/workflows/ci.yml` — the digest-pin loop greps out
+# this file). Public-network Dockerfiles in the repo (`Dockerfile`,
+# `Dockerfile.operator`) are still strictly digest-pinned.
+#
+# # Pinning the digest before deploying
+#
+# DoD operators MUST re-pin the digest in their own CI to recover
+# the supply-chain guarantee. Iron Bank publishes a manifest digest
+# per UBI minor version; resolve it from your authenticated session
+# and edit the two `FROM` lines below:
+#
+#     # Resolve current digest (run from a CAC-authenticated host)
+#     docker buildx imagetools inspect \
+#         registry1.dso.mil/ironbank/redhat/ubi/ubi9:9-latest \
+#         | grep -i 'Digest:'
+#     # Copy the resulting sha256:… and pin both FROM lines:
+#     #   FROM registry1.dso.mil/ironbank/redhat/ubi/ubi9:9-latest@sha256:<paste>
+#     #   FROM registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:9-latest@sha256:<paste>
+#
+# The Iron Bank dashboard for UBI minimal:
 #
 #     https://repo1.dso.mil/dsop/redhat/ubi/ubi9-minimal
 #
