@@ -1,0 +1,105 @@
+kind: ZarfPackageConfig
+metadata:
+  name: rustgate
+  description: >
+    Tactical mTLS message router for the UDS (Unicorn Delivery Service)
+    platform. Bundles the rustgate container image plus the in-tree
+    Helm chart so the package can be deployed into a disconnected
+    cluster via `zarf package deploy` (or composed into a UDS bundle
+    via `bundle/uds-bundle.yaml`, which is the recommended path for
+    UDS Core deployments).
+  # Track the Helm chart's appVersion — `helm/Chart.yaml` is the
+  # canonical source of truth for both the chart's package version
+  # and the image tag deployed inside it. When you bump either,
+  # bump this `version` to match.
+  version: "0.9.0"
+  url: https://github.com/rchiofalo/rustgate
+  # Production deployments SHOULD pin to a digest; the
+  # `signature` and `aggregateChecksum` fields are populated by
+  # `zarf package create` and committed alongside the .tar.zst
+  # artifact in your release-asset pipeline.
+  authors: rchiofalo
+
+# Build-time hints for `zarf package create`.
+#
+# `flavor` lets a downstream consumer build either the default
+# (ghcr.io) variant or the `ironbank` variant once H4 lands the
+# hardened Dockerfile. Both flavors produce the same Helm release
+# — only the image-pull origin changes.
+build:
+  flavor: default
+
+components:
+  # ----------------------------------------------------------------
+  # Core component: the rustgate StatefulSet driven by the in-tree
+  # Helm chart at `../helm`. The Helm chart already declares every
+  # Kubernetes object the service needs (StatefulSet, Service, PDB,
+  # HPA, NetworkPolicy, optional RustgateCluster CRD); Zarf's job
+  # is to package the chart + the container image into a
+  # disconnected-deploy-capable .tar.zst.
+  # ----------------------------------------------------------------
+  - name: rustgate
+    description: rustgate StatefulSet, Service, PDB, HPA, NetworkPolicy, and (optional) CRDs.
+    required: true
+    only:
+      # rustgate runs on any Kubernetes flavor (k3s, kubeadm, EKS,
+      # ROSA, …). Mark as "k8s" so Zarf doesn't waste cycles
+      # inspecting host-mode targets.
+      cluster:
+        distros:
+          - k8s
+    charts:
+      - name: rustgate
+        # `localPath` is relative to this `zarf.yaml`. Points at
+        # the existing in-tree Helm chart so the Zarf package
+        # tracks the same chart the CI/CD pipeline already lints
+        # via `helm lint helm/`.
+        localPath: ../helm
+        # Track the chart's own version from `helm/Chart.yaml`.
+        version: 1.5.0
+        namespace: rustgate
+        # No `valuesFiles` here — operators pass their own values
+        # via `zarf package deploy --set` or the parent
+        # `uds-bundle.yaml` overrides. The chart's defaults
+        # (`helm/values.yaml`) are operator-safe but assume
+        # production-like resource requests, NetworkPolicy
+        # enabled, and Pod Security Standards (`restricted`)
+        # already in force on the target namespace.
+
+    # Image list. `zarf package create` resolves each tag, pulls
+    # the digest, and embeds the layers into the package so the
+    # disconnected cluster never reaches out to ghcr.io.
+    #
+    # Keep the tags in sync with `helm/values.yaml`'s
+    # `image.tag` and `operator.image.tag` — H5's CI workflow
+    # will catch drift. When updating either, ALSO update the
+    # `metadata.version` above.
+    images:
+      - ghcr.io/rchiofalo/rustgate:0.9.0
+      # Operator image is only deployed when the chart's
+      # `operator.enabled` value is `true`, but Zarf packages it
+      # unconditionally so a downstream values override can flip
+      # the flag without a re-pull. The image is ~10 MiB so the
+      # cost is acceptable for the optionality it provides.
+      - ghcr.io/rchiofalo/rustgate-operator:0.9.0
+
+  # ----------------------------------------------------------------
+  # Optional component: NATS dependency. The rustgate Helm chart
+  # references NATS for cross-instance scaling (the `--nats-url`
+  # path) but does NOT include a NATS chart by default — the
+  # workspace convention is "operators bring their own NATS".
+  # This component is `required: false` so a deployer who wants
+  # NATS-free single-instance rustgate skips it; UDS bundle
+  # composition (H2) handles the NATS case via the upstream
+  # `uds-package-nats` package instead of bundling NATS here.
+  # ----------------------------------------------------------------
+  - name: rustgate-nats-info
+    description: >
+      Pointer component — NATS is not bundled here. For UDS Core
+      deployments that need the NATS bridge, compose with
+      `bundle/uds-bundle.yaml` (lands in PR H2) or install
+      `uds-package-nats` separately. For non-UDS deployments,
+      install a NATS chart of your choice and pass
+      `--set rustgateConfig.natsUrl=nats://<svc>:4222` at
+      deploy time.
+    required: false
