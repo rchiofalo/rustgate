@@ -1,0 +1,40 @@
+# UDS deploy-time configuration example.
+#
+# This file is the deployer-side counterpart to `uds-bundle.yaml`.
+# Copy it to `uds-config.yaml` (gitignored) on the deployment host,
+# adjust the values, and pass `--config uds-config.yaml` to
+# `uds deploy`.
+#
+# Reference: https://uds.defenseunicorns.com/reference/bundles/overrides/
+#
+# uds deploy `uds-bundle-rustgate-amd64-0.9.0.tar.zst` \
+#     --config uds-config.yaml --confirm
+
+# Package-specific overrides. Each key matches the package `name`
+# from `uds-bundle.yaml`'s `packages:` list. The keys inside the
+# package map to the chart-component-value path declared by the
+# bundle's `overrides:` section.
+options:
+  # Run un-attended; pair with `--confirm` on the CLI.
+  confirm: true
+
+variables:
+  rustgate:
+    # NATS bridge — uncomment to enable cross-instance scaling.
+    # Requires a NATS server reachable at the URL; pair with the
+    # commented-out NATS package entry in `uds-bundle.yaml`.
+    #
+    # rustgateConfig.natsUrl: "nats://uds-nats:4222"
+
+    # Replica count override. Default is 3 (set in
+    # `uds-bundle.yaml`); override for resource-constrained
+    # environments (single-node demos, etc.).
+    #
+    # replicaCount: 1
+
+    # Ingress host. Bare bundle does not expose ingress (the chart
+    # ships `ingress.enabled: false` by default). For UDS Core
+    # deployments, prefer the Istio gateway over plain ingress —
+    # the Pepr admission CR (PR H3) wires that automatically.
+    #
+    # ingress.hosts[0].host: rustgate.example.local

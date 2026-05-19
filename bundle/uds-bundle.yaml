@@ -1,0 +1,103 @@
+kind: UDSBundle
+metadata:
+  name: rustgate
+  description: >
+    rustgate tactical mTLS message router on the UDS Core platform.
+    Composes the upstream UDS Core init package (CRDs, Istio sidecar
+    injection, Pepr admission policies, monitoring stack) with the
+    rustgate Zarf package from `../zarf/zarf.yaml`. Deploy with
+    `uds deploy uds-bundle-rustgate-<arch>-<version>.tar.zst`.
+  # Track the rustgate Zarf package's metadata.version; both bump
+  # in lockstep with `helm/Chart.yaml`'s appVersion. PR H5's CI
+  # workflow validates the version triangle (helm + zarf + bundle).
+  version: "0.9.0"
+  url: https://github.com/rchiofalo/rustgate
+  authors: rchiofalo
+
+packages:
+  # ----------------------------------------------------------------
+  # UDS Core init package. Provides:
+  #   - Kubernetes CRDs the rest of UDS Core depends on (Istio,
+  #     Pepr, Prometheus operator, cert-manager, kyverno, …)
+  #   - Istio service mesh with strict mTLS between pods
+  #   - Pepr admission controller (executes our `uds-package.yaml`
+  #     CR from PR H3 to wire network policies + monitoring +
+  #     service-mesh integration)
+  #   - Prometheus + Grafana + Loki for the observability stack
+  #
+  # Track the upstream version conservatively — bump when a
+  # security advisory or a UDS Core feature we actually need
+  # ships. The default flavor pulls every Core component; a
+  # leaner deployment can opt out via `optionalComponents` here
+  # (see the UDS Core release notes for which components are
+  # required for a given Core feature surface).
+  # ----------------------------------------------------------------
+  - name: init
+    repository: ghcr.io/defenseunicorns/packages/init
+    ref: v0.42.0
+    # No `optionalComponents:` — accept the upstream default
+    # component set so we get the full Pepr + Istio + monitoring
+    # surface. Downstream operators can override via a
+    # `uds-config.yaml` (see `uds-config.yaml.example` in this
+    # directory).
+
+  # ----------------------------------------------------------------
+  # rustgate Zarf package from this repo. `path: ../zarf` resolves
+  # the Zarf manifest at `../zarf/zarf.yaml` (sibling of this
+  # bundle directory) — `uds create` packages it inline and
+  # produces a single .tar.zst that carries both UDS Core init AND
+  # rustgate.
+  # ----------------------------------------------------------------
+  - name: rustgate
+    path: ../zarf
+    ref: "0.9.0"
+    # Helm overrides applied at deploy time. The values here are
+    # production-leaning defaults the UDS Core platform expects
+    # (3 replicas for HA, NetworkPolicy on, monitoring enabled);
+    # deployers can override further via `uds-config.yaml` at
+    # `uds deploy` time.
+    overrides:
+      rustgate:
+        rustgate:
+          values:
+            # HA defaults: 3 replicas with the existing PDB
+            # (helm/templates/pdb.yaml) requiring 2 to stay up
+            # during voluntary disruptions.
+            - path: replicaCount
+              value: 3
+            # Production resource requests / limits — rustgate's
+            # async runtime + Rust binary footprint is small; the
+            # chart's defaults are conservative for a development
+            # workstation but right-sized for a UDS Core node.
+            - path: resources.requests.cpu
+              value: "500m"
+            - path: resources.requests.memory
+              value: "512Mi"
+            - path: resources.limits.cpu
+              value: "2"
+            - path: resources.limits.memory
+              value: "2Gi"
+            # Enable the Prometheus ServiceMonitor so the UDS Core
+            # monitoring stack scrapes rustgate's /metrics endpoint
+            # without further wiring.
+            - path: monitoring.serviceMonitor.enabled
+              value: true
+
+  # ----------------------------------------------------------------
+  # OPTIONAL: NATS for cross-instance scaling.
+  #
+  # rustgate's NATS bridge is feature-gated and only activates when
+  # `RUSTGATE_NATS_URL` (or the helm `rustgateConfig.natsUrl`) is
+  # set. UDS Core has no canonical NATS package today; deployers
+  # who need it can add `uds-package-nats` (or any upstream NATS
+  # bundle) here:
+  #
+  # - name: nats
+  #   repository: ghcr.io/defenseunicorns/uds-package-nats
+  #   ref: 0.1.0
+  #
+  # Then override `rustgateConfig.natsUrl` to the NATS service
+  # DNS name (e.g. `nats://uds-nats:4222`). The default bundle
+  # leaves NATS out so single-instance deployments don't pay the
+  # extra footprint.
+  # ----------------------------------------------------------------
