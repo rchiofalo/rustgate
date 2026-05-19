@@ -175,6 +175,82 @@ Messages pass through a codec pipeline based on the configured framing mode:
 | `tak-protobuf` | `TakFrameCodec` | 0xBF magic + varint length |
 | `tak-negotiate` | Negotiation then `TakFrameCodec` or `XmlStreamCodec` | Server advertises, client opts in |
 
+## Schema-Driven Tactical Codecs
+
+Beyond the transport framing pipeline above, every tactical-protocol crate
+(`rustgate-stanag4586`, `rustgate-dis`, `rustgate-mavlink`, `rustgate-vmf`,
+`rustgate-link16`, `rustgate-asterix`, …) ships a hand-rolled byte-level codec
+**plus** a YAML schema that declares the same wire layout in the codec-schema
+vocabulary. The schema runtime (`rustgate-codec-schema::SchemaCodec`) is a
+generic decode/encode driver that reads any schema and produces / consumes the
+declared bytes — one runtime, N protocols.
+
+### Why two implementations
+
+The hand-rolled codec stays the production code path. The schema is **a
+declarative pin** of the wire layout, validated by a per-crate `schema-parity`
+proptest:
+
+```text
+Generate arbitrary inputs (proptest)
+        │
+        ▼
+  reference_encoder()    SchemaCodec::from_entity()
+        │                         │
+        └────── byte-equal ───────┘  ← assertion
+```
+
+When the test passes for every arbitrary input proptest generates, the schema
+and the hand-rolled codec agree on every wire byte. Any drift between the two
+implementations (an offset change in the schema, a byte-ordering bug in the
+hand-rolled codec) lights up the test the moment it lands.
+
+### When to add a new grammar feature
+
+The schema grammar is intentionally narrow — it covers what tactical wire
+formats actually need:
+
+| Grammar version | Feature | Real-world protocol that needed it |
+|---|---|---|
+| v1 | Fixed offsets, primitives, calibration, range, `entity-path` | STANAG 4586 vehicle position |
+| v2 | Multi-message dispatch, `value-mapping` | DIS PDU header (72 PDU types) |
+| v3 | `present-if` sparse-projection, `repeat` (`count-from`), single-byte bit-packing | DIS Entity State articulation tail, Entity Appearance bits |
+| v4 | Cross-byte bit spans, bit-packed u16/u32/u64 | VMF 24-bit URN, 25/26-bit lat/lon |
+| v4.1 | Signed bit-packed (i8/i16/i32/i64) with sign-extension | VMF signed latitude/longitude |
+| v5 | Variable-shift `present-if` (`shift-mode: collapse-when-absent`) | VMF FPI cascade, ASTERIX FX-continuation chain |
+
+Adding a new feature is a deliberate decision. The bar:
+
+1. **At least one real protocol needs it** that we ship a codec for.
+2. **Existing grammar genuinely cannot express it** — checked by trying to
+   write the schema first and surfacing the validator error.
+3. **Backward-compatible** — a v3 schema must validate and produce byte-identical
+   wire output after the grammar grows to v4+.
+
+Issues tracking deferred grammar work that doesn't yet have a forcing function:
+
+- **#1411 v6 schema chaining** — header + body composition across separate
+  schemas. Needed for VMF K05.1 production migration (the body's bit position
+  depends on the variable-length header).
+- **Protobuf / XML support** — would need an entirely different grammar
+  vocabulary; codec-schema is binary-fixed-offset by design.
+
+### What the schema does NOT do
+
+- **Replace production codecs.** The schema-parity test is a pin, not a
+  drop-in. Migrating a production codec to a SchemaCodec-driven runtime is a
+  separate refactor (the only one that landed and stuck is STANAG 4586
+  vehicle_position decode in #1390/#1393).
+- **Handle XML / JSON / Protobuf.** The grammar targets fixed-offset binary.
+  CoT (XML), SAPIENT (protobuf), Meshtastic (protobuf), NFFI (XML) have
+  hand-rolled codecs and no schema-parity test.
+- **Carry runtime semantics** beyond wire layout. Range guards, NaN rejection,
+  ASCII sanitization on string fields, calibration into physical units — those
+  stay in the wrapper layer above the SchemaCodec call.
+
+For the full grammar reference (every YAML key, every validator constraint,
+every backward-compat rule), see [`codec-schema-grammar.md`](codec-schema-grammar.md).
+
 ## Message Routing
 
 The `Router` maintains a map of session ID -> `SessionHandle` (mpsc sender). On each message:
