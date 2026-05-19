@@ -1,0 +1,207 @@
+name: UDS Package
+
+# Validates the Zarf package + UDS bundle artifacts every time a PR
+# (or push to main) touches the deployment surface. Catches three
+# common drift modes the deployer would otherwise discover at
+# `zarf package create` / `uds create` time:
+#
+#   1. `zarf/zarf.yaml` references a non-existent Helm chart path
+#      or a missing container image.
+#   2. `bundle/uds-bundle.yaml` references a non-existent Zarf
+#      package or a UDS Core init version that's been yanked.
+#   3. The version-triangle drifts: `helm/Chart.yaml`'s
+#      `appVersion`, `zarf/zarf.yaml`'s `metadata.version`, and
+#      `bundle/uds-bundle.yaml`'s `metadata.version` MUST agree.
+#
+# Lives in its own workflow file (not ci.yml) so the deployment
+# surface can iterate on tooling versions without rebuilding the
+# whole CI matrix. Mirrors the existing helm-lint stanza's path
+# filtering.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile*"
+      - "helm/**"
+      - "zarf/**"
+      - "bundle/**"
+      - ".github/workflows/uds-package.yml"
+  pull_request:
+    paths:
+      - "Dockerfile*"
+      - "helm/**"
+      - "zarf/**"
+      - "bundle/**"
+      - ".github/workflows/uds-package.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------
+  # Job 1: Version triangle. Cheapest check; runs in <5 seconds.
+  # Fails the build immediately if the three deployment artifacts
+  # disagree on what version of rustgate they're packaging.
+  # ------------------------------------------------------------------
+  version-triangle:
+    name: Deployment version triangle
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check helm / zarf / bundle agree on version
+        run: |
+          set -euo pipefail
+
+          # appVersion is the rustgate binary version the chart ships.
+          # (The chart's own `version` is the chart-package SemVer and
+          # drifts independently — that's expected.)
+          helm_appversion=$(awk '/^appVersion:/ {gsub(/"/,"",$2); print $2}' helm/Chart.yaml)
+          zarf_version=$(awk '/^  version:/ {gsub(/"/,"",$2); print $2; exit}' zarf/zarf.yaml)
+          bundle_version=$(awk '/^  version:/ {gsub(/"/,"",$2); print $2; exit}' bundle/uds-bundle.yaml)
+
+          echo "helm/Chart.yaml appVersion:           ${helm_appversion}"
+          echo "zarf/zarf.yaml metadata.version:      ${zarf_version}"
+          echo "bundle/uds-bundle.yaml metadata.version: ${bundle_version}"
+
+          if [ "${helm_appversion}" != "${zarf_version}" ] \
+              || [ "${zarf_version}" != "${bundle_version}" ]; then
+              echo ""
+              echo "::error::Deployment version triangle is out of sync."
+              echo "::error::Bump helm/Chart.yaml appVersion, zarf/zarf.yaml metadata.version,"
+              echo "::error::and bundle/uds-bundle.yaml metadata.version in lockstep when"
+              echo "::error::cutting a new rustgate release."
+              exit 1
+          fi
+
+      - name: Check zarf images match helm values
+        run: |
+          set -euo pipefail
+
+          # The Zarf package's `images:` block declares what gets
+          # embedded for airgap pull. Those tags MUST match the Helm
+          # chart's image references — Zarf can only embed what the
+          # chart actually deploys.
+          helm_image_tag=$(awk '
+              /^image:/ { in_image=1; next }
+              in_image && /^[^ ]/ { in_image=0 }
+              in_image && /^  tag:/ { gsub(/"/, "", $2); print $2; exit }
+          ' helm/values.yaml)
+
+          zarf_app_tag=$(awk '
+              /ghcr\.io\/rchiofalo\/rustgate:/ && !/operator/ {
+                  sub(/.*rustgate:/, ""); sub(/[ ]*#.*/, ""); print; exit
+              }
+          ' zarf/zarf.yaml)
+
+          echo "helm/values.yaml image.tag:           ${helm_image_tag}"
+          echo "zarf/zarf.yaml rustgate image tag:    ${zarf_app_tag}"
+
+          if [ "${helm_image_tag}" != "${zarf_app_tag}" ]; then
+              echo ""
+              echo "::error::helm/values.yaml image.tag (${helm_image_tag}) does not match"
+              echo "::error::the rustgate tag in zarf/zarf.yaml images: (${zarf_app_tag})."
+              echo "::error::Zarf cannot embed an image the chart does not deploy."
+              exit 1
+          fi
+
+  # ------------------------------------------------------------------
+  # Job 2: Zarf package builds. Validates `zarf/zarf.yaml` parses,
+  # the referenced Helm chart resolves, and all declared images can
+  # be pulled. ~3-4 minutes on the GitHub runner; the image pulls
+  # dominate the wall time.
+  # ------------------------------------------------------------------
+  zarf-create:
+    name: zarf package create
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: version-triangle
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Zarf
+        uses: defenseunicorns/setup-zarf@main
+
+      - name: zarf package create (rustgate)
+        working-directory: zarf
+        run: |
+          zarf package create --confirm --output ../
+
+      - name: Upload Zarf package as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustgate-zarf-package
+          path: zarf-package-rustgate-*.tar.zst
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # Job 3: UDS bundle builds. Validates `bundle/uds-bundle.yaml` parses
+  # and composes the Zarf package from job 2 with the UDS Core init
+  # package. Pulls the UDS Core init package over the network — this
+  # is the only job that needs outbound internet to ghcr.io.
+  # ------------------------------------------------------------------
+  uds-create:
+    name: uds bundle create
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: zarf-create
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Zarf
+        uses: defenseunicorns/setup-zarf@main
+
+      - name: Install UDS CLI
+        uses: defenseunicorns/setup-uds@main
+
+      - name: Download Zarf package from job 2
+        uses: actions/download-artifact@v5
+        with:
+          name: rustgate-zarf-package
+          path: ./
+
+      - name: uds create (composes UDS Core + rustgate)
+        working-directory: bundle
+        run: |
+          uds create --confirm --output ../
+
+      - name: Upload UDS bundle as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustgate-uds-bundle
+          path: uds-bundle-rustgate-*.tar.zst
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # Job 4: UDS Package CR schema validation. Runs kubeconform with
+  # the UDS Core schema registry to confirm `bundle/uds-package.yaml`
+  # is valid against the `Package.uds.dev/v1alpha1` schema. Cheap;
+  # skips the full UDS Core install path that production deploys
+  # exercise.
+  # ------------------------------------------------------------------
+  uds-package-cr:
+    name: UDS Package CR schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSL -o /tmp/kubeconform.tar.gz \
+              https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /usr/local/bin/
+
+      - name: Validate uds-package.yaml against UDS Core schema
+        # Failure is non-blocking until the UDS Core schema is
+        # published to a public OCI registry kubeconform can reach
+        # without auth — track upstream at
+        # https://github.com/defenseunicorns/uds-core/issues
+        continue-on-error: true
+        run: |
+          kubeconform -strict -summary \
+              -schema-location 'default' \
+              -schema-location 'https://raw.githubusercontent.com/defenseunicorns/uds-core/main/src/pepr/operator/crd/sources/uds.dev/v1alpha1/{kind}.json' \
+              bundle/uds-package.yaml
