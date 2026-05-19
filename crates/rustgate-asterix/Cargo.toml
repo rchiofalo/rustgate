@@ -14,3 +14,12 @@ workspace = true
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# Schema-parity proptest in `tests/schema_parity_fspec.rs` pins
+# byte-identical round-trip between the hand-rolled FSPEC chain
+# decoder and `SchemaCodec` over `schemas/datablock_fspec.yaml`.
+# Dev-only — the production codec stays hand-rolled; the parity
+# test is a declarative pin of the wire layout.
+rustgate-codec-schema = { workspace = true }
