@@ -748,6 +748,21 @@ The chart includes Pod Security Standards (restricted profile), startup/liveness
 
 For full deployment documentation see [docs/deployment.md](docs/deployment.md).
 
+### Deployment paths
+
+rustgate supports multiple deployment paths — pick the one that matches your environment. **None of these depend on each other**; the UDS/Zarf surface is opt-in for airgap / Platform One deployments and does not change the others.
+
+| Path | Use when | Where to start |
+|------|----------|----------------|
+| **Direct binary** | Bare-metal edge node, systemd service, dev box | `cargo build --release` + [docs/deployment.md § Binary](docs/deployment.md#binary) |
+| **Docker** | Single-container deployment | `docker run ghcr.io/rchiofalo/rustgate:0.9.0` + [Dockerfile](Dockerfile) |
+| **Docker Compose** | Local dev with NATS / federation peers | `docker compose up` + [docker-compose.yml](docker-compose.yml) |
+| **Helm chart** | Internet-connected Kubernetes (EKS, GKE, AKS, k3s, kubeadm) | `helm install rustgate helm/` + [docs/deployment.md § Kubernetes](docs/deployment.md#kubernetes) |
+| **Kubernetes operator** | Multi-cluster fleet management via `RustgateCluster` CRD | [`rustgate-operator`](crates/rustgate-operator/README.md) |
+| **Zarf package (airgap)** | Disconnected Kubernetes with no inbound internet | [`zarf/README.md`](zarf/README.md) + [docs/uds-deployment.md § Path 1](docs/uds-deployment.md#path-1-standalone-zarf) |
+| **UDS bundle** | UDS Core platform (Istio mTLS mesh, Pepr admission, monitoring stack) | [`bundle/README.md`](bundle/README.md) + [docs/uds-deployment.md § Path 2](docs/uds-deployment.md#path-2-uds-bundle-uds-core-integration) |
+| **Iron Bank / Platform One** | DoD STIG-compliant deployment | [`Dockerfile.ironbank`](Dockerfile.ironbank) + [docs/uds-deployment.md § Path 3](docs/uds-deployment.md#path-3-iron-bank--platform-one) |
+
 ## Security
 
 - **mTLS everywhere** — all client and federation connections require mutual TLS with certificate verification
