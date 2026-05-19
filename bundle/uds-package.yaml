@@ -1,0 +1,141 @@
+# UDS Package custom resource for rustgate.
+#
+# Applied AT DEPLOY TIME (post-Helm) by the UDS Core Pepr admission
+# controller. Tells UDS Core what network access rustgate needs,
+# what services to expose via the Istio gateway, and what metrics
+# endpoints to scrape into the Core monitoring stack.
+#
+# UDS Core admission is namespace-scoped; this CR lives in the
+# `rustgate` namespace (set by the Zarf package's chart namespace)
+# and is delivered as a Helm template via the chart in PR H3
+# follow-ups OR applied directly via `kubectl apply -f` against an
+# already-Helm-installed rustgate.
+#
+# The minimal deployment can land this CR via the
+# `extraManifests` value path on the rustgate Helm chart (see
+# `helm/values.yaml`); a future chart enhancement may move it
+# inline as `templates/uds-package.yaml` gated by a
+# `uds.enabled` feature flag.
+#
+# Reference: https://uds.defenseunicorns.com/reference/configuration/custom-resources/packages-v1alpha1-cr/
+apiVersion: uds.dev/v1alpha1
+kind: Package
+metadata:
+  name: rustgate
+  namespace: rustgate
+spec:
+  # ---------------------------------------------------------------
+  # Network policies — UDS Core defaults to deny-all between pods;
+  # every flow needs to be explicitly allowed. The list below
+  # mirrors the ports the Helm chart's StatefulSet exposes
+  # (`helm/templates/statefulset.yaml`'s `containerPort` block)
+  # and the Service's port mappings (`helm/templates/service.yaml`).
+  # ---------------------------------------------------------------
+  network:
+    allow:
+      # ---- INGRESS: client / operator traffic ----
+      - description: "mTLS client connections (CoT XML / TAK protobuf)"
+        direction: Ingress
+        remoteGenerated: Anywhere
+        port: 4433
+      - description: "WebSocket (wss://) client connections"
+        direction: Ingress
+        remoteGenerated: Anywhere
+        port: 8443
+      - description: "MQTT 5.0/3.1.1 client connections (mqtts://)"
+        direction: Ingress
+        remoteGenerated: Anywhere
+        port: 8883
+      - description: "HTTPS certificate enrollment endpoint"
+        direction: Ingress
+        remoteGenerated: Anywhere
+        port: 8087
+
+      # ---- INGRESS: monitoring stack scrape ----
+      - description: "Prometheus scrape of /metrics"
+        direction: Ingress
+        remoteNamespace: monitoring
+        port: 9090
+
+      # ---- INGRESS: federation peer connections ----
+      - description: "Federation V1 (length-prefixed XML over mTLS)"
+        direction: Ingress
+        remoteGenerated: Anywhere
+        port: 9000
+      - description: "Federation V2 (gRPC over mTLS)"
+        direction: Ingress
+        remoteGenerated: Anywhere
+        port: 9001
+
+      # ---- EGRESS: kube-apiserver (operator + service discovery) ----
+      - description: "Kubernetes API server access for the operator"
+        direction: Egress
+        remoteGenerated: KubeAPI
+
+      # ---- EGRESS: NATS (optional, only if --nats-url is set) ----
+      # Uncomment when the optional NATS package (see
+      # `uds-bundle.yaml`'s commented-out package entry) is
+      # composed into the bundle.
+      #
+      # - description: "NATS bridge (cross-instance scaling)"
+      #   direction: Egress
+      #   remoteNamespace: uds-nats
+      #   port: 4222
+
+      # ---- EGRESS: outbound federation peer dial-out ----
+      - description: "Federation peer dial-out (V1 mTLS + V2 gRPC)"
+        direction: Egress
+        remoteGenerated: Anywhere
+        port: 9000
+      - description: "Federation V2 peer dial-out"
+        direction: Egress
+        remoteGenerated: Anywhere
+        port: 9001
+
+    # ---------------------------------------------------------------
+    # Istio gateway exposure. Lets operators reach rustgate's
+    # public endpoints (mTLS client port + WebSocket + MQTT) via
+    # the UDS Core tenant Istio gateway, with mesh-level mTLS
+    # between pods and per-VirtualService TLS termination at the
+    # gateway boundary.
+    #
+    # The host names are configurable via the bundle's
+    # `overrides:` mechanism (see `uds-bundle.yaml`'s overrides
+    # stanza); the defaults below match the production values
+    # file template.
+    # ---------------------------------------------------------------
+    expose:
+      - description: "rustgate mTLS client endpoint via Istio tenant gateway"
+        host: "rustgate"
+        gateway: tenant
+        service: rustgate
+        port: 4433
+        targetPort: 4433
+        selector:
+          app.kubernetes.io/name: rustgate
+
+      - description: "rustgate WebSocket endpoint via Istio tenant gateway"
+        host: "rustgate-ws"
+        gateway: tenant
+        service: rustgate
+        port: 8443
+        targetPort: 8443
+        selector:
+          app.kubernetes.io/name: rustgate
+
+  # ---------------------------------------------------------------
+  # Monitoring — UDS Core's Prometheus auto-creates a ServiceMonitor
+  # from this declaration. Bundle override `monitoring.serviceMonitor.enabled=true`
+  # (set in `uds-bundle.yaml`) already enables the chart's own
+  # ServiceMonitor; this Package-level declaration is the canonical
+  # UDS Core way and supersedes the chart's template when both are
+  # present.
+  # ---------------------------------------------------------------
+  monitor:
+    - description: "rustgate Prometheus metrics"
+      kind: ServiceMonitor
+      selector:
+        app.kubernetes.io/name: rustgate
+      portName: metrics
+      targetPort: 9090
+      path: /metrics
