@@ -37,8 +37,43 @@
 //!   `record_count` attribute on the [`crate::codec::VmfCodec`]
 //!   integration layer.
 
+use std::sync::OnceLock;
+
+use rustgate_codec_schema::{SchemaCodec, bitstream};
+use rustgate_core::entity::{AttributeValue, EntityCodec};
+
 use crate::bitstream::{BitReader, BitWriter};
 use crate::error::VmfError;
+
+/// Embedded body schema. Parsed once on first use by
+/// [`schema_codec`] — the YAML is a `const &str` baked in at
+/// compile time and the resulting `SchemaCodec` is immutable, so
+/// re-parsing on every decode would be CPU waste.
+const SCHEMA_YAML: &str = include_str!("../schemas/k05_1.yaml");
+
+/// Attribute key prefix the schema runtime produces for K05.1
+/// fields (no `entity-path` declared, so every field goes under
+/// `schema.<protocol-name>.<field>`).
+const ATTR_PREFIX: &str = "schema.vmf.k05_1.";
+
+/// Cached [`SchemaCodec`] built from the embedded K05.1 body
+/// schema. `OnceLock` is the workspace-standard pattern (banned:
+/// `once_cell::sync::Lazy`).
+fn schema_codec() -> &'static SchemaCodec {
+    static CODEC: OnceLock<SchemaCodec> = OnceLock::new();
+    CODEC.get_or_init(|| {
+        // justification: the embedded schema is validated at workspace-
+        // test time by `tests/schema_parity_k05_1.rs` — a parse failure
+        // here would mean an invalid YAML committed to `schemas/`,
+        // which CI catches before any caller reaches this code path.
+        // Falling back via `Result` would force every callsite into
+        // error-handling boilerplate for an invariant the build
+        // already guarantees.
+        #[allow(clippy::expect_used)]
+        SchemaCodec::from_schema_text(SCHEMA_YAML)
+            .expect("embedded k05_1.yaml schema must parse and validate")
+    })
+}
 
 /// Latitude/longitude bit widths and LSB scaling. The 25/26 layout
 /// pinned here is the most common MIL-STD-6017 form; some VMF
@@ -116,46 +151,104 @@ impl K051PositionReport {
     /// Decode a K05.1 body from a bit reader positioned at the first
     /// bit of the body. The header is decoded separately (see
     /// [`crate::header::VmfHeader::decode`]).
+    ///
+    /// **Schema-driven decode (since I2)**: the bit-stream parse is
+    /// delegated to the [`SchemaCodec`] built from
+    /// `schemas/k05_1.yaml`. The wrapper retains range guards
+    /// (lat ∈ `[-90, 90]`, lon ∈ `[-180, 180]`), calibration math
+    /// (raw → degrees / m·s⁻¹), and `unit_identifier` sanitization
+    /// (non-printable ASCII → `?`, trailing padding trimmed). The
+    /// schema runtime handles the bit-cursor + FPI cascade via v5
+    /// variable-shift `present-if`.
     pub fn decode(reader: &mut BitReader<'_>) -> Result<Self, VmfError> {
-        let reporting_urn = reader.read_bits(24, "k05_1.reporting_urn")?;
-        let lat_raw = reader.read_bits_signed(LAT_BITS, "k05_1.latitude")?;
-        let lon_raw = reader.read_bits_signed(LON_BITS, "k05_1.longitude")?;
+        // Extract the body slice from the BitReader's current
+        // position. The header decode left the cursor at the
+        // body's first bit; we slice the underlying payload from
+        // that byte forward, then shift_left by the bit-offset so
+        // the body's first bit lands at byte 0 bit 0 of a new
+        // buffer (the schema runtime's contract).
+        let body_start_bit = reader.position_bits();
+        let body_byte_offset = body_start_bit / 8;
+        let body_bit_offset = (body_start_bit % 8) as u8;
+        let payload = reader.payload();
+        let remaining = payload.get(body_byte_offset..).ok_or(VmfError::Truncated {
+            field: "k05_1.body",
+            needed_bits: 79,
+        })?;
+        let body_bytes = bitstream::shift_left(remaining, body_bit_offset);
+
+        // Run the schema decode. `PayloadTooShort` from the schema
+        // runtime maps to `VmfError::Truncated` so existing callers
+        // matching on that variant keep working; everything else
+        // surfaces as `InvalidValue` with the schema error's
+        // display string.
+        let entity = schema_codec().to_entity(&body_bytes).map_err(|e| match e {
+            rustgate_codec_schema::error::SchemaCodecError::PayloadTooShort {
+                required, ..
+            } => VmfError::Truncated {
+                field: "k05_1.body",
+                needed_bits: u32::try_from(required.saturating_mul(8)).unwrap_or(u32::MAX),
+            },
+            other => VmfError::InvalidValue {
+                field: "k05_1.schema",
+                detail: other.to_string(),
+            },
+        })?;
+
+        // Project the schema attributes back to typed fields. Each
+        // helper reads `schema.vmf.k05_1.<name>` and applies the
+        // calibration / sanitization the wrapper layer owns.
+        let reporting_urn = read_u32_attr(&entity, "reporting_urn")?;
+        let lat_raw = read_i32_attr(&entity, "latitude")?;
+        let lon_raw = read_i32_attr(&entity, "longitude")?;
         let latitude_deg = decode_latitude(lat_raw)?;
         let longitude_deg = decode_longitude(lon_raw)?;
 
-        let altitude_m = if reader.read_bit("k05_1.altitude_fpi")? {
-            let raw = reader.read_bits_signed(16, "k05_1.altitude")?;
+        let altitude_fpi = read_u8_attr(&entity, "altitude_fpi")?;
+        let altitude_m = if altitude_fpi == 1 {
+            // i32 raw extracted by schema; cast back to i16 — schema
+            // already constrained to 16-bit signed range.
+            let raw = read_i32_attr(&entity, "altitude")?;
             Some(raw as i16)
         } else {
             None
         };
-        let speed_m_per_s = if reader.read_bit("k05_1.speed_fpi")? {
-            let raw = reader.read_bits(SPEED_BITS, "k05_1.speed")?;
+        let speed_fpi = read_u8_attr(&entity, "speed_fpi")?;
+        let speed_m_per_s = if speed_fpi == 1 {
+            let raw = read_u32_attr(&entity, "speed")?;
             Some(f64::from(raw) * SPEED_LSB_M_PER_S)
         } else {
             None
         };
-        let course_deg = if reader.read_bit("k05_1.course_fpi")? {
-            let raw = reader.read_bits(COURSE_BITS, "k05_1.course")?;
+        let course_fpi = read_u8_attr(&entity, "course_fpi")?;
+        let course_deg = if course_fpi == 1 {
+            let raw = read_u32_attr(&entity, "course")?;
             Some(f64::from(raw) * 360.0 / COURSE_DENOM)
         } else {
             None
         };
-        let unit_identifier = if reader.read_bit("k05_1.unit_id_fpi")? {
-            // Read 7 bytes one byte at a time to tolerate a non-byte-
-            // aligned cursor — the FPI bit above almost always leaves
-            // the cursor on a non-byte boundary, so a `read_bytes`
-            // call would surface a misalignment error even on
-            // well-formed input.
-            let mut raw = [0u8; UNIT_ID_LEN];
-            for slot in raw.iter_mut() {
-                *slot = reader.read_bits(8, "k05_1.unit_id")? as u8;
-            }
-            // Sanitize: non-printable bytes become '?' so an attacker
-            // cannot ship CR/LF or terminal control codes through the
-            // operator dashboard.
+        let unit_id_fpi = read_u8_attr(&entity, "unit_id_fpi")?;
+        let unit_identifier = if unit_id_fpi == 1 {
+            // The schema declares `unit_identifier` as a 56-bit u64
+            // (bit-packed integer — the schema grammar's bit-packing
+            // path only carries integer types). Decompose MSB-first
+            // back to the 7 wire bytes; this matches how the
+            // hand-rolled encoder writes them.
+            let raw = read_u64_attr(&entity, "unit_identifier")?;
+            let raw_bytes: [u8; UNIT_ID_LEN] = [
+                ((raw >> 48) & 0xFF) as u8,
+                ((raw >> 40) & 0xFF) as u8,
+                ((raw >> 32) & 0xFF) as u8,
+                ((raw >> 24) & 0xFF) as u8,
+                ((raw >> 16) & 0xFF) as u8,
+                ((raw >> 8) & 0xFF) as u8,
+                (raw & 0xFF) as u8,
+            ];
+            // Sanitize: non-printable bytes become '?' so a hostile
+            // sender cannot inject CR/LF / terminal control codes
+            // through the operator dashboard.
             let mut out = String::with_capacity(UNIT_ID_LEN);
-            for &b in raw.iter() {
+            for &b in raw_bytes.iter() {
                 if (0x20..=0x7E).contains(&b) {
                     out.push(b as char);
                 } else {
@@ -168,6 +261,20 @@ impl K051PositionReport {
         } else {
             None
         };
+
+        // Compute bits consumed and advance the reader so downstream
+        // callers see the cursor at the right position. v5
+        // variable-shift `present-if` collapses absent fields on the
+        // wire, so the consumed-bit count is the SUM of always-present
+        // bits plus the conditional contributions.
+        let bits_consumed = 24  // reporting_urn
+            + LAT_BITS as usize
+            + LON_BITS as usize
+            + 1 + if altitude_m.is_some() { 16 } else { 0 }
+            + 1 + if speed_m_per_s.is_some() { SPEED_BITS as usize } else { 0 }
+            + 1 + if course_deg.is_some() { COURSE_BITS as usize } else { 0 }
+            + 1 + if unit_identifier.is_some() { UNIT_ID_LEN * 8 } else { 0 };
+        reader.advance_bits(bits_consumed)?;
 
         Ok(Self {
             reporting_urn,
@@ -266,6 +373,148 @@ impl K051PositionReport {
             None => writer.write_bit(false, "k05_1.unit_id_fpi")?,
         }
         Ok(())
+    }
+}
+
+/// Read a `u32`-typed attribute from the schema-decoded entity.
+/// The schema runtime projects every integer field through
+/// [`AttributeValue::Int`] (`i64`); cast back to `u32` with a
+/// bounded check so a malformed schema (or a future field-width
+/// change) surfaces as a typed error rather than a silent
+/// truncation.
+fn read_u32_attr(
+    entity: &rustgate_core::entity::Entity,
+    short_name: &'static str,
+) -> Result<u32, VmfError> {
+    let key = format!("{ATTR_PREFIX}{short_name}");
+    let av = entity.attributes.get(&key).ok_or(VmfError::InvalidValue {
+        field: short_name_to_static(short_name),
+        detail: format!("schema decode missing attribute `{key}`"),
+    })?;
+    match av {
+        AttributeValue::Int(v) if *v >= 0 && *v <= i64::from(u32::MAX) => {
+            // justification: the guard above constrains the value to
+            // the u32 range; the cast is exact.
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(*v as u32)
+        }
+        AttributeValue::Int(v) => Err(VmfError::InvalidValue {
+            field: short_name_to_static(short_name),
+            detail: format!("value {v} does not fit in u32"),
+        }),
+        other => Err(VmfError::InvalidValue {
+            field: short_name_to_static(short_name),
+            detail: format!("expected Int attribute, got {other:?}"),
+        }),
+    }
+}
+
+/// Read an `i32`-typed attribute. The schema's signed bit-packed
+/// fields (latitude, longitude, altitude) project as
+/// [`AttributeValue::Int`] (`i64`); cast back with a bounded
+/// check that catches a misconfigured schema.
+fn read_i32_attr(
+    entity: &rustgate_core::entity::Entity,
+    short_name: &'static str,
+) -> Result<i32, VmfError> {
+    let key = format!("{ATTR_PREFIX}{short_name}");
+    let av = entity.attributes.get(&key).ok_or(VmfError::InvalidValue {
+        field: short_name_to_static(short_name),
+        detail: format!("schema decode missing attribute `{key}`"),
+    })?;
+    match av {
+        AttributeValue::Int(v) if *v >= i64::from(i32::MIN) && *v <= i64::from(i32::MAX) => {
+            // justification: bounded by the guard above.
+            #[allow(clippy::cast_possible_truncation)]
+            Ok(*v as i32)
+        }
+        AttributeValue::Int(v) => Err(VmfError::InvalidValue {
+            field: short_name_to_static(short_name),
+            detail: format!("value {v} does not fit in i32"),
+        }),
+        other => Err(VmfError::InvalidValue {
+            field: short_name_to_static(short_name),
+            detail: format!("expected Int attribute, got {other:?}"),
+        }),
+    }
+}
+
+/// Read a `u8`-typed attribute (used for the FPI flag bits).
+fn read_u8_attr(
+    entity: &rustgate_core::entity::Entity,
+    short_name: &'static str,
+) -> Result<u8, VmfError> {
+    let key = format!("{ATTR_PREFIX}{short_name}");
+    let av = entity.attributes.get(&key).ok_or(VmfError::InvalidValue {
+        field: short_name_to_static(short_name),
+        detail: format!("schema decode missing attribute `{key}`"),
+    })?;
+    match av {
+        AttributeValue::Int(v) if *v >= 0 && *v <= i64::from(u8::MAX) => {
+            // justification: bounded by the guard above.
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(*v as u8)
+        }
+        AttributeValue::Int(v) => Err(VmfError::InvalidValue {
+            field: short_name_to_static(short_name),
+            detail: format!("value {v} does not fit in u8"),
+        }),
+        other => Err(VmfError::InvalidValue {
+            field: short_name_to_static(short_name),
+            detail: format!("expected Int attribute, got {other:?}"),
+        }),
+    }
+}
+
+/// Read a `u64`-typed attribute (used for the 56-bit
+/// `unit_identifier` field — the schema runtime carries it as
+/// a bit-packed u64 since the grammar's bit-packing path is
+/// integer-only). Negative values surface from i64 → u64
+/// bit-casts the validator allows; we mask the high bits to the
+/// declared 56-bit width to be safe.
+fn read_u64_attr(
+    entity: &rustgate_core::entity::Entity,
+    short_name: &'static str,
+) -> Result<u64, VmfError> {
+    let key = format!("{ATTR_PREFIX}{short_name}");
+    let av = entity.attributes.get(&key).ok_or(VmfError::InvalidValue {
+        field: short_name_to_static(short_name),
+        detail: format!("schema decode missing attribute `{key}`"),
+    })?;
+    match av {
+        AttributeValue::Int(v) => {
+            // justification: bit-cast — every i64 maps to a unique
+            // u64. The caller masks to the schema's declared
+            // bit-width before consuming, so high bits don't leak.
+            #[allow(clippy::cast_sign_loss)]
+            let raw = *v as u64;
+            Ok(raw)
+        }
+        other => Err(VmfError::InvalidValue {
+            field: short_name_to_static(short_name),
+            detail: format!("expected Int attribute, got {other:?}"),
+        }),
+    }
+}
+
+/// Map a short field name to a `&'static str` for `VmfError`'s
+/// `field: &'static str` discipline. The schema's field names are
+/// stable across the schema YAML and the production code so an
+/// inline match arm is the right shape.
+fn short_name_to_static(name: &str) -> &'static str {
+    match name {
+        "reporting_urn" => "k05_1.reporting_urn",
+        "latitude" => "k05_1.latitude",
+        "longitude" => "k05_1.longitude",
+        "altitude_fpi" => "k05_1.altitude_fpi",
+        "altitude" => "k05_1.altitude",
+        "speed_fpi" => "k05_1.speed_fpi",
+        "speed" => "k05_1.speed",
+        "course_fpi" => "k05_1.course_fpi",
+        "course" => "k05_1.course",
+        "unit_id_fpi" => "k05_1.unit_id_fpi",
+        "unit_identifier" => "k05_1.unit_id",
+        _ => "k05_1.unknown",
     }
 }
 

@@ -64,6 +64,32 @@ impl<'a> BitReader<'a> {
         self.pos
     }
 
+    /// Borrow the underlying byte slice. Surface for callers that
+    /// need to extract a sub-slice at the current bit cursor — the
+    /// VMF K05.1 codec migration uses this to hand a byte-aligned
+    /// view of the body to the `rustgate-codec-schema` runtime.
+    #[must_use]
+    pub fn payload(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Advance the bit cursor by `n` bits without reading. Used by
+    /// callers that consumed bits through an alternate path (e.g.
+    /// `SchemaCodec` decode operating on a byte-aligned slice
+    /// produced via `bitstream::shift_left`) and need to mark those
+    /// bits as consumed in the BitReader for any downstream code
+    /// to pick up at the right position.
+    pub fn advance_bits(&mut self, n: usize) -> Result<(), VmfError> {
+        if self.remaining_bits() < n {
+            return Err(VmfError::Truncated {
+                field: "advance_bits",
+                needed_bits: u32::try_from(n).unwrap_or(u32::MAX),
+            });
+        }
+        self.pos += n;
+        Ok(())
+    }
+
     /// Read `n` bits (1..=32) and return them right-justified in a
     /// `u32`. Returns [`VmfError::Truncated`] when the stream runs out
     /// of bytes mid-read.
