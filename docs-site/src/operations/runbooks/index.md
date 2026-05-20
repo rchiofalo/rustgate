@@ -7,8 +7,11 @@ Operational runbooks for the most common rustgate failure modes. Each runbook is
 | [Anti-Replay](./anti-replay.md) | Duplicate messages observed downstream, dedup gauges climbing, audit log shows replay attempts. |
 | [Certificate Rotation](./certificate-rotation.md) | Server or client certs are approaching expiry, or you need an emergency rotation after a compromise. |
 | [CRL Updates](./crl-updates.md) | A CRL must be reloaded out-of-cycle to revoke a compromised client. |
+| [Enrollment Rate Limit](./enrollment-rate-limit.md) | The per-IP enrollment throttle is rejecting CSR signing requests with `429 Too Many Requests`. |
 | [Federation Reconnect](./federation-reconnect.md) | A federation peer is stuck in `reconnecting`, queue lag is climbing, or replay buffer is filling. |
 | [High Memory](./high-memory.md) | Resident memory is climbing without a corresponding increase in connection count or routing throughput. |
+| [HTTP Egress Circuit Tripped](./http-egress-circuit-tripped.md) | A per-target HTTP egress circuit breaker is stuck Open or HalfOpen, the DLQ is filling, or downstream consumers report missing data. |
+| [MQTT Issues](./mqtt-issues.md) | MQTT clients fail to connect, PUBLISHes silently drop, SUBSCRIBE returns failure codes, or will-messages fire at scale. |
 | [NATS Bridge Failure](./nats-bridge-failure.md) | The JetStream consumer is lagging, redeliveries are climbing, or the bridge keeps reconnecting. |
 | [TLS Handshake Failures](./tls-handshake-failures.md) | Clients can't connect, handshake error rate is climbing, or a specific group is being rejected. |
 | [WebSocket Storms](./websocket-storms.md) | A WebSocket flood is consuming connection slots or memory. |
