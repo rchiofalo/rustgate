@@ -36,6 +36,7 @@ pub mod acl_config;
 pub mod acl_reloader;
 #[cfg(feature = "correlation")]
 pub mod correlation;
+pub mod error;
 #[cfg(feature = "management-api")]
 pub mod management_api;
 #[cfg(feature = "marti-compat")]
@@ -49,6 +50,7 @@ pub mod video;
 pub use acl_api::{AclApiState, validate_bearer_token_length};
 pub use acl_config::{GroupAclEntry, GroupAclFile};
 pub use acl_reloader::AclReloader;
+pub use error::{AclReloadError, AdminServerError};
 #[cfg(feature = "management-api")]
 pub use management_api::{
     AuditVerifyReport, ClientDetail, ClientDetailFn, ClientSnapshot, ClientsFn, ConfigFn,

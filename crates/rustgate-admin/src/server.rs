@@ -828,8 +828,10 @@ pub async fn serve(
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
     router_slot: RouterSlot,
     max_http_connections: usize,
-) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+) -> Result<(), crate::error::AdminServerError> {
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(|source| crate::error::AdminServerError::Bind { addr: bind, source })?;
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_http_connections));
     // The metrics server is up — the process loop is reachable, so the
     // liveness flag may flip on. Readiness/startup remain controlled by
@@ -838,7 +840,10 @@ pub async fn serve(
     tracing::info!(addr = %bind, "metrics server started");
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|source| crate::error::AdminServerError::Accept { source })?;
 
         // Apply shared TCP tactical-socket tuning so dead NAT middleboxes
         // and half-open scrapers are detected instead of hanging the

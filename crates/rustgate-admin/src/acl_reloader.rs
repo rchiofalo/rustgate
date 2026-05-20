@@ -21,6 +21,8 @@ use rustgate_router::Router;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
+use crate::error::AclReloadError;
+
 /// Watches a group ACL JSON file and hot-reloads the router's policy on change.
 ///
 /// Construct with [`AclReloader::new`], then call
@@ -54,10 +56,15 @@ impl AclReloader {
     /// file content has changed.
     ///
     /// Returns `Ok(true)` if the policy was swapped, `Ok(false)` if unchanged.
-    pub fn reload(&self) -> anyhow::Result<bool> {
-        let data = std::fs::read_to_string(&self.acl_path).map_err(|e| {
-            anyhow::anyhow!("failed to read ACL file {}: {e}", self.acl_path.display())
-        })?;
+    /// Errors are the structured [`AclReloadError`] variants — match on
+    /// the discriminator to distinguish IO failures (file rotation, missing
+    /// file) from validation rejections (reserved sentinel group IDs).
+    pub fn reload(&self) -> Result<bool, AclReloadError> {
+        let data =
+            std::fs::read_to_string(&self.acl_path).map_err(|source| AclReloadError::Read {
+                path: self.acl_path.clone(),
+                source,
+            })?;
 
         let new_hash = Self::compute_hash(data.as_bytes());
 
@@ -66,7 +73,7 @@ impl AclReloader {
             let guard = self
                 .last_hash
                 .lock()
-                .map_err(|_| anyhow::anyhow!("ACL reloader hash lock poisoned"))?;
+                .map_err(|_| AclReloadError::HashLockPoisoned)?;
             if *guard == new_hash {
                 debug!(
                     path = %self.acl_path.display(),
@@ -77,9 +84,11 @@ impl AclReloader {
         }
 
         // File changed -- parse and swap.
-        let config: crate::acl_config::GroupAclFile = serde_json::from_str(&data).map_err(|e| {
-            anyhow::anyhow!("failed to parse ACL file {}: {e}", self.acl_path.display())
-        })?;
+        let config: crate::acl_config::GroupAclFile =
+            serde_json::from_str(&data).map_err(|source| AclReloadError::Parse {
+                path: self.acl_path.clone(),
+                source,
+            })?;
 
         // Reject reserved-sentinel group ids (`__*__`) on reload, same
         // guardrail the startup loader applies. A bad reload must fail
@@ -87,10 +96,10 @@ impl AclReloader {
         // reload tick re-parses the file and re-reports the same error
         // instead of silently treating the bad state as "already loaded".
         if let Err(msg) = config.validate_operator_policy() {
-            return Err(anyhow::anyhow!(
-                "refusing to reload ACL file {}: {msg}",
-                self.acl_path.display()
-            ));
+            return Err(AclReloadError::ValidationRejected {
+                path: self.acl_path.clone(),
+                detail: msg,
+            });
         }
 
         let mut groups = std::collections::HashMap::new();
@@ -138,7 +147,7 @@ impl AclReloader {
             let mut guard = self
                 .last_hash
                 .lock()
-                .map_err(|_| anyhow::anyhow!("ACL reloader hash lock poisoned"))?;
+                .map_err(|_| AclReloadError::HashLockPoisoned)?;
             *guard = new_hash;
         }
 
