@@ -6,7 +6,7 @@ rustgate is a Rust-native secure message router built for tactical edge deployme
 
 The workspace ships **39 crates** under `crates/`. The full table — kept in
 sync with `cargo metadata` via the `cargo-toml-drift` CI check — is in the
-top-level [`README.md`](../README.md#architecture). The architectural
+top-level [`README.md`](https://github.com/rchiofalo/rustgate/blob/main/README.md#architecture). The architectural
 groupings are:
 
 ### Foundation
@@ -309,7 +309,7 @@ Issues tracking deferred grammar work that doesn't yet have a forcing function:
   stay in the wrapper layer above the SchemaCodec call.
 
 For the full grammar reference (every YAML key, every validator constraint,
-every backward-compat rule), see [`codec-schema-grammar.md`](codec-schema-grammar.md).
+every backward-compat rule), see [`codec-schema-grammar.md`](https://github.com/rchiofalo/rustgate/blob/main/docs/codec-schema-grammar.md).
 
 ## Message Routing
 
