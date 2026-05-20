@@ -23,6 +23,7 @@
 
 - [Deployment](./operations/deployment.md)
 - [Observability & Metrics](./operations/observability.md)
+- [Metrics Reference](./operations/metrics-reference.md)
 - [Performance Tuning](./operations/performance-tuning.md)
 - [Disaster Recovery](./operations/disaster-recovery.md)
 - [Graceful Degradation](./operations/graceful-degradation.md)
