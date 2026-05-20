@@ -83,6 +83,8 @@ fn config_with_endpoint(endpoint: &str) -> SensorThingsConfig {
             poll_interval_secs: None,
             page_size: Some(50),
         }],
+        #[cfg(feature = "mqtt-push")]
+        mqtt_push: None,
     }
 }
 
@@ -159,6 +161,8 @@ async fn polling_with_since_cursor_includes_filter_clause() {
         request_timeout_secs: 10,
         expand_location: false,
         subscriptions: vec![],
+        #[cfg(feature = "mqtt-push")]
+        mqtt_push: None,
     };
     let client = SensorThingsClient::new(&cfg, None).expect("build");
     let page = client.poll(42, 100, Some(since)).await.expect("poll");
@@ -185,6 +189,8 @@ async fn http_500_surfaces_as_http_status_variant() {
         request_timeout_secs: 10,
         expand_location: false,
         subscriptions: vec![],
+        #[cfg(feature = "mqtt-push")]
+        mqtt_push: None,
     };
     let client = SensorThingsClient::new(&cfg, None).expect("build");
     let err = client
@@ -228,6 +234,8 @@ async fn http_404_classifies_as_non_transient() {
         request_timeout_secs: 10,
         expand_location: false,
         subscriptions: vec![],
+        #[cfg(feature = "mqtt-push")]
+        mqtt_push: None,
     };
     let client = SensorThingsClient::new(&cfg, None).expect("build");
     let err = client
@@ -257,6 +265,8 @@ async fn malformed_response_body_surfaces_as_decode_error() {
         request_timeout_secs: 10,
         expand_location: false,
         subscriptions: vec![],
+        #[cfg(feature = "mqtt-push")]
+        mqtt_push: None,
     };
     let client = SensorThingsClient::new(&cfg, None).expect("build");
     let err = client
@@ -294,6 +304,8 @@ async fn bearer_token_is_attached_to_request() {
         request_timeout_secs: 10,
         expand_location: false,
         subscriptions: vec![],
+        #[cfg(feature = "mqtt-push")]
+        mqtt_push: None,
     };
     let client =
         SensorThingsClient::new(&cfg, Some(Arc::from("test-token"))).expect("build with token");

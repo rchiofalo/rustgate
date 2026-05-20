@@ -78,6 +78,19 @@ pub enum SensorThingsError {
         /// problem.
         message: String,
     },
+
+    /// The MQTT push broker URI used the `mqtts://` scheme, which
+    /// the MVP does not support. TLS for the MQTT push transport
+    /// lands in a follow-up alongside CA-pin / mTLS / SNI override
+    /// knobs — until then, configuring `mqtts://` fails fast at
+    /// startup so operators do not silently fall back to plaintext.
+    /// Feature-gated to keep this variant out of builds that have
+    /// not opted into the MQTT push path.
+    #[cfg(feature = "mqtt-push")]
+    #[error(
+        "SensorThings MQTT push broker URI uses `mqtts://`; TLS for the push transport is not yet supported (see #1380, follow-up)"
+    )]
+    MqttsNotSupported,
 }
 
 impl SensorThingsError {
@@ -97,6 +110,8 @@ impl SensorThingsError {
                 *status == 408 || *status == 429 || (500..600).contains(status)
             }
             Self::Decode { .. } | Self::Config { .. } => false,
+            #[cfg(feature = "mqtt-push")]
+            Self::MqttsNotSupported => false,
         }
     }
 }

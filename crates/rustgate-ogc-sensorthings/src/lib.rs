@@ -44,12 +44,15 @@
 //!   poller carries the most recent `phenomenonTime` it has seen so
 //!   subsequent polls request only newer observations via
 //!   `?$filter=phenomenonTime gt …` — no client-side dedup is needed.
-//! - **MQTT push subscription is deferred.** SensorThings v1.0 also
-//!   defines an MQTT publish/subscribe transport (`v1.0/Datastreams(N)/Observations`)
-//!   for push notification. That half lands in a follow-up issue and
-//!   reuses the existing [`rustgate-mqtt`] client capability — the
-//!   payload shape is identical to the REST-polled `Observation`
-//!   document, so the [`mapper`] module is shared verbatim.
+//! - **MQTT push subscription is available behind `--features mqtt-push`.**
+//!   SensorThings v1.0 §10 defines an MQTT publish/subscribe transport
+//!   (`v1.0/Datastreams(N)/Observations`) for push notification. When
+//!   the feature is enabled and `[sensorthings.mqtt-push]` is
+//!   configured, the [`mqtt_push`] module spawns a subscriber that
+//!   feeds incoming `Observation` documents through the same
+//!   [`mapper`] module the polling path uses. The MVP accepts only
+//!   `mqtt://` broker URIs; `mqtts://` (TLS) is rejected at startup
+//!   pending the CA-pin / mTLS / SNI override knobs.
 //! - **Location resolution.** When the operator opts into it, the
 //!   poller widens the request to
 //!   `?$expand=Datastream/Thing/Locations` so the lat/lon for each
@@ -83,8 +86,12 @@
 //!
 //! # What is deliberately absent
 //!
-//! - **MQTT push subscription** — deferred to a follow-up; the MVP
-//!   exposes the polling path only.
+//! - **MQTT push TLS, auth, per-subscription QoS** — the MQTT push
+//!   path (`--features mqtt-push`) accepts only `mqtt://` URIs with
+//!   no auth and subscribes at QoS 1. Operators who need TLS,
+//!   authentication, or finer-grained QoS configuration will
+//!   wait for the follow-up extension on
+//!   [`config::MqttPushConfig`].
 //! - **HistoricalLocations / FeaturesOfInterest enumeration** — the
 //!   MVP polls `Datastreams(N)/Observations` and resolves Location
 //!   via `$expand`. The full hypermedia surface is not exposed.
@@ -124,12 +131,18 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod mapper;
+#[cfg(feature = "mqtt-push")]
+pub mod mqtt_push;
 pub mod types;
 pub mod wiring;
 
 pub use client::SensorThingsClient;
+#[cfg(feature = "mqtt-push")]
+pub use config::{DEFAULT_MQTT_KEEPALIVE_SECS, MqttPushConfig};
 pub use config::{EntityKindTag, SensorThingsConfig, Subscription};
 pub use error::SensorThingsError;
 pub use mapper::observation_to_entity;
+#[cfg(feature = "mqtt-push")]
+pub use mqtt_push::{datastream_id_from_topic, observation_topic_for, spawn_mqtt_push_task};
 pub use types::{Datastream, Location, Observation, ObservationsPage, Thing};
 pub use wiring::{SOURCE_OGC_SENSORTHINGS, spawn_polling_task};

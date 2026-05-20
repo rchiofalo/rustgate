@@ -265,6 +265,8 @@ mod tests {
             request_timeout_secs: 10,
             expand_location: true,
             subscriptions: vec![],
+            #[cfg(feature = "mqtt-push")]
+            mqtt_push: None,
         }
     }
 

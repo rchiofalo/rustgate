@@ -10,8 +10,9 @@ seismic networks, CBRN detectors, and similar fixed-station telemetry.
 
 ## Status
 
-This crate ships the **HTTP polling half** of the SensorThings
-integration:
+This crate ships **both transports** defined by SensorThings v1.0:
+
+### HTTP polling (default)
 
 - Per-`Datastream` polling with configurable cadence, page size, and
   optional `?$expand=Datastream/Thing/Locations` for single-round-trip
@@ -29,12 +30,26 @@ integration:
   `Timeout` / `Config`, with `is_transient()` driving the polling
   task's backoff decision.
 
-The **MQTT push subscription half** is deferred to a follow-up issue
-— the SensorThings `v1.0/Datastreams(N)/Observations` MQTT topic is
-declared in the spec alongside the REST polling path and the
-`Observation` payload shape is byte-for-byte identical, so the
-existing `rustgate-mqtt` client capability + the [`mapper`] module
-in this crate cover the upgrade without restructuring either.
+### MQTT push (`--features mqtt-push`, opt-in)
+
+- Subscribes to the SensorThings v1.0 §10 topic shape
+  `v1.0/Datastreams(<id>)/Observations` for every configured
+  `[[sensorthings.subscriptions]]` entry.
+- Reuses the polling path's `observation_to_entity` mapper verbatim
+  — the `Observation` JSON payload is identical to the REST form.
+- Pluggable broker via `[sensorthings.mqtt-push]` config block
+  (`broker-uri`, `client-id`, `keepalive-secs`).
+- `rumqttc` owns reconnect; the subscriber task tails its event
+  stream and logs transient failures.
+- **MVP transport caveats**: `mqtt://` only (`mqtts://` rejected at
+  startup), no auth, QoS 1 per subscription. TLS, auth, and
+  per-subscription QoS land in a follow-up extension to
+  `MqttPushConfig`.
+
+Operators who want both transports can configure them
+side-by-side; the cross-path dedup cache in
+`rustgate_router::dedup` collapses any observation that arrives via
+both routes.
 
 ## Public API
 
@@ -42,10 +57,13 @@ in this crate cover the upgrade without restructuring either.
 |------|---------|
 | `SensorThingsClient` | HTTP polling client; per-config one instance |
 | `SensorThingsConfig` / `Subscription` | TOML config root + per-`Datastream` subscription entry |
+| `MqttPushConfig` | MQTT push subscriber config (feature `mqtt-push`) |
 | `EntityKindTag` | Closed-vocabulary tag controlling the mapped `EntityKind` |
 | `Observation` / `Datastream` / `Thing` / `Location` / `ObservationsPage` | Strict-subset wire types |
 | `observation_to_entity` | Pure projection helper |
-| `wiring::spawn_polling_task` | Background task constructor |
+| `wiring::spawn_polling_task` | Background polling task constructor |
+| `mqtt_push::spawn_mqtt_push_task` | Background MQTT subscriber task (feature `mqtt-push`) |
+| `mqtt_push::observation_topic_for` / `datastream_id_from_topic` | SensorThings topic helpers (feature `mqtt-push`) |
 | `wiring::SOURCE_OGC_SENSORTHINGS` | Source-protocol tag for emitted `RoutableMessage`s |
 | `SensorThingsError` | Typed failure enum |
 
@@ -68,6 +86,14 @@ entity-kind = "sensor"      # any closed-vocabulary EntityKind tag
 group = "weather"           # optional Destination::Group target
 poll-interval-secs = 15     # per-subscription override
 page-size = 100             # ?$top= for the polling URL
+
+# Optional. Requires building rustgate-ogc-sensorthings with
+# --features mqtt-push. The subscriber binds the topic list from the
+# datastream-id values configured in [[sensorthings.subscriptions]].
+[sensorthings.mqtt-push]
+broker-uri = "mqtt://broker.example.com:1883"
+client-id = "rustgate-edge-7"
+keepalive-secs = 30
 ```
 
 The schema uses `kebab-case` field names with `deny_unknown_fields`
@@ -117,9 +143,10 @@ included `@iot.selfLink`.
 
 ## Out of scope (deferred)
 
-- **MQTT push subscription** — the SensorThings MQTT half lands in a
-  follow-up issue and reuses `rustgate-mqtt` plus the `mapper` module
-  here.
+- **MQTT push TLS, auth, and per-subscription QoS** — the
+  `mqtt-push` feature accepts only `mqtt://` URIs with no auth and
+  subscribes at QoS 1. TLS / auth / QoS knobs are a follow-up
+  extension to `MqttPushConfig`.
 - **HistoricalLocations / FeaturesOfInterest enumeration** — the MVP
   polls `Datastreams(N)/Observations` and resolves Location via
   `$expand`. The full hypermedia surface is not exposed.

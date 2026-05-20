@@ -56,6 +56,13 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 10;
 /// `?$top=` is supplied.
 pub const DEFAULT_PAGE_SIZE: u32 = 100;
 
+/// Default MQTT keep-alive interval in seconds. Matches the
+/// SensorThings community-default of 60 s — long enough to ride
+/// short network blips, short enough that a broker promptly
+/// detects a presence-lost client.
+#[cfg(feature = "mqtt-push")]
+pub const DEFAULT_MQTT_KEEPALIVE_SECS: u16 = 60;
+
 /// Root of the SensorThings client configuration.
 ///
 /// `endpoint` is the SensorThings v1.0 root — the URL up to and
@@ -105,6 +112,67 @@ pub struct SensorThingsConfig {
     /// on shutdown).
     #[serde(default)]
     pub subscriptions: Vec<Subscription>,
+
+    /// Optional MQTT push transport. When present, the wiring
+    /// spawns an MQTT subscriber alongside the polling supervisor
+    /// and feeds incoming `Observation` documents through the
+    /// same `observation_to_entity` mapper as the polling path.
+    /// `None` disables push; this is the default. Requires
+    /// `--features mqtt-push` on this crate.
+    #[cfg(feature = "mqtt-push")]
+    #[serde(default)]
+    pub mqtt_push: Option<MqttPushConfig>,
+}
+
+/// MQTT push subscriber configuration.
+///
+/// SensorThings v1.0 §10 defines an MQTT publish/subscribe transport
+/// for `Observation` documents. A SensorThings-compliant broker
+/// publishes one JSON document per observation on the topic
+/// `v1.0/Datastreams(<id>)/Observations`, where `<id>` is the
+/// numeric `Datastream` id. The payload shape is identical to the
+/// REST-polled `Observation` document, so the existing
+/// [`crate::observation_to_entity`] mapper is reused verbatim.
+///
+/// # MVP scope
+///
+/// - `broker_uri` accepts `mqtt://host[:port]`. `mqtts://` is
+///   rejected at startup with [`crate::SensorThingsError::MqttsNotSupported`].
+/// - Auth (username/password, bearer-over-MQTT, OAuth) is out of
+///   scope. SensorThings does not pin an auth scheme.
+/// - Per-subscription QoS configuration is out of scope. The
+///   subscriber binds every topic at QoS 1, which is the
+///   SensorThings community default.
+/// - The list of `Datastream` ids the subscriber binds to is taken
+///   from [`SensorThingsConfig::subscriptions`] — the same list the
+///   polling path uses. Running polling and push at the same time
+///   for the same `Datastream` is operator-defined: both paths
+///   reach the router and the cross-path dedup cache
+///   (`rustgate_router::dedup`) collapses duplicates.
+#[cfg(feature = "mqtt-push")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct MqttPushConfig {
+    /// Broker URI. The MVP accepts `mqtt://host[:port][/path]`.
+    /// `mqtts://` is rejected at startup; TLS lands in a follow-up.
+    /// The path component (if any) is ignored — SensorThings topics
+    /// are absolute strings.
+    pub broker_uri: String,
+
+    /// MQTT client identifier sent on CONNECT. Brokers use this to
+    /// uniquely identify the session and route LWT messages. The
+    /// SensorThings community convention is a fixed string per
+    /// deployment (e.g. `"rustgate-<hostname>"`); duplicates trip
+    /// the broker's last-connection-wins semantics, which is
+    /// rarely what an operator wants.
+    pub client_id: String,
+
+    /// MQTT keep-alive interval in seconds. The broker disconnects
+    /// the client when no PUBLISH or PINGREQ is observed within
+    /// roughly `1.5 × keepalive`. Defaults to
+    /// [`DEFAULT_MQTT_KEEPALIVE_SECS`].
+    #[serde(default = "default_mqtt_keepalive_secs")]
+    pub keepalive_secs: u16,
 }
 
 /// One entry in the subscription list. Each entry binds a
@@ -254,6 +322,33 @@ impl SensorThingsConfig {
                 });
             }
         }
+        #[cfg(feature = "mqtt-push")]
+        if let Some(mqtt) = &self.mqtt_push {
+            if mqtt.broker_uri.trim().is_empty() {
+                return Err(SensorThingsError::Config {
+                    message: "[sensorthings.mqtt-push] broker-uri must be a non-empty URI".into(),
+                });
+            }
+            if mqtt.client_id.trim().is_empty() {
+                return Err(SensorThingsError::Config {
+                    message: "[sensorthings.mqtt-push] client-id must be a non-empty string".into(),
+                });
+            }
+            if mqtt.keepalive_secs == 0 {
+                return Err(SensorThingsError::Config {
+                    message: "[sensorthings.mqtt-push] keepalive-secs must be > 0".into(),
+                });
+            }
+            if self.subscriptions.is_empty() {
+                return Err(SensorThingsError::Config {
+                    message: "[sensorthings.mqtt-push] requires at least one \
+                              [[sensorthings.subscriptions]] entry — the push \
+                              subscriber binds the topic list from the same \
+                              datastream-id values"
+                        .into(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -295,6 +390,11 @@ fn default_request_timeout_secs() -> u64 {
 
 fn default_expand_location() -> bool {
     true
+}
+
+#[cfg(feature = "mqtt-push")]
+fn default_mqtt_keepalive_secs() -> u16 {
+    DEFAULT_MQTT_KEEPALIVE_SECS
 }
 
 fn default_page_size_opt() -> Option<u32> {
@@ -462,6 +562,8 @@ mod tests {
             request_timeout_secs: 10,
             expand_location: true,
             subscriptions: vec![],
+            #[cfg(feature = "mqtt-push")]
+            mqtt_push: None,
         };
         let with_override = Subscription {
             datastream_id: 42,
@@ -496,6 +598,8 @@ mod tests {
             request_timeout_secs: 10,
             expand_location: true,
             subscriptions: vec![],
+            #[cfg(feature = "mqtt-push")]
+            mqtt_push: None,
         };
         assert_eq!(
             cfg.normalised_endpoint(),

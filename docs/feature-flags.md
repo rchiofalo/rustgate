@@ -251,6 +251,12 @@ optional subsystems. Most of its features only re-export crate deps.
 |---|---|
 | `controller` | Full Kubernetes controller stack (`kube`, `k8s-openapi`, `tokio`, `axum`, `prometheus`, `chrono`, `futures`, `fastrand`, `schemars`) |
 
+### `rustgate-ogc-sensorthings`
+
+| Feature | Pulls in |
+|---|---|
+| `mqtt-push` | `rumqttc` (`default-features = false`, no TLS features — MVP accepts only `mqtt://` URIs and rejects `mqtts://` at startup, so the rustls / native-tls feature flags stay off until a follow-up adds CA-pin / mTLS / SNI knobs). Enables the SensorThings v1.0 §10 MQTT push subscriber. |
+
 ### Mock-able integrations
 
 `rustgate-dds`, `rustgate-foundry`, `rustgate-inference`,
