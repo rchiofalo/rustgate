@@ -2,6 +2,8 @@
 
 rustgate provides three observability pillars: structured JSON logs (always on), Prometheus metrics (`--features metrics`), and distributed tracing (`--features otel`).
 
+For the full per-metric catalogue (154 Prometheus metrics across all crates, grouped by operational domain with recommended alerts), see [metrics-reference.md](metrics-reference.md).
+
 ## Distributed Tracing (OpenTelemetry)
 
 When built with the `otel` feature, rustgate exports traces via the [OpenTelemetry Protocol (OTLP)](https://opentelemetry.io/docs/specs/otlp/) over gRPC. Any OTLP-compatible backend works: Jaeger, Grafana Tempo, Honeycomb, Datadog, etc.
