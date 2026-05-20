@@ -334,9 +334,21 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false, env = "RUSTGATE_CLIENT_OCSP")]
     pub(crate) client_ocsp: bool,
 
+    /// Wire framing strategy applied to every accepted client session.
+    /// `xml` (default) accepts raw CoT XML streams with depth tracking.
+    /// `length-prefixed` reads a 4-byte big-endian length header before
+    /// each message. `line` parses newline-delimited records.
+    /// `tak-protobuf` requires the `0xBF` magic + varint length frame.
+    /// `tak-negotiate` server-advertises both XML and protobuf and
+    /// upgrades each session at the client's option. See
+    /// [docs/architecture.md § Codec Pipeline](../../docs/architecture.md#codec-pipeline)
+    /// for the framing table.
     #[arg(long, value_enum, default_value_t = Framing::Xml, env = "RUSTGATE_FRAMING")]
     pub(crate) framing: Framing,
 
+    /// Per-session payload encoding for length-prefixed frames. `raw`
+    /// (default) writes the exact bytes the codec produces. Reserved
+    /// for future codec-specific encoding overlays.
     #[arg(long, value_enum, default_value_t = Encoding::Raw, env = "RUSTGATE_ENCODING")]
     pub(crate) encoding: Encoding,
 
