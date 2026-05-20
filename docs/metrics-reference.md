@@ -6,6 +6,7 @@ by source crate so an operator can find "the connection counters" without
 knowing which crate registers them.
 
 For trace spans and structured logging, see [observability.md](observability.md).
+For the audit-event catalogue, see [audit-events-reference.md](audit-events-reference.md).
 
 ## How metrics work
 
