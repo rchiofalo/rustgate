@@ -28,17 +28,40 @@ When `--otel-endpoint` is not set, OTel tracing is disabled even if compiled wit
 
 ### Instrumented Spans
 
-All hot-path spans use `debug` level to avoid excessive trace volume under load.
-Set `RUST_LOG=debug` (or a more targeted filter like `RUST_LOG=rustgate_transport=debug`)
-to include them in traces.
+Most hot-path spans use `debug` level to avoid excessive trace volume under load.
+Set `RUST_LOG=debug` (or a more targeted filter like `RUST_LOG=rustgate_router=debug`)
+to include them in traces. The `tls_handshake` span at `info` level is always on
+when OTel is enabled and bounded by the handshake-limit semaphore.
+
+Named explicit spans (via `tracing::*_span!`):
 
 | Span | Level | Crate | Description |
 |------|-------|-------|-------------|
-| `tls_handshake` | `info` | `rustgate-transport` | TLS handshake duration per connection |
-| `route` | `debug` | `rustgate-transport` | Message routing (direct, group, broadcast) |
-| `federation_forward` | `debug` | `rustgate-federation` | Message forwarding to federation peers |
+| `tls_handshake` | `info` | `rustgate-tls` | TLS handshake duration per accepted connection (carries `peer_addr`) |
+| `http_dispatch` | `debug` | `rustgate-http` | HTTP egress dispatch per target |
 | `nats_publish` | `debug` | `rustgate-nats` | NATS message publish |
 | `nats_recv` | `debug` | `rustgate-nats` | NATS message receive and local delivery |
+| `nats_request` | `debug` | `rustgate-nats` | NATS request/reply round-trip |
+
+Function-level spans (via `#[tracing::instrument]` — 29 sites across the workspace).
+The most operator-relevant:
+
+| Function span | Level | Crate | Description |
+|---|---|---|---|
+| `route_inner` | `debug` | `rustgate-router` | Per-message routing decision (ACL + dedup + fanout) |
+| `route_for_egress` | `debug` | `rustgate-router` | Per-recipient egress envelope rendering |
+| `forward_inner` | `debug` | `rustgate-federation` | Message forwarded to federation peers |
+| `send_with_trace` | `debug` | `rustgate-federation` | V2 gRPC per-peer send |
+| `drain_for_tenant` | `debug` | `rustgate-router` | Store-and-forward drain on client reconnect |
+| `sign` / `revoke` (enrollment handlers) | `info` | `rustgate-enrollment` | CSR signing + cert revocation |
+| `evaluate` / `compile` | `debug` | `rustgate-authz` | Policy evaluation + recompilation |
+
+The full list (29 `#[instrument]` sites + 6 explicit `*_span!` calls) can be
+enumerated with `rg --type rust '#\[(tracing::)?instrument'` and
+`rg --type rust '(info|debug)_span!' crates/`. When adding a new span,
+prefer `#[instrument(level = "debug", skip_all, fields(…))]` on the function
+boundary over `tracing::debug_span!` inside the body — easier to spot in
+review and survives function refactors.
 
 ### Jaeger Setup
 
