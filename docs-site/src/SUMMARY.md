@@ -52,6 +52,7 @@
 
 - [REST API](./reference/rest-api.md)
 - [Configuration Reference](./reference/configuration.md)
+- [Feature Flags Reference](./reference/feature-flags.md)
 
 ---
 
