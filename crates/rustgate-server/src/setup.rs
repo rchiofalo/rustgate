@@ -12,7 +12,7 @@ use std::sync::Arc;
 #[cfg(feature = "federation")]
 use std::time::SystemTime;
 
-use anyhow::Context;
+use anyhow::Context as _;
 #[cfg(feature = "federation")]
 use rustgate_core::identity::Identity;
 #[cfg(feature = "federation-ha")]
