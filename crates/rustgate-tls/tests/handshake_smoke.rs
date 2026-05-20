@@ -23,14 +23,12 @@
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
+use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
 use rustgate_tls::{TlsConfig, TlsListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ------------------------------------------------------------------
 // Happy-path handshake + identity extraction
