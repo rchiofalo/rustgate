@@ -75,11 +75,11 @@ pub enum AclReloadError {
 /// per-connection failures the inner accept loop bubbles up.
 #[derive(Debug, thiserror::Error)]
 pub enum AdminServerError {
-    /// `TcpListener::bind` failed on the configured admin address.
-    /// Common causes: port already in use (another rustgate instance
-    /// or a kube-proxy taking the same address), insufficient
-    /// privilege to bind a low-numbered port, or address-family
-    /// mismatch between `--admin-bind` and the host's networking.
+    /// The TCP bind to the configured admin address failed. Common
+    /// causes: port already in use (another rustgate instance or a
+    /// kube-proxy taking the same address), insufficient privilege
+    /// to bind a low-numbered port, or address-family mismatch
+    /// between `--admin-bind` and the host's networking.
     #[error("failed to bind admin server to {addr}: {source}")]
     Bind {
         addr: std::net::SocketAddr,
@@ -87,7 +87,7 @@ pub enum AdminServerError {
         source: std::io::Error,
     },
 
-    /// `TcpListener::accept` failed inside the accept loop. The loop
+    /// The accept call inside the connection loop failed. The loop
     /// continues (one accept failure does not bring the server down),
     /// but the error is logged + returned for the supervising task
     /// to record. Real-world triggers: file-descriptor exhaustion,
