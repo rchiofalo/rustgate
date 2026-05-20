@@ -4,23 +4,83 @@ rustgate is a Rust-native secure message router built for tactical edge deployme
 
 ## Crate Structure
 
-```
-crates/
-  rustgate-core/          Shared types (Identity, RoutableMessage, Destination, framing)
-  rustgate-cot/           Cursor on Target XML parsing, MessageBuilder
-  rustgate-authz/         Authorization engine (RBAC/ABAC policy evaluation, Cedar backend)
-  rustgate-transport/     mTLS listener, codecs, session management, message router
-  rustgate-websocket/     WebSocket (wss://) listener with mTLS, router integration
-  rustgate-mqtt/          MQTT 5.0/3.1.1 transport with mTLS, dynamic group subscriptions
-  rustgate-nats/          NATS pub/sub bridge with JetStream history replay
-  rustgate-http/          HTTP/webhook egress bridge (auth, retry, circuit breaking)
-  rustgate-enrollment/    HTTPS certificate enrollment (Marti v2 CSR signing)
-  rustgate-proto/         Protobuf translation (XML / proto) and negotiation
-  rustgate-federation/    Server-to-server federation (V1 XML, V2 gRPC)
-  rustgate-client/        Lightweight client library for integration testing
-  rustgate-server/        Binary entry point wiring all crates together
-  rustgate-test-utils/    Ephemeral certificate generation for tests
-```
+The workspace ships **39 crates** under `crates/`. The full table — kept in
+sync with `cargo metadata` via the `cargo-toml-drift` CI check — is in the
+top-level [`README.md`](../README.md#architecture). The architectural
+groupings are:
+
+### Foundation
+
+| Crate | Purpose |
+|---|---|
+| `rustgate-core` | Shared types: `Identity`, `RoutableMessage`, `Destination`, framing strategies |
+| `rustgate-cot` | Cursor on Target XML parsing, MessageBuilder |
+| `rustgate-tls` | TLS/mTLS configuration, X.509 identity extraction, OCSP, SPIFFE, TCP listeners |
+| `rustgate-authz` | RBAC/ABAC policy evaluation (Cedar backend) |
+| `rustgate-router` | Routing engine: Router, ACL, dedup, store-and-forward, position cache, replay |
+| `rustgate-transport` | Codec / framing primitives, hardware identity, UDP / multicast |
+| `rustgate-resilience` | Circuit breakers, backoff, rate limiters, token buckets |
+| `rustgate-metrics` | Prometheus scaffolding: OnceLock fallbacks, init() orchestration |
+| `rustgate-archive` | Encrypted hash-chained archives for tamper-evident audit |
+| `rustgate-codec-schema` | Declarative schema format + generic codec runtime |
+
+### Client-facing transports
+
+| Crate | Purpose |
+|---|---|
+| `rustgate-websocket` | wss:// listener with mTLS |
+| `rustgate-mqtt` | MQTT 5.0/3.1.1 transport adapter with mTLS |
+| `rustgate-nats` | NATS pub/sub bridge with JetStream history replay |
+| `rustgate-http` | HTTP/webhook egress (auth, retry, circuit breaking) |
+| `rustgate-enrollment` | HTTPS certificate enrollment (Marti v2 CSR signing) |
+| `rustgate-federation` | V1 (length-prefixed XML) and V2 (gRPC) federation |
+| `rustgate-proto` | TAK protobuf translation (XML ↔ proto) |
+
+### Tactical protocol codecs
+
+| Crate | Protocol |
+|---|---|
+| `rustgate-mavlink` | MAVLink v1/v2 frame codec |
+| `rustgate-meshtastic` | Meshtastic / LoRa TAKPacket compact-protobuf codec |
+| `rustgate-vmf` | VMF / MIL-STD-6017 bit-level codec (K05.1 Position Reports) |
+| `rustgate-sapient` | SAPIENT (BSI Flex 335) autonomous-sensor / counter-UAS protobuf |
+| `rustgate-nffi` | NFFI (STANAG 5527) NATO Friendly Force Information XML |
+| `rustgate-dis` | DIS (IEEE 1278.1) Entity State PDU codec |
+| `rustgate-link16` | Link 16 / JREAP-C (STANAG 5518) frame codec |
+| `rustgate-stanag4586` | STANAG 4586 LOI 2-3 telemetry codec (NATO UAS interop) |
+| `rustgate-asterix` | ASTERIX (Eurocontrol surveillance) binary codec |
+
+### Partner / platform integrations
+
+| Crate | Backend |
+|---|---|
+| `rustgate-lattice` | Anduril Lattice bidirectional adapter (partner-gated SDK) |
+| `rustgate-foundry` | Palantir Foundry / Gotham REST/WebSocket bridge (partner-gated) |
+| `rustgate-dds` | DDS Pub/Sub bridge for NGVA (STANAG 4754) / VICTORY |
+| `rustgate-ogc-sensorthings` | OGC SensorThings v1.0 HTTP polling client |
+
+### Higher-order pipeline
+
+| Crate | Purpose |
+|---|---|
+| `rustgate-correlation` | Multi-sensor track correlation (CoT / Link 16 / MAVLink / DIS / SAPIENT) |
+| `rustgate-inference` | Edge ML inference pipeline (pluggable backends) |
+| `rustgate-guard` | Cross-domain content inspection guard: rate limit, marking, dedicated egress |
+| `rustgate-missions` | TAK Data Packages — content-addressed package store |
+
+### Server + client + ops
+
+| Crate | Purpose |
+|---|---|
+| `rustgate-server` | Binary entry point, CLI, orchestration |
+| `rustgate-client` | Reference client library for integration tests |
+| `rustgate-admin` | HTTP management server: metrics, health, federation/ACL/missions APIs |
+| `rustgate-operator` | Kubernetes operator for the `RustgateCluster` CRD |
+| `rustgate-test-utils` | TestCa, CRL, and certificate generation helpers |
+
+The README has the same table with per-crate links to source. **The crate
+table here should match `README.md`'s.** When adding or renaming a crate,
+update both — the workspace pre-commit hook flags drift.
 
 ## Data Flow
 
