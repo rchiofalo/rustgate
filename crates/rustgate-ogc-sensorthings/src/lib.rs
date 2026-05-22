@@ -48,7 +48,7 @@
 //!   SensorThings v1.0 §10 defines an MQTT publish/subscribe transport
 //!   (`v1.0/Datastreams(N)/Observations`) for push notification. When
 //!   the feature is enabled and `[sensorthings.mqtt-push]` is
-//!   configured, the [`mqtt_push`] module spawns a subscriber that
+//!   configured, the `mqtt_push` module spawns a subscriber that
 //!   feeds incoming `Observation` documents through the same
 //!   [`mapper`] module the polling path uses. The MVP accepts only
 //!   `mqtt://` broker URIs; `mqtts://` (TLS) is rejected at startup
@@ -90,8 +90,7 @@
 //!   path (`--features mqtt-push`) accepts only `mqtt://` URIs with
 //!   no auth and subscribes at QoS 1. Operators who need TLS,
 //!   authentication, or finer-grained QoS configuration will
-//!   wait for the follow-up extension on
-//!   [`config::MqttPushConfig`].
+//!   wait for the follow-up extension on `config::MqttPushConfig`.
 //! - **HistoricalLocations / FeaturesOfInterest enumeration** — the
 //!   MVP polls `Datastreams(N)/Observations` and resolves Location
 //!   via `$expand`. The full hypermedia surface is not exposed.
