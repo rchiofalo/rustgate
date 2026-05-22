@@ -15,6 +15,7 @@ rustgate-core = { workspace = true }
 rustgate-router = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }
+rumqttc = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -25,3 +26,13 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 toml = { workspace = true }
 wiremock = { workspace = true }
+
+[features]
+# Adds SensorThings v1.0 §10 MQTT push subscription. Off by default;
+# when enabled, the wiring layer can subscribe to
+# `v1.0/Datastreams(N)/Observations` topics on a configured broker
+# and feed received `Observation` documents through the same
+# `observation_to_entity` mapper as the polling path. MVP rejects
+# `mqtts://` broker URIs at startup — TLS lands once a deployment
+# needs CA-pin / mTLS / SNI override knobs.
+mqtt-push = ["dep:rumqttc"]
