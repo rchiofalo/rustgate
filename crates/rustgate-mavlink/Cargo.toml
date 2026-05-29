@@ -13,9 +13,14 @@ workspace = true
 [dependencies]
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
+lru = { workspace = true }
+parking_lot = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

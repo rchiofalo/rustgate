@@ -35,7 +35,7 @@
 //!
 //! - **CRC verification.** Discarding corrupt frames here would hide
 //!   classes of hostile-input bugs from the signing layer. Verification
-//!   happens in the `signing` module (future PR) where it can also check
+//!   happens in the [`signing`] module where it also checks
 //!   replay-timestamp monotonicity.
 //! - **Message-ID interpretation.** The framer does not know or care
 //!   whether a frame is `HEARTBEAT` or `GLOBAL_POSITION_INT`. Obligation
@@ -60,6 +60,7 @@ pub mod crc_extra;
 pub mod entity;
 pub mod error;
 pub mod frame;
+pub mod signing;
 
 pub use codec::MavlinkCodec;
 pub use crc_extra::crc_extra;
@@ -68,4 +69,8 @@ pub use error::MavlinkError;
 pub use frame::{
     HEARTBEAT_MSG_ID, MAVLINK_V1_MAGIC, MAVLINK_V2_MAGIC, MavlinkFrameCodec, MavlinkVersion,
     OnMavlinkHeartbeat, OnMavlinkRejection, RejectionReason,
+};
+pub use signing::{
+    DEFAULT_REPLAY_CAPACITY, SIGNATURE_LEN, SIGNING_KEY_LEN, SigningError, SigningKey,
+    SigningKeyStore, VerifiedFrame, compute_signature, signing_timestamp,
 };
