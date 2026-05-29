@@ -2,11 +2,12 @@
 
 //! MAVLink wire-format primitives for rustgate.
 //!
-//! This crate hosts the low-level MAVLink v1/v2 frame parser and the
+//! This crate hosts the low-level MAVLink v1/v2 frame parser, the
 //! [`rustgate_core::codec::Codec`] adapter that lets the rest of the
-//! workspace treat MAVLink like any other transport. No session wiring
-//! lives here — UDP and TCP listeners that drive the codec arrive in a
-//! follow-up PR.
+//! workspace treat MAVLink like any other transport, the v2 signing
+//! trust boundary ([`signing`]), and the UDP/TCP listeners
+//! ([`listener`]) that drive the codec and hand verified frames to the
+//! router via a sink callback.
 //!
 //! # Scope
 //!
@@ -60,6 +61,7 @@ pub mod crc_extra;
 pub mod entity;
 pub mod error;
 pub mod frame;
+pub mod listener;
 pub mod signing;
 
 pub use codec::MavlinkCodec;
@@ -69,6 +71,10 @@ pub use error::MavlinkError;
 pub use frame::{
     HEARTBEAT_MSG_ID, MAVLINK_V1_MAGIC, MAVLINK_V2_MAGIC, MavlinkFrameCodec, MavlinkVersion,
     OnMavlinkHeartbeat, OnMavlinkRejection, RejectionReason,
+};
+pub use listener::{
+    LinkRegistry, MavlinkDestination, MavlinkListenerConfig, OnMavlinkMessage, spawn_tcp_listener,
+    spawn_udp_listener,
 };
 pub use signing::{
     DEFAULT_REPLAY_CAPACITY, SIGNATURE_LEN, SIGNING_KEY_LEN, SigningError, SigningKey,
