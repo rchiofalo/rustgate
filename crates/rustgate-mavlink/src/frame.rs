@@ -70,13 +70,13 @@ pub const MAVLINK_V2_MAGIC: u8 = 0xFD;
 const MAVLINK_V1_HEADER_LEN: usize = 6;
 
 /// v2 header size: STX + LEN + INCOMPAT + COMPAT + SEQ + SYSID + COMPID + MSGID(3).
-const MAVLINK_V2_HEADER_LEN: usize = 10;
+pub(crate) const MAVLINK_V2_HEADER_LEN: usize = 10;
 
 /// CRC-16/MCRF4XX trailer size, identical for v1 and v2.
-const MAVLINK_CRC_LEN: usize = 2;
+pub(crate) const MAVLINK_CRC_LEN: usize = 2;
 
 /// v2 signature trailer size: LINK_ID(1) + TIMESTAMP(6) + SIGNATURE(6).
-const MAVLINK_SIGNATURE_LEN: usize = 13;
+pub(crate) const MAVLINK_SIGNATURE_LEN: usize = 13;
 
 /// INCOMPAT_FLAGS bit marking a v2 frame as signed.
 ///
@@ -84,7 +84,7 @@ const MAVLINK_SIGNATURE_LEN: usize = 13;
 /// changes where the CRC lives relative to the end of the frame. A
 /// receiver that doesn't recognise the flag literally can't tell where
 /// the frame ends, so unknown INCOMPAT bits MUST cause rejection.
-const MAVLINK_IFLAG_SIGNED: u8 = 0x01;
+pub(crate) const MAVLINK_IFLAG_SIGNED: u8 = 0x01;
 
 /// Hard cap on a single MAVLink frame (v2 signed, `LEN = 255`).
 ///
