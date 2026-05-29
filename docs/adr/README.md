@@ -49,6 +49,7 @@ does.
 | [0017](0017-workspace-dependency-inheritance.md) | Workspace dependency inheritance for every crate | Accepted |
 | [0018](0018-schema-first-codec-design.md) | Schema-first codec design for tactical wire formats | Accepted |
 | [0019](0019-cnsa2-hybrid-mldsa.md) | CNSA 2.0 with Composite ML-DSA hybrid certificates | Proposed |
+| [0020](0020-mavlink-pq-rekey.md) | MAVLink integration with ML-KEM-768 rekey channel | Proposed |
 
 ## Authoring a new ADR
 
