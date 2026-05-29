@@ -446,6 +446,38 @@ pub fn signing_timestamp(now: std::time::SystemTime) -> Option<u64> {
     u64::try_from(ticks).ok()
 }
 
+/// Build a complete signed v2 frame from scratch — header (SIGNED bit
+/// set), `payload_len` payload bytes, an opaque 2-byte CRC, and a trailer
+/// signed under `key`.
+///
+/// Test-only helper shared with the `listener` module's tests; the CRC is
+/// not a real MAVLink CRC because the signing path never inspects it.
+#[cfg(test)]
+pub(crate) fn sign_through_crc_for_test(
+    key: &[u8; SIGNING_KEY_LEN],
+    system_id: u8,
+    component_id: u8,
+    link_id: u8,
+    timestamp: u64,
+    payload_len: u8,
+) -> Bytes {
+    let mut through_crc = vec![
+        MAVLINK_V2_MAGIC,     // STX
+        payload_len,          // LEN
+        MAVLINK_IFLAG_SIGNED, // INCOMPAT (signed)
+        0x00,                 // COMPAT
+        0x07,                 // SEQ
+        system_id,
+        component_id,
+        0x00,
+        0x00,
+        0x00, // MSGID = 0 (HEARTBEAT)
+    ];
+    through_crc.extend(std::iter::repeat_n(0xAB, payload_len as usize)); // payload
+    through_crc.extend_from_slice(&[0xDE, 0xAD]); // CRC (opaque to signing)
+    sign_through_crc(key, &through_crc, link_id, timestamp)
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, unused_results)]
 mod tests {

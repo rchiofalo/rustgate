@@ -132,6 +132,59 @@ pub fn tls_accept_error(peer: SocketAddr, error: &str) {
     );
 }
 
+/// Record a rejected MAVLink v2 frame whose signature failed verification
+/// (wrong key, unknown link, malformed, or unsigned where signing is
+/// required).
+///
+/// Sanitization: `reason` is sanitized at the audit boundary because it
+/// is built from a `SigningError` whose `Display` may embed wire-derived
+/// values.
+pub fn mavlink_signature_rejected(peer: SocketAddr, reason: &str) {
+    let reason = s(reason);
+    audit!(
+        "mavlink.signature_rejected",
+        peer = %peer,
+        action = "mavlink_verify",
+        result = "rejected",
+        reason = %reason
+    );
+}
+
+/// Record a rejected MAVLink v2 frame whose signing timestamp did not
+/// advance past the last accepted value for its
+/// `(system_id, component_id, link_id)` stream (replay defence).
+pub fn mavlink_replay_rejected(peer: SocketAddr, link_id: u8, timestamp: u64, last: u64) {
+    audit!(
+        "mavlink.replay_rejected",
+        peer = %peer,
+        link_id = link_id,
+        timestamp = timestamp,
+        last_accepted = last,
+        action = "mavlink_verify",
+        result = "rejected",
+        reason = "replayed_timestamp"
+    );
+}
+
+/// Record a MAVLink v1 frame admitted under the shared fallback CN.
+///
+/// v1 has no native signing, so this path is only reachable when an
+/// operator has explicitly opted in (`--mavlink-allow-v1` plus a
+/// configured fallback CN). The event documents the degraded identity
+/// posture in the audit trail.
+///
+/// Sanitization: `cn` is sanitized at the audit boundary.
+pub fn mavlink_v1_admitted(cn: &str, peer: SocketAddr) {
+    let cn = s(cn);
+    audit!(
+        "mavlink.v1_admitted",
+        cn = %cn,
+        peer = %peer,
+        action = "mavlink_ingress",
+        result = "degraded"
+    );
+}
+
 /// Record a protocol negotiation outcome.
 ///
 /// Sanitization: `cn` and `protocol` are sanitized at the audit boundary.
