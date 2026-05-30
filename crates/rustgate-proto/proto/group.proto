@@ -1,3 +1,13 @@
+// Copyright © 2026 Roberto Chiofalo.
+//
+// Independent clean-room implementation of the public TAK protocol wire
+// format for interoperability. The field names, types, and numbers below
+// are dictated by the protocol's wire format (a method of operation /
+// uncopyrightable interface, cf. 17 U.S.C. §102(b)); they are NOT copied
+// from, and this file is NOT derived from, any third-party source code.
+// Authored from public protocol documentation and observed wire behavior.
+// See docs/adr/0021-clean-room-tak-interop.md.
+
 syntax = "proto3";
 package atakmap.commoncommo.protobuf.v1;
 

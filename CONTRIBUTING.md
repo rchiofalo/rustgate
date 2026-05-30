@@ -538,3 +538,47 @@ must pass before a PR is mergeable:
 - After merge, delete the feature branch and clean up your local
   worktree. The squashed commit on `main` carries the `Closes #N`
   trailer and GitHub closes the issue automatically.
+
+## Clean-room rule for third-party protocols (MANDATORY)
+
+rustgate ships under a **proprietary** license and interoperates with
+protocols whose reference implementations are **copyleft** (the TAK
+ecosystem — ATAK-CIV and TAK Server are GPLv3; FreeTAKServer / taky are
+GPL/EPL). When you write code that speaks one of these protocols, follow
+[ADR 0021](docs/adr/0021-clean-room-tak-interop.md) exactly. The short
+version:
+
+**You MAY build from:**
+
+- Published protocol specs, schema/IDL files, and developer docs that
+  describe the wire format as a fact (RFCs, MIL-STD / NATO / OGC specs,
+  `mavlink.io`, the public TAK protocol documentation).
+- Wire behavior you observe yourself from a client/server you are
+  entitled to run, captured as your own traces/fixtures.
+- Your own original expression written against the above.
+
+**You MUST NOT:**
+
+- Copy, paste, or transcribe **source code** from TAK Server, ATAK-CIV,
+  FreeTAKServer, taky, or any copyleft/NDA/EULA-restricted implementation
+  — including their comments, internal structure, helper logic, naming
+  beyond protocol-required field tuples, or test fixtures. You may *read*
+  a copyleft reference to understand the **public protocol**; you may not
+  copy its **expression**.
+- Decompile shipped binaries to recover source.
+
+**You MUST:**
+
+- Put the ADR 0021 §4 provenance header at the top of any new/changed
+  schema or IDL file (`.proto`, etc.) — it records that the file is an
+  independent implementation of the public wire format and is not derived
+  from third-party source.
+- State in your PR description the **public source** the code was built
+  from (which spec / doc / observed behavior).
+- Never state or imply in a commit/PR/comment that you read a prohibited
+  source to produce the code.
+
+This is how rustgate keeps interoperability code defensible — the goal is
+that independent authorship is provable from the contemporaneous record,
+not reconstructed later. When in doubt, work from the spec, not the
+implementation, and ask in the issue thread first.
