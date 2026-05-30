@@ -10,6 +10,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Post-quantum signing-key rekey channel (ADR 0020). Pulls in aws-lc-rs
+# for ML-KEM-768, which builds aws-lc from source (cmake + Go) — off by
+# default so the standard build and most CI lanes stay lean. Exercised in
+# the post-quantum CI lane.
+mavlink-pq = ["dep:aws-lc-rs", "dep:ciborium", "dep:hkdf", "dep:chacha20poly1305", "dep:serde"]
+
 [dependencies]
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
@@ -22,6 +29,13 @@ tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", 
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
+
+# --- mavlink-pq feature deps ---
+aws-lc-rs = { workspace = true, optional = true }
+ciborium = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -243,7 +243,7 @@ jobs:
             DEPTH=2
           fi
           echo "Running cargo hack check at depth $DEPTH (event=${{ github.event_name }})"
-          cargo hack check --feature-powerset --depth "$DEPTH" --exclude-features jemalloc,fips,otel,post-quantum --no-dev-deps
+          cargo hack check --feature-powerset --depth "$DEPTH" --exclude-features jemalloc,fips,otel,post-quantum,mavlink-pq --no-dev-deps
 
   check-features-triples:
     # Targeted three-way feature interaction coverage (issue #832 F-147).
@@ -678,6 +678,14 @@ jobs:
 
       - name: Build server with post-quantum
         run: cargo build --locked -p rustgate-server --features post-quantum,federation,enrollment,http
+
+      - name: Clippy + test MAVLink PQ rekey channel
+        # The `mavlink-pq` feature pulls in aws-lc-rs (ML-KEM-768), which
+        # needs cmake + Go — available in this lane but excluded from the
+        # cargo-hack feature-powerset job. Exercise it here.
+        run: |
+          cargo clippy --locked -p rustgate-mavlink --features mavlink-pq --all-targets
+          cargo nextest run --locked -p rustgate-mavlink --features mavlink-pq
 
       - name: Run PQ transport tests
         run: cargo nextest run --locked -p rustgate-transport --features post-quantum

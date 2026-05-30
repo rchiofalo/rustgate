@@ -31,8 +31,10 @@ build-time and runtime cost of each, see `docs/performance-tuning.md`.
   toolchain or build matrix (Go required for FIPS / PQ; protoc
   required for proto / OTel). Marked with **(special build)** below.
 - **CI coverage**: `cargo hack check --feature-powerset --depth 2` runs
-  on every PR, excluding `jemalloc, fips, otel, post-quantum` (which
-  require special builds). Independent CI jobs cover those four.
+  on every PR, excluding `jemalloc, fips, otel, post-quantum,
+  mavlink-pq` (which require special builds). Independent CI jobs cover
+  those — `mavlink-pq` is clippy-checked and tested in the
+  `post-quantum` lane (it shares the aws-lc-rs build dependency).
 
 ### Quick-start bundles
 
@@ -198,6 +200,12 @@ the table below is the source of truth.
 | `otel` | `opentelemetry`, `tracing-opentelemetry` |
 | `fips` | `rustls/{aws_lc_rs,fips}` |
 | `post-quantum` | `rustls/{aws_lc_rs,prefer-post-quantum}` |
+
+### `rustgate-mavlink`
+
+| Feature | Pulls in |
+|---|---|
+| `mavlink-pq` *(special build)* | `aws-lc-rs` (ML-KEM-768), `ciborium`, `hkdf`, `chacha20poly1305`, `serde` — the post-quantum signing-key rekey channel (ADR 0020). Needs Go + cmake; off by default. |
 
 ### `rustgate-mqtt`, `rustgate-websocket`, `rustgate-cot`, `rustgate-proto`, `rustgate-guard`
 

@@ -75,6 +75,13 @@ sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 hkdf = "0.12"
+# ML-KEM-768 (FIPS 203) KEM for the MAVLink PQ rekey channel (ADR 0020,
+# rustgate-mavlink `mavlink-pq` feature). Builds aws-lc from source via
+# cmake (and Go for the FIPS module) — gated off by default like the
+# other aws-lc-rs PQ surfaces.
+aws-lc-rs = "1.16"
+# CBOR for the MAVLink rekey envelope payload (ADR 0020 §5).
+ciborium = "0.2"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 bytes = "1"
 quick-xml = "0.39"
