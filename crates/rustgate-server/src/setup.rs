@@ -930,9 +930,15 @@ pub(crate) fn warn_lattice_disabled(cli: &Cli) {
 /// integration without touching the SDK. Refs #851.
 #[cfg(feature = "foundry")]
 pub(crate) fn init_foundry_scaffold() {
-    tracing::info!(
+    // WARN, not INFO (issue #1456): the Foundry bridge is scaffold-only —
+    // no Foundry traffic flows in this build. Surface it loudly so an
+    // operator who built `--features foundry` is not misled into expecting
+    // a live integration.
+    tracing::warn!(
         target: "rustgate.foundry",
-        "Foundry bridge scaffold linked (trait + config + wiring); awaiting partner SDK adapter behind future foundry-real feature flag"
+        "Foundry bridge is COMPILED IN but NOT ACTIVE — scaffold only (trait + config + \
+         wiring); the partner SDK adapter lands behind a future `foundry-real` feature. \
+         No Foundry traffic flows in this build. Refs #851, #1456."
     );
 }
 
@@ -968,9 +974,15 @@ pub(crate) fn init_foundry_scaffold() {
 /// integration without touching the SDK. Refs #870.
 #[cfg(feature = "dds")]
 pub(crate) fn init_dds_scaffold() {
-    tracing::info!(
+    // WARN, not INFO (issue #1456): the DDS bridge is scaffold-only — no
+    // DDS traffic flows in this build. Surface it loudly so an operator
+    // who built `--features dds` is not misled into expecting a live
+    // in-vehicle-bus integration.
+    tracing::warn!(
         target: "rustgate.dds",
-        "DDS bridge scaffold linked (trait + config + wiring); awaiting real DDS SDK adapter behind future dds-real feature flag"
+        "DDS bridge is COMPILED IN but NOT ACTIVE — scaffold only (trait + config + \
+         wiring); the real DDS SDK adapter lands behind a future `dds-real` feature. \
+         No DDS traffic flows in this build. Refs #870, #1456."
     );
 }
 
@@ -2753,9 +2765,15 @@ pub fn start_inference() {
     // appear unused to `cargo machete`. The constant is `&str`, so
     // the `let _ = …` is free.
     let _: &str = rustgate_inference::SOURCE_INFERENCE;
-    tracing::info!(
-        "rustgate-inference compiled in — pipeline scaffolded; \
-         binary-side wiring lands in follow-up. See #858.",
+    // WARN, not INFO (issue #1456): an operator who built `--features
+    // inference` expecting an active ML pipeline gets a no-op. Surfacing
+    // this at WARN makes the "compiled-in but NOT active" gap visible in
+    // startup logs instead of lost among info-level diagnostics.
+    tracing::warn!(
+        target: "rustgate.inference",
+        "rustgate-inference is COMPILED IN but NOT ACTIVE — this build performs no \
+         inference (the binary-side pipeline wiring is a follow-up, see #858). \
+         Any `[inference]` configuration is ignored.",
     );
 }
 
