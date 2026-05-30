@@ -420,6 +420,7 @@ fn obligation_label(o: &crate::model::Obligation) -> &'static str {
         Obligation::StripPii => "strip_pii",
         Obligation::DegradePosition { .. } => "degrade_position",
         Obligation::InjectMarking { .. } => "inject_marking",
+        Obligation::MaskCommand => "mask_command",
     }
 }
 

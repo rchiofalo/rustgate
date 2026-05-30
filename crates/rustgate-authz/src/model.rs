@@ -210,6 +210,19 @@ pub enum Obligation {
         /// crafted marking cannot break out of the attribute value.
         marking: String,
     },
+    /// Refuse to forward a MAVLink actuation/command frame
+    /// (`COMMAND_LONG`, `COMMAND_INT`, `MANUAL_CONTROL`). Introduced by
+    /// ADR 0020 for the MAVLink integration: a policy can let telemetry
+    /// flow to a recipient while denying the ability to *command* the
+    /// vehicle. Non-MAVLink payloads, and MAVLink frames that are not
+    /// command frames, pass through unmodified — the actuator lives in
+    /// `rustgate_mavlink::obligations::is_command_frame`.
+    ///
+    /// **Chaining group**: 1 (Redactor). It can drop the entire payload
+    /// (a command frame is refused outright), so it must run before any
+    /// classifier or auditor sees the bytes — same group as the other
+    /// redactors.
+    MaskCommand,
 }
 
 impl Obligation {
@@ -257,6 +270,7 @@ impl Obligation {
             // before any classifier or auditor sees the bytes.
             Obligation::MaskPoint
             | Obligation::MaskPayload
+            | Obligation::MaskCommand
             | Obligation::StripPii
             | Obligation::DegradePosition { .. } => 0,
             // Group 2 — Classifiers / Taggers. `InjectMarking` joins

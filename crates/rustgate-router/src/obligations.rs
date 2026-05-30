@@ -404,7 +404,7 @@ pub enum ObligationError {
 /// fires on delivery.
 pub(crate) fn obligations_mutate_payload(obligations: &[Obligation]) -> bool {
     obligations.iter().any(|o| match o {
-        Obligation::MaskPoint | Obligation::MaskPayload => true,
+        Obligation::MaskPoint | Obligation::MaskPayload | Obligation::MaskCommand => true,
         Obligation::TagClassified | Obligation::AuditExtended => false,
         // Refs #857 — every cross-domain inspection variant rewrites
         // the payload (PII strip, position rounding, marking
@@ -514,6 +514,7 @@ pub fn apply_obligations_with_limiter(
         match obligation {
             Obligation::MaskPoint => apply_mask_point(msg, policy_id, rate_limiter),
             Obligation::MaskPayload => apply_mask_payload(msg),
+            Obligation::MaskCommand => apply_mask_command(msg, policy_id, rate_limiter),
             // Audit-only obligations handled at the call site.
             Obligation::TagClassified | Obligation::AuditExtended => {}
             // Refs #857 — cross-domain inspection scaffold.
@@ -637,6 +638,30 @@ fn apply_mask_point(
     policy_id: &str,
     rate_limiter: Option<&ObligationRateLimiter>,
 ) {
+    // MAVLink frames are binary, not XML. A GLOBAL_POSITION_INT frame has
+    // its coordinates zeroed (CRC recomputed); any other MAVLink frame
+    // has no `<point>` analogue and forwards unmodified, audited in the
+    // same `forwarded_binary` bucket the legacy non-XML path used.
+    if msg.metadata.source_protocol == rustgate_core::message::SOURCE_MAVLINK {
+        if let Some(masked) = rustgate_mavlink::mask_position(&msg.payload) {
+            msg.payload = masked;
+        } else {
+            audit::authz_obligation_failed(
+                &msg.source.cn,
+                "MaskPoint",
+                audit::OBLIGATION_REASON_MASK_POINT_NON_XML,
+                audit::classify_mask_recovery_for(&msg.metadata.source_protocol),
+                &msg.metadata.source_protocol,
+                msg.destination.kind_str(),
+                policy_id,
+            );
+            if let Some(limiter) = rate_limiter {
+                limiter.observe_failure(audit::OBLIGATION_REASON_MASK_POINT_NON_XML);
+            }
+        }
+        return;
+    }
+
     // XML-intent is decided from the payload itself: first
     // non-whitespace byte is `<`. Non-XML payloads cannot host a
     // `<point>` element — forward unmodified but still audit so
@@ -741,8 +766,52 @@ fn apply_mask_point(
 /// body that's been stripped. This matches XACML-style "reduce to
 /// metadata" semantics.
 fn apply_mask_payload(msg: &mut RoutableMessage) {
+    // MAVLink: a stripped frame is replaced with a benign zeroed HEARTBEAT
+    // (a well-formed presence ping) rather than an empty body, so the
+    // recipient sees a live-but-contentless frame instead of a malformed
+    // zero-length one. The message stays typed as `Mavlink`.
+    if msg.metadata.source_protocol == rustgate_core::message::SOURCE_MAVLINK {
+        msg.payload = rustgate_mavlink::mask_as_heartbeat(&msg.payload);
+        msg.metadata.message_type = MessageType::Mavlink;
+        return;
+    }
     msg.payload = Bytes::new();
     msg.metadata.message_type = MessageType::Other("masked".into());
+}
+
+/// Refuse to forward a MAVLink actuation/command frame (`COMMAND_LONG`,
+/// `COMMAND_INT`, `MANUAL_CONTROL`) — ADR 0020 §7.
+///
+/// A command frame is neutralised by replacing it with a benign zeroed
+/// HEARTBEAT (the same redaction [`apply_mask_payload`] applies to a
+/// stripped MAVLink frame), so the recipient cannot act on the command
+/// but the link does not appear to drop. Non-MAVLink payloads and
+/// non-command MAVLink frames (telemetry) pass through unmodified —
+/// `MaskCommand` gates actuation, not observation.
+fn apply_mask_command(
+    msg: &mut RoutableMessage,
+    policy_id: &str,
+    rate_limiter: Option<&ObligationRateLimiter>,
+) {
+    if msg.metadata.source_protocol != rustgate_core::message::SOURCE_MAVLINK {
+        return;
+    }
+    if rustgate_mavlink::is_command_frame(&msg.payload) {
+        msg.payload = rustgate_mavlink::mask_as_heartbeat(&msg.payload);
+        msg.metadata.message_type = MessageType::Mavlink;
+        audit::authz_obligation_failed(
+            &msg.source.cn,
+            "MaskCommand",
+            "mask_command_refused",
+            audit::MASK_RECOVERY_DROPPED,
+            &msg.metadata.source_protocol,
+            msg.destination.kind_str(),
+            policy_id,
+        );
+        if let Some(limiter) = rate_limiter {
+            limiter.observe_failure("mask_command_refused");
+        }
+    }
 }
 
 /// Refs #857 — common recovery path for the cross-domain inspection
