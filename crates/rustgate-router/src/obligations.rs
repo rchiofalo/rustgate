@@ -404,7 +404,7 @@ pub enum ObligationError {
 /// fires on delivery.
 pub(crate) fn obligations_mutate_payload(obligations: &[Obligation]) -> bool {
     obligations.iter().any(|o| match o {
-        Obligation::MaskPoint | Obligation::MaskPayload => true,
+        Obligation::MaskPoint | Obligation::MaskPayload | Obligation::MaskCommand => true,
         Obligation::TagClassified | Obligation::AuditExtended => false,
         // Refs #857 — every cross-domain inspection variant rewrites
         // the payload (PII strip, position rounding, marking
@@ -514,6 +514,7 @@ pub fn apply_obligations_with_limiter(
         match obligation {
             Obligation::MaskPoint => apply_mask_point(msg, policy_id, rate_limiter),
             Obligation::MaskPayload => apply_mask_payload(msg),
+            Obligation::MaskCommand => apply_mask_command(msg, policy_id, rate_limiter),
             // Audit-only obligations handled at the call site.
             Obligation::TagClassified | Obligation::AuditExtended => {}
             // Refs #857 — cross-domain inspection scaffold.
