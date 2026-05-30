@@ -62,6 +62,8 @@ pub mod entity;
 pub mod error;
 pub mod frame;
 pub mod listener;
+#[cfg(feature = "mavlink-pq")]
+pub mod rekey;
 pub mod signing;
 
 pub use codec::MavlinkCodec;
@@ -75,6 +77,10 @@ pub use frame::{
 pub use listener::{
     LinkRegistry, MavlinkDestination, MavlinkListenerConfig, OnMavlinkMessage, spawn_tcp_listener,
     spawn_udp_listener,
+};
+#[cfg(feature = "mavlink-pq")]
+pub use rekey::{
+    ALG_ML_KEM_768, MavlinkRekeyPayload, RekeyError, RekeyReceiver, generate_keypair, seal,
 };
 pub use signing::{
     DEFAULT_REPLAY_CAPACITY, SIGNATURE_LEN, SIGNING_KEY_LEN, SigningError, SigningKey,
