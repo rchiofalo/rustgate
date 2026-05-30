@@ -307,6 +307,20 @@ identity, autopilot, frame metadata).
 | `mavlink.unsigned_rejected` | `peer`, `reason`, `action`, `result` | Unsigned MAVLink v2 frame rejected by a signature-requiring codec. |
 | `mavlink.heartbeat_received` | `system_id`, `component_id`, `autopilot`, `vehicle_type`, `action`, `result` | MAVLink HEARTBEAT decoded — useful for vehicle inventory. |
 
+## `guard` — cross-domain boundary
+
+Cross-domain inspection guard (`rustgate-guard`). The guard writes its
+own tamper-evident `boundary.evaluate` record to a **dedicated**
+hash-chained log on every evaluation; these two events mirror activation
+and the *deny* outcome into the main audit stream so a SIEM watching the
+operational log sees boundary gating without tailing the separate guard
+chain.
+
+| Event | Fields | Purpose |
+|---|---|---|
+| `guard.activated` | `sink`, `direction`, `mandatory_marking`, `action="guard_activate"`, `result="active"` | A cross-domain guard was wired onto an egress leg at startup. |
+| `guard.rejected` | `cn`, `sink`, `direction`, `reason`, `action="guard_evaluate"`, `result="rejected"` | A message was dropped at the boundary (`reason = rate_limit \| missing_marking \| unauthorized_classification \| audit_error`). |
+
 ## `store_forward` — offline queue
 
 Per-CN durable offline queue lifecycle. `store_forward.drained` (issue
