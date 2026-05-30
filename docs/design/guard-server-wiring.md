@@ -112,16 +112,67 @@ options are therefore:
   `rustgate-router` → guard dependency edge (or a guard *callback* the
   router holds, which keeps the edge out but moves the hook into core).
 
-**Recommendation:** start v1 on the **UDP/NATS seam (D1a, clean)** —
-prove the gate end-to-end where the `RoutableMessage` is in hand and the
-CN audit is complete — and treat **federation** as a fast-follow that
-picks (i) `Bytes`-only-with-`unknown`-CN or (ii) widen
-`OnFederationForward`. This reverses the note's earlier "federation
-first" instinct, which did not survive contact with the callback
-signature. **Decision needed from the maintainer:** confirm
-UDP/NATS-first under D1a, and pick the federation path (i vs ii) for the
-fast-follow — or choose D1b if uniform CN audit across all sinks is
-worth the router→guard coupling.
+#### Resolved — security first, then reuse
+
+The maintainer directive is: pick the **most secure** option; if options
+are equally secure, prefer the one that lets shared logic live in a
+**shared crate**. Applying both, in order:
+
+**Security — D1b wins, decisively.** The two options are *not* equally
+secure, so the reuse tie-breaker never engages:
+
+- **`route_for_egress` is the single egress chokepoint today.** Every
+  ingress→egress path in the workspace flows through it — UDP, NATS,
+  MQTT, plaintext, and federation-sourced messages all call it
+  (verified: `mqtt/session.rs`, `nats/subscriber.rs`, `transport/udp.rs`,
+  `server/setup.rs`, plus `route()` which delegates to it). `Router::send`
+  is *not* a bypass — it is the downstream per-session channel push used
+  *inside* the fan-out, after `route_for_egress`. A gate placed **inside**
+  `route_for_egress` (D1b) is therefore **complete by construction over
+  every path that exists today**, and any *new* sink that uses the normal
+  routing entrypoint inherits the gate with zero extra code. (The one
+  residual obligation: a future delivery path that deliberately skips
+  `route_for_egress` would escape the gate — so the invariant "all egress
+  goes through `route_for_egress`" should be stated in the router docs and
+  guarded by review, which is far easier to hold than "every sink author
+  remembered to call the gate.")
+- **D1a (per-sink) is fail-*open* by omission.** It relies on every sink
+  author remembering to call `gate.evaluate(...)`. A new egress sink — or
+  a refactor that adds a delivery path — silently escapes the boundary
+  until someone notices. For a cross-domain guard whose entire purpose is
+  "nothing crosses unchecked," a control you can forget to wire is the
+  wrong control. This is the deciding factor.
+- D1b also gives **uniform, complete CN audit** on every sink (the
+  `RoutableMessage` — hence `source.cn`, classification, tenant — is in
+  hand at that point), so `audit::guard_rejected` is always fully
+  populated. The `Bytes`-only / `unknown`-CN compromise the federation
+  seam would have forced under D1a disappears entirely.
+
+**Reuse — D1b also satisfies it, so there is no trade-off.** D1b does
+**not** require a `rustgate-router → rustgate-guard` dependency. Instead,
+follow the pattern the router already uses for `OnNatsPublish` /
+`OnFederationForward` / `OnHttpForward` (all defined via `on_callback!`
+in `rustgate-core::egress`): define an **`OnEgressGuard` callback alias in
+`rustgate-core::egress`**, hold an `ArcSwap<Option<OnEgressGuard>>` on the
+`Router` (same hot-reload pattern as `on_fanout`), and have the **server**
+construct the closure from its `GuardGate` and install it. The guard
+decision logic stays in `rustgate-guard`; the *seam* is a core callback
+alias reused exactly like the existing egress callbacks. Net: router
+stays guard-free **and** the gate is unbypassable — the security win and
+the layering win coincide.
+
+**Decision:** **D1b via a core `OnEgressGuard` callback.** The gate runs
+inside `route_for_egress` after Send-PEP obligations and before any sink
+forwarding; on `Err` the message is dropped and `audit::guard_rejected`
+fires with the full CN. v1 wires the closure for whichever boundaries the
+`[guard]` config names; because the hook is central, no per-sink edits
+are needed and future sinks inherit it.
+
+**What this changes in the PR plan:** there is no separate "federation
+fast-follow" (PR-D) — the central hook covers federation, UDP, NATS, MQTT,
+and any future sink at once. PR-C becomes: add `OnEgressGuard` to
+`rustgate-core::egress`, the `ArcSwap` slot + invocation in
+`route_for_egress`, and the server `start_guard` + closure install.
 
 ### D2 — The `&mut self` hot-path lock
 
@@ -211,34 +262,51 @@ and the existing crate, the wiring **must reuse**, not reinvent:
    `audit::guard_rejected` in `rustgate-core::audit`. Note `guard_rejected`
    takes a `subject_cn`; see the seam finding — the federation seam cannot
    supply it as-is.
-3. **PR-C (server):** `--guard-config` flag + `define_config_file!` field +
-   new off-by-default `guard` feature (`rustgate-guard` optional dep);
-   `start_guard()` in `setup.rs` (mirrors `start_ogc_sensorthings` for the
-   load half) returning the `GuardGate`; **gate the UDP/NATS egress seam
-   first** (those sinks hold the `Arc`, so `evaluate(&arc_msg, dir)` has
-   the CN for a complete `guard.rejected` audit); `docs/cross-domain-guard.md`;
-   CHANGELOG. Integration test: a boundary-violating message
-   (over-cap / missing-marking / non-dominant-classification) is dropped +
-   audited with its CN on the egress leg.
-4. **PR-D (fast-follow):** federation seam — either accept `Bytes`-only
-   guarding at `OnFederationForward` (audit `cn = "unknown"`) or widen
-   `OnFederationForward` to carry the source identity. Chosen per the D1
-   decision below.
-5. **ADR** recording D1/D2/D3 + the seam finding once chosen.
+3. **PR-C (core + server) — the central gate (D1b):**
+   - **core:** add an `OnEgressGuard` callback alias to
+     `rustgate-core::egress` (alongside the existing `OnNatsPublish` /
+     `OnFederationForward` / `OnHttpForward`), an
+     `ArcSwap<Option<OnEgressGuard>>` slot on `Router` (same hot-reload
+     pattern as `on_fanout`), and the invocation inside `route_for_egress`
+     — after Send-PEP obligations, before sink forwarding; on `Err` drop
+     the message and fire `audit::guard_rejected` with the full CN. **No
+     `rustgate-router → rustgate-guard` dependency** (the seam is a core
+     callback the server fills).
+   - **server:** `--guard-config` flag + `define_config_file!` field +
+     off-by-default `guard` feature (`rustgate-guard` optional dep);
+     `start_guard()` in `setup.rs` (mirrors `start_ogc_sensorthings` for
+     the load half) builds the `GuardGate` and installs the closure on the
+     router; `docs/cross-domain-guard.md`; CHANGELOG.
+   - **test:** a boundary-violating message (over-cap / missing-marking /
+     non-dominant-classification) is dropped + audited with its CN — and a
+     test that a sink with no guard configured is unaffected.
 
-PR-A and PR-B are self-contained and merged-ready; PR-C touches egress and
-wants the most review; PR-D depends on the federation-seam decision.
+   Because the gate is central, this single PR covers federation, UDP,
+   NATS, MQTT, and any future sink at once — there is **no separate
+   federation fast-follow**.
+4. **ADR** recording D1 (D1b via core `OnEgressGuard`), D2, D3 + the
+   single-chokepoint seam finding.
+
+PR-A and PR-B are merged-ready. PR-C is the central-hook change and wants
+the most review (it touches `route_for_egress`); splitting the core-alias
+half from the server-wiring half into two PRs is reasonable if the diff
+gets large.
 
 ## Open questions for sign-off
 
-1. **D1 / seam:** confirm **UDP+NATS first under D1a** (router stays
-   guard-free, full CN audit), with federation as PR-D? Or go **D1b**
-   (router-level gate inside `route_for_egress`) for uniform CN audit
-   across every sink at the cost of a router→guard coupling?
-2. **Federation seam (gates PR-D):** if D1a, pick (i) `Bytes`-only
-   guarding with `cn = "unknown"` in the audit, or (ii) widen
-   `OnFederationForward` to carry the source `Identity`/CN?
-3. **D3:** global direction for v1, or per-sink from the start?
-4. Single `parking_lot::Mutex<Guard>` acceptable for v1 (the audit writer
+D1 and the federation-seam question are **resolved** above (D1b via a core
+`OnEgressGuard` callback — most secure *and* keeps the router guard-free).
+Remaining:
+
+1. **D3:** global direction for v1 (single `GuardConfig.direction`), or
+   per-sink direction from the start? *(Recommendation: global for v1 — a
+   central single gate has one direction context unless/until per-sink
+   config is added; per-sink can layer on later without a wire break.)*
+2. Single `parking_lot::Mutex<Guard>` acceptable for v1 (the audit writer
    is a single-file serialization point regardless)? — *implemented as
-   such in PR-A; flag if you want sharding.*
+   such in PR-A; flag if you want sharding.* With the **central** gate,
+   the mutex is now a genuine single chokepoint on the egress hot path, so
+   this is worth an explicit nod: `evaluate` is cheap (bucket math + one
+   audit append) and the audit file serializes anyway, so it is sound for
+   v1; revisit only if egress-throughput profiling shows the gate's
+   critical section dominating.
