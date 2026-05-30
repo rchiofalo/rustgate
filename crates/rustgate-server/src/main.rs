@@ -31,6 +31,7 @@ mod cli;
 mod diagnostics;
 #[cfg(feature = "federation")]
 mod federation_reloader;
+mod mavlink;
 #[cfg(feature = "metrics")]
 mod metrics;
 #[cfg(feature = "metrics")]
@@ -1992,6 +1993,15 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // back out the egress socket subject to the configured BPS cap.
     let udp_multicast_shutdown = setup::start_udp_multicast(&cli, &router).await?;
 
+    // ── MAVLink UDP/TCP listeners (closes #731) ────────────────────
+    //
+    // Autonomous-vehicle telemetry/command over MAVLink. UDP is the
+    // canonical transport; TCP serves tethered ground-control stations.
+    // Identity comes from the v2 signing `link_id` resolved through the
+    // `--mavlink-signing-key-file` manifest (ADR 0020), so ACL/authz
+    // apply to MAVLink exactly as to every other transport.
+    let mavlink_shutdowns = mavlink::start_mavlink(&cli, &router).await?;
+
     // ── Management REST API ────────────────────────────────────────
     //
     // Registered only when `--mgmt-api-token-file` is supplied. Exposes
@@ -2355,6 +2365,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
     if let Some(handle) = udp_multicast_shutdown {
         stop_subsystem("udp-multicast", handle).await;
+    }
+    for handle in mavlink_shutdowns {
+        stop_subsystem("mavlink", handle).await;
     }
     if let Some(handle) = archive_rotation_handle {
         handle.abort();
