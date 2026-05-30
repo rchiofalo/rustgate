@@ -904,6 +904,51 @@ pub(crate) struct Cli {
     )]
     pub(crate) mavlink_allow_v1: bool,
 
+    /// Bind address for the MAVLink UDP listener (e.g. `0.0.0.0:14550`).
+    /// UDP is the canonical MAVLink transport (one frame per datagram).
+    /// Datagrams are NOT encrypted — identity comes from the v2 signing
+    /// `link_id` resolved through `--mavlink-signing-key-file` (ADR 0020).
+    /// When unset, the UDP listener is not started.
+    #[arg(long, env = "RUSTGATE_MAVLINK_BIND", value_parser = parse_socket_addr)]
+    pub(crate) mavlink_bind: Option<String>,
+
+    /// Bind address for the MAVLink TCP listener (e.g. `0.0.0.0:14550`),
+    /// used by tethered ground-control stations. Same identity model as
+    /// the UDP listener. When unset, the TCP listener is not started.
+    #[arg(long, env = "RUSTGATE_MAVLINK_TCP_BIND", value_parser = parse_socket_addr)]
+    pub(crate) mavlink_tcp_bind: Option<String>,
+
+    /// Destination group every ingested MAVLink frame routes to (ADR 0020
+    /// §2). When unset, frames are broadcast to all sessions. `direct` and
+    /// `multicast` destinations have no sensible telemetry mapping and are
+    /// not offered.
+    #[arg(long, env = "RUSTGATE_MAVLINK_GROUP")]
+    pub(crate) mavlink_group: Option<String>,
+
+    /// Path to the TOML MAVLink link manifest mapping each v2 signing
+    /// `link_id` to a rustgate identity (`cn`, `groups`) and its 32-byte
+    /// `signing-key-hex` (ADR 0020 §1). The file is read into zeroized
+    /// memory; keys are wiped after decode. A frame whose verified
+    /// `link_id` is absent from the manifest is dropped — there is no
+    /// anonymous-MAVLink path.
+    #[arg(long, env = "RUSTGATE_MAVLINK_SIGNING_KEY_FILE")]
+    pub(crate) mavlink_signing_key_file: Option<String>,
+
+    /// Path to the 32-byte pre-shared bootstrap secret (mode 0400) for the
+    /// post-quantum signing-key rekey channel (ADR 0020 §6). Only
+    /// meaningful in `mavlink-pq` builds; the rekey receive socket is a
+    /// follow-up, so this flag is currently accepted and validated but not
+    /// yet wired to a running channel.
+    #[arg(long, env = "RUSTGATE_MAVLINK_PQ_BOOTSTRAP_FILE")]
+    pub(crate) mavlink_pq_bootstrap_file: Option<String>,
+
+    /// Shared fallback CN applied to admitted MAVLink v1 frames (ADR 0020
+    /// §1). Required when `--mavlink-allow-v1` is set, because v1 has no
+    /// signing identity. Must be a configured shared identity, not a real
+    /// client CN.
+    #[arg(long, env = "RUSTGATE_MAVLINK_V1_FALLBACK_CN")]
+    pub(crate) mavlink_v1_fallback_cn: Option<String>,
+
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -2250,6 +2295,12 @@ define_config_file! {
     mqtt_wildcard_policy: MqttWildcardPolicy,
     mavlink_require_signing: bool,
     mavlink_allow_v1: bool,
+    mavlink_bind: Option<String>,
+    mavlink_tcp_bind: Option<String>,
+    mavlink_group: Option<String>,
+    mavlink_signing_key_file: Option<String>,
+    mavlink_pq_bootstrap_file: Option<String>,
+    mavlink_v1_fallback_cn: Option<String>,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
     udp_rate_limit: u32,

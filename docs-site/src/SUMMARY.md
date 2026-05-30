@@ -18,6 +18,7 @@
 - [NATS Bridge](./architecture/nats-bridge.md)
 - [Enrollment](./architecture/enrollment.md)
 - [MQTT Transport](./architecture/mqtt.md)
+- [MAVLink Integration](./architecture/mavlink.md)
 
 # Operations
 
