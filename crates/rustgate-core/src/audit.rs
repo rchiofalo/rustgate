@@ -3951,11 +3951,11 @@ mod tests {
                     .expect("direction string"),
                 "high_to_low"
             );
-            assert_eq!(
+            assert!(
                 event["fields"]["mandatory_marking"]
                     .as_bool()
                     .expect("mandatory_marking bool"),
-                true
+                "mandatory_marking must serialize as true"
             );
             assert_eq!(
                 event["fields"]["result"].as_str().expect("result string"),
