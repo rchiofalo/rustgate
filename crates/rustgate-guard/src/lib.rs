@@ -68,6 +68,7 @@ use rustgate_archive::audit_chain::{AuditChainError, GENESIS_PREV, HashChainWrit
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
 use rustgate_resilience::token_bucket::TokenBucket;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 #[cfg(feature = "metrics")]
@@ -89,7 +90,8 @@ pub mod metrics;
 /// guard accepts traffic in both directions. The per-direction caps are
 /// still enforced independently; this is just a deployment hint
 /// captured for audit attribution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum GuardDirection {
     /// Inbound to the higher-classification side.
     LowToHigh,
@@ -135,32 +137,100 @@ impl std::fmt::Display for GuardDirection {
 /// throughput caps and mandatory-marking switch are loaded from the
 /// guard config TOML file (handled by `rustgate-server`); this struct
 /// is the parsed, validated shape the runtime consumes.
-#[derive(Debug, Clone)]
+///
+/// # Deserialization
+///
+/// `GuardConfig` deserializes directly from the operator's `[guard]`
+/// TOML block (kebab-case keys, unknown keys rejected) so the crate is
+/// the single source of truth for the config shape — the server does
+/// not shadow it with a duplicate type. Every field has a fail-closed
+/// default ([`GuardConfig::default`]): mandatory marking on, the
+/// security-sensitive `high-to-low` cap tighter than `low-to-high`, and
+/// the v1 audit-log path. Call [`GuardConfig::validate`] after
+/// deserialization before constructing a [`CrossDomainGuard`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct GuardConfig {
     /// Maximum sustained bytes-per-second for messages travelling from
     /// the lower-classification side to the higher-classification side.
     /// Used as both the refill rate and the burst cap of the
     /// `LowToHigh` token bucket — bursts up to one second of capacity
     /// are admitted at once, beyond that the bucket throttles.
+    #[serde(default = "default_low_to_high_max_bps")]
     pub low_to_high_max_bps: u64,
     /// Maximum sustained bytes-per-second for messages travelling from
     /// the higher-classification side to the lower-classification side.
     /// The most security-sensitive direction; v1 deployments default
     /// to a tighter cap than `low_to_high_max_bps` (see
     /// [`GuardConfig::defaults_for_v1`]).
+    #[serde(default = "default_high_to_low_max_bps")]
     pub high_to_low_max_bps: u64,
     /// When `true`, every inbound message MUST carry a parseable CAPCO
     /// marking. Messages without a marking are rejected at the
-    /// boundary with [`GuardError::MissingMarking`].
+    /// boundary with [`GuardError::MissingMarking`]. Defaults to `true`
+    /// (fail-closed): an operator must opt *out* of mandatory marking,
+    /// never silently get it disabled.
+    #[serde(default = "default_mandatory_marking")]
     pub mandatory_marking: bool,
     /// Path to the dedicated boundary audit log. Hash-chained via
     /// [`HashChainWriter`]; a SIEM tailing the path observes one record
     /// per boundary evaluation in canonical JSON.
+    #[serde(default = "default_audit_log_path")]
     pub audit_log_path: PathBuf,
     /// Deployment direction hint. Recorded in audit metadata; does not
     /// short-circuit the per-call direction the runtime supplies to
     /// [`CrossDomainGuard::evaluate`].
+    #[serde(default = "default_direction")]
     pub direction: GuardDirection,
+}
+
+fn default_low_to_high_max_bps() -> u64 {
+    1_048_576
+}
+fn default_high_to_low_max_bps() -> u64 {
+    262_144
+}
+fn default_mandatory_marking() -> bool {
+    true
+}
+fn default_audit_log_path() -> PathBuf {
+    PathBuf::from("/var/log/rustgate/boundary-audit.jsonl")
+}
+fn default_direction() -> GuardDirection {
+    GuardDirection::Bidirectional
+}
+
+impl Default for GuardConfig {
+    /// Fail-closed v1 defaults — see the field-level `#[serde(default)]`
+    /// functions. Equivalent to
+    /// `defaults_for_v1("/var/log/rustgate/boundary-audit.jsonl")`.
+    fn default() -> Self {
+        Self {
+            low_to_high_max_bps: default_low_to_high_max_bps(),
+            high_to_low_max_bps: default_high_to_low_max_bps(),
+            mandatory_marking: default_mandatory_marking(),
+            audit_log_path: default_audit_log_path(),
+            direction: default_direction(),
+        }
+    }
+}
+
+/// Error returned by [`GuardConfig::validate`].
+#[derive(Debug, thiserror::Error)]
+pub enum GuardConfigError {
+    /// A throughput cap was zero — a zero token-bucket rate would reject
+    /// all traffic in that direction, which is almost certainly a
+    /// misconfiguration rather than an intentional hard-stop. Operators
+    /// who genuinely want to block a direction should not configure a
+    /// guard on it.
+    #[error("guard {field} must be greater than zero (a zero cap rejects all traffic)")]
+    ZeroCap {
+        /// The offending field name (`low-to-high-max-bps` etc.).
+        field: &'static str,
+    },
+    /// The audit log path is empty.
+    #[error("guard audit-log-path must not be empty")]
+    EmptyAuditPath,
 }
 
 impl GuardConfig {
@@ -172,12 +242,34 @@ impl GuardConfig {
     /// individual fields rather than constructing from scratch.
     pub fn defaults_for_v1<P: Into<PathBuf>>(audit_log_path: P) -> Self {
         Self {
-            low_to_high_max_bps: 1_048_576,
-            high_to_low_max_bps: 262_144,
-            mandatory_marking: true,
             audit_log_path: audit_log_path.into(),
-            direction: GuardDirection::Bidirectional,
+            ..Self::default()
         }
+    }
+
+    /// Validate a deserialized config before it is handed to
+    /// [`CrossDomainGuard::new`].
+    ///
+    /// # Errors
+    ///
+    /// - [`GuardConfigError::ZeroCap`] if either throughput cap is zero.
+    /// - [`GuardConfigError::EmptyAuditPath`] if the audit log path is
+    ///   empty.
+    pub fn validate(&self) -> std::result::Result<(), GuardConfigError> {
+        if self.low_to_high_max_bps == 0 {
+            return Err(GuardConfigError::ZeroCap {
+                field: "low-to-high-max-bps",
+            });
+        }
+        if self.high_to_low_max_bps == 0 {
+            return Err(GuardConfigError::ZeroCap {
+                field: "high-to-low-max-bps",
+            });
+        }
+        if self.audit_log_path.as_os_str().is_empty() {
+            return Err(GuardConfigError::EmptyAuditPath);
+        }
+        Ok(())
     }
 }
 
@@ -511,6 +603,79 @@ impl CrossDomainGuard {
         }
 
         Ok(())
+    }
+}
+
+/// Shareable, hot-path-safe handle to a [`CrossDomainGuard`].
+///
+/// [`CrossDomainGuard::evaluate`] takes `&mut self` (it mutates the
+/// token buckets and appends to the audit chain), so a guard shared
+/// across the per-sink egress tasks needs interior mutability. The
+/// server wires one `GuardGate` per configured boundary and the egress
+/// forwarders consult it before a message leaves the process.
+///
+/// # Lock posture (fail-closed by design)
+///
+/// The inner guard is held behind a [`parking_lot::Mutex`] — the
+/// workspace standard for sync hot paths (no poisoning, no `.unwrap()`
+/// on lock). `evaluate` is cheap (token-bucket arithmetic plus one
+/// audit-record append), and the single-file audit writer is the
+/// serialization point regardless, so a single mutex is the right v1
+/// shape rather than per-direction sharding. Unlike the fail-*open*
+/// token-bucket limiter in `rustgate-resilience`, a cross-domain guard
+/// is fail-*closed*: if evaluation cannot complete, the message does not
+/// cross. `parking_lot` cannot poison, so the lock is always acquirable
+/// and the fail-closed decision always comes from `evaluate` itself.
+#[derive(Clone)]
+pub struct GuardGate {
+    inner: std::sync::Arc<parking_lot::Mutex<CrossDomainGuard>>,
+}
+
+impl std::fmt::Debug for GuardGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Lock briefly to render the inner guard's operator-visible
+        // surface; never blocks for long (see lock-posture docs).
+        f.debug_struct("GuardGate")
+            .field("guard", &*self.inner.lock())
+            .finish()
+    }
+}
+
+impl GuardGate {
+    /// Build a gate from a validated config, constructing the underlying
+    /// [`CrossDomainGuard`] (which opens / resumes the audit chain).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`GuardError`] from [`CrossDomainGuard::new`] (audit
+    /// log open / chain-state read failure).
+    pub fn new(config: GuardConfig) -> Result<Self> {
+        Ok(Self {
+            inner: std::sync::Arc::new(parking_lot::Mutex::new(CrossDomainGuard::new(config)?)),
+        })
+    }
+
+    /// Wrap an already-constructed guard.
+    #[must_use]
+    pub fn from_guard(guard: CrossDomainGuard) -> Self {
+        Self {
+            inner: std::sync::Arc::new(parking_lot::Mutex::new(guard)),
+        }
+    }
+
+    /// Evaluate one message crossing the boundary in `direction`.
+    ///
+    /// Acquires the lock, runs [`CrossDomainGuard::evaluate`] (which
+    /// audits exactly once), and releases. Returns the admitted payload
+    /// or the typed [`GuardError`]; the caller MUST drop the message on
+    /// `Err` (fail-closed). The lock is held only for the duration of
+    /// the synchronous evaluation.
+    ///
+    /// # Errors
+    ///
+    /// See [`CrossDomainGuard::evaluate`].
+    pub fn evaluate(&self, msg: &RoutableMessage, direction: GuardDirection) -> Result<Bytes> {
+        self.inner.lock().evaluate(msg, direction)
     }
 }
 
@@ -1052,5 +1217,118 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("TOP SECRET"));
         assert!(s.contains("HighToLow"));
+    }
+
+    // ---- GuardConfig deserialization + validation (PR-A) ----
+
+    #[test]
+    fn config_deserializes_from_kebab_case_toml() {
+        let toml = r#"
+            low-to-high-max-bps = 2097152
+            high-to-low-max-bps = 131072
+            mandatory-marking = false
+            audit-log-path = "/tmp/g.jsonl"
+            direction = "high-to-low"
+        "#;
+        let cfg: GuardConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.low_to_high_max_bps, 2_097_152);
+        assert_eq!(cfg.high_to_low_max_bps, 131_072);
+        assert!(!cfg.mandatory_marking);
+        assert_eq!(cfg.audit_log_path, PathBuf::from("/tmp/g.jsonl"));
+        assert_eq!(cfg.direction, GuardDirection::HighToLow);
+    }
+
+    #[test]
+    fn config_defaults_are_fail_closed() {
+        // An empty block yields the secure defaults: mandatory marking
+        // ON, the high-to-low (release) cap tighter than low-to-high.
+        let cfg: GuardConfig = toml::from_str("").unwrap();
+        assert!(cfg.mandatory_marking);
+        assert!(cfg.high_to_low_max_bps < cfg.low_to_high_max_bps);
+        assert_eq!(cfg.direction, GuardDirection::Bidirectional);
+    }
+
+    #[test]
+    fn config_rejects_unknown_fields() {
+        let toml = r#"
+            low-to-high-max-bps = 1024
+            bogus-knob = true
+        "#;
+        assert!(toml::from_str::<GuardConfig>(toml).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_caps_and_empty_path() {
+        let zero_low = GuardConfig {
+            low_to_high_max_bps: 0,
+            ..GuardConfig::default()
+        };
+        assert!(matches!(
+            zero_low.validate(),
+            Err(GuardConfigError::ZeroCap {
+                field: "low-to-high-max-bps"
+            })
+        ));
+
+        let zero_high = GuardConfig {
+            high_to_low_max_bps: 0,
+            ..GuardConfig::default()
+        };
+        assert!(matches!(
+            zero_high.validate(),
+            Err(GuardConfigError::ZeroCap {
+                field: "high-to-low-max-bps"
+            })
+        ));
+
+        let empty_path = GuardConfig {
+            audit_log_path: PathBuf::new(),
+            ..GuardConfig::default()
+        };
+        assert!(matches!(
+            empty_path.validate(),
+            Err(GuardConfigError::EmptyAuditPath)
+        ));
+
+        assert!(
+            GuardConfig::defaults_for_v1("/tmp/ok.jsonl")
+                .validate()
+                .is_ok()
+        );
+    }
+
+    // ---- GuardGate (PR-A) ----
+
+    #[test]
+    fn gate_evaluates_and_shares_state_across_clones() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp, 64 * 1024, 64 * 1024, false);
+        let gate = GuardGate::new(cfg).unwrap();
+        let gate2 = gate.clone();
+
+        let msg = make_message(cot_with_marking("u1", "//SECRET//NOFORN"));
+        // Both clones drive the same underlying guard + audit chain.
+        assert!(gate.evaluate(&msg, GuardDirection::LowToHigh).is_ok());
+        assert!(gate2.evaluate(&msg, GuardDirection::LowToHigh).is_ok());
+
+        // Two evaluations wrote two audit records to the one file.
+        let report = rustgate_archive::audit_chain::verify_audit_log(
+            &tmp.path().join("boundary-audit.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(report.records, 2);
+    }
+
+    #[test]
+    fn gate_propagates_rejection_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+        // mandatory marking on; a message without a marking is rejected.
+        let cfg = test_config(&tmp, 64 * 1024, 64 * 1024, true);
+        let gate = GuardGate::new(cfg).unwrap();
+        let msg = make_message(cot_without_marking("u2"));
+        assert!(matches!(
+            gate.evaluate(&msg, GuardDirection::LowToHigh),
+            Err(GuardError::MissingMarking)
+        ));
     }
 }
