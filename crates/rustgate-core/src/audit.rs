@@ -185,6 +185,61 @@ pub fn mavlink_v1_admitted(cn: &str, peer: SocketAddr) {
     );
 }
 
+/// Record activation of a cross-domain guard on an egress boundary.
+///
+/// Emitted once at startup per configured guard so the audit trail shows
+/// which boundary legs are gated and with what posture. `direction` is
+/// the guard's configured deployment direction (`low_to_high` /
+/// `high_to_low` / `bidirectional`); `sink` names the egress leg the
+/// guard sits on (e.g. `federation`); `mandatory_marking` records whether
+/// unmarked traffic is rejected.
+///
+/// Sanitization: `sink` and `direction` are static, low-cardinality tags
+/// supplied by the server wiring, not attacker input — no sanitization
+/// needed, but they pass through `s()` for uniformity.
+pub fn guard_activated(sink: &str, direction: &str, mandatory_marking: bool) {
+    let sink = s(sink);
+    let direction = s(direction);
+    audit!(
+        "guard.activated",
+        sink = %sink,
+        direction = %direction,
+        mandatory_marking = mandatory_marking,
+        action = "guard_activate",
+        result = "active"
+    );
+}
+
+/// Record a message dropped at a cross-domain guard boundary.
+///
+/// The guard crate writes its own tamper-evident `boundary.evaluate`
+/// record on every evaluation; this server-side event mirrors the *deny*
+/// outcome into the main audit stream so a SIEM watching the operational
+/// log sees boundary rejections without having to tail the dedicated
+/// guard chain. `reason` is the stable token from the guard's error
+/// (`rate_limit` / `missing_marking` / `unauthorized_classification` /
+/// `audit_error`); `sink` is the egress leg; `direction` the attempted
+/// crossing.
+///
+/// Sanitization: `subject_cn` is sanitized at the audit boundary (it
+/// derives from a client-supplied certificate CN). `sink`, `direction`,
+/// and `reason` are server-supplied tags, sanitized for uniformity.
+pub fn guard_rejected(subject_cn: &str, sink: &str, direction: &str, reason: &str) {
+    let subject_cn = s(subject_cn);
+    let sink = s(sink);
+    let direction = s(direction);
+    let reason = s(reason);
+    audit!(
+        "guard.rejected",
+        cn = %subject_cn,
+        sink = %sink,
+        direction = %direction,
+        action = "guard_evaluate",
+        result = "rejected",
+        reason = %reason
+    );
+}
+
 /// Record a protocol negotiation outcome.
 ///
 /// Sanitization: `cn` and `protocol` are sanitized at the audit boundary.
@@ -3879,6 +3934,60 @@ mod tests {
                     .as_str()
                     .expect("result must be a JSON string"),
                 "initiated"
+            );
+        }
+
+        #[test]
+        fn guard_activated_emits_documented_shape() {
+            let snapshot = capture_audit(|| guard_activated("federation", "high_to_low", true));
+            let event = parse_event(&snapshot, "guard.activated");
+            assert_eq!(
+                event["fields"]["sink"].as_str().expect("sink string"),
+                "federation"
+            );
+            assert_eq!(
+                event["fields"]["direction"]
+                    .as_str()
+                    .expect("direction string"),
+                "high_to_low"
+            );
+            assert!(
+                event["fields"]["mandatory_marking"]
+                    .as_bool()
+                    .expect("mandatory_marking bool"),
+                "mandatory_marking must serialize as true"
+            );
+            assert_eq!(
+                event["fields"]["result"].as_str().expect("result string"),
+                "active"
+            );
+        }
+
+        #[test]
+        fn guard_rejected_sanitizes_cn_and_pins_shape() {
+            // `cn` derives from a client certificate — pin that the audit
+            // boundary scrubs CR/LF/ANSI so a crafted CN cannot forge a
+            // log line, and that the SIEM-keyed tokens stay stable.
+            let malicious_cn = "drone\r\n\x1b[31m[FAKE]\x1b[0m";
+            let snapshot = capture_audit(|| {
+                guard_rejected(malicious_cn, "federation", "high_to_low", "missing_marking")
+            });
+            let event = parse_event(&snapshot, "guard.rejected");
+            let cn = event["fields"]["cn"].as_str().expect("cn string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(
+                    !cn.contains(*forbidden),
+                    "forge byte {forbidden:?} must be replaced: {cn:?}"
+                );
+            }
+            assert!(cn.contains('\u{FFFD}'), "sanitized cn must contain U+FFFD");
+            assert_eq!(
+                event["fields"]["reason"].as_str().expect("reason string"),
+                "missing_marking"
+            );
+            assert_eq!(
+                event["fields"]["result"].as_str().expect("result string"),
+                "rejected"
             );
         }
 
