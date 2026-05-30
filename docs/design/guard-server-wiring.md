@@ -168,6 +168,35 @@ fires with the full CN. v1 wires the closure for whichever boundaries the
 `[guard]` config names; because the hook is central, no per-sink edits
 are needed and future sinks inherit it.
 
+#### Placement finding — the gate covers external-sink egress, by design
+
+A subtlety verified while reading `route_for_egress`: it calls
+`route_inner` *first* (which does the **local same-domain session
+fan-out** — Send-PEP + per-session delivery) and *then* returns the
+`Arc<RoutableMessage>` that external sinks (NATS/federation/HTTP/MQTT)
+forward. So a gate placed at the **end** of `route_for_egress` (on that
+returned `Arc`, before the sink-forward callbacks fire) gates the
+**external-sink egress**, *not* the local session fan-out that already
+happened inside `route_inner`.
+
+That is the **correct** boundary for this guard, because the guard's model
+is **network-to-network**, not session-to-session: its `GuardDirection`
+doc is explicit — "lower-classification *network* → higher-classification
+*network*." rustgate sits between two enclaves; the cross-domain hop is
+the **egress to the other enclave** (a federation peer or external
+bridge), which is exactly the external-sink `Arc`. Local sessions on the
+same listener are same-domain by definition and are not a cross-domain
+crossing.
+
+**Therefore the gate goes immediately after `route_inner` returns `Some`,
+before the `on_multicast_forward` / `on_routed` callbacks and before any
+external sink consumes the returned `Arc`.** If a deployment ever needed
+to gate *local session* delivery across a domain split (sessions of
+different classifications on one server), that is a distinct, larger
+feature and a separate ADR — explicitly out of scope here. This scoping
+is stated so a future reviewer does not mistake "guards external egress"
+for "guards everything that leaves a session."
+
 **What this changes in the PR plan:** there is no separate "federation
 fast-follow" (PR-D) — the central hook covers federation, UDP, NATS, MQTT,
 and any future sink at once. PR-C becomes: add `OnEgressGuard` to
@@ -298,10 +327,9 @@ D1 and the federation-seam question are **resolved** above (D1b via a core
 `OnEgressGuard` callback — most secure *and* keeps the router guard-free).
 Remaining:
 
-1. **D3:** global direction for v1 (single `GuardConfig.direction`), or
-   per-sink direction from the start? *(Recommendation: global for v1 — a
-   central single gate has one direction context unless/until per-sink
-   config is added; per-sink can layer on later without a wire break.)*
+1. **D3 — RESOLVED: global direction for v1.** A single
+   `GuardConfig.direction` drives the central gate; per-sink direction can
+   layer on later without a wire break. Confirmed by the maintainer.
 2. Single `parking_lot::Mutex<Guard>` acceptable for v1 (the audit writer
    is a single-file serialization point regardless)? — *implemented as
    such in PR-A; flag if you want sharding.* With the **central** gate,
@@ -309,4 +337,12 @@ Remaining:
    this is worth an explicit nod: `evaluate` is cheap (bucket math + one
    audit append) and the audit file serializes anyway, so it is sound for
    v1; revisit only if egress-throughput profiling shows the gate's
-   critical section dominating.
+   critical section dominating. **Accepted for v1.**
+
+All design questions are now resolved. PR-C may proceed:
+- **D1:** D1b — central gate via core `OnEgressGuard` callback.
+- **Placement:** after `route_inner` returns `Some`, before the
+  `on_multicast_forward` / `on_routed` callbacks; gates external-sink
+  egress (the cross-domain hop), not local same-domain session fan-out.
+- **D2:** `Arc<parking_lot::Mutex<CrossDomainGuard>>`, fail-closed.
+- **D3:** global direction for v1.
