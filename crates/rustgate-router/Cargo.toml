@@ -29,6 +29,7 @@ rustgate-core = { workspace = true, features = ["pem"] }
 rustgate-cot = { workspace = true }
 rustgate-authz = { workspace = true }
 rustgate-resilience = { workspace = true }
+rustgate-mavlink = { workspace = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
