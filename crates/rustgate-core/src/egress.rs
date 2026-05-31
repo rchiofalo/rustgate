@@ -66,6 +66,59 @@ on_callback!(
     RoutableMessage
 );
 
+/// Outcome of a cross-domain egress-guard evaluation.
+///
+/// Distinct from the fire-and-forget `on_callback!` aliases above: a
+/// guard is a **gate**, not an observer, so it returns a verdict the
+/// router acts on. Deliberately minimal — the guard's own dedicated
+/// hash-chained audit log records the full forensic detail; this verdict
+/// only tells the router whether the message may continue to external
+/// sinks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EgressGuardVerdict {
+    /// The message may continue to external egress sinks.
+    Allow,
+    /// The message is blocked at the cross-domain boundary and MUST NOT
+    /// reach any external sink. `reason` is a stable, low-cardinality
+    /// token (`rate_limit` / `missing_marking` /
+    /// `unauthorized_classification` / `audit_error`) suitable for the
+    /// `audit::guard_rejected` `reason` field and a Prometheus label.
+    Deny {
+        /// Stable rejection-reason token.
+        reason: &'static str,
+    },
+}
+
+/// Cross-domain egress guard hook (issue #1457).
+///
+/// Installed on the router via `Router::set_on_egress_guard` and invoked
+/// inside `Router::route_for_egress` **after** Send-PEP obligations and
+/// the local same-domain session fan-out, and **before** the message's
+/// post-route `Arc` is handed to any external sink (NATS / federation /
+/// HTTP / MQTT). This is the single egress chokepoint, so one installed
+/// guard covers every external sink — present and future — by
+/// construction (ADR for #1457; design note
+/// `docs/design/guard-server-wiring.md`).
+///
+/// The closure receives the post-Send-PEP message (full
+/// [`RoutableMessage`], so the source CN, classification, and tenant are
+/// available for a complete `audit::guard_rejected` record) and returns
+/// an [`EgressGuardVerdict`]. A `Deny` verdict causes the router to drop
+/// the message from external egress — the guard is **fail-closed** by
+/// design.
+///
+/// `None` (the default) means no guard is wired and the egress path is
+/// unchanged; the hot path on the un-installed build is a single
+/// `ArcSwap::load` + `is_none()` check, matching the other optional
+/// router hooks.
+///
+/// Uses `Fn` (not `AsyncFn`) for the same object-safety reason as the
+/// `on_callback!` aliases; the guard's evaluation is synchronous (token-
+/// bucket arithmetic + one audit-log append), so no async dispatch is
+/// needed inside the closure.
+pub type OnEgressGuard =
+    std::sync::Arc<dyn Fn(&RoutableMessage) -> EgressGuardVerdict + Send + Sync>;
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
