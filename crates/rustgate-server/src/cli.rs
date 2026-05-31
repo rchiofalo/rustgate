@@ -949,6 +949,16 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_MAVLINK_V1_FALLBACK_CN")]
     pub(crate) mavlink_v1_fallback_cn: Option<String>,
 
+    /// Path to the TOML cross-domain guard config (`[guard]` block:
+    /// per-direction throughput caps, mandatory-marking switch, dedicated
+    /// audit-log path, deployment direction). When set, the guard is
+    /// installed on the router's egress chokepoint and every message
+    /// leaving the process toward an external sink is inspected at the
+    /// boundary; a denial drops the message and is audited. Requires the
+    /// `guard` build feature (#1457). When unset, no guard is installed.
+    #[arg(long, env = "RUSTGATE_GUARD_CONFIG")]
+    pub(crate) guard_config_file: Option<String>,
+
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -2301,6 +2311,7 @@ define_config_file! {
     mavlink_signing_key_file: Option<String>,
     mavlink_pq_bootstrap_file: Option<String>,
     mavlink_v1_fallback_cn: Option<String>,
+    guard_config_file: Option<String>,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
     udp_rate_limit: u32,
