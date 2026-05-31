@@ -416,6 +416,7 @@ pub struct AuthzEvent<'a> {
     pub policy_id: &'a str,
 }
 use rustgate_core::audit;
+use rustgate_core::egress::{EgressGuardVerdict, OnEgressGuard};
 use rustgate_core::entity::EntityCodecRegistry;
 use rustgate_core::identity::{GroupId, Identity};
 use rustgate_core::masking::hash_cn;
@@ -1245,6 +1246,18 @@ pub struct Router {
     /// stream catalog under `--features video`) install without
     /// colliding with the rebroadcast hook. Default `None`. Closes #862.
     on_routed: ArcSwap<Option<OnRouted>>,
+    /// Optional cross-domain egress guard (issue #1457). When installed,
+    /// it is consulted inside [`Self::route_for_egress`] **after** the
+    /// local same-domain session fan-out and **before** the routed
+    /// `Arc<RoutableMessage>` is returned for external-sink forwarding
+    /// (NATS / federation / HTTP / MQTT). A
+    /// [`EgressGuardVerdict::Deny`] suppresses the external-egress
+    /// return (the message is dropped from cross-domain forwarding and
+    /// `audit::guard_rejected` fires). This is the single egress
+    /// chokepoint, so one installed guard covers every external sink by
+    /// construction. Default `None`; the un-installed hot path is a
+    /// single `ArcSwap::load` + `is_none()` check. Hot-reloadable.
+    on_egress_guard: ArcSwap<Option<OnEgressGuard>>,
     /// Pre-routing interceptor chain. Fires inside
     /// [`Self::route_for_egress`] after tenant-stamping and
     /// before ACL / dedup / PEP / fanout. The chain runs in
@@ -1355,6 +1368,10 @@ impl std::fmt::Debug for Router {
             )
             .field("on_routed_installed", &(**self.on_routed.load()).is_some())
             .field(
+                "on_egress_guard_installed",
+                &(**self.on_egress_guard.load()).is_some(),
+            )
+            .field(
                 "entity_codec_registry_installed",
                 &self.entity_codec_registry.is_some(),
             )
@@ -1403,6 +1420,7 @@ impl Default for Router {
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
+            on_egress_guard: ArcSwap::from_pointee(None),
             interceptors: ArcSwap::from_pointee(Vec::new()),
             on_interceptor_verdict: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
@@ -1471,6 +1489,7 @@ impl Router {
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
+            on_egress_guard: ArcSwap::from_pointee(None),
             interceptors: ArcSwap::from_pointee(Vec::new()),
             on_interceptor_verdict: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
@@ -1528,6 +1547,7 @@ impl Router {
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
+            on_egress_guard: ArcSwap::from_pointee(None),
             interceptors: ArcSwap::from_pointee(Vec::new()),
             on_interceptor_verdict: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
@@ -1588,6 +1608,7 @@ impl Router {
             on_message_dropped: ArcSwap::from_pointee(None),
             on_multicast_forward: ArcSwap::from_pointee(None),
             on_routed: ArcSwap::from_pointee(None),
+            on_egress_guard: ArcSwap::from_pointee(None),
             interceptors: ArcSwap::from_pointee(Vec::new()),
             on_interceptor_verdict: ArcSwap::from_pointee(None),
             entity_codec_registry: None,
@@ -2121,6 +2142,26 @@ impl Router {
     /// restarting the routing pipeline.
     pub fn set_on_routed(&self, cb: Option<OnRouted>) {
         self.on_routed.store(Arc::new(cb));
+    }
+
+    /// Install (or replace) the cross-domain egress guard (issue #1457).
+    ///
+    /// The guard is consulted inside [`Self::route_for_egress`] after the
+    /// local same-domain session fan-out and before the routed
+    /// `Arc<RoutableMessage>` is returned for external-sink forwarding.
+    /// A [`EgressGuardVerdict::Deny`] suppresses the external-egress
+    /// return — the message does not reach any external sink — and the
+    /// caller-supplied closure is responsible for emitting the guard's
+    /// own forensic audit record; the router additionally emits
+    /// `audit::guard_rejected` for the operational-stream mirror.
+    ///
+    /// Because `route_for_egress` is the single egress chokepoint, one
+    /// installed guard covers every external sink (NATS / federation /
+    /// HTTP / MQTT) and any future sink that routes through it. Pass
+    /// `None` (the default) to remove the guard without restarting the
+    /// pipeline — hot-reloadable via `ArcSwap`.
+    pub fn set_on_egress_guard(&self, cb: Option<OnEgressGuard>) {
+        self.on_egress_guard.store(Arc::new(cb));
     }
 
     /// Append an interceptor to the router's pre-routing chain.
@@ -2872,6 +2913,42 @@ impl Router {
             }
             None => {
                 self.emit_dropped_by_tenant("no_subscribers", routed_tenant.as_deref());
+            }
+        }
+
+        // Cross-domain egress guard (issue #1457). Consulted AFTER the
+        // local same-domain session fan-out completed inside
+        // `route_inner` and BEFORE the routed `Arc` is observed by the
+        // egress hooks or returned to external sinks. The guard's model
+        // is network-to-network (lower-classification network → higher),
+        // so it gates the external-sink egress — the cross-domain hop —
+        // not the same-domain local delivery that already happened. A
+        // `Deny` verdict drops the message from external egress by
+        // returning `None`; local recipients already received it.
+        // Fail-closed: a guard that cannot complete its evaluation
+        // returns `Deny`. Un-installed hot path is one `ArcSwap::load`
+        // + `is_none()` check, matching the sibling hooks.
+        if let Some(ref arc_msg) = routed {
+            let guard_slot = self.on_egress_guard.load();
+            if let Some(guard) = (**guard_slot).as_ref()
+                && let EgressGuardVerdict::Deny { reason } = guard(arc_msg)
+            {
+                audit::guard_rejected(
+                    &arc_msg.source.cn,
+                    "egress",
+                    destination_kind(&arc_msg.destination),
+                    reason,
+                );
+                tracing::debug!(
+                    target: "router",
+                    reason = %reason,
+                    source_cn = %hash_cn(&arc_msg.source.cn),
+                    "cross-domain egress guard denied message",
+                );
+                // Suppress external egress. Local same-domain fan-out
+                // already occurred in `route_inner`; the cross-domain
+                // boundary is the external sinks, which see `None`.
+                return None;
             }
         }
 
@@ -8863,5 +8940,78 @@ mod tests {
             .await;
         let captured = labels.lock().clone();
         assert_eq!(captured, vec!["allow", "allow", "allow"]);
+    }
+
+    #[tokio::test]
+    async fn egress_guard_deny_suppresses_external_egress() {
+        // #1457: a Deny verdict from the cross-domain egress guard makes
+        // route_for_egress return None — so no external sink (NATS /
+        // federation / HTTP) receives the Arc. Local same-domain fan-out
+        // has already happened in route_inner; the guard gates the
+        // cross-domain hop only.
+        let router = Router::new();
+        let seen = Arc::new(parking_lot::Mutex::new(0u32));
+        let seen_cb = Arc::clone(&seen);
+        router.set_on_egress_guard(Some(Arc::new(move |_msg: &RoutableMessage| {
+            *seen_cb.lock() += 1;
+            EgressGuardVerdict::Deny {
+                reason: "missing_marking",
+            }
+        })));
+
+        let alice = make_identity("alice", &["g1"]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let routed = router
+            .route_for_egress(make_chat(&alice, Destination::Broadcast))
+            .await;
+        assert!(
+            routed.is_none(),
+            "Deny verdict must suppress the external-egress Arc"
+        );
+        assert_eq!(*seen.lock(), 1, "guard consulted exactly once");
+    }
+
+    #[tokio::test]
+    async fn egress_guard_allow_passes_external_egress() {
+        // #1457: an Allow verdict leaves route_for_egress returning the
+        // Arc for external sinks, exactly as if no guard were installed.
+        let router = Router::new();
+        router.set_on_egress_guard(Some(Arc::new(|_msg: &RoutableMessage| {
+            EgressGuardVerdict::Allow
+        })));
+
+        let alice = make_identity("alice", &["g1"]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+
+        let routed = router
+            .route_for_egress(make_chat(&alice, Destination::Broadcast))
+            .await;
+        assert!(
+            routed.is_some(),
+            "Allow verdict must leave the external-egress Arc intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_egress_guard_is_unchanged_default() {
+        // The un-installed default must behave exactly as before — the
+        // Arc is returned for egress.
+        let router = Router::new();
+        let alice = make_identity("alice", &["g1"]);
+        let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
+        router
+            .register(SessionHandle::new(alice.clone(), ptx, ntx))
+            .await;
+        let routed = router
+            .route_for_egress(make_chat(&alice, Destination::Broadcast))
+            .await;
+        assert!(routed.is_some(), "no guard installed → egress unchanged");
     }
 }
