@@ -54,6 +54,7 @@
 - [FIPS 140-3](./security/fips.md)
 - [Post-Quantum KEX](./security/post-quantum.md)
 - [Authorization](./security/authorization.md)
+- [Cross-Domain Guard](./security/cross-domain-guard.md)
 
 # Reference
 

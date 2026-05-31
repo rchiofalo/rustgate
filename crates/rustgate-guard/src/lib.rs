@@ -316,6 +316,26 @@ pub enum GuardError {
     },
 }
 
+impl GuardError {
+    /// Stable, low-cardinality token naming the rejection reason.
+    ///
+    /// Single source of truth for the reason string used in the
+    /// `audit::guard_rejected` `reason` field, the
+    /// `rustgate_core::egress::EgressGuardVerdict::Deny { reason }` the
+    /// server maps this error to, and any Prometheus label. SIEM rules
+    /// grep on these exact tokens — treat them as a wire contract.
+    #[must_use]
+    pub fn reason_token(&self) -> &'static str {
+        match self {
+            Self::RateLimitExceeded { .. } => "rate_limit",
+            Self::MissingMarking => "missing_marking",
+            Self::UnauthorizedClassification { .. } => "unauthorized_classification",
+            Self::Audit { .. } => "audit_error",
+            Self::Io { .. } => "io_error",
+        }
+    }
+}
+
 /// Result alias for guard operations.
 pub type Result<T> = std::result::Result<T, GuardError>;
 

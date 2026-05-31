@@ -31,6 +31,8 @@ mod cli;
 mod diagnostics;
 #[cfg(feature = "federation")]
 mod federation_reloader;
+#[cfg(feature = "guard")]
+mod guard;
 mod mavlink;
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -2001,6 +2003,17 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // `--mavlink-signing-key-file` manifest (ADR 0020), so ACL/authz
     // apply to MAVLink exactly as to every other transport.
     let mavlink_shutdowns = mavlink::start_mavlink(&cli, &router).await?;
+
+    // ── Cross-domain egress guard (#1457) ──────────────────────────
+    //
+    // When `--guard-config` is set (and the `guard` feature is built),
+    // install the cross-domain inspection boundary on the router's
+    // egress chokepoint. Every message leaving toward an external sink
+    // is then gated at the boundary; a denial drops it and is audited.
+    // No background task — the gate is a synchronous hook inside
+    // `route_for_egress`, so there is no shutdown handle to track.
+    #[cfg(feature = "guard")]
+    guard::start_guard(&cli, &router)?;
 
     // ── Management REST API ────────────────────────────────────────
     //

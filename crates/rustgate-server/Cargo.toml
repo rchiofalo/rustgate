@@ -27,6 +27,10 @@ ignored = ["rustgate-meshtastic", "rustgate-sapient", "rustgate-foundry", "rustg
 
 [features]
 nats = ["dep:rustgate-nats", "rustgate-admin/nats"]
+# Cross-domain inspection guard (#1457). Off by default; pulls in
+# rustgate-guard and enables the `--guard-config` boundary gate wired
+# onto the router's egress chokepoint.
+guard = ["dep:rustgate-guard"]
 enrollment = ["dep:rustgate-enrollment"]
 est = ["enrollment", "rustgate-enrollment/est"]
 proto = ["dep:rustgate-proto", "rustgate-transport/proto", "rustgate-http?/proto"]
@@ -190,6 +194,7 @@ rustgate-dis = { workspace = true }
 rustgate-tls = { workspace = true }
 rustgate-transport = { workspace = true }
 rustgate-router = { workspace = true }
+rustgate-guard = { workspace = true, optional = true }
 rustgate-websocket = { workspace = true, optional = true }
 rustgate-mqtt = { workspace = true, optional = true }
 rustgate-nats = { workspace = true, optional = true }
