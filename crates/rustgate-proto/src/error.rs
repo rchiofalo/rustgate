@@ -17,16 +17,18 @@ pub enum ProtoError {
     #[error("missing field: {0}")]
     MissingField(&'static str),
 
-    /// A required protocol-negotiation version string was absent or
-    /// blank (empty / whitespace-only) on the wire.
+    /// A required protocol-negotiation version field was absent on the
+    /// wire (the proto3 `uint32` zero default) or sent explicitly as `0`.
     ///
-    /// Pre-F-64, `parse_tak_request` silently mapped an empty
-    /// `min_proto_version` / `max_proto_version` to the server's
-    /// supported range, which let a malicious client force negotiation
-    /// to `MAX_PROTO_VERSION` by sending empty strings. The server now
-    /// requires both fields to be explicitly populated and parseable;
-    /// blank values surface as this typed error.
-    #[error("missing or blank protocol-negotiation field: {0}")]
+    /// `min_proto_version` / `max_proto_version` are `uint32`; proto3
+    /// decodes an unset scalar to `0`, which is indistinguishable from a
+    /// literal `0`. Pre-F-64, `parse_tak_request` silently mapped that
+    /// unset default to the server's supported range, which let a
+    /// malicious client force negotiation to `MAX_PROTO_VERSION` without
+    /// populating the fields. The server now rejects `0` (never a valid
+    /// version — the lowest real version is `1`); it surfaces as this
+    /// typed error.
+    #[error("missing or zero protocol-negotiation field: {0}")]
     BlankVersion(&'static str),
 
     #[error("invalid timestamp: {0}")]

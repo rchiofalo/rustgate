@@ -68,8 +68,8 @@ fn round_trip_with_tak_control() {
 
     let msg = tak_proto::TakMessage {
         tak_control: Some(tak_proto::TakControl {
-            min_proto_version: "1".into(),
-            max_proto_version: "1".into(),
+            min_proto_version: 1,
+            max_proto_version: 1,
             contact_uid: "test-client".into(),
         }),
         cot_event: None,
@@ -82,8 +82,8 @@ fn round_trip_with_tak_control() {
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     let roundtripped = tak_proto::TakMessage::decode(&decoded[..]).unwrap();
     let control = roundtripped.tak_control.unwrap();
-    assert_eq!(control.min_proto_version, "1");
-    assert_eq!(control.max_proto_version, "1");
+    assert_eq!(control.min_proto_version, 1);
+    assert_eq!(control.max_proto_version, 1);
     assert_eq!(control.contact_uid, "test-client");
 }
 
@@ -362,8 +362,8 @@ fn build_tak_response_is_decodeable_as_tak_message() {
 
     let msg = tak_proto::TakMessage::decode(payload).unwrap();
     let control = msg.tak_control.unwrap();
-    assert_eq!(control.min_proto_version, "1");
-    assert_eq!(control.max_proto_version, "1");
+    assert_eq!(control.min_proto_version, 1);
+    assert_eq!(control.max_proto_version, 1);
     assert!(msg.cot_event.is_none());
 }
 
@@ -384,8 +384,8 @@ fn build_tak_response_total_length_matches() {
 fn parse_tak_request_accepts_valid_v1() {
     let msg = tak_proto::TakMessage {
         tak_control: Some(tak_proto::TakControl {
-            min_proto_version: "1".into(),
-            max_proto_version: "1".into(),
+            min_proto_version: 1,
+            max_proto_version: 1,
             contact_uid: "client-uid".into(),
         }),
         cot_event: None,
@@ -395,16 +395,17 @@ fn parse_tak_request_accepts_valid_v1() {
 }
 
 #[test]
-fn parse_tak_request_rejects_empty_versions() {
-    // F-64 hardening: empty `min_proto_version` / `max_proto_version`
+fn parse_tak_request_rejects_unset_versions() {
+    // F-64 hardening: an unset `min_proto_version` / `max_proto_version`
     // used to silently map to the server's supported range, which let a
-    // malicious client force negotiation to MAX_PROTO_VERSION by
-    // sending two empty strings. Both blank fields are now rejected as
-    // a typed protocol error.
+    // malicious client force negotiation to MAX_PROTO_VERSION without
+    // populating the fields. They are `uint32` now; proto3 decodes an
+    // omitted scalar to `0`, so leaving both at their zero default must
+    // be rejected as a typed protocol error.
     let msg = tak_proto::TakMessage {
         tak_control: Some(tak_proto::TakControl {
-            min_proto_version: String::new(),
-            max_proto_version: String::new(),
+            min_proto_version: 0,
+            max_proto_version: 0,
             contact_uid: String::new(),
         }),
         cot_event: None,
@@ -417,8 +418,8 @@ fn parse_tak_request_rejects_unsupported_version() {
     // min=3,max=4 has no overlap with server's [1..2]
     let msg = tak_proto::TakMessage {
         tak_control: Some(tak_proto::TakControl {
-            min_proto_version: "3".into(),
-            max_proto_version: "4".into(),
+            min_proto_version: 3,
+            max_proto_version: 4,
             contact_uid: String::new(),
         }),
         cot_event: None,
@@ -465,8 +466,8 @@ async fn read_tak_request_accepts_valid_frame() {
 
     let msg = tak_proto::TakMessage {
         tak_control: Some(tak_proto::TakControl {
-            min_proto_version: "1".into(),
-            max_proto_version: "1".into(),
+            min_proto_version: 1,
+            max_proto_version: 1,
             contact_uid: "async-client".into(),
         }),
         cot_event: None,
