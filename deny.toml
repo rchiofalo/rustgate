@@ -50,16 +50,25 @@ ignore = [
     # RUSTSEC-2024-0436 — paste 1.0.15 is archived/unmaintained.
     # Refs #714 (original observation), #1249 (re-investigation:
     # confirmed paste is purely transitive, no direct use site to swap),
-    # and #1315 (github-actions auto-regenerated tracking issue;
-    # closed via the PR that this entry now references).
+    # #1315 and #1449 (github-actions auto-regenerated tracking issues).
     #
-    # Dependency-graph entry point: paste enters the dep graph only when
-    # the `jemalloc` feature is enabled, via the chain
-    #   rustgate-server -> tikv-jemalloc-ctl 0.6.1 -> paste 1.0.15
-    # `cargo tree --workspace -e normal --all-features -i paste` confirms
-    # this is the only path; rustgate has no direct paste dependency, no
-    # `use paste::*` import, and no `paste!` macro invocation in any
-    # workspace crate.
+    # Dependency-graph entry points: paste enters via TWO independent
+    # feature-gated chains — `cargo tree --workspace -e normal
+    # --all-features -i paste` shows both, and neither alone accounts for
+    # the dep:
+    #   (1) jemalloc feature:
+    #         rustgate-server -> tikv-jemalloc-ctl -> paste 1.0.15
+    #   (2) dds-real feature:
+    #         rustgate-server -> rustgate-dds -> rustdds -> cdr-encoding
+    #           -> paste 1.0.15
+    #         rustgate-server -> rustgate-dds -> rustdds -> paste 1.0.15
+    #         (also reachable via ros2-client -> rustdds)
+    # rustgate itself has no direct paste dependency, no `use paste::*`
+    # import, and no `paste!` macro invocation in any workspace crate.
+    # (An earlier revision of this note claimed jemalloc was the *only*
+    # path; that was wrong — the dds-real / rustdds chain pulls paste
+    # independently of jemalloc, which is why a jemalloc-only fix does not
+    # clear the advisory. Corrected per #1449.)
     #
     # Risk surface: the advisory is "unmaintained" (informational), not a
     # vulnerability. paste is a proc-macro that runs at compile time and
@@ -68,22 +77,29 @@ ignore = [
     # pass our `Cargo.lock` review and `cargo deny check sources` gate
     # before it could enter a build.
     #
-    # Why we cannot fix this in our tree: the latest release of
-    # `tikv-jemalloc-ctl` (0.6.1) still depends on `paste`. The community
-    # fork `pastey` is a drop-in replacement for direct consumers, but
-    # tikv-jemalloc-ctl is the consumer here, not us — adopting pastey
-    # would require forking tikv-jemalloc-ctl itself. Upstream is aware:
-    # https://github.com/tikv/jemallocator/pull/130 (open, not yet
-    # merged) migrates jemallocator from `paste` to `preinterpret`. We
-    # are tracking that PR rather than carrying a downstream fork.
+    # Why we cannot fix this in our tree: paste is pulled by upstream
+    # crates we do not own (tikv-jemalloc-ctl on one chain; rustdds /
+    # cdr-encoding / ros2-client on the other). The community fork
+    # `pastey` is a drop-in replacement for direct consumers, but the
+    # consumers here are those upstreams, not us — adopting pastey would
+    # require forking each. On the jemalloc side, upstream is aware:
+    # https://github.com/tikv/jemallocator/pull/130 migrates jemallocator
+    # off `paste` to `preinterpret`; a newer `tikv-jemalloc-ctl` (0.7.0)
+    # is published, but bumping it alone would NOT clear this advisory
+    # because chain (2) still pulls paste. The rustdds/cdr-encoding side
+    # has no equivalent migration yet.
     #
-    # Removal trigger: drop this ignore the next release after
-    # tikv/jemallocator#130 (or any equivalent upstream change) lands in
-    # a published `tikv-jemalloc-ctl` and we bump our pin past it. At
-    # that point `cargo tree -i paste` should return no entries.
+    # Removal trigger: drop this ignore only when BOTH chains stop pulling
+    # paste — i.e. when `cargo tree --all-features -i paste` returns no
+    # entries after (a) tikv-jemalloc-ctl drops paste (tracking
+    # tikv/jemallocator#130) AND (b) rustdds + cdr-encoding (+ ros2-client)
+    # drop it — and we bump our pins past those releases. Bumping only one
+    # chain is not sufficient and must not trigger removal.
     "RUSTSEC-2024-0436",
     # RUSTSEC-2020-0016 — `net2` 0.2.39 is unmaintained; the maintained
     # replacement is `socket2`.
+    # Ref #1448 (github-actions auto-regenerated tracking issue;
+    # re-verified accurate as of 2026-05 — see entry points below).
     #
     # Dependency-graph entry point: net2 enters the dep graph only when
     # the `rustgate-dds` `dds-real` feature is enabled, via the chain
