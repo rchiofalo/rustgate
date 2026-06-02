@@ -18,7 +18,7 @@
 //!    dropped before any decode (no unbounded work).
 //! 3. **Validating decode** — the datagram is decoded with the *same*
 //!    [`DynEntityCodec`] the router uses ([decision D2/Q3]); a datagram
-//!    that does not decode to a valid [`Entity`] is dropped at the edge and
+//!    that does not decode to a valid `Entity` is dropped at the edge and
 //!    audited. The decoded entity is **discarded** — the router re-decodes
 //!    via its [`rustgate_core::entity::EntityCodecRegistry`] so it stays the
 //!    single source of routing truth.
