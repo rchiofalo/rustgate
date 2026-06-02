@@ -6,11 +6,12 @@ codec ingress* is a generic, codec-pluggable **UDP listener** that turns
 datagram-oriented tactical traffic into routed messages — subject to the
 same ACL/authz, dedup, and egress as every other transport.
 
-The first wave wires **DIS** (IEEE 1278.1 Entity State PDUs). **ASTERIX**
-and **VMF** layer onto the same listener as follow-ups; Link 16 / STANAG
+Wired today: **DIS** (IEEE 1278.1 Entity State PDUs), **ASTERIX** (CAT-062
+system tracks), and **VMF** (MIL-STD-6017 K05.1 position reports) — all on
+the same listener and the same `--<proto>-*` flag shape. Link 16 / STANAG
 4586 / SAPIENT (stream-framed) and Meshtastic (LoRa) are separate ingress
-paths. See the design note (`docs/design/tactical-codec-ingress.md`) and
-the tracking epic (#1473).
+paths still to come. See the design note
+(`docs/design/tactical-codec-ingress.md`) and the tracking epic (#1473).
 
 > **Security warning:** These are unauthenticated, unencrypted UDP ingress
 > paths. There is no mTLS — anyone who can reach the bound port can submit
@@ -37,47 +38,55 @@ the tracking epic (#1473).
   per-IP rate limit → synthetic-identity cap → datagram size cap. Each
   rejection is audited by class.
 - **Secure-default rate limit.** Unlike the CoT-UDP listener, the rate
-  limit is **never off**: an unset/`0` `--dis-rate-limit-pps` applies the
-  built-in default (10000 pps/IP), not "unlimited."
-- **No allowlist ⇒ loud warning.** Starting without `--dis-allowed-cidrs`
-  logs a prominent warning that the port is exposed to the whole reachable
-  network.
+  limit is **never off**: an unset/`0` `--<proto>-rate-limit-pps` applies
+  the built-in default (10000 pps/IP), not "unlimited."
+- **No allowlist ⇒ loud warning.** Starting without
+  `--<proto>-allowed-cidrs` logs a prominent warning that the port is
+  exposed to the whole reachable network.
 
-## Enabling DIS ingress
+## Enabling ingress
+
+Each protocol has the same five flags under its own `--<proto>-` prefix.
+Set the `--<proto>-bind` to enable it; leaving it unset disables that
+protocol (default-deny). All flags have matching `RUSTGATE_<PROTO>_*`
+environment variables and TOML config-file keys.
 
 ```bash
 rustgate-server \
-  --dis-bind 0.0.0.0:3000 \
-  --dis-group dis-feed \
-  --dis-allowed-cidrs 10.20.0.0/16 \
-  --dis-rate-limit-pps 5000 \
-  --dis-max-identities 1024
+  --dis-bind     0.0.0.0:3000  --dis-allowed-cidrs     10.20.0.0/16 \
+  --asterix-bind 0.0.0.0:8600  --asterix-allowed-cidrs 10.20.0.0/16 \
+  --vmf-bind     0.0.0.0:1581  --vmf-allowed-cidrs     10.20.0.0/16
 ```
 
-When `--dis-bind` is unset, DIS ingress is disabled (default-deny). All
-flags have matching `RUSTGATE_DIS_*` environment variables and TOML
-config-file keys.
+| Protocol | `--<proto>` prefix | Wire input | Default group |
+|----------|--------------------|------------|---------------|
+| **DIS** (IEEE 1278.1) | `dis` | UDP Entity State PDUs (≈3000) | `dis` |
+| **ASTERIX** (CAT-062) | `asterix` | UDP datablocks (≈8600) | `asterix` |
+| **VMF** (MIL-STD-6017 K05.1) | `vmf` | UDP position reports (≈1581) | `vmf` |
+
+Per-protocol flags (shown for `dis`; identical for `asterix` / `vmf`):
 
 | Flag | Env | Default | Purpose |
 |------|-----|---------|---------|
-| `--dis-bind` | `RUSTGATE_DIS_BIND` | *(unset → disabled)* | UDP bind address for DIS Entity State PDUs |
-| `--dis-group` | `RUSTGATE_DIS_GROUP` | `dis` | Destination group accepted PDUs route to (ACL/authz apply) |
+| `--dis-bind` | `RUSTGATE_DIS_BIND` | *(unset → disabled)* | UDP bind address |
+| `--dis-group` | `RUSTGATE_DIS_GROUP` | `dis` | Destination group accepted datagrams route to (ACL/authz apply) |
 | `--dis-rate-limit-pps` | `RUSTGATE_DIS_RATE_LIMIT_PPS` | `0` → secure default | Per-IP datagrams/sec (`0` = built-in default, not off) |
 | `--dis-allowed-cidrs` | `RUSTGATE_DIS_ALLOWED_CIDRS` | *(unset → warn)* | Comma-separated source CIDR allowlist |
 | `--dis-max-identities` | `RUSTGATE_DIS_MAX_IDENTITIES` | `1024` | Synthetic-identity LRU bound (new IPs rejected at cap) |
 
 ## How a datagram flows
 
-1. **Receive** a UDP datagram on `--dis-bind`.
+1. **Receive** a UDP datagram on `--<proto>-bind`.
 2. **Admission** — drop (and audit) if the source IP is outside the
    allowlist, over its rate budget, or new while the identity cap is full;
    drop if the datagram exceeds the size cap.
-3. **Validate** — decode with the DIS codec; drop + audit if it is not a
-   well-formed Entity State PDU.
-4. **Route** — build a message carrying the raw PDU bytes, the synthetic
-   identity, the configured group, and `source_protocol = "dis"`, then hand
-   it to the router. ACL/authz, dedup, multi-sensor correlation, and egress
-   (NATS/federation/etc.) apply exactly as for any other source.
+3. **Validate** — decode with that protocol's codec; drop + audit if it is
+   not a well-formed message.
+4. **Route** — build a message carrying the raw datagram bytes, the
+   synthetic identity, the configured group, and `source_protocol`
+   (`"dis"` / `"asterix"` / `"vmf"`), then hand it to the router. ACL/authz,
+   dedup, multi-sensor correlation, and egress (NATS/federation/etc.) apply
+   exactly as for any other source.
 
 ## Observability
 
@@ -86,17 +95,20 @@ config-file keys.
 - Drops are audited by class: `client.rejected` with reason
   `cidr_not_allowed` / `identity_cap_reached` / `datagram_too_large` /
   `malformed_datagram`, and `security.rate_limited` for rate-limit drops.
-- Accepted PDUs appear in the access log and audit trail like any routed
-  message (`source_protocol = "dis"`), with the canonical entity kind
-  surfaced via the router's `EntityCodecRegistry`.
+- Accepted datagrams appear in the access log and audit trail like any
+  routed message (with their `source_protocol`), and the router's
+  `EntityCodecRegistry` surfaces the canonical entity kind.
 
-## Limitations (first wave)
+## Limitations
 
-- **DIS only** so far. ASTERIX and VMF use the same listener and config
-  shape and land next; Link 16 / STANAG 4586 / SAPIENT (stream-framed) and
-  Meshtastic (LoRa/serial) are distinct ingress paths.
-- **Entity State PDUs only** for DIS (other PDU types are dropped at the
-  validating decode until the codec supports them).
-- **Unicast only** in this first wave; multicast ingress (ASTERIX / DIS on
-  an exercise LAN) reuses the same controls and lands with the multicast
-  follow-up.
+- **One canonical message per datagram.** Each protocol's codec decodes a
+  single canonical entity per datagram: DIS **Entity State PDUs** only,
+  ASTERIX the **first CAT-062 track** of the datablock, VMF **K05.1**
+  position reports only. Other PDU/category/message types are dropped at the
+  validating decode until the codec maps them, and multi-record datagrams
+  (e.g. several ASTERIX tracks in one datablock) surface only their first
+  record for now.
+- **Unicast only** so far; multicast ingress (ASTERIX / DIS on an exercise
+  LAN) reuses the same controls and lands with the multicast follow-up.
+- Stream-framed protocols (Link 16 / STANAG 4586 / SAPIENT) and Meshtastic
+  (LoRa/serial) are distinct ingress paths, tracked under #1473.

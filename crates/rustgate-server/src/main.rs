@@ -29,7 +29,6 @@ mod audit;
 mod authz_reloader;
 mod cli;
 mod diagnostics;
-mod dis;
 #[cfg(feature = "federation")]
 mod federation_reloader;
 #[cfg(feature = "guard")]
@@ -45,6 +44,7 @@ mod otel;
 mod otel_metrics;
 mod session;
 mod setup;
+mod tactical_ingress;
 
 use cli::{Cli, Command};
 use rustgate_core::tasks::{spawn_background, stop_subsystem};
@@ -996,6 +996,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             std::sync::Arc::new(rustgate_stanag4586::entity::Stanag4586EntityCodec),
         );
         registry.register("dis", std::sync::Arc::new(rustgate_dis::DisCodec));
+        registry.register("vmf", std::sync::Arc::new(rustgate_vmf::VmfCodec));
         Arc::new(registry)
     };
 
@@ -2016,15 +2017,18 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(feature = "guard")]
     guard::start_guard(&cli, &router)?;
 
-    // ── Tactical codec ingress: DIS over UDP (#1473) ───────────────
+    // ── Tactical codec ingress: DIS / ASTERIX / VMF over UDP (#1473) ─
     //
-    // When `--dis-bind` is set, bind a UDP listener that validates each
-    // datagram with the DIS EntityCodec at the edge and routes accepted
-    // PDUs (tagged `source_protocol = "dis"`) through the normal ACL/
-    // authz path. Unauthenticated, trusted-network-only — see
-    // `docs/tactical-ingress.md`. First protocol on the generic
-    // codec-ingress seam; ASTERIX/VMF layer on the same listener.
-    let dis_shutdown = dis::start_dis(&cli, &router).await?;
+    // For each protocol whose `--<proto>-bind` is set, bind a UDP
+    // listener that validates each datagram with that protocol's
+    // EntityCodec at the edge and routes accepted messages (tagged
+    // `source_protocol`) through the normal ACL/authz path. All three
+    // share the generic codec-ingress listener + admission gate.
+    // Unauthenticated, trusted-network-only — see
+    // `docs/tactical-ingress.md`.
+    let dis_shutdown = tactical_ingress::start_dis(&cli, &router).await?;
+    let asterix_shutdown = tactical_ingress::start_asterix(&cli, &router).await?;
+    let vmf_shutdown = tactical_ingress::start_vmf(&cli, &router).await?;
 
     // ── Management REST API ────────────────────────────────────────
     //
@@ -2395,6 +2399,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
     if let Some(handle) = dis_shutdown {
         stop_subsystem("dis", handle).await;
+    }
+    if let Some(handle) = asterix_shutdown {
+        stop_subsystem("asterix", handle).await;
+    }
+    if let Some(handle) = vmf_shutdown {
+        stop_subsystem("vmf", handle).await;
     }
     if let Some(handle) = archive_rotation_handle {
         handle.abort();

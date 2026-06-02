@@ -989,6 +989,58 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "1024", env = "RUSTGATE_DIS_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
     pub(crate) dis_max_identities: usize,
 
+    /// Bind address for ASTERIX (CAT-062) datablock input over UDP
+    /// (e.g. 0.0.0.0:8600). WARNING: datagrams are UNAUTHENTICATED and NOT
+    /// encrypted — use only on a trusted network segment, and pair with
+    /// `--asterix-allowed-cidrs`. When unset, ASTERIX ingress is disabled.
+    #[arg(long, env = "RUSTGATE_ASTERIX_BIND", value_parser = parse_socket_addr)]
+    pub(crate) asterix_bind: Option<String>,
+
+    /// Destination group every accepted ASTERIX datagram routes to.
+    #[arg(long, default_value = "asterix", env = "RUSTGATE_ASTERIX_GROUP")]
+    pub(crate) asterix_group: String,
+
+    /// Per-IP rate limit in datagrams per second for ASTERIX input. `0`
+    /// (the default) applies the built-in secure default, not "unlimited".
+    #[arg(long, default_value = "0", env = "RUSTGATE_ASTERIX_RATE_LIMIT_PPS")]
+    pub(crate) asterix_rate_limit_pps: u32,
+
+    /// Comma-separated CIDR prefixes allowed to send ASTERIX datagrams.
+    /// Strongly recommended; unset starts the listener but warns it is
+    /// exposed to the whole reachable network.
+    #[arg(long, env = "RUSTGATE_ASTERIX_ALLOWED_CIDRS")]
+    pub(crate) asterix_allowed_cidrs: Option<String>,
+
+    /// Maximum concurrent synthetic ASTERIX identities tracked.
+    #[arg(long, default_value = "1024", env = "RUSTGATE_ASTERIX_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
+    pub(crate) asterix_max_identities: usize,
+
+    /// Bind address for VMF (MIL-STD-6017 K05.1) position-report input over
+    /// UDP (e.g. 0.0.0.0:1581). WARNING: datagrams are UNAUTHENTICATED and
+    /// NOT encrypted — use only on a trusted network segment, and pair with
+    /// `--vmf-allowed-cidrs`. When unset, VMF ingress is disabled.
+    #[arg(long, env = "RUSTGATE_VMF_BIND", value_parser = parse_socket_addr)]
+    pub(crate) vmf_bind: Option<String>,
+
+    /// Destination group every accepted VMF datagram routes to.
+    #[arg(long, default_value = "vmf", env = "RUSTGATE_VMF_GROUP")]
+    pub(crate) vmf_group: String,
+
+    /// Per-IP rate limit in datagrams per second for VMF input. `0` (the
+    /// default) applies the built-in secure default, not "unlimited".
+    #[arg(long, default_value = "0", env = "RUSTGATE_VMF_RATE_LIMIT_PPS")]
+    pub(crate) vmf_rate_limit_pps: u32,
+
+    /// Comma-separated CIDR prefixes allowed to send VMF datagrams.
+    /// Strongly recommended; unset starts the listener but warns it is
+    /// exposed to the whole reachable network.
+    #[arg(long, env = "RUSTGATE_VMF_ALLOWED_CIDRS")]
+    pub(crate) vmf_allowed_cidrs: Option<String>,
+
+    /// Maximum concurrent synthetic VMF identities tracked.
+    #[arg(long, default_value = "1024", env = "RUSTGATE_VMF_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
+    pub(crate) vmf_max_identities: usize,
+
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -2347,6 +2399,16 @@ define_config_file! {
     dis_rate_limit_pps: u32,
     dis_allowed_cidrs: Option<String>,
     dis_max_identities: usize,
+    asterix_bind: Option<String>,
+    asterix_group: String,
+    asterix_rate_limit_pps: u32,
+    asterix_allowed_cidrs: Option<String>,
+    asterix_max_identities: usize,
+    vmf_bind: Option<String>,
+    vmf_group: String,
+    vmf_rate_limit_pps: u32,
+    vmf_allowed_cidrs: Option<String>,
+    vmf_max_identities: usize,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
     udp_rate_limit: u32,
