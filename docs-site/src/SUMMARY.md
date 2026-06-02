@@ -19,6 +19,7 @@
 - [Enrollment](./architecture/enrollment.md)
 - [MQTT Transport](./architecture/mqtt.md)
 - [MAVLink Integration](./architecture/mavlink.md)
+- [Tactical Codec Ingress](./architecture/tactical-ingress.md)
 
 # Operations
 
