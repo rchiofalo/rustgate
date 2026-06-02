@@ -4996,6 +4996,7 @@ dependencies = [
  "rustgate-test-utils",
  "rustgate-tls",
  "rustgate-transport",
+ "rustgate-vmf",
  "rustgate-websocket",
  "rustix",
  "rustls",
