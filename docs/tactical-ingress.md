@@ -9,8 +9,8 @@ same ACL/authz, dedup, and egress as every other transport.
 The first wave wires **DIS** (IEEE 1278.1 Entity State PDUs). **ASTERIX**
 and **VMF** layer onto the same listener as follow-ups; Link 16 / STANAG
 4586 / SAPIENT (stream-framed) and Meshtastic (LoRa) are separate ingress
-paths. See the [design note](design/tactical-codec-ingress.md) and the
-tracking epic (#1473).
+paths. See the design note (`docs/design/tactical-codec-ingress.md`) and
+the tracking epic (#1473).
 
 > [!WARNING]
 > **These are unauthenticated, unencrypted UDP ingress paths.** There is no
