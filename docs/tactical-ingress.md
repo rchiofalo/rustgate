@@ -12,12 +12,12 @@ and **VMF** layer onto the same listener as follow-ups; Link 16 / STANAG
 paths. See the design note (`docs/design/tactical-codec-ingress.md`) and
 the tracking epic (#1473).
 
-> [!WARNING]
-> **These are unauthenticated, unencrypted UDP ingress paths.** There is no
-> mTLS — anyone who can reach the bound port can submit datagrams. Identity
-> is synthetic. Deploy **only on a trusted network segment**, always pair
-> with a CIDR allowlist, and rely on group-level ACL/authz for trust. This
-> is the same posture as the plaintext CoT-over-UDP listener.
+> **Security warning:** These are unauthenticated, unencrypted UDP ingress
+> paths. There is no mTLS — anyone who can reach the bound port can submit
+> datagrams, and identity is synthetic. Deploy **only on a trusted network
+> segment**, always pair with a CIDR allowlist, and rely on group-level
+> ACL/authz for trust. This is the same posture as the plaintext
+> CoT-over-UDP listener.
 
 ## Security model
 
