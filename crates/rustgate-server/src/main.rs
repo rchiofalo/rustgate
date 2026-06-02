@@ -29,6 +29,7 @@ mod audit;
 mod authz_reloader;
 mod cli;
 mod diagnostics;
+mod dis;
 #[cfg(feature = "federation")]
 mod federation_reloader;
 #[cfg(feature = "guard")]
@@ -2015,6 +2016,16 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(feature = "guard")]
     guard::start_guard(&cli, &router)?;
 
+    // ── Tactical codec ingress: DIS over UDP (#1473) ───────────────
+    //
+    // When `--dis-bind` is set, bind a UDP listener that validates each
+    // datagram with the DIS EntityCodec at the edge and routes accepted
+    // PDUs (tagged `source_protocol = "dis"`) through the normal ACL/
+    // authz path. Unauthenticated, trusted-network-only — see
+    // `docs/tactical-ingress.md`. First protocol on the generic
+    // codec-ingress seam; ASTERIX/VMF layer on the same listener.
+    let dis_shutdown = dis::start_dis(&cli, &router).await?;
+
     // ── Management REST API ────────────────────────────────────────
     //
     // Registered only when `--mgmt-api-token-file` is supplied. Exposes
@@ -2381,6 +2392,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
     for handle in mavlink_shutdowns {
         stop_subsystem("mavlink", handle).await;
+    }
+    if let Some(handle) = dis_shutdown {
+        stop_subsystem("dis", handle).await;
     }
     if let Some(handle) = archive_rotation_handle {
         handle.abort();

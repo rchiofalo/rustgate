@@ -959,6 +959,36 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_GUARD_CONFIG")]
     pub(crate) guard_config_file: Option<String>,
 
+    // -- Tactical codec ingress (#1473) --
+    /// Bind address for DIS (IEEE 1278.1) Entity State PDU input over UDP
+    /// (e.g. 0.0.0.0:3000). WARNING: datagrams are UNAUTHENTICATED and NOT
+    /// encrypted — use only on a trusted network segment, and pair with
+    /// `--dis-allowed-cidrs`. When unset, DIS ingress is disabled.
+    #[arg(long, env = "RUSTGATE_DIS_BIND", value_parser = parse_socket_addr)]
+    pub(crate) dis_bind: Option<String>,
+
+    /// Destination group every accepted DIS datagram routes to. ACL/authz
+    /// apply to this group exactly as for any other transport.
+    #[arg(long, default_value = "dis", env = "RUSTGATE_DIS_GROUP")]
+    pub(crate) dis_group: String,
+
+    /// Per-IP rate limit in datagrams per second for DIS input. `0` (the
+    /// default) applies the built-in secure default rather than disabling
+    /// the limit — a tactical ingress is never truly unlimited.
+    #[arg(long, default_value = "0", env = "RUSTGATE_DIS_RATE_LIMIT_PPS")]
+    pub(crate) dis_rate_limit_pps: u32,
+
+    /// Comma-separated CIDR prefixes allowed to send DIS datagrams
+    /// (e.g. "10.0.0.0/8"). Strongly recommended; when unset the listener
+    /// starts but warns that it is exposed to the whole reachable network.
+    #[arg(long, env = "RUSTGATE_DIS_ALLOWED_CIDRS")]
+    pub(crate) dis_allowed_cidrs: Option<String>,
+
+    /// Maximum concurrent synthetic DIS identities tracked. Datagrams from
+    /// new source IPs are rejected once the cap is reached.
+    #[arg(long, default_value = "1024", env = "RUSTGATE_DIS_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
+    pub(crate) dis_max_identities: usize,
+
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -2312,6 +2342,11 @@ define_config_file! {
     mavlink_pq_bootstrap_file: Option<String>,
     mavlink_v1_fallback_cn: Option<String>,
     guard_config_file: Option<String>,
+    dis_bind: Option<String>,
+    dis_group: String,
+    dis_rate_limit_pps: u32,
+    dis_allowed_cidrs: Option<String>,
+    dis_max_identities: usize,
     tcp_bind: Option<String>,
     udp_bind: Option<String>,
     udp_rate_limit: u32,
