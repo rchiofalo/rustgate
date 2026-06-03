@@ -219,7 +219,7 @@ pub(crate) fn build_report(path: &Path, strict: bool) -> CheckReport {
     // operators benefit from seeing in CI output (matches the
     // tracing::warn! emissions in `Cli::validate` so a check-config
     // run does not lose information vs. `validate-config`).
-    if cli.authz_fail_open && cli.authz_policy_file.is_none() {
+    if cli.authz.authz_fail_open && cli.authz.authz_policy_file.is_none() {
         warnings.push("--authz-fail-open has no effect without --authz-policy-file".to_string());
     }
 
@@ -269,8 +269,8 @@ fn check_strict_referenced_paths(cli: &Cli, errors: &mut Vec<String>, warnings: 
     // The base TLS material's existence is already enforced by
     // `Cli::validate`; the strict pass adds a permission audit on the
     // private key (the most sensitive of the three).
-    if !cli.spiffe && !cli.key.is_empty() {
-        check_file_permissions(&cli.key, "TLS key", errors);
+    if !cli.tls.spiffe && !cli.tls.key.is_empty() {
+        check_file_permissions(&cli.tls.key, "TLS key", errors);
     }
 
     // Optional secret-bearing files referenced via Cli fields. Any
@@ -291,17 +291,17 @@ fn check_strict_referenced_paths(cli: &Cli, errors: &mut Vec<String>, warnings: 
         }
     };
 
-    maybe_check(&cli.crl, "CRL", false);
-    maybe_check(&cli.group_acl_file, "ACL", false);
-    maybe_check(&cli.authz_policy_file, "authz policy", false);
-    maybe_check(&cli.metrics_token_file, "metrics token", true);
-    maybe_check(&cli.ca_key, "CA private key", true);
+    maybe_check(&cli.tls.crl, "CRL", false);
+    maybe_check(&cli.authz.group_acl_file, "ACL", false);
+    maybe_check(&cli.authz.authz_policy_file, "authz policy", false);
+    maybe_check(&cli.metrics.metrics_token_file, "metrics token", true);
+    maybe_check(&cli.enrollment.ca_key, "CA private key", true);
     maybe_check(&cli.archive_key_file_str(), "archive key", true);
 
     // Files where existence is interesting but missing permissions are
     // an advisory rather than a hard fail. The runtime path tolerates
     // the missing perms via warn-only logging.
-    if let Some(audit_log) = cli.audit_log.as_ref()
+    if let Some(audit_log) = cli.observability.audit_log.as_ref()
         && audit_log != "-"
     {
         // The audit log file may not exist yet on a fresh deployment —
@@ -395,7 +395,8 @@ impl Cli {
     /// `check_strict_referenced_paths`. The field itself is a
     /// `Option<PathBuf>`; the conversion never panics.
     pub(crate) fn archive_key_file_str(&self) -> Option<String> {
-        self.archive_key_file
+        self.archive
+            .archive_key_file
             .as_ref()
             .map(|p| p.display().to_string())
     }

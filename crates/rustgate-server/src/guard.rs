@@ -77,7 +77,7 @@ fn per_call_direction(configured: GuardDirection) -> GuardDirection {
 /// fails [`GuardConfig::validate`], or the gate cannot open its audit
 /// log.
 pub(crate) fn start_guard(cli: &Cli, router: &Arc<Router>) -> anyhow::Result<()> {
-    let Some(path) = cli.guard_config_file.as_ref() else {
+    let Some(path) = cli.integrations.guard_config_file.as_ref() else {
         return Ok(());
     };
 

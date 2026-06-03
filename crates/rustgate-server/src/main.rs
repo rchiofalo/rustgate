@@ -362,7 +362,7 @@ fn main() -> anyhow::Result<()> {
 
     // Optional encryption key ring shared by the audit log and CoT archive.
     let archive_key_ring: Option<Arc<rustgate_archive::encrypted::KeyRing>> =
-        if let Some(ref kp) = cli.archive_key_file {
+        if let Some(ref kp) = cli.archive.archive_key_file {
             let ring = rustgate_archive::encrypted::KeyRing::load(kp).map_err(|e| {
                 anyhow::anyhow!("failed to load --archive-key-file {}: {e}", kp.display())
             })?;
@@ -383,7 +383,7 @@ fn main() -> anyhow::Result<()> {
     // JSON lines to the configured file (or stdout when "-"). When an archive
     // key file is configured and the path is not "-", events are encrypted
     // per-line using ChaCha20-Poly1305.
-    let audit_layer = if let Some(ref audit_path) = cli.audit_log {
+    let audit_layer = if let Some(ref audit_path) = cli.observability.audit_log {
         let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if audit_path == "-" {
             // Stdout sinks start each process with a genesis chain since
             // there is no persistent file to resume from.
@@ -429,7 +429,7 @@ fn main() -> anyhow::Result<()> {
                     anchor_tip,
                     live_tip,
                 }) => {
-                    if !cli.audit_allow_chain_break {
+                    if !cli.observability.audit_allow_chain_break {
                         anyhow::bail!(
                             "audit chain discontinuity detected for {audit_path}: \
                              anchor tip `{anchor_tip}` does not match live tip \
@@ -502,7 +502,7 @@ fn main() -> anyhow::Result<()> {
 
     // Dedicated access log sink: filters only target="access" events and
     // appends one JSON line per routed message. Opt-in via --access-log.
-    let access_layer = if let Some(ref access_path) = cli.access_log {
+    let access_layer = if let Some(ref access_path) = cli.observability.access_log {
         let writer: std::sync::Mutex<Box<dyn std::io::Write + Send>> = if access_path == "-" {
             std::sync::Mutex::new(Box::new(std::io::stdout()))
         } else {
@@ -526,13 +526,13 @@ fn main() -> anyhow::Result<()> {
     };
 
     #[cfg(feature = "otel")]
-    let otel_layer = if let Some(ref endpoint) = cli.otel_endpoint {
+    let otel_layer = if let Some(ref endpoint) = cli.observability.otel_endpoint {
         // Air-gap enforcement: refuse OTEL endpoints that resolve to
         // public hostnames or addresses. The exporter is a long-lived
         // outbound stream, so a misconfigured endpoint here would
         // continually leak traces to an external destination — exactly
         // what air-gap mode is meant to prevent.
-        if cli.air_gap {
+        if cli.tls.air_gap {
             let host = rustgate_core::air_gap::extract_host(endpoint);
             let permitted = host
                 .map(rustgate_core::air_gap::is_private_host)
@@ -549,7 +549,10 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Some(otel::init_layer(endpoint, &cli.otel_service_name)?)
+        Some(otel::init_layer(
+            endpoint,
+            &cli.observability.otel_service_name,
+        )?)
     } else {
         None
     };
@@ -566,12 +569,12 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     #[cfg(feature = "otel")]
-    if let Some(ref endpoint) = cli.otel_endpoint {
+    if let Some(ref endpoint) = cli.observability.otel_endpoint {
         tracing::info!(endpoint = %endpoint, "OpenTelemetry trace export enabled");
     }
 
     #[cfg(not(feature = "otel"))]
-    if cli.otel_endpoint.is_some() {
+    if cli.observability.otel_endpoint.is_some() {
         tracing::warn!(
             "--otel-endpoint provided but the otel feature is not compiled in; \
              rebuild with --features otel to enable trace export"
@@ -582,7 +585,7 @@ fn main() -> anyhow::Result<()> {
     // When both `post-quantum` and `fips` are enabled, the PQ provider
     // includes FIPS validation (same aws-lc-rs backend) plus PQ KX groups.
     #[cfg(feature = "post-quantum")]
-    if let Some(ref groups) = cli.kx_groups {
+    if let Some(ref groups) = cli.tls.kx_groups {
         rustgate_tls::install_provider_with_kx_groups(groups)?;
     } else {
         rustgate_tls::install_pq_provider()?;
@@ -591,7 +594,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(all(feature = "fips", not(feature = "post-quantum")))]
     rustgate_tls::install_fips_provider()?;
 
-    if cli.fips_required && !rustgate_tls::is_fips_provider_active() {
+    if cli.tls.fips_required && !rustgate_tls::is_fips_provider_active() {
         anyhow::bail!(
             "--fips-required is set but FIPS crypto provider is not active. \
              Build with --features fips to enable FIPS 140-3 mode."
@@ -606,7 +609,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     #[cfg(not(feature = "post-quantum"))]
-    if cli.prefer_post_quantum {
+    if cli.tls.prefer_post_quantum {
         tracing::warn!(
             "--prefer-post-quantum set but the post-quantum feature is not compiled in; \
              rebuild with --features post-quantum to enable PQ key exchange"
@@ -614,7 +617,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     #[cfg(not(feature = "post-quantum"))]
-    if cli.kx_groups.is_some() {
+    if cli.tls.kx_groups.is_some() {
         tracing::warn!(
             "--kx-groups set but the post-quantum feature is not compiled in; \
              rebuild with --features post-quantum to enable custom key exchange groups"
@@ -630,7 +633,7 @@ fn main() -> anyhow::Result<()> {
     // actually get versus the full CNSA 2.0 target.
     //
     // [aws-lc-rs #964]: https://github.com/aws/aws-lc-rs/issues/964
-    if cli.cnsa2 {
+    if cli.tls.cnsa2 {
         #[cfg(not(feature = "post-quantum"))]
         {
             tracing::error!(
@@ -659,8 +662,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    tracing::info!(bind = %cli.bind, "rustgate starting");
-    audit::server_started(&cli.bind, env!("CARGO_PKG_VERSION"));
+    tracing::info!(bind = %cli.tls.bind, "rustgate starting");
+    audit::server_started(&cli.tls.bind, env!("CARGO_PKG_VERSION"));
 
     // If the operator opted into a chain break via --audit-allow-chain-break,
     // record it in the audit log now that the subscriber is installed. This
@@ -703,14 +706,14 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         #[cfg(feature = "ocsp")]
         ocsp_stapler,
     } = tls_handle;
-    let framing = cli.framing;
-    let encoding = cli.encoding;
+    let framing = cli.codec.framing;
+    let encoding = cli.codec.encoding;
 
     setup::validate_framing(&cli)?;
 
     let codec = cli::build_codec(framing, encoding);
 
-    tracing::info!(addr = %listener.local_addr()?, framing = ?cli.framing, encoding = ?encoding, "listening");
+    tracing::info!(addr = %listener.local_addr()?, framing = ?cli.codec.framing, encoding = ?encoding, "listening");
 
     // Differentiated health probe state for K8s liveness/readiness/startup.
     // `live` flips on inside `rustgate_admin::serve` when the metrics server binds.
@@ -812,17 +815,17 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // traces. The `/metrics` scrape target is unaffected — this is an
     // additive sink, not a replacement.
     #[cfg(all(feature = "otel", feature = "metrics"))]
-    if cli.otlp_metrics {
-        match cli.otel_endpoint.as_deref() {
+    if cli.observability.otlp_metrics {
+        match cli.observability.otel_endpoint.as_deref() {
             Some(endpoint) => {
                 otel_metrics::init(
                     endpoint,
-                    &cli.otel_service_name,
-                    Duration::from_secs(cli.otlp_metrics_interval),
+                    &cli.observability.otel_service_name,
+                    Duration::from_secs(cli.observability.otlp_metrics_interval),
                 )?;
                 tracing::info!(
                     endpoint = %endpoint,
-                    interval_secs = cli.otlp_metrics_interval,
+                    interval_secs = cli.observability.otlp_metrics_interval,
                     "OTLP metrics export enabled"
                 );
             }
@@ -836,7 +839,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
 
     #[cfg(all(feature = "otel", not(feature = "metrics")))]
-    if cli.otlp_metrics {
+    if cli.observability.otlp_metrics {
         tracing::warn!(
             "--otlp-metrics requires --features metrics; rebuild with --features metrics,otel \
              to enable OTLP metrics export"
@@ -844,7 +847,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
 
     #[cfg(not(feature = "otel"))]
-    if cli.otlp_metrics {
+    if cli.observability.otlp_metrics {
         anyhow::bail!(
             "--otlp-metrics requires --features otel; rebuild with --features otel,metrics \
              to enable OTLP metrics export"
@@ -853,17 +856,18 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
     // ── Connection limit ────────────────────────────────────────────
     // CLI validation ensures max_connections is 1..=u32::MAX
-    let max_connections: u32 = cli.max_connections as u32;
+    let max_connections: u32 = cli.limits.max_connections as u32;
     let (group_acl, acl_file_hash, acl_file_parsed) = setup::load_group_acl(&cli).await?;
     // ── Global admission control / backpressure gate ─────────────
     let mut backpressure_gate = BackpressureGate::with_limits(
-        cli.max_queued_bytes,
-        cli.max_queued_bytes_low_water
-            .unwrap_or_else(|| cli.max_queued_bytes.saturating_mul(9) / 10),
+        cli.limits.max_queued_bytes,
+        cli.limits
+            .max_queued_bytes_low_water
+            .unwrap_or_else(|| cli.limits.max_queued_bytes.saturating_mul(9) / 10),
     );
     BackpressureGate::with_resume_dwell(
         &mut backpressure_gate,
-        std::time::Duration::from_millis(cli.backpressure_resume_dwell_ms),
+        std::time::Duration::from_millis(cli.limits.backpressure_resume_dwell_ms),
     )
     .context("configure backpressure resume dwell")?;
     #[cfg(feature = "metrics")]
@@ -886,27 +890,30 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     tracing::info!(
         max_queued_bytes = backpressure_gate.high_water(),
         low_water_bytes = backpressure_gate.low_water(),
-        resume_dwell_ms = cli.backpressure_resume_dwell_ms,
+        resume_dwell_ms = cli.limits.backpressure_resume_dwell_ms,
         "admission control enabled"
     );
 
     let client_queue: Option<Arc<rustgate_router::ClientQueue>> =
-        if let Some(ref dir) = cli.client_queue_dir {
+        if let Some(ref dir) = cli.observability.client_queue_dir {
             // Choose the open mode: persistent-key > explicit-wipe > plain.
             // The plain `open` now fails closed if the on-disk queue has
             // entries and no persistent key was supplied (F-49 / #740).
-            let open_result = if let Some(ref key_path) = cli.client_queue_key_file {
+            let open_result = if let Some(ref key_path) = cli.observability.client_queue_key_file {
                 let key = read_queue_key_file(key_path)
                     .map_err(|e| anyhow::anyhow!("--client-queue-key-file: {e}"))?;
                 rustgate_router::ClientQueue::open_with_hmac_key(
                     dir,
-                    cli.client_queue_max_bytes,
+                    cli.observability.client_queue_max_bytes,
                     Some(key),
                 )
-            } else if cli.client_queue_wipe_on_start {
-                rustgate_router::ClientQueue::open_with_wipe(dir, cli.client_queue_max_bytes)
+            } else if cli.observability.client_queue_wipe_on_start {
+                rustgate_router::ClientQueue::open_with_wipe(
+                    dir,
+                    cli.observability.client_queue_max_bytes,
+                )
             } else {
-                rustgate_router::ClientQueue::open(dir, cli.client_queue_max_bytes)
+                rustgate_router::ClientQueue::open(dir, cli.observability.client_queue_max_bytes)
             };
 
             let q = open_result.map_err(|e| {
@@ -919,9 +926,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             })?;
             tracing::info!(
                 dir = %dir.display(),
-                max_bytes = cli.client_queue_max_bytes,
-                persistent_key = cli.client_queue_key_file.is_some(),
-                wipe_on_start = cli.client_queue_wipe_on_start,
+                max_bytes = cli.observability.client_queue_max_bytes,
+                persistent_key = cli.observability.client_queue_key_file.is_some(),
+                wipe_on_start = cli.observability.client_queue_wipe_on_start,
                 "per-client store-and-forward queue enabled"
             );
             Some(Arc::new(q))
@@ -930,7 +937,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         };
     // ── Per-tenant quota tracker ────────────────────────────────────
     let quota_tracker: Option<Arc<rustgate_router::TenantQuotaTracker>> =
-        if let Some(ref path) = cli.tenant_quota_file {
+        if let Some(ref path) = cli.authz.tenant_quota_file {
             match rustgate_router::TenantQuotaTracker::load_config(path) {
                 Ok(config) => {
                     let tracker = Arc::new(rustgate_router::TenantQuotaTracker::new(config));
@@ -1019,19 +1026,19 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         // fail-closed mode; operators opt into fail-open via
         // `--authz-allow-unknown-obligations` /
         // `RUSTGATE_AUTHZ_ALLOW_UNKNOWN_OBLIGATIONS`.
-        .with_allow_unknown_obligations(cli.authz_allow_unknown_obligations)
+        .with_allow_unknown_obligations(cli.authz.authz_allow_unknown_obligations)
         // Refs #849: when `--require-classification-marking` is set,
         // every inbound message that lacks a marking is rejected at
         // admission. Default `false` keeps pre-#849 behaviour for
         // legacy traffic that does not yet attach a marking.
-        .with_require_classification_marking(cli.require_classification_marking)
+        .with_require_classification_marking(cli.authz.require_classification_marking)
         // Issue #724: cap per-CN position replay events with a
         // TokenBucket so a flap-looping client cannot drive the
         // authz engine at an uncapped rate. Defaults
         // (rate=100/sec, burst=200) are operator-safe.
         .with_position_replay_limit(rustgate_router::PositionReplayLimitConfig::new(
-            cli.position_replay_rate_per_sec,
-            cli.position_replay_burst,
+            cli.authz.position_replay_rate_per_sec,
+            cli.authz.position_replay_burst,
         ));
         // Issue #769: install the unknown-obligation rate limiter
         // with the metric callback so
@@ -1135,7 +1142,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // `message_dropped` helpers. When unset (the default), the slots
     // stay `None` and the routing hot path pays only an
     // `ArcSwap::load` + `is_none` check per recipient.
-    if cli.audit_delivery {
+    if cli.observability.audit_delivery {
         router.set_on_message_delivered(Some(std::sync::Arc::new(
             |source_cn, dest_cn, msg_uid, msg_type, group, entity_kind, trace_id| {
                 // entity_kind closes #847; trace_id closes #852 PR-C
@@ -1246,9 +1253,11 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
     // ── Cross-path deduplication ───────────────────────────────────
     #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
-    if let Some(mut dedup) =
-        rustgate_router::DedupCache::from_secs(cli.dedup_window_secs, cli.dedup_cache_size)
-            .map(|d| d.with_cross_tenant(cli.dedup_cross_tenant))
+    if let Some(mut dedup) = rustgate_router::DedupCache::from_secs(
+        cli.dedup.dedup_window_secs,
+        cli.dedup.dedup_cache_size,
+    )
+    .map(|d| d.with_cross_tenant(cli.dedup.dedup_cross_tenant))
     {
         #[cfg(feature = "metrics")]
         {
@@ -1260,10 +1269,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             }));
         }
         router.set_dedup(Some(dedup));
-        if cli.dedup_cross_tenant {
+        if cli.dedup.dedup_cross_tenant {
             tracing::warn!(
-                window_secs = cli.dedup_window_secs,
-                cache_size = cli.dedup_cache_size,
+                window_secs = cli.dedup.dedup_window_secs,
+                cache_size = cli.dedup.dedup_cache_size,
                 "cross-path message deduplication enabled WITHOUT tenant \
                  isolation (--dedup-cross-tenant); cross-tenant timing \
                  side-channel is open (issue #722) — only use in \
@@ -1272,8 +1281,8 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             );
         } else {
             tracing::info!(
-                window_secs = cli.dedup_window_secs,
-                cache_size = cli.dedup_cache_size,
+                window_secs = cli.dedup.dedup_window_secs,
+                cache_size = cli.dedup.dedup_cache_size,
                 "cross-path message deduplication enabled (tenant-isolated)"
             );
         }
@@ -1286,16 +1295,16 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // can use the same code path. The polling watcher is only spawned when
     // `acl_reload_interval > 0`.
     let mut acl_reloader_handle: Option<Arc<rustgate_admin::AclReloader>> = None;
-    if let Some(ref acl_file) = cli.group_acl_file {
+    if let Some(ref acl_file) = cli.authz.group_acl_file {
         let initial_hash =
             acl_file_hash.unwrap_or_else(|| rustgate_admin::AclReloader::compute_hash(b""));
         let reloader =
             rustgate_admin::AclReloader::new(acl_file.clone(), Arc::clone(&router), initial_hash);
-        if cli.acl_reload_interval > 0 {
-            let interval = Duration::from_secs(cli.acl_reload_interval);
+        if cli.authz.acl_reload_interval > 0 {
+            let interval = Duration::from_secs(cli.authz.acl_reload_interval);
             reloader.spawn_watcher(interval);
             tracing::info!(
-                interval_secs = cli.acl_reload_interval,
+                interval_secs = cli.authz.acl_reload_interval,
                 path = %acl_file,
                 "ACL hot-reload enabled"
             );
@@ -1313,14 +1322,14 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // set, in which case we log a warning and continue without any
     // engine installed). On success, install the engine on the router,
     // wire the metrics observer, and spawn the polling reloader.
-    if let Some(ref authz_path) = cli.authz_policy_file {
+    if let Some(ref authz_path) = cli.authz.authz_policy_file {
         let path = std::path::PathBuf::from(authz_path);
 
         // Cedar backend selection is mutually exclusive with the native
         // reloader path: the native polling watcher assumes a
         // `NativeEngine`, so Cedar loads once at startup without
         // hot-reload. Future follow-up can generalize the reloader.
-        match cli.authz_policy_format {
+        match cli.authz.authz_policy_format {
             crate::cli::AuthzPolicyFormat::Cedar => {
                 #[cfg(feature = "cedar")]
                 {
@@ -1345,7 +1354,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                                 "authz policy loaded"
                             );
                         }
-                        Err(e) if cli.authz_fail_open => {
+                        Err(e) if cli.authz.authz_fail_open => {
                             rustgate_core::audit::authz_reload_failed(
                                 authz_path,
                                 "startup",
@@ -1405,7 +1414,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                         "authz policy loaded"
                     );
 
-                    let interval = Duration::from_secs(cli.authz_reload_interval);
+                    let interval = Duration::from_secs(cli.authz.authz_reload_interval);
                     let _reloader = authz_reloader::spawn_authz_reloader(
                         Arc::clone(&router),
                         path,
@@ -1448,12 +1457,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                         });
                     }
                     tracing::info!(
-                        interval_secs = cli.authz_reload_interval,
+                        interval_secs = cli.authz.authz_reload_interval,
                         path = %authz_path,
                         "authz hot-reload enabled"
                     );
                 }
-                Err(e) if cli.authz_fail_open => {
+                Err(e) if cli.authz.authz_fail_open => {
                     rustgate_core::audit::authz_reload_failed(
                         authz_path,
                         "startup",
@@ -1484,7 +1493,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                     // the engine in.
                     #[cfg(feature = "metrics")]
                     router.set_authz_observer(Some(Arc::new(metrics::observe_authz_event)));
-                    let interval = Duration::from_secs(cli.authz_reload_interval);
+                    let interval = Duration::from_secs(cli.authz.authz_reload_interval);
                     let _reloader = authz_reloader::spawn_authz_reloader(
                         Arc::clone(&router),
                         path,
@@ -1492,7 +1501,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                         interval,
                     );
                     tracing::info!(
-                        interval_secs = cli.authz_reload_interval,
+                        interval_secs = cli.authz.authz_reload_interval,
                         path = %authz_path,
                         "authz hot-reload enabled (fail-open retry)"
                     );
@@ -1515,7 +1524,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // persist mutations to.
     #[cfg(feature = "metrics")]
     {
-        match (&cli.group_acl_file, &cli.acl_api_token_file) {
+        match (&cli.authz.group_acl_file, &cli.authz.acl_api_token_file) {
             (Some(acl_file), Some(token_file)) => {
                 // Routed through the shared `read_secret_file` helper so
                 // the ACL API token file is now subject to the unified
@@ -1763,7 +1772,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(feature = "federation")]
     let fed_peer_reloader: Option<Arc<federation_reloader::FederationPeerReloader>> =
         if let (Some(peers_path), Some(rwlock)) = (
-            cli.federation_peers_file.as_ref(),
+            cli.federation.federation_peers_file.as_ref(),
             fed_shutdown_handle.as_ref(),
         ) {
             let initial = std::fs::read(peers_path).unwrap_or_default();
@@ -1773,10 +1782,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 Arc::clone(rwlock),
                 initial_hash,
             );
-            if cli.federation_peers_reload_interval > 0 {
-                reloader.spawn_watcher(Duration::from_secs(cli.federation_peers_reload_interval));
+            if cli.federation.federation_peers_reload_interval > 0 {
+                reloader.spawn_watcher(Duration::from_secs(
+                    cli.federation.federation_peers_reload_interval,
+                ));
                 tracing::info!(
-                    interval_secs = cli.federation_peers_reload_interval,
+                    interval_secs = cli.federation.federation_peers_reload_interval,
                     path = %peers_path,
                     "federation peer hot-reload enabled"
                 );
@@ -1800,7 +1811,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         } else {
             // Federation disabled at runtime — warn if the flag was set.
             use crate::cli::PeerDiscoveryBackend;
-            if cli.federation_peer_discovery != PeerDiscoveryBackend::None {
+            if cli.federation.federation_peer_discovery != PeerDiscoveryBackend::None {
                 tracing::warn!(
                     "--federation-peer-discovery requires federation to be configured; ignoring"
                 );
@@ -1842,7 +1853,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // `Cli::validate`, so a parse failure here means the validator
     // missed a case — bail rather than silently skip.
     let default_classification: Option<rustgate_core::classification::ClassificationMarking> =
-        match cli.default_classification.as_ref() {
+        match cli.authz.default_classification.as_ref() {
             Some(banner) => Some(banner.parse().map_err(|e| {
                 anyhow::anyhow!(
                     "--default-classification ({banner:?}) parse failed at startup: {e}"
@@ -1852,10 +1863,11 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         };
 
     // ── Anti-replay filter ─────────────────────────────────────────
-    let replay_filter = rustgate_router::ReplayFilter::from_secs(cli.replay_window).map(Arc::new);
+    let replay_filter =
+        rustgate_router::ReplayFilter::from_secs(cli.ratelimit.replay_window).map(Arc::new);
     if replay_filter.is_some() {
         tracing::info!(
-            window_secs = cli.replay_window,
+            window_secs = cli.ratelimit.replay_window,
             "anti-replay detection enabled"
         );
     }
@@ -1897,7 +1909,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
     // ── CoT event archival ──────────────────────────────────────────
     let archive_key_ring: Option<Arc<rustgate_archive::encrypted::KeyRing>> =
-        if let Some(ref kp) = cli.archive_key_file {
+        if let Some(ref kp) = cli.archive.archive_key_file {
             Some(Arc::new(
                 rustgate_archive::encrypted::KeyRing::load(kp)
                     .map_err(|e| anyhow::anyhow!("failed to load archive key file: {e}"))?,
@@ -1906,7 +1918,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             None
         };
 
-    let archiver = if let Some(ref dir) = cli.archive_dir {
+    let archiver = if let Some(ref dir) = cli.archive.archive_dir {
         if let Some(ref ring) = archive_key_ring {
             tracing::info!(
                 dir = %dir,
@@ -1926,8 +1938,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     };
 
     // ── CoT archive retention / rotation ───────────────────────────
-    let archive_rotation_handle = if let Some(ref dir) = cli.archive_dir
-        && (cli.archive_max_size > 0 || cli.archive_max_age > 0 || cli.archive_max_active_bytes > 0)
+    let archive_rotation_handle = if let Some(ref dir) = cli.archive.archive_dir
+        && (cli.archive.archive_max_size > 0
+            || cli.archive.archive_max_age > 0
+            || cli.archive.archive_max_active_bytes > 0)
     {
         // Surface the per-pass `bytes_after` count to the existing
         // `rustgate_archive_bytes` Prometheus gauge via the
@@ -1943,22 +1957,22 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
 
         let cfg = rustgate_archive::RotationConfig {
             dir: std::path::PathBuf::from(dir),
-            max_bytes: cli.archive_max_size,
-            max_active_bytes: cli.archive_max_active_bytes,
-            max_age: std::time::Duration::from_secs(cli.archive_max_age),
+            max_bytes: cli.archive.archive_max_size,
+            max_active_bytes: cli.archive.archive_max_active_bytes,
+            max_age: std::time::Duration::from_secs(cli.archive.archive_max_age),
             // `cli.validate()` enforces `archive_rotate_interval >= 60` when
             // rotation is enabled (F-69), so the `.max(1)` defense here is
             // redundant — the value is already safe at this point.
-            interval: std::time::Duration::from_secs(cli.archive_rotate_interval),
+            interval: std::time::Duration::from_secs(cli.archive.archive_rotate_interval),
             archiver: archiver.clone(),
             on_stats,
         };
         tracing::info!(
             dir = %dir,
-            max_bytes = cli.archive_max_size,
-            max_active_bytes = cli.archive_max_active_bytes,
-            max_age_secs = cli.archive_max_age,
-            interval_secs = cli.archive_rotate_interval,
+            max_bytes = cli.archive.archive_max_size,
+            max_active_bytes = cli.archive.archive_max_active_bytes,
+            max_age_secs = cli.archive.archive_max_age,
+            interval_secs = cli.archive.archive_rotate_interval,
             "CoT archive rotation enabled",
         );
         Some(rustgate_archive::spawn(cfg))
@@ -2045,7 +2059,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // request, so setting it this late is race-free.
     #[cfg(feature = "metrics")]
     {
-        if let Some(ref token_file) = cli.mgmt_api_token_file {
+        if let Some(ref token_file) = cli.authz.mgmt_api_token_file {
             // Closes #797: route through the shared `read_secret_file`
             // helper so the management API token file is subject to the
             // unified perm/size/empty/UTF-8 discipline. The helper is
@@ -2076,7 +2090,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             // side-effects.
             let cert_for_reload = cert_reloader.clone();
             let acl_for_reload = acl_reloader_handle.clone();
-            let crl_path_for_reload = cli.crl.clone();
+            let crl_path_for_reload = cli.tls.crl.clone();
             #[cfg(feature = "ocsp")]
             let ocsp_for_reload = ocsp_stapler.clone();
             #[cfg(feature = "federation")]
@@ -2125,7 +2139,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             let api_state = Arc::new(mgmt_api::MgmtApiState {
                 router: Arc::clone(&router),
                 cert_reloader: cert_reloader.as_ref().map(Arc::clone),
-                crl_path: cli.crl.as_ref().map(std::path::PathBuf::from),
+                crl_path: cli.tls.crl.as_ref().map(std::path::PathBuf::from),
                 reload: reload_fn,
                 #[cfg(feature = "http")]
                 http_publisher: _http_publisher.clone(),
@@ -2161,7 +2175,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             {
                 let mgmt_token_clone = token_str.as_bytes().to_vec();
                 let providers = build_management_api_providers(&cli, &router);
-                let audit_log_path = cli.audit_log.as_ref().and_then(|s| {
+                let audit_log_path = cli.observability.audit_log.as_ref().and_then(|s| {
                     if s == "stdout" {
                         None
                     } else {
@@ -2210,7 +2224,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     {
         let cert_for_hup = cert_reloader.clone();
         let acl_for_hup = acl_reloader_handle.clone();
-        let crl_path_for_hup = cli.crl.clone();
+        let crl_path_for_hup = cli.tls.crl.clone();
         #[cfg(feature = "ocsp")]
         let ocsp_for_hup = ocsp_stapler.clone();
         #[cfg(feature = "federation")]
@@ -2305,14 +2319,14 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                             throttle_config: tc,
                             archiver: arch,
                             replay_filter: rf,
-                            circuit_breaker_threshold: cli.circuit_breaker_threshold,
+                            circuit_breaker_threshold: cli.ratelimit.circuit_breaker_threshold,
                             delta_config: session::DeltaConfig {
-                                enabled: cli.cot_delta_encoding,
-                                cache_size: cli.cot_delta_cache_size,
-                                epsilon_meters: cli.cot_delta_epsilon_meters,
+                                enabled: cli.dedup.cot_delta_encoding,
+                                cache_size: cli.dedup.cot_delta_cache_size,
+                                epsilon_meters: cli.dedup.cot_delta_epsilon_meters,
                             },
                             negotiation_timeout: std::time::Duration::from_secs(
-                                cli.negotiation_timeout_secs,
+                                cli.limits.negotiation_timeout_secs,
                             ),
                             #[cfg(feature = "metrics")]
                             metrics_identity: Arc::clone(&metrics_identity),
@@ -2415,7 +2429,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let active = router.session_count().await;
     tracing::info!(
         sessions = active,
-        drain_timeout_secs = cli.shutdown_drain_timeout,
+        drain_timeout_secs = cli.limits.shutdown_drain_timeout,
         "draining connections"
     );
 
@@ -2426,7 +2440,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let closed = router.close_all_session_senders().await;
     tracing::debug!(closed_sessions = closed, "closed session outbound channels");
 
-    let drain_timeout = Duration::from_secs(cli.shutdown_drain_timeout);
+    let drain_timeout = Duration::from_secs(cli.limits.shutdown_drain_timeout);
     let drain = connection_limit.acquire_many(max_connections);
 
     match tokio::time::timeout(drain_timeout, drain).await {

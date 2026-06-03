@@ -7,7 +7,7 @@
 //! `FramingStrategy`.
 
 use clap::parser::ValueSource;
-use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rustgate_core::config::validate::{
     validate_non_empty as core_validate_non_empty, validate_path_exists as core_validate_path,
 };
@@ -108,33 +108,18 @@ fn validate_write_buffer_range(n: usize) -> Result<usize, String> {
     Ok(n)
 }
 
-#[derive(Parser, Serialize)]
-#[command(
-    name = "rustgate",
-    about = "Secure tactical message router",
-    version,
-    // Without this, clap enforces the top-level `--cert/--key/--ca`
-    // requirement even when the user is invoking a diagnostic
-    // subcommand that has no use for them (e.g. `rustgate cert-info
-    // foo.pem`). `subcommand_negates_reqs` tells clap to skip the
-    // parent's required-arg checks whenever any subcommand is
-    // supplied, which is exactly what every diagnostic wants.
-    subcommand_negates_reqs = true,
-)]
+// ── clap argument groups ───────────────────────────────────────────
+//
+// The server's CLI surface is large. Splitting it into `#[derive(clap::Args)]`
+// groups that are `#[command(flatten)]`-ed into `Cli` keeps each clap-derived
+// `augment_args` / `from_arg_matches` method a separate (small) stack frame —
+// the monolithic single-frame version overflowed libtest's ~2 MiB per-test
+// thread stack. `#[serde(flatten)]` preserves the flat TOML/`print-config`
+// surface so config-file keys and `RUSTGATE_*` env vars are unchanged.
+
+#[derive(Args, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) struct Cli {
-    /// Subcommand. When omitted, the server runs normally with the supplied flags.
-    #[command(subcommand)]
-    #[serde(skip)]
-    pub(crate) command: Option<Command>,
-
-    /// Path to a TOML configuration file. Settings are merged in the order
-    /// defaults -> file -> environment variables -> CLI flags. Command-line
-    /// flags always win.
-    #[arg(long, env = "RUSTGATE_CONFIG")]
-    #[serde(skip_serializing)]
-    pub(crate) config: Option<String>,
-
+pub(crate) struct TlsArgs {
     /// TCP socket address to bind the primary TLS listener on, as
     /// `<host>:<port>`. Use `0.0.0.0:<port>` to accept IPv4 on all
     /// interfaces and `[::]:<port>` to dual-bind IPv4 + IPv6.
@@ -333,7 +318,11 @@ pub(crate) struct Cli {
     /// to CRLs, which only refresh on a schedule.
     #[arg(long, default_value_t = false, env = "RUSTGATE_CLIENT_OCSP")]
     pub(crate) client_ocsp: bool,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct CodecArgs {
     /// Wire framing strategy applied to every accepted client session.
     /// `xml` (default) accepts raw CoT XML streams with depth tracking.
     /// `length-prefixed` reads a 4-byte big-endian length header before
@@ -351,7 +340,11 @@ pub(crate) struct Cli {
     /// for future codec-specific encoding overlays.
     #[arg(long, value_enum, default_value_t = Encoding::Raw, env = "RUSTGATE_ENCODING")]
     pub(crate) encoding: Encoding,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct NatsArgs {
     /// NATS server URL (enables NATS bridge when set). Requires --features nats.
     #[arg(long, env = "RUSTGATE_NATS_URL")]
     pub(crate) nats_url: Option<String>,
@@ -433,7 +426,11 @@ pub(crate) struct Cli {
     /// on restart instead of replaying the entire history stream.
     #[arg(long, env = "RUSTGATE_NATS_CHECKPOINT_PATH")]
     pub(crate) nats_checkpoint_path: Option<String>,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct IntegrationArgs {
     /// Path to TOML file configuring HTTP webhook/REST targets.
     /// Requires --features http.
     #[arg(long, env = "RUSTGATE_HTTP_CONFIG")]
@@ -456,6 +453,20 @@ pub(crate) struct Cli {
     #[arg(long, env = "RUSTGATE_OGC_SENSORTHINGS_CONFIG")]
     pub(crate) ogc_sensorthings_config_file: Option<String>,
 
+    /// Path to the TOML cross-domain guard config (`[guard]` block:
+    /// per-direction throughput caps, mandatory-marking switch, dedicated
+    /// audit-log path, deployment direction). When set, the guard is
+    /// installed on the router's egress chokepoint and every message
+    /// leaving the process toward an external sink is inspected at the
+    /// boundary; a denial drops the message and is audited. Requires the
+    /// `guard` build feature (#1457). When unset, no guard is installed.
+    #[arg(long, env = "RUSTGATE_GUARD_CONFIG")]
+    pub(crate) guard_config_file: Option<String>,
+}
+
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct EnrollmentArgs {
     /// Bind address for the enrollment HTTPS server (e.g. 0.0.0.0:8446).
     /// Requires --features enrollment.
     #[arg(long, env = "RUSTGATE_ENROLLMENT_BIND", value_parser = parse_socket_addr)]
@@ -521,7 +532,11 @@ pub(crate) struct Cli {
     /// Requires `--features est` and `--enrollment-bind`.
     #[arg(long, default_value_t = false, env = "RUSTGATE_EST_ENABLED")]
     pub(crate) est_enabled: bool,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct MetricsArgs {
     /// Bind address for the Prometheus metrics HTTP server (e.g. 127.0.0.1:9090).
     /// Defaults to localhost to prevent accidental network exposure.
     /// Requires --features metrics.
@@ -554,7 +569,11 @@ pub(crate) struct Cli {
     /// Maximum concurrent connections to the metrics HTTP server.
     #[arg(long, default_value_t = 128, env = "RUSTGATE_METRICS_MAX_CONNECTIONS")]
     pub(crate) metrics_max_connections: usize,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct LimitArgs {
     /// Maximum concurrent TLS sessions. Prevents resource exhaustion
     /// from connection floods.
     #[arg(long, default_value_t = 1024, env = "RUSTGATE_MAX_CONNECTIONS", value_parser = parse_max_connections)]
@@ -633,7 +652,11 @@ pub(crate) struct Cli {
         env = "RUSTGATE_BACKPRESSURE_RESUME_DWELL_MS"
     )]
     pub(crate) backpressure_resume_dwell_ms: u64,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct WebsocketArgs {
     /// Bind address for the WebSocket (wss://) listener (e.g. 0.0.0.0:8443).
     /// Requires --features websocket.
     #[arg(long, env = "RUSTGATE_WEBSOCKET_BIND", value_parser = parse_socket_addr)]
@@ -772,7 +795,11 @@ pub(crate) struct Cli {
     /// when `--ws-ping-interval-secs` is non-zero.
     #[arg(long, default_value_t = 0, env = "RUSTGATE_WS_PONG_TIMEOUT_SECS")]
     pub(crate) ws_pong_timeout_secs: u64,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct MqttArgs {
     // -- MQTT flags --
     /// Bind address for the MQTT (mqtts://) listener (e.g. 0.0.0.0:8883).
     /// Requires --features mqtt.
@@ -871,7 +898,11 @@ pub(crate) struct Cli {
         env = "RUSTGATE_MQTT_WILDCARD_POLICY"
     )]
     pub(crate) mqtt_wildcard_policy: MqttWildcardPolicy,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct MavlinkArgs {
     // -- MAVLink signing policy flags (F-72) --
     /// Require the MAVLink v2 SIGNED INCOMPAT bit on every accepted v2
     /// frame. Default `true` — unsigned v2 frames are rejected at the
@@ -948,17 +979,11 @@ pub(crate) struct Cli {
     /// client CN.
     #[arg(long, env = "RUSTGATE_MAVLINK_V1_FALLBACK_CN")]
     pub(crate) mavlink_v1_fallback_cn: Option<String>,
+}
 
-    /// Path to the TOML cross-domain guard config (`[guard]` block:
-    /// per-direction throughput caps, mandatory-marking switch, dedicated
-    /// audit-log path, deployment direction). When set, the guard is
-    /// installed on the router's egress chokepoint and every message
-    /// leaving the process toward an external sink is inspected at the
-    /// boundary; a denial drops the message and is audited. Requires the
-    /// `guard` build feature (#1457). When unset, no guard is installed.
-    #[arg(long, env = "RUSTGATE_GUARD_CONFIG")]
-    pub(crate) guard_config_file: Option<String>,
-
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct TacticalIngressArgs {
     // -- Tactical codec ingress (#1473) --
     /// Bind address for DIS (IEEE 1278.1) Entity State PDU input over UDP
     /// (e.g. 0.0.0.0:3000). WARNING: datagrams are UNAUTHENTICATED and NOT
@@ -1040,7 +1065,11 @@ pub(crate) struct Cli {
     /// Maximum concurrent synthetic VMF identities tracked.
     #[arg(long, default_value = "1024", env = "RUSTGATE_VMF_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
     pub(crate) vmf_max_identities: usize,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct PlaintextArgs {
     // -- Plaintext input flags --
     /// Bind address for plaintext TCP input (e.g. 0.0.0.0:8087).
     /// WARNING: connections are NOT encrypted. Use only on trusted networks.
@@ -1141,7 +1170,11 @@ pub(crate) struct Cli {
         env = "RUSTGATE_PLAINTEXT_GROUP"
     )]
     pub(crate) plaintext_group: String,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct FederationArgs {
     // -- Federation flags --
     /// V1 federation listen address (enables federation when set, e.g. 0.0.0.0:9000).
     /// Requires --features federation.
@@ -1399,58 +1432,17 @@ pub(crate) struct Cli {
         env = "RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_PREFIX"
     )]
     pub(crate) federation_peer_discovery_etcd_prefix: String,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct RateLimitArgs {
     // -- QoS / rate limiting --
     /// Sliding-window replay detection window in seconds. Messages with the same
     /// (uid, time) pair seen within this window are dropped as replays.
     /// Set to 0 to disable replay detection.
     #[arg(long, default_value_t = 300, env = "RUSTGATE_REPLAY_WINDOW")]
     pub(crate) replay_window: u64,
-
-    /// Cross-path deduplication window in seconds. When > 0, the router
-    /// suppresses duplicate messages that arrive via multiple ingress
-    /// paths (e.g. direct client + federation) within this window.
-    /// Disabled by default.
-    #[arg(long, default_value_t = 0, env = "RUSTGATE_DEDUP_WINDOW_SECS")]
-    pub(crate) dedup_window_secs: u64,
-
-    /// Maximum number of entries retained in the cross-path dedup cache.
-    /// Bounds memory usage; oldest entries are evicted in LRU order.
-    #[arg(long, default_value_t = 100_000, env = "RUSTGATE_DEDUP_CACHE_SIZE")]
-    pub(crate) dedup_cache_size: usize,
-
-    /// Opt into cross-tenant duplicate suppression. When `false` (the
-    /// default), the dedup key folds in the sender's tenant so a
-    /// message sent by tenant `A` CANNOT suppress a byte-identical
-    /// message sent by tenant `B`. Setting this to `true` forces the
-    /// tenant slot empty on every lookup, restoring the pre-#722
-    /// behaviour. **Unsafe in any multi-tenant deployment where
-    /// tenants do not fully trust each other** — it opens a timing
-    /// side-channel where a malicious tenant can probe for specific
-    /// messages in another tenant. Leave disabled unless you have a
-    /// concrete reason and have accepted the risk.
-    #[arg(long, default_value_t = false, env = "RUSTGATE_DEDUP_CROSS_TENANT")]
-    pub(crate) dedup_cross_tenant: bool,
-
-    /// Enable per-UID delta encoding for outbound CoT events on XML sessions.
-    /// When enabled, each writer task tracks the last-sent event per UID
-    /// and emits a compact `<delta>` wrapper carrying only the fields
-    /// that changed. Disabled by default. Applies only to XML-framed
-    /// sessions; protobuf sessions always receive full events.
-    #[arg(long, default_value_t = false, env = "RUSTGATE_COT_DELTA_ENCODING")]
-    pub(crate) cot_delta_encoding: bool,
-
-    /// Per-session LRU cache capacity for the CoT delta encoder (entries).
-    /// Oldest UIDs are evicted first; the next event for an evicted UID
-    /// is emitted as a full event.
-    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u64).range(1..), env = "RUSTGATE_COT_DELTA_CACHE_SIZE")]
-    pub(crate) cot_delta_cache_size: u64,
-
-    /// Ground distance in meters below which position-only CoT updates
-    /// are suppressed entirely. Set to `0` to disable suppression and
-    /// ship every event (either full or delta, never suppressed).
-    #[arg(long, default_value_t = 1.0, env = "RUSTGATE_COT_DELTA_EPSILON_METERS")]
-    pub(crate) cot_delta_epsilon_meters: f64,
 
     /// Maximum sustained messages per second per connected client (0 = disabled).
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CLIENT_MSG_RATE")]
@@ -1466,7 +1458,11 @@ pub(crate) struct Cli {
     /// Set to 0 to disable the circuit breaker.
     #[arg(long, default_value_t = 10, env = "RUSTGATE_CIRCUIT_BREAKER_THRESHOLD")]
     pub(crate) circuit_breaker_threshold: u32,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct AuthzArgs {
     /// Path to JSON file containing group access control rules.
     /// When set, per-group send/receive permissions are enforced at
     /// router dispatch time. Groups not listed in the file operate in
@@ -1617,7 +1613,11 @@ pub(crate) struct Cli {
     /// issued to narrower scrape/polling jobs than the ACL write token.
     #[arg(long, env = "RUSTGATE_MGMT_API_TOKEN_FILE")]
     pub(crate) mgmt_api_token_file: Option<String>,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct ArchiveArgs {
     // -- Data retention / archival --
     /// Directory for CoT event archival (JSONL). Enables structured logging of
     /// all received CoT events to date-stamped files.
@@ -1671,7 +1671,11 @@ pub(crate) struct Cli {
     /// this are eligible for cleanup. 0 = no expiration.
     #[arg(long, default_value_t = 0, env = "RUSTGATE_PACKAGE_MAX_AGE_HOURS")]
     pub(crate) package_max_age_hours: u64,
+}
 
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct ObservabilityArgs {
     // -- Observability --
     /// Write audit events as JSON lines to a dedicated file. When set,
     /// audit events (target="audit") are written to this file in addition
@@ -1789,6 +1793,138 @@ pub(crate) struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub(crate) otlp_metrics_interval: u64,
+}
+
+#[derive(Args, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct DedupArgs {
+    /// Cross-path deduplication window in seconds. When > 0, the router
+    /// suppresses duplicate messages that arrive via multiple ingress
+    /// paths (e.g. direct client + federation) within this window.
+    /// Disabled by default.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_DEDUP_WINDOW_SECS")]
+    pub(crate) dedup_window_secs: u64,
+
+    /// Maximum number of entries retained in the cross-path dedup cache.
+    /// Bounds memory usage; oldest entries are evicted in LRU order.
+    #[arg(long, default_value_t = 100_000, env = "RUSTGATE_DEDUP_CACHE_SIZE")]
+    pub(crate) dedup_cache_size: usize,
+
+    /// Opt into cross-tenant duplicate suppression. When `false` (the
+    /// default), the dedup key folds in the sender's tenant so a
+    /// message sent by tenant `A` CANNOT suppress a byte-identical
+    /// message sent by tenant `B`. Setting this to `true` forces the
+    /// tenant slot empty on every lookup, restoring the pre-#722
+    /// behaviour. **Unsafe in any multi-tenant deployment where
+    /// tenants do not fully trust each other** — it opens a timing
+    /// side-channel where a malicious tenant can probe for specific
+    /// messages in another tenant. Leave disabled unless you have a
+    /// concrete reason and have accepted the risk.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_DEDUP_CROSS_TENANT")]
+    pub(crate) dedup_cross_tenant: bool,
+
+    /// Enable per-UID delta encoding for outbound CoT events on XML sessions.
+    /// When enabled, each writer task tracks the last-sent event per UID
+    /// and emits a compact `<delta>` wrapper carrying only the fields
+    /// that changed. Disabled by default. Applies only to XML-framed
+    /// sessions; protobuf sessions always receive full events.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_COT_DELTA_ENCODING")]
+    pub(crate) cot_delta_encoding: bool,
+
+    /// Per-session LRU cache capacity for the CoT delta encoder (entries).
+    /// Oldest UIDs are evicted first; the next event for an evicted UID
+    /// is emitted as a full event.
+    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u64).range(1..), env = "RUSTGATE_COT_DELTA_CACHE_SIZE")]
+    pub(crate) cot_delta_cache_size: u64,
+
+    /// Ground distance in meters below which position-only CoT updates
+    /// are suppressed entirely. Set to `0` to disable suppression and
+    /// ship every event (either full or delta, never suppressed).
+    #[arg(long, default_value_t = 1.0, env = "RUSTGATE_COT_DELTA_EPSILON_METERS")]
+    pub(crate) cot_delta_epsilon_meters: f64,
+}
+
+#[derive(Parser, Serialize)]
+#[command(
+    name = "rustgate",
+    about = "Secure tactical message router",
+    version,
+    // Without this, clap enforces the top-level `--cert/--key/--ca`
+    // requirement even when the user is invoking a diagnostic
+    // subcommand that has no use for them (e.g. `rustgate cert-info
+    // foo.pem`). `subcommand_negates_reqs` tells clap to skip the
+    // parent's required-arg checks whenever any subcommand is
+    // supplied, which is exactly what every diagnostic wants.
+    subcommand_negates_reqs = true,
+)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct Cli {
+    /// Subcommand. When omitted, the server runs normally with the supplied flags.
+    #[command(subcommand)]
+    #[serde(skip)]
+    pub(crate) command: Option<Command>,
+
+    /// Path to a TOML configuration file. Settings are merged in the order
+    /// defaults -> file -> environment variables -> CLI flags. Command-line
+    /// flags always win.
+    #[arg(long, env = "RUSTGATE_CONFIG")]
+    #[serde(skip_serializing)]
+    pub(crate) config: Option<String>,
+
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) tls: TlsArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) codec: CodecArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) nats: NatsArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) integrations: IntegrationArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) enrollment: EnrollmentArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) metrics: MetricsArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) limits: LimitArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) websocket: WebsocketArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) mqtt: MqttArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) mavlink: MavlinkArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) ingress: TacticalIngressArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) plaintext: PlaintextArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) federation: FederationArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) ratelimit: RateLimitArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) authz: AuthzArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) archive: ArchiveArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) observability: ObservabilityArgs,
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub(crate) dedup: DedupArgs,
 }
 
 /// Top-level subcommands. The default (no subcommand) runs the server.
@@ -2265,8 +2401,14 @@ pub(crate) fn build_codec(
 /// directly onto CLI flag names in kebab-case (hyphens preserved) via
 /// `serde(rename_all = "kebab-case")`.
 macro_rules! define_config_file {
-    ( $( $field:ident : $ty:ty ),* $(,)? ) => {
+    ( $( $field:ident in $group:ident : $ty:ty ),* $(,)? ) => {
         /// All-optional mirror of [`Cli`] used for TOML deserialization.
+        ///
+        /// Stays a single flat struct (one key per CLI flag) even though
+        /// [`Cli`] now groups its flags into `#[command(flatten)]`
+        /// sub-structs — the `in <group>` tag only routes the merge below
+        /// to the right sub-struct field. TOML keys and `generate-config`
+        /// output are therefore unchanged.
         #[derive(Debug, Default, Deserialize, Serialize)]
         #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
         #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
@@ -2283,7 +2425,7 @@ macro_rules! define_config_file {
                     if let Some(v) = self.$field
                         && matches!(matches.value_source(stringify!($field)), Some(ValueSource::DefaultValue) | None)
                     {
-                        cli.$field = v;
+                        cli.$group.$field = v;
                     }
                 )*
             }
@@ -2300,200 +2442,200 @@ macro_rules! define_config_file {
 }
 
 define_config_file! {
-    bind: String,
-    cert: String,
-    key: String,
-    ca: String,
-    crl: Option<String>,
-    tls_min_version: String,
-    crl_warn_stale: bool,
-    fips_required: bool,
-    air_gap: bool,
-    prefer_post_quantum: bool,
-    kx_groups: Option<String>,
-    cnsa2: bool,
-    cert_reload_interval: u64,
-    ocsp_stapling: bool,
-    spiffe: bool,
-    spiffe_workload_api_socket: String,
-    spiffe_trust_domain: Option<String>,
-    spiffe_refresh_interval: u64,
-    client_ocsp: bool,
-    framing: Framing,
-    encoding: Encoding,
-    nats_url: Option<String>,
-    nats_credentials: Option<String>,
-    nats_tls_cert: Option<std::path::PathBuf>,
-    nats_tls_key: Option<std::path::PathBuf>,
-    nats_tls_ca: Option<std::path::PathBuf>,
-    nats_tls_required: bool,
-    nats_subscription_capacity: usize,
-    nats_live_stream: String,
-    nats_max_ack_pending: i64,
-    nats_max_deliver: i64,
-    nats_dead_letter_subject: Option<String>,
-    nats_checkpoint_path: Option<String>,
-    http_config_file: Option<String>,
-    lattice_config_file: Option<String>,
-    ogc_sensorthings_config_file: Option<String>,
-    enrollment_bind: Option<String>,
-    ca_key: Option<String>,
-    enrollment_user: Option<String>,
-    enrollment_password: Option<String>,
-    ca_organization: String,
-    enrollment_rate_limit: u32,
-    data_package_dir: Option<String>,
-    package_signature_ca: Option<String>,
-    package_strict_signatures: bool,
-    revocation_db: Option<String>,
-    crl_validity_days: u32,
-    est_enabled: bool,
-    metrics_bind: Option<String>,
-    metrics_token_file: Option<String>,
-    metrics_per_identity: bool,
-    metrics_identity_allowlist: Option<std::path::PathBuf>,
-    metrics_max_connections: usize,
-    max_connections: usize,
-    shutdown_drain_timeout: u64,
-    max_concurrent_handshakes: usize,
-    negotiation_timeout_secs: u64,
-    max_queued_bytes: usize,
-    max_queued_bytes_low_water: Option<usize>,
-    backpressure_resume_dwell_ms: u64,
-    websocket_bind: Option<String>,
-    ws_max_frames_per_sec: u32,
-    ws_max_bytes_per_sec: u64,
-    ws_max_violations: u32,
-    ws_max_write_buffer_bytes: usize,
-    ws_max_frame_size: usize,
-    ws_max_message_size: usize,
-    ws_rate_limit_max: usize,
-    ws_rate_limit_window_secs: u64,
-    ws_subprotocols: Vec<String>,
-    ws_subprotocol_strict: bool,
-    ws_compression_disabled: bool,
-    ws_ping_interval_secs: u64,
-    ws_pong_timeout_secs: u64,
-    mqtt_bind: Option<String>,
-    mqtt_topic_prefix: Option<String>,
-    mqtt_max_packet_size: usize,
-    mqtt_receive_max: u16,
-    mqtt_topic_alias_max: u16,
-    mqtt_max_session_expiry_secs: u32,
-    mqtt_max_retained_sessions: usize,
-    mqtt_min_keep_alive_secs: u16,
-    mqtt_server_keep_alive_secs: u16,
-    mqtt_response_channel_capacity: usize,
-    mqtt_wildcard_policy: MqttWildcardPolicy,
-    mavlink_require_signing: bool,
-    mavlink_allow_v1: bool,
-    mavlink_bind: Option<String>,
-    mavlink_tcp_bind: Option<String>,
-    mavlink_group: Option<String>,
-    mavlink_signing_key_file: Option<String>,
-    mavlink_pq_bootstrap_file: Option<String>,
-    mavlink_v1_fallback_cn: Option<String>,
-    guard_config_file: Option<String>,
-    dis_bind: Option<String>,
-    dis_group: String,
-    dis_rate_limit_pps: u32,
-    dis_allowed_cidrs: Option<String>,
-    dis_max_identities: usize,
-    asterix_bind: Option<String>,
-    asterix_group: String,
-    asterix_rate_limit_pps: u32,
-    asterix_allowed_cidrs: Option<String>,
-    asterix_max_identities: usize,
-    vmf_bind: Option<String>,
-    vmf_group: String,
-    vmf_rate_limit_pps: u32,
-    vmf_allowed_cidrs: Option<String>,
-    vmf_max_identities: usize,
-    tcp_bind: Option<String>,
-    udp_bind: Option<String>,
-    udp_rate_limit: u32,
-    udp_allowed_cidrs: Option<String>,
-    udp_max_identities: usize,
-    udp_multicast_groups: Option<String>,
-    udp_multicast_interface: String,
-    udp_multicast_loop: bool,
-    udp_multicast_ttl: u32,
-    udp_multicast_rebroadcast: bool,
-    udp_multicast_max_bps: u64,
-    plaintext_cn: String,
-    plaintext_group: String,
-    federation_v1_bind: Option<String>,
-    federation_v2_bind: Option<String>,
-    federation_id: String,
-    federation_peers_file: Option<String>,
-    federation_peers_reload_interval: u64,
-    federation_skip_hostname_verify: bool,
-    federation_max_hops: u8,
-    federation_store_path: Option<String>,
-    federation_trust_store_dir: Option<String>,
-    federation_circuit_breaker_threshold: u32,
-    federation_circuit_breaker_timeout: u64,
-    federation_replay_buffer_size: usize,
-    federation_replay_dir: Option<std::path::PathBuf>,
-    federation_replay_max_bytes: u64,
-    federation_max_groups_per_peer: usize,
-    federation_max_group_name_length: usize,
-    federation_trust_peer_groups: bool,
-    federation_ha_nats_url: Option<String>,
-    federation_pod_id: Option<String>,
-    federation_region: Option<String>,
-    federation_peer_discovery: PeerDiscoveryBackend,
-    federation_peer_discovery_interval: u64,
-    federation_peer_discovery_dns_sd_service: String,
-    federation_peer_discovery_consul_addr: String,
-    federation_peer_discovery_consul_service: String,
-    federation_peer_discovery_etcd_endpoints: String,
-    federation_peer_discovery_etcd_prefix: String,
-    jwks_pending_window_secs: u64,
-    jwks_retiring_window_secs: u64,
-    replay_window: u64,
-    client_message_rate: u32,
-    client_burst: u32,
-    circuit_breaker_threshold: u32,
-    group_acl_file: Option<String>,
-    acl_reload_interval: u64,
-    authz_policy_file: Option<String>,
-    authz_policy_format: AuthzPolicyFormat,
-    authz_reload_interval: u64,
-    authz_fail_open: bool,
-    authz_allow_unknown_obligations: bool,
-    require_classification_marking: bool,
-    default_classification: Option<String>,
-    position_replay_rate_per_sec: u32,
-    position_replay_burst: u32,
-    tenant_quota_file: Option<std::path::PathBuf>,
-    acl_api_token_file: Option<String>,
-    mgmt_api_token_file: Option<String>,
-    archive_dir: Option<String>,
-    archive_key_file: Option<std::path::PathBuf>,
-    archive_max_size: u64,
-    archive_max_age: u64,
-    archive_max_active_bytes: u64,
-    archive_rotate_interval: u64,
-    package_max_age_hours: u64,
-    audit_log: Option<String>,
-    audit_allow_chain_break: bool,
-    access_log: Option<String>,
-    audit_delivery: bool,
-    client_queue_dir: Option<std::path::PathBuf>,
-    client_queue_max_bytes: u64,
-    client_queue_key_file: Option<std::path::PathBuf>,
-    client_queue_wipe_on_start: bool,
-    otel_endpoint: Option<String>,
-    otel_service_name: String,
-    otlp_metrics: bool,
-    otlp_metrics_interval: u64,
-    dedup_window_secs: u64,
-    dedup_cache_size: usize,
-    dedup_cross_tenant: bool,
-    cot_delta_encoding: bool,
-    cot_delta_cache_size: u64,
-    cot_delta_epsilon_meters: f64,
+    bind in tls: String,
+    cert in tls: String,
+    key in tls: String,
+    ca in tls: String,
+    crl in tls: Option<String>,
+    tls_min_version in tls: String,
+    crl_warn_stale in tls: bool,
+    fips_required in tls: bool,
+    air_gap in tls: bool,
+    prefer_post_quantum in tls: bool,
+    kx_groups in tls: Option<String>,
+    cnsa2 in tls: bool,
+    cert_reload_interval in tls: u64,
+    ocsp_stapling in tls: bool,
+    spiffe in tls: bool,
+    spiffe_workload_api_socket in tls: String,
+    spiffe_trust_domain in tls: Option<String>,
+    spiffe_refresh_interval in tls: u64,
+    client_ocsp in tls: bool,
+    framing in codec: Framing,
+    encoding in codec: Encoding,
+    nats_url in nats: Option<String>,
+    nats_credentials in nats: Option<String>,
+    nats_tls_cert in nats: Option<std::path::PathBuf>,
+    nats_tls_key in nats: Option<std::path::PathBuf>,
+    nats_tls_ca in nats: Option<std::path::PathBuf>,
+    nats_tls_required in nats: bool,
+    nats_subscription_capacity in nats: usize,
+    nats_live_stream in nats: String,
+    nats_max_ack_pending in nats: i64,
+    nats_max_deliver in nats: i64,
+    nats_dead_letter_subject in nats: Option<String>,
+    nats_checkpoint_path in nats: Option<String>,
+    http_config_file in integrations: Option<String>,
+    lattice_config_file in integrations: Option<String>,
+    ogc_sensorthings_config_file in integrations: Option<String>,
+    enrollment_bind in enrollment: Option<String>,
+    ca_key in enrollment: Option<String>,
+    enrollment_user in enrollment: Option<String>,
+    enrollment_password in enrollment: Option<String>,
+    ca_organization in enrollment: String,
+    enrollment_rate_limit in enrollment: u32,
+    data_package_dir in enrollment: Option<String>,
+    package_signature_ca in enrollment: Option<String>,
+    package_strict_signatures in enrollment: bool,
+    revocation_db in enrollment: Option<String>,
+    crl_validity_days in enrollment: u32,
+    est_enabled in enrollment: bool,
+    metrics_bind in metrics: Option<String>,
+    metrics_token_file in metrics: Option<String>,
+    metrics_per_identity in metrics: bool,
+    metrics_identity_allowlist in metrics: Option<std::path::PathBuf>,
+    metrics_max_connections in metrics: usize,
+    max_connections in limits: usize,
+    shutdown_drain_timeout in limits: u64,
+    max_concurrent_handshakes in limits: usize,
+    negotiation_timeout_secs in limits: u64,
+    max_queued_bytes in limits: usize,
+    max_queued_bytes_low_water in limits: Option<usize>,
+    backpressure_resume_dwell_ms in limits: u64,
+    websocket_bind in websocket: Option<String>,
+    ws_max_frames_per_sec in websocket: u32,
+    ws_max_bytes_per_sec in websocket: u64,
+    ws_max_violations in websocket: u32,
+    ws_max_write_buffer_bytes in websocket: usize,
+    ws_max_frame_size in websocket: usize,
+    ws_max_message_size in websocket: usize,
+    ws_rate_limit_max in websocket: usize,
+    ws_rate_limit_window_secs in websocket: u64,
+    ws_subprotocols in websocket: Vec<String>,
+    ws_subprotocol_strict in websocket: bool,
+    ws_compression_disabled in websocket: bool,
+    ws_ping_interval_secs in websocket: u64,
+    ws_pong_timeout_secs in websocket: u64,
+    mqtt_bind in mqtt: Option<String>,
+    mqtt_topic_prefix in mqtt: Option<String>,
+    mqtt_max_packet_size in mqtt: usize,
+    mqtt_receive_max in mqtt: u16,
+    mqtt_topic_alias_max in mqtt: u16,
+    mqtt_max_session_expiry_secs in mqtt: u32,
+    mqtt_max_retained_sessions in mqtt: usize,
+    mqtt_min_keep_alive_secs in mqtt: u16,
+    mqtt_server_keep_alive_secs in mqtt: u16,
+    mqtt_response_channel_capacity in mqtt: usize,
+    mqtt_wildcard_policy in mqtt: MqttWildcardPolicy,
+    mavlink_require_signing in mavlink: bool,
+    mavlink_allow_v1 in mavlink: bool,
+    mavlink_bind in mavlink: Option<String>,
+    mavlink_tcp_bind in mavlink: Option<String>,
+    mavlink_group in mavlink: Option<String>,
+    mavlink_signing_key_file in mavlink: Option<String>,
+    mavlink_pq_bootstrap_file in mavlink: Option<String>,
+    mavlink_v1_fallback_cn in mavlink: Option<String>,
+    guard_config_file in integrations: Option<String>,
+    dis_bind in ingress: Option<String>,
+    dis_group in ingress: String,
+    dis_rate_limit_pps in ingress: u32,
+    dis_allowed_cidrs in ingress: Option<String>,
+    dis_max_identities in ingress: usize,
+    asterix_bind in ingress: Option<String>,
+    asterix_group in ingress: String,
+    asterix_rate_limit_pps in ingress: u32,
+    asterix_allowed_cidrs in ingress: Option<String>,
+    asterix_max_identities in ingress: usize,
+    vmf_bind in ingress: Option<String>,
+    vmf_group in ingress: String,
+    vmf_rate_limit_pps in ingress: u32,
+    vmf_allowed_cidrs in ingress: Option<String>,
+    vmf_max_identities in ingress: usize,
+    tcp_bind in plaintext: Option<String>,
+    udp_bind in plaintext: Option<String>,
+    udp_rate_limit in plaintext: u32,
+    udp_allowed_cidrs in plaintext: Option<String>,
+    udp_max_identities in plaintext: usize,
+    udp_multicast_groups in plaintext: Option<String>,
+    udp_multicast_interface in plaintext: String,
+    udp_multicast_loop in plaintext: bool,
+    udp_multicast_ttl in plaintext: u32,
+    udp_multicast_rebroadcast in plaintext: bool,
+    udp_multicast_max_bps in plaintext: u64,
+    plaintext_cn in plaintext: String,
+    plaintext_group in plaintext: String,
+    federation_v1_bind in federation: Option<String>,
+    federation_v2_bind in federation: Option<String>,
+    federation_id in federation: String,
+    federation_peers_file in federation: Option<String>,
+    federation_peers_reload_interval in federation: u64,
+    federation_skip_hostname_verify in federation: bool,
+    federation_max_hops in federation: u8,
+    federation_store_path in federation: Option<String>,
+    federation_trust_store_dir in federation: Option<String>,
+    federation_circuit_breaker_threshold in federation: u32,
+    federation_circuit_breaker_timeout in federation: u64,
+    federation_replay_buffer_size in federation: usize,
+    federation_replay_dir in federation: Option<std::path::PathBuf>,
+    federation_replay_max_bytes in federation: u64,
+    federation_max_groups_per_peer in federation: usize,
+    federation_max_group_name_length in federation: usize,
+    federation_trust_peer_groups in federation: bool,
+    federation_ha_nats_url in federation: Option<String>,
+    federation_pod_id in federation: Option<String>,
+    federation_region in federation: Option<String>,
+    federation_peer_discovery in federation: PeerDiscoveryBackend,
+    federation_peer_discovery_interval in federation: u64,
+    federation_peer_discovery_dns_sd_service in federation: String,
+    federation_peer_discovery_consul_addr in federation: String,
+    federation_peer_discovery_consul_service in federation: String,
+    federation_peer_discovery_etcd_endpoints in federation: String,
+    federation_peer_discovery_etcd_prefix in federation: String,
+    jwks_pending_window_secs in federation: u64,
+    jwks_retiring_window_secs in federation: u64,
+    replay_window in ratelimit: u64,
+    client_message_rate in ratelimit: u32,
+    client_burst in ratelimit: u32,
+    circuit_breaker_threshold in ratelimit: u32,
+    group_acl_file in authz: Option<String>,
+    acl_reload_interval in authz: u64,
+    authz_policy_file in authz: Option<String>,
+    authz_policy_format in authz: AuthzPolicyFormat,
+    authz_reload_interval in authz: u64,
+    authz_fail_open in authz: bool,
+    authz_allow_unknown_obligations in authz: bool,
+    require_classification_marking in authz: bool,
+    default_classification in authz: Option<String>,
+    position_replay_rate_per_sec in authz: u32,
+    position_replay_burst in authz: u32,
+    tenant_quota_file in authz: Option<std::path::PathBuf>,
+    acl_api_token_file in authz: Option<String>,
+    mgmt_api_token_file in authz: Option<String>,
+    archive_dir in archive: Option<String>,
+    archive_key_file in archive: Option<std::path::PathBuf>,
+    archive_max_size in archive: u64,
+    archive_max_age in archive: u64,
+    archive_max_active_bytes in archive: u64,
+    archive_rotate_interval in archive: u64,
+    package_max_age_hours in archive: u64,
+    audit_log in observability: Option<String>,
+    audit_allow_chain_break in observability: bool,
+    access_log in observability: Option<String>,
+    audit_delivery in observability: bool,
+    client_queue_dir in observability: Option<std::path::PathBuf>,
+    client_queue_max_bytes in observability: u64,
+    client_queue_key_file in observability: Option<std::path::PathBuf>,
+    client_queue_wipe_on_start in observability: bool,
+    otel_endpoint in observability: Option<String>,
+    otel_service_name in observability: String,
+    otlp_metrics in observability: bool,
+    otlp_metrics_interval in observability: u64,
+    dedup_window_secs in dedup: u64,
+    dedup_cache_size in dedup: usize,
+    dedup_cross_tenant in dedup: bool,
+    cot_delta_encoding in dedup: bool,
+    cot_delta_cache_size in dedup: u64,
+    cot_delta_epsilon_meters in dedup: f64,
 }
 
 impl Cli {
@@ -2522,18 +2664,18 @@ impl Cli {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         // SPIFFE mode obtains cert/key/ca from the Workload API, so
         // file-based TLS checks do not apply.
-        if !self.spiffe {
+        if !self.tls.spiffe {
             // Non-empty checks delegate to the shared validator; messages
             // are wrapped to preserve the longstanding operator-facing
             // "(or [<key>] in the config file)" hint that makes the error
             // actionable from either CLI or config-file misconfiguration.
-            if core_validate_non_empty(&self.cert, "--cert").is_err() {
+            if core_validate_non_empty(&self.tls.cert, "--cert").is_err() {
                 anyhow::bail!("--cert (or [cert] in the config file) is required");
             }
-            if core_validate_non_empty(&self.key, "--key").is_err() {
+            if core_validate_non_empty(&self.tls.key, "--key").is_err() {
                 anyhow::bail!("--key (or [key] in the config file) is required");
             }
-            if core_validate_non_empty(&self.ca, "--ca").is_err() {
+            if core_validate_non_empty(&self.tls.ca, "--ca").is_err() {
                 anyhow::bail!("--ca (or [ca] in the config file) is required");
             }
 
@@ -2543,62 +2685,64 @@ impl Cli {
             // not found: <path>") that operator runbooks and our own
             // regression tests grep on; the shared validator's structured
             // error is consumed only as a yes/no probe here.
-            if !self.cert.is_empty()
-                && core_validate_path(std::path::Path::new(&self.cert), "--cert").is_err()
+            if !self.tls.cert.is_empty()
+                && core_validate_path(std::path::Path::new(&self.tls.cert), "--cert").is_err()
             {
-                anyhow::bail!("TLS cert file not found: {}", self.cert);
+                anyhow::bail!("TLS cert file not found: {}", self.tls.cert);
             }
-            if !self.key.is_empty()
-                && core_validate_path(std::path::Path::new(&self.key), "--key").is_err()
+            if !self.tls.key.is_empty()
+                && core_validate_path(std::path::Path::new(&self.tls.key), "--key").is_err()
             {
-                anyhow::bail!("TLS key file not found: {}", self.key);
+                anyhow::bail!("TLS key file not found: {}", self.tls.key);
             }
-            if !self.ca.is_empty()
-                && core_validate_path(std::path::Path::new(&self.ca), "--ca").is_err()
+            if !self.tls.ca.is_empty()
+                && core_validate_path(std::path::Path::new(&self.tls.ca), "--ca").is_err()
             {
-                anyhow::bail!("TLS CA file not found: {}", self.ca);
+                anyhow::bail!("TLS CA file not found: {}", self.tls.ca);
             }
         }
 
         // Federation requires an explicit identity.
-        let federation_enabled = self.federation_v1_bind.is_some()
-            || self.federation_v2_bind.is_some()
-            || self.federation_peers_file.is_some();
-        if federation_enabled && self.federation_id.is_empty() {
+        let federation_enabled = self.federation.federation_v1_bind.is_some()
+            || self.federation.federation_v2_bind.is_some()
+            || self.federation.federation_peers_file.is_some();
+        if federation_enabled && self.federation.federation_id.is_empty() {
             anyhow::bail!("--federation-id is required when federation is enabled");
         }
 
         // Rate-limit sanity — burst must absorb at least the steady-state rate.
-        if self.client_message_rate > 0 && self.client_burst < self.client_message_rate {
+        if self.ratelimit.client_message_rate > 0
+            && self.ratelimit.client_burst < self.ratelimit.client_message_rate
+        {
             anyhow::bail!(
                 "--client-burst ({}) must be >= --client-message-rate ({})",
-                self.client_burst,
-                self.client_message_rate,
+                self.ratelimit.client_burst,
+                self.ratelimit.client_message_rate,
             );
         }
 
         // Authz fail-open without a policy file is a no-op; warn rather
         // than bail so the server still starts (harmless misconfiguration).
-        if self.authz_fail_open && self.authz_policy_file.is_none() {
+        if self.authz.authz_fail_open && self.authz.authz_policy_file.is_none() {
             tracing::warn!("--authz-fail-open has no effect without --authz-policy-file");
         }
 
         // Refs #849: a `--default-classification` value MUST parse as a
         // CAPCO banner string. Catch typos at startup rather than on
         // every inbound message.
-        if let Some(ref banner) = self.default_classification
+        if let Some(ref banner) = self.authz.default_classification
             && let Err(e) = banner.parse::<rustgate_core::classification::ClassificationMarking>()
         {
             anyhow::bail!("--default-classification ({banner:?}) is not a valid CAPCO banner: {e}");
         }
 
-        if self.authz_policy_file.is_some() && self.authz_reload_interval == 0 {
+        if self.authz.authz_policy_file.is_some() && self.authz.authz_reload_interval == 0 {
             anyhow::bail!("--authz-reload-interval must be >= 1 when --authz-policy-file is set");
         }
 
         // ACL reload interval must be non-zero when an ACL file is set,
         // matching the authz_reload_interval check above.
-        if self.group_acl_file.is_some() && self.acl_reload_interval == 0 {
+        if self.authz.group_acl_file.is_some() && self.authz.acl_reload_interval == 0 {
             anyhow::bail!("--acl-reload-interval must be >= 1 when --group-acl-file is set");
         }
 
@@ -2608,21 +2752,21 @@ impl Cli {
         // window and increases load for no operator benefit. Enforce a
         // hard minimum of MIN_ROTATION_INTERVAL_SECS and warn below the
         // recommended RECOMMENDED_MIN_ROTATION_INTERVAL_SECS.
-        let archive_rotation_enabled = self.archive_dir.is_some()
-            && (self.archive_max_size > 0
-                || self.archive_max_age > 0
-                || self.archive_max_active_bytes > 0);
+        let archive_rotation_enabled = self.archive.archive_dir.is_some()
+            && (self.archive.archive_max_size > 0
+                || self.archive.archive_max_age > 0
+                || self.archive.archive_max_active_bytes > 0);
         if archive_rotation_enabled {
-            if self.archive_rotate_interval < MIN_ROTATION_INTERVAL_SECS {
+            if self.archive.archive_rotate_interval < MIN_ROTATION_INTERVAL_SECS {
                 anyhow::bail!(
                     "--archive-rotate-interval ({}) must be >= {} seconds",
-                    self.archive_rotate_interval,
+                    self.archive.archive_rotate_interval,
                     MIN_ROTATION_INTERVAL_SECS,
                 );
             }
-            if self.archive_rotate_interval < RECOMMENDED_MIN_ROTATION_INTERVAL_SECS {
+            if self.archive.archive_rotate_interval < RECOMMENDED_MIN_ROTATION_INTERVAL_SECS {
                 tracing::warn!(
-                    interval_secs = self.archive_rotate_interval,
+                    interval_secs = self.archive.archive_rotate_interval,
                     recommended_min_secs = RECOMMENDED_MIN_ROTATION_INTERVAL_SECS,
                     "--archive-rotate-interval is below the recommended minimum; \
                      aggressive rotation widens the torn-write window and stresses disk I/O",
@@ -2632,7 +2776,7 @@ impl Cli {
 
         // Validate ws buffer size — CLI args go through the clap value_parser,
         // but TOML config values bypass it and need an explicit check here.
-        let _ = validate_write_buffer_range(self.ws_max_write_buffer_bytes)
+        let _ = validate_write_buffer_range(self.websocket.ws_max_write_buffer_bytes)
             .map_err(|e| anyhow::anyhow!("ws-max-write-buffer-bytes: {e}"))?;
         Ok(())
     }
@@ -2691,12 +2835,12 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert_eq!(cli.bind, "0.0.0.0:4433");
-        assert_eq!(cli.max_connections, 1024);
-        assert_eq!(cli.max_concurrent_handshakes, 100);
+        assert_eq!(cli.tls.bind, "0.0.0.0:4433");
+        assert_eq!(cli.limits.max_connections, 1024);
+        assert_eq!(cli.limits.max_concurrent_handshakes, 100);
         // F-65: pin the default at 10s so a future change cannot
         // silently re-introduce the 30s slow-negotiate window.
-        assert_eq!(cli.negotiation_timeout_secs, 10);
+        assert_eq!(cli.limits.negotiation_timeout_secs, 10);
     }
 
     #[test]
@@ -2713,7 +2857,7 @@ mod tests {
             "5",
         ])
         .expect("should parse");
-        assert_eq!(cli.negotiation_timeout_secs, 5);
+        assert_eq!(cli.limits.negotiation_timeout_secs, 5);
     }
 
     #[test]
@@ -2747,7 +2891,7 @@ mod tests {
         ])
         .expect("should parse");
         assert_eq!(
-            cli.negotiation_timeout_secs,
+            cli.limits.negotiation_timeout_secs,
             rustgate_proto::NEGOTIATION_TIMEOUT_DEFAULT_SECS,
             "CLI default must mirror the proto crate's authoritative const",
         );
@@ -2767,7 +2911,7 @@ mod tests {
             "50",
         ])
         .expect("should parse");
-        assert_eq!(cli.max_concurrent_handshakes, 50);
+        assert_eq!(cli.limits.max_concurrent_handshakes, 50);
     }
 
     #[test]
@@ -2784,7 +2928,7 @@ mod tests {
             "512",
         ])
         .expect("should parse");
-        assert_eq!(cli.max_connections, 512);
+        assert_eq!(cli.limits.max_connections, 512);
     }
 
     #[test]
@@ -2809,7 +2953,7 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert!(cli.metrics_bind.is_none());
+        assert!(cli.metrics.metrics_bind.is_none());
 
         let cli = Cli::try_parse_from([
             "rustgate",
@@ -2823,7 +2967,7 @@ mod tests {
             "0.0.0.0:9090",
         ])
         .expect("should parse");
-        assert_eq!(cli.metrics_bind.as_deref(), Some("0.0.0.0:9090"));
+        assert_eq!(cli.metrics.metrics_bind.as_deref(), Some("0.0.0.0:9090"));
     }
 
     #[test]
@@ -2944,17 +3088,17 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert!(cli.federation_v1_bind.is_none());
-        assert!(cli.federation_v2_bind.is_none());
-        assert_eq!(cli.federation_id, "rustgate-federation-1");
-        assert!(cli.federation_peers_file.is_none());
-        assert!(!cli.federation_skip_hostname_verify);
+        assert!(cli.federation.federation_v1_bind.is_none());
+        assert!(cli.federation.federation_v2_bind.is_none());
+        assert_eq!(cli.federation.federation_id, "rustgate-federation-1");
+        assert!(cli.federation.federation_peers_file.is_none());
+        assert!(!cli.federation.federation_skip_hostname_verify);
         // Default is 8, matching the historical hard-coded
         // MAX_FEDERATION_HOPS that was the inbound enforcement bound
         // before #758. See `cli_federation_max_hops_default_eight` for
         // the explicit pin.
-        assert_eq!(cli.federation_max_hops, 8);
-        assert!(cli.federation_store_path.is_none());
+        assert_eq!(cli.federation.federation_max_hops, 8);
+        assert!(cli.federation.federation_store_path.is_none());
     }
 
     #[test]
@@ -2977,10 +3121,16 @@ mod tests {
             "5",
         ])
         .expect("should parse");
-        assert_eq!(cli.federation_v1_bind.as_deref(), Some("0.0.0.0:9000"));
-        assert_eq!(cli.federation_v2_bind.as_deref(), Some("0.0.0.0:9001"));
-        assert_eq!(cli.federation_id, "my-fed-server");
-        assert_eq!(cli.federation_max_hops, 5);
+        assert_eq!(
+            cli.federation.federation_v1_bind.as_deref(),
+            Some("0.0.0.0:9000")
+        );
+        assert_eq!(
+            cli.federation.federation_v2_bind.as_deref(),
+            Some("0.0.0.0:9001")
+        );
+        assert_eq!(cli.federation.federation_id, "my-fed-server");
+        assert_eq!(cli.federation.federation_max_hops, 5);
     }
 
     /// Pin the new default for `--federation-max-hops` post-#758.
@@ -2995,7 +3145,7 @@ mod tests {
         ])
         .expect("should parse");
         assert_eq!(
-            cli.federation_max_hops, 8,
+            cli.federation.federation_max_hops, 8,
             "default --federation-max-hops must be 8 (matches MAX_FEDERATION_HOPS)"
         );
     }
@@ -3016,7 +3166,7 @@ mod tests {
             "16",
         ])
         .expect("should parse");
-        assert_eq!(cli.federation_max_hops, 16);
+        assert_eq!(cli.federation.federation_max_hops, 16);
     }
 
     /// `--federation-max-hops 0` must be rejected at CLI parse time:
@@ -3081,7 +3231,7 @@ mod tests {
             "--federation-skip-hostname-verify",
         ])
         .expect("should parse");
-        assert!(cli.federation_skip_hostname_verify);
+        assert!(cli.federation.federation_skip_hostname_verify);
     }
 
     #[test]
@@ -3090,7 +3240,7 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert!(cli.audit_log.is_none());
+        assert!(cli.observability.audit_log.is_none());
     }
 
     #[test]
@@ -3108,7 +3258,7 @@ mod tests {
         ])
         .expect("should parse");
         assert_eq!(
-            cli.audit_log.as_deref(),
+            cli.observability.audit_log.as_deref(),
             Some("/var/log/rustgate/audit.jsonl")
         );
     }
@@ -3127,7 +3277,7 @@ mod tests {
             "-",
         ])
         .expect("should parse");
-        assert_eq!(cli.audit_log.as_deref(), Some("-"));
+        assert_eq!(cli.observability.audit_log.as_deref(), Some("-"));
     }
 
     #[test]
@@ -3136,7 +3286,7 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert!(!cli.audit_allow_chain_break);
+        assert!(!cli.observability.audit_allow_chain_break);
     }
 
     #[test]
@@ -3152,7 +3302,7 @@ mod tests {
             "--audit-allow-chain-break",
         ])
         .expect("should parse");
-        assert!(cli.audit_allow_chain_break);
+        assert!(cli.observability.audit_allow_chain_break);
     }
 
     #[test]
@@ -3165,7 +3315,7 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert!(!cli.audit_delivery);
+        assert!(!cli.observability.audit_delivery);
     }
 
     #[test]
@@ -3186,7 +3336,7 @@ mod tests {
             "--audit-delivery",
         ])
         .expect("should parse");
-        assert!(cli.audit_delivery);
+        assert!(cli.observability.audit_delivery);
     }
 
     #[test]
@@ -3200,8 +3350,8 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert_eq!(cli.jwks_pending_window_secs, 60);
-        assert_eq!(cli.jwks_retiring_window_secs, 300);
+        assert_eq!(cli.federation.jwks_pending_window_secs, 60);
+        assert_eq!(cli.federation.jwks_retiring_window_secs, 300);
     }
 
     #[test]
@@ -3223,8 +3373,8 @@ mod tests {
             "600",
         ])
         .expect("should parse");
-        assert_eq!(cli.jwks_pending_window_secs, 120);
-        assert_eq!(cli.jwks_retiring_window_secs, 600);
+        assert_eq!(cli.federation.jwks_pending_window_secs, 120);
+        assert_eq!(cli.federation.jwks_retiring_window_secs, 600);
     }
 
     // ── build_codec tests ──────────────────────────────────────────
@@ -3280,7 +3430,10 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert_eq!(cli.ws_max_write_buffer_bytes, WS_WRITE_BUFFER_DEFAULT);
+        assert_eq!(
+            cli.websocket.ws_max_write_buffer_bytes,
+            WS_WRITE_BUFFER_DEFAULT
+        );
     }
 
     #[test]
@@ -3297,7 +3450,7 @@ mod tests {
             "1048576",
         ])
         .expect("should parse");
-        assert_eq!(cli.ws_max_write_buffer_bytes, 1_048_576);
+        assert_eq!(cli.websocket.ws_max_write_buffer_bytes, 1_048_576);
     }
 
     #[test]
@@ -3346,7 +3499,7 @@ mod tests {
             "65536",
         ])
         .expect("should parse minimum (64 KiB)");
-        assert_eq!(cli.ws_max_write_buffer_bytes, 65_536);
+        assert_eq!(cli.websocket.ws_max_write_buffer_bytes, 65_536);
     }
 
     #[test]
@@ -3363,7 +3516,7 @@ mod tests {
             "67108864",
         ])
         .expect("should parse maximum (64 MiB)");
-        assert_eq!(cli.ws_max_write_buffer_bytes, 67_108_864);
+        assert_eq!(cli.websocket.ws_max_write_buffer_bytes, 67_108_864);
     }
 
     #[cfg(feature = "websocket")]
@@ -3402,9 +3555,9 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert_eq!(cli.ws_rate_limit_max, cfg.conn_rate_limit);
+        assert_eq!(cli.websocket.ws_rate_limit_max, cfg.conn_rate_limit);
         assert_eq!(
-            cli.ws_rate_limit_window_secs,
+            cli.websocket.ws_rate_limit_window_secs,
             cfg.conn_rate_window.as_secs()
         );
     }
@@ -3427,8 +3580,8 @@ mod tests {
             "30",
         ])
         .expect("should parse");
-        assert_eq!(cli.ws_rate_limit_max, 200);
-        assert_eq!(cli.ws_rate_limit_window_secs, 30);
+        assert_eq!(cli.websocket.ws_rate_limit_max, 200);
+        assert_eq!(cli.websocket.ws_rate_limit_window_secs, 30);
     }
 
     #[test]
@@ -3450,8 +3603,8 @@ mod tests {
             "20",
         ])
         .expect("legacy aliases must still parse");
-        assert_eq!(cli.ws_rate_limit_max, 50);
-        assert_eq!(cli.ws_rate_limit_window_secs, 20);
+        assert_eq!(cli.websocket.ws_rate_limit_max, 50);
+        assert_eq!(cli.websocket.ws_rate_limit_window_secs, 20);
     }
 
     #[test]
@@ -3486,8 +3639,8 @@ mod tests {
             .get_matches_from(["rustgate", "--cert", cert_s, "--key", key_s, "--ca", ca_s]);
         let mut cli = Cli::from_arg_matches(&matches).expect("parse");
         file.apply_to(&mut cli, &matches);
-        assert_eq!(cli.ws_rate_limit_max, 250);
-        assert_eq!(cli.ws_rate_limit_window_secs, 45);
+        assert_eq!(cli.websocket.ws_rate_limit_max, 250);
+        assert_eq!(cli.websocket.ws_rate_limit_window_secs, 45);
     }
 
     // ─── F-72 MAVLink signing-policy CLI flags ───────────────────────
@@ -3502,8 +3655,11 @@ mod tests {
             "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
         ])
         .expect("should parse");
-        assert!(cli.mavlink_require_signing, "default: require signing");
-        assert!(!cli.mavlink_allow_v1, "default: reject v1");
+        assert!(
+            cli.mavlink.mavlink_require_signing,
+            "default: require signing"
+        );
+        assert!(!cli.mavlink.mavlink_allow_v1, "default: reject v1");
     }
 
     #[test]
@@ -3522,11 +3678,11 @@ mod tests {
             "true",
         ])
         .expect("should parse");
-        assert!(cli.mavlink_allow_v1);
+        assert!(cli.mavlink.mavlink_allow_v1);
         // The unrelated default stays put — the two knobs are
         // independent so an operator can opt into v1 *and* keep
         // signing required for any v2 traffic.
-        assert!(cli.mavlink_require_signing);
+        assert!(cli.mavlink.mavlink_require_signing);
     }
 
     #[test]
@@ -3545,8 +3701,8 @@ mod tests {
             "false",
         ])
         .expect("should parse");
-        assert!(!cli.mavlink_require_signing);
-        assert!(!cli.mavlink_allow_v1);
+        assert!(!cli.mavlink.mavlink_require_signing);
+        assert!(!cli.mavlink.mavlink_allow_v1);
     }
 
     #[test]
@@ -3716,8 +3872,8 @@ mod tests {
     fn validate_rejects_federation_without_id() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.federation_v1_bind = Some("0.0.0.0:9000".to_owned());
-        cli.federation_id = String::new();
+        cli.federation.federation_v1_bind = Some("0.0.0.0:9000".to_owned());
+        cli.federation.federation_id = String::new();
 
         let err = cli.validate().unwrap_err();
         assert!(
@@ -3731,8 +3887,8 @@ mod tests {
     fn validate_rejects_burst_below_rate() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.client_message_rate = 100;
-        cli.client_burst = 50;
+        cli.ratelimit.client_message_rate = 100;
+        cli.ratelimit.client_burst = 50;
 
         let err = cli.validate().unwrap_err();
         assert!(
@@ -3746,8 +3902,8 @@ mod tests {
     fn validate_accepts_burst_equal_to_rate() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.client_message_rate = 100;
-        cli.client_burst = 100;
+        cli.ratelimit.client_message_rate = 100;
+        cli.ratelimit.client_burst = 100;
         cli.validate().expect("burst == rate should be valid");
     }
 
@@ -3755,8 +3911,8 @@ mod tests {
     fn validate_skips_rate_check_when_disabled() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.client_message_rate = 0;
-        cli.client_burst = 0;
+        cli.ratelimit.client_message_rate = 0;
+        cli.ratelimit.client_burst = 0;
         cli.validate()
             .expect("rate limiting disabled should be valid");
     }
@@ -3765,8 +3921,8 @@ mod tests {
     fn validate_warns_authz_fail_open_without_policy() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.authz_fail_open = true;
-        cli.authz_policy_file = None;
+        cli.authz.authz_fail_open = true;
+        cli.authz.authz_policy_file = None;
 
         // Should succeed (warn, not bail).
         cli.validate()
@@ -3801,13 +3957,13 @@ mod tests {
         ])
         .expect("flag should parse");
         assert!(
-            cli.require_classification_marking,
+            cli.authz.require_classification_marking,
             "--require-classification-marking must set the field to true"
         );
 
         let cli_default = cli_with_temp_tls(&dir);
         assert!(
-            !cli_default.require_classification_marking,
+            !cli_default.authz.require_classification_marking,
             "default value must be false (legacy traffic flows unchanged)"
         );
     }
@@ -3838,7 +3994,7 @@ mod tests {
         ])
         .expect("flag should parse");
         assert_eq!(
-            cli.default_classification.as_deref(),
+            cli.authz.default_classification.as_deref(),
             Some("//UNCLASSIFIED"),
             "value must round-trip verbatim into the field"
         );
@@ -3854,7 +4010,7 @@ mod tests {
         // can fix the typo from the error message alone.
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.default_classification = Some("not-a-banner".to_string());
+        cli.authz.default_classification = Some("not-a-banner".to_string());
         let err = cli.validate().unwrap_err();
         assert!(
             err.to_string().contains("--default-classification"),
@@ -3866,8 +4022,8 @@ mod tests {
     fn validate_rejects_acl_reload_interval_zero_with_acl_file() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.group_acl_file = Some("/tmp/acl.json".to_owned());
-        cli.acl_reload_interval = 0;
+        cli.authz.group_acl_file = Some("/tmp/acl.json".to_owned());
+        cli.authz.acl_reload_interval = 0;
 
         let err = cli.validate().unwrap_err();
         assert!(
@@ -3881,8 +4037,8 @@ mod tests {
     fn validate_accepts_federation_with_id() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.federation_v1_bind = Some("0.0.0.0:9000".to_owned());
-        cli.federation_id = "my-server".to_owned();
+        cli.federation.federation_v1_bind = Some("0.0.0.0:9000".to_owned());
+        cli.federation.federation_id = "my-server".to_owned();
         cli.validate().expect("federation with ID should be valid");
     }
 
@@ -3900,9 +4056,9 @@ mod tests {
         // cadence by accident. See F-69.
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.archive_dir = Some(dir.path().to_string_lossy().into_owned());
-        cli.archive_max_size = 1_000_000;
-        cli.archive_rotate_interval = 30;
+        cli.archive.archive_dir = Some(dir.path().to_string_lossy().into_owned());
+        cli.archive.archive_max_size = 1_000_000;
+        cli.archive.archive_rotate_interval = 30;
 
         let err = cli.validate().unwrap_err();
         assert!(
@@ -3916,9 +4072,9 @@ mod tests {
     fn validate_accepts_archive_rotate_interval_at_minimum() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.archive_dir = Some(dir.path().to_string_lossy().into_owned());
-        cli.archive_max_size = 1_000_000;
-        cli.archive_rotate_interval = 60;
+        cli.archive.archive_dir = Some(dir.path().to_string_lossy().into_owned());
+        cli.archive.archive_max_size = 1_000_000;
+        cli.archive.archive_rotate_interval = 60;
         // Emits a warning but must not bail.
         cli.validate().expect("60s minimum should be accepted");
     }
@@ -3927,9 +4083,9 @@ mod tests {
     fn validate_accepts_archive_rotate_interval_above_recommended() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.archive_dir = Some(dir.path().to_string_lossy().into_owned());
-        cli.archive_max_age = 86400;
-        cli.archive_rotate_interval = 600;
+        cli.archive.archive_dir = Some(dir.path().to_string_lossy().into_owned());
+        cli.archive.archive_max_age = 86400;
+        cli.archive.archive_rotate_interval = 600;
         cli.validate()
             .expect("cadence above recommended should be accepted");
     }
@@ -3941,10 +4097,10 @@ mod tests {
         // must not trigger validation.
         let dir = tempfile::tempdir().expect("tmpdir");
         let mut cli = cli_with_temp_tls(&dir);
-        cli.archive_dir = Some(dir.path().to_string_lossy().into_owned());
-        cli.archive_max_size = 0;
-        cli.archive_max_age = 0;
-        cli.archive_rotate_interval = 1; // aggressive, but rotation is off
+        cli.archive.archive_dir = Some(dir.path().to_string_lossy().into_owned());
+        cli.archive.archive_max_size = 0;
+        cli.archive.archive_max_age = 0;
+        cli.archive.archive_rotate_interval = 1; // aggressive, but rotation is off
         cli.validate().expect("disabled rotation should skip check");
     }
 

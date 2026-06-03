@@ -128,7 +128,7 @@ fn build_runtime(cli: &Cli) -> anyhow::Result<MavlinkRuntime> {
     let mut store = SigningKeyStore::new();
     let mut registry = LinkRegistry::new();
 
-    if let Some(path) = cli.mavlink_signing_key_file.as_ref() {
+    if let Some(path) = cli.mavlink.mavlink_signing_key_file.as_ref() {
         let raw = Zeroizing::new(
             std::fs::read_to_string(path)
                 .with_context(|| format!("reading MAVLink signing key file `{path}`"))?,
@@ -148,8 +148,8 @@ fn build_runtime(cli: &Cli) -> anyhow::Result<MavlinkRuntime> {
         }
     }
 
-    if cli.mavlink_allow_v1 {
-        let cn = cli.mavlink_v1_fallback_cn.as_ref().ok_or_else(|| {
+    if cli.mavlink.mavlink_allow_v1 {
+        let cn = cli.mavlink.mavlink_v1_fallback_cn.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "--mavlink-allow-v1 requires --mavlink-v1-fallback-cn: v1 frames have no \
                  signing identity, so a shared fallback CN must be configured"
@@ -173,7 +173,7 @@ fn build_runtime(cli: &Cli) -> anyhow::Result<MavlinkRuntime> {
 /// Build the destination every ingested frame routes to (ADR 0020 §2):
 /// a group when `--mavlink-group` is set, broadcast otherwise.
 fn destination(cli: &Cli) -> MavlinkDestination {
-    match cli.mavlink_group.as_ref() {
+    match cli.mavlink.mavlink_group.as_ref() {
         Some(g) => MavlinkDestination::Group(Arc::from(g.as_str())),
         None => MavlinkDestination::Broadcast,
     }
@@ -206,7 +206,7 @@ pub(crate) async fn start_mavlink(
     cli: &Cli,
     router: &Arc<Router>,
 ) -> anyhow::Result<Vec<SubsystemHandle>> {
-    if cli.mavlink_bind.is_none() && cli.mavlink_tcp_bind.is_none() {
+    if cli.mavlink.mavlink_bind.is_none() && cli.mavlink.mavlink_tcp_bind.is_none() {
         return Ok(Vec::new());
     }
 
@@ -214,15 +214,15 @@ pub(crate) async fn start_mavlink(
     let dest = destination(cli);
     let mut handles = Vec::new();
 
-    if let Some(bind) = cli.mavlink_bind.as_ref() {
+    if let Some(bind) = cli.mavlink.mavlink_bind.as_ref() {
         let addr: SocketAddr = bind
             .parse()
             .with_context(|| format!("parsing --mavlink-bind `{bind}`"))?;
         let config = MavlinkListenerConfig {
             bind: addr,
             destination: dest.clone(),
-            require_signing: cli.mavlink_require_signing,
-            allow_v1: cli.mavlink_allow_v1,
+            require_signing: cli.mavlink.mavlink_require_signing,
+            allow_v1: cli.mavlink.mavlink_allow_v1,
         };
         tracing::warn!(addr = %addr, "MAVLink UDP input enabled — datagrams are NOT encrypted");
         let handle = spawn_udp_listener(
@@ -236,15 +236,15 @@ pub(crate) async fn start_mavlink(
         handles.push(handle);
     }
 
-    if let Some(bind) = cli.mavlink_tcp_bind.as_ref() {
+    if let Some(bind) = cli.mavlink.mavlink_tcp_bind.as_ref() {
         let addr: SocketAddr = bind
             .parse()
             .with_context(|| format!("parsing --mavlink-tcp-bind `{bind}`"))?;
         let config = MavlinkListenerConfig {
             bind: addr,
             destination: dest,
-            require_signing: cli.mavlink_require_signing,
-            allow_v1: cli.mavlink_allow_v1,
+            require_signing: cli.mavlink.mavlink_require_signing,
+            allow_v1: cli.mavlink.mavlink_allow_v1,
         };
         tracing::warn!(addr = %addr, "MAVLink TCP input enabled — connections are NOT encrypted");
         let handle = spawn_tcp_listener(
