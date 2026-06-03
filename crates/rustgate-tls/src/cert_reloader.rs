@@ -280,7 +280,7 @@ impl CertReloader {
         Ok(CertifiedKey::new(certs, signing_key))
     }
 
-    /// Convert a [`PrivateKeyDer`] into a rustls [`SigningKey`] using the
+    /// Convert a [`PrivateKeyDer`] into a rustls [`rustls::sign::SigningKey`] using the
     /// active crypto provider.
     fn load_signing_key(key: PrivateKeyDer<'static>) -> Result<Arc<dyn rustls::sign::SigningKey>> {
         let provider = rustls::crypto::CryptoProvider::get_default().ok_or_else(|| {

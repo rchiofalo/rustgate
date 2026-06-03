@@ -430,7 +430,7 @@ fn parse_offer(input: &str) -> Option<ParsedOffer<'_>> {
 pub struct Deflater {
     /// LZ77 sliding-window size in bits. Honoured today only for the
     /// per-call-frame-size budget; flate2's `Compress` API uses its own
-    /// internal default. See [`flate2::Compress::new_with_window_bits`]
+    /// internal default. See `flate2::Compress::new_with_window_bits`
     /// for the future hook.
     window_bits: u8,
 }

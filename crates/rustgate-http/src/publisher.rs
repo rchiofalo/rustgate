@@ -1567,7 +1567,7 @@ enum ReplayOutcome {
 
 /// Decode and re-deliver a single DLQ entry to `target`.
 ///
-/// Reconstructs a [`RoutableMessage`] with a synthetic [`Identity`]
+/// Reconstructs a [`RoutableMessage`] with a synthetic [`rustgate_core::identity::Identity`]
 /// (CN preserved, everything else defaulted — the original cert
 /// material is not captured in the DLQ). Calls [`send_request`]
 /// directly so the entry's preserved `delivery_id` is forwarded on the

@@ -985,7 +985,7 @@ impl EntityCodec for SchemaCodec {
 }
 
 impl SchemaCodec {
-    /// Apply the field's optional [`Range`] check on the calibrated
+    /// Apply the field's optional [`crate::schema::Range`] check on the calibrated
     /// physical value of a freshly-decoded `DecodedValue`. Returns
     /// `Ok(())` when no range is declared or the value falls within
     /// `[range.min, range.max]`. Surfaces
@@ -1016,7 +1016,7 @@ impl SchemaCodec {
         Ok(())
     }
 
-    /// Apply the field's optional [`Range`] check on an
+    /// Apply the field's optional [`crate::schema::Range`] check on an
     /// [`EncodedValue`] before it is written to the wire buffer.
     /// Mirrors [`Self::check_range_on_decode`] so an out-of-range
     /// value fails the encode call symmetrically — the operator

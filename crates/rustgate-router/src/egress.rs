@@ -257,7 +257,7 @@ pub(crate) struct EgressContext<'a> {
 ///    audits because the sink knows its own context for the
 ///    `authz_denied` record). The single-recipient classes are wired
 ///    by #737 follow-ups; this PR delivers the variants for the
-///    sinks that need them but exercises only [`Self::Multicast`].
+///    sinks that need them but exercises only [`RecipientClass::Multicast`].
 /// 4. **Audit emission** — when the helper applies one or more
 ///    obligations, it emits one
 ///    [`audit::egress_obligation_applied`] event per applied

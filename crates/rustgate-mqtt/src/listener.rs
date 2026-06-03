@@ -2,7 +2,7 @@
 
 //! MQTT TLS listener — accepts TCP connections and performs mTLS handshake.
 //!
-//! Mirrors the pattern from [`rustgate_websocket`]: binds a TCP socket with
+//! Mirrors the pattern from the `rustgate-websocket` crate: binds a TCP socket with
 //! `SO_REUSEADDR`, wraps it with a [`TlsAcceptor`], and extracts the client
 //! identity from the peer certificate.
 //!
