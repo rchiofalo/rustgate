@@ -557,7 +557,7 @@ impl RoutedMessage {
     /// audit-shaped obligations (via
     /// [`obligations_mutate_payload`]) this is a cheap [`Clone`] that
     /// reuses the same `Arc<RoutableMessage>`; otherwise the payload
-    /// is cloned out of the `Arc`, mutated via [`apply_obligations`],
+    /// is cloned out of the `Arc`, mutated via [`crate::obligations::apply_obligations`],
     /// and re-wrapped so other recipients whose decisions produced
     /// different obligations are not affected.
     ///
@@ -1700,7 +1700,7 @@ impl Router {
 
     /// Send-PEP entry point. Evaluates the installed engine for an
     /// outbound (sender-side) decision and returns the
-    /// [`DecisionOutcome`].
+    /// [`rustgate_authz::DecisionOutcome`].
     ///
     /// Closes #730: split from a former `authz_evaluate(action)` so the
     /// direction is implicit in the call site. A refactor that drops or

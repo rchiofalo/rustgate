@@ -320,7 +320,7 @@ fn build_velocity(frame: &VehiclePosition) -> Velocity {
 /// air platform — so a route-planning dashboard that filters on
 /// `EntityKind::Aircraft` does not include UAVs that have already
 /// landed. [`FlightState::Other`] surfaces as
-/// [`EntityKind::Unknown("stanag4586-flight-state-{:#04x}")`] so a
+/// [`EntityKind::Unknown`] with a `"stanag4586-flight-state-{:#04x}"` label so a
 /// firmware revision that introduces a new state byte still yields a
 /// structured classification dashboards can group on without growing
 /// a new enum variant per protocol.

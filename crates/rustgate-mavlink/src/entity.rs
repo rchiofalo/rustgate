@@ -194,7 +194,7 @@ impl EntityCodec for MavlinkEntityCodec {
 /// `MAV_TYPE` enum values published in `message_definitions/v1.0/
 /// common.xml`. Anything outside this list folds into
 /// [`MavType::Other`] and surfaces as
-/// [`EntityKind::Unknown("mavlink-{:?}")`] so the downstream
+/// [`EntityKind::Unknown`] with a `"mavlink-{:?}"` label so the downstream
 /// dashboard can still group on the label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MavType {

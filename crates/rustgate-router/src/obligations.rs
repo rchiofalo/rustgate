@@ -822,10 +822,10 @@ fn apply_mask_command(
 ///   bytes verbatim) — the obligation is a CoT control, so a non-XML
 ///   payload is forwarded unmodified and the audit trail records the
 ///   pass-through.
-/// - **XML-intent parse failure** ([`MaskError::Xml`]) — fail-closed:
+/// - **XML-intent parse failure** ([`rustgate_cot::mask::MaskError::Xml`]) — fail-closed:
 ///   erase the body via [`apply_mask_payload`] so a crafted partial
 ///   document cannot leak pre-redaction bytes via pass-through.
-/// - **Attribute budget trip** ([`MaskError::AttrBudgetExceeded`]) —
+/// - **Attribute budget trip** ([`rustgate_cot::mask::MaskError::AttrBudgetExceeded`]) —
 ///   same fail-closed posture as `MaskPoint`.
 ///
 /// `obligation_label` is the `Debug`-derived obligation name for the

@@ -74,13 +74,13 @@ const PII_CONTACT_ATTR_TOKENS: &[&[u8]] = &[
     b"username",
 ];
 
-/// Per-element attribute-count cap reused from [`mask`]. Crafted XML
+/// Per-element attribute-count cap reused from [`crate::mask`]. Crafted XML
 /// packing thousands of attributes onto a single `<contact>` element
 /// would otherwise force the actuator to allocate per-attribute; the
 /// cap fail-closes via [`MaskError::AttrBudgetExceeded`] instead.
 const ATTR_BUDGET: usize = MAX_DETAIL_ATTRIBUTES;
 
-/// Local-name predicate factored out of [`mask`]: strip any namespace
+/// Local-name predicate factored out of [`crate::mask`]: strip any namespace
 /// prefix and return the local part for case-insensitive comparison.
 fn local_name(name: &[u8]) -> &[u8] {
     match name.iter().rposition(|b| *b == b':') {
@@ -154,7 +154,7 @@ fn is_xml_intent(xml: &[u8]) -> bool {
         .is_some_and(|b| *b == b'<')
 }
 
-/// Build a [`Reader`] with the same defaults as the [`mask`] family.
+/// Build a [`Reader`] with the same defaults as the [`crate::mask`] family.
 fn reader(xml: &[u8]) -> Reader<&[u8]> {
     let mut r = Reader::from_reader(xml);
     // Match the existing masker: no entity resolution, no DTD

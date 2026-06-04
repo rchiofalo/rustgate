@@ -147,7 +147,7 @@ fn der_sequence(inner: &[u8]) -> Vec<u8> {
     der_wrap(0x30, inner)
 }
 
-/// Build a context-specific constructed [0] wrapper.
+/// Build a context-specific constructed `[0]` wrapper.
 fn der_context_0(inner: &[u8]) -> Vec<u8> {
     der_wrap(0xa0, inner)
 }
