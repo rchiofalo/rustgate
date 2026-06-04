@@ -398,18 +398,6 @@ jobs:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
-    env:
-      # libtest runs each `#[test]` on a worker thread whose stack defaults
-      # to ~2 MiB. The server's clap-derived `Cli` is large enough that
-      # parsing it (`Cli::try_parse_from` in the `cli::tests`) overflows
-      # that default — even though the production binary parses the same
-      # CLI fine on its 8 MiB main-thread stack, and the `cli_parsing`
-      # integration tests pass because they spawn the binary. Raise the
-      # per-thread minimum so the test environment matches production
-      # reality rather than the smaller libtest default. (Root-cause
-      # hygiene — shrinking the `Cli` by flattening arg groups — is tracked
-      # separately.)
-      RUST_MIN_STACK: "16777216"
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -477,11 +465,6 @@ jobs:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
-    env:
-      # See the `test` job: the large clap-derived `Cli` overflows libtest's
-      # ~2 MiB default per-test-thread stack; raise it so coverage's nextest
-      # run matches the production main-thread stack.
-      RUST_MIN_STACK: "16777216"
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1

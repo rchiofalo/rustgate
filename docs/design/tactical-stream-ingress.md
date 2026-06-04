@@ -152,12 +152,15 @@ listener that already exists.
 Per-protocol `[ingress.<proto>]` blocks + `--<proto>-bind` flags with
 `deny_unknown_fields`, identical to the datagram protocols, plus the two
 stream-only knobs (`--<proto>-max-connections`, and the read-timeout which
-defaults to the shared `READ_TIMEOUT`). Off by default. To keep the
-top-level `Cli` from growing further (it already hit a libtest
-thread-stack ceiling at the DIS/ASTERIX/VMF additions, mitigated by
-`RUST_MIN_STACK` in CI), the **ingress flags should be flattened into a
-`#[command(flatten)]` sub-struct** as part of the first stream PR — the
-hygiene fix already queued.
+defaults to the shared `READ_TIMEOUT`). Off by default. The top-level
+`Cli` once hit a libtest thread-stack ceiling at the DIS/ASTERIX/VMF
+additions (temporarily mitigated by `RUST_MIN_STACK` in CI); that hygiene
+fix has since landed — every flag now lives in a `#[command(flatten)]`
+`clap::Args` sub-struct (the tactical ingress flags in
+`TacticalIngressArgs`), the per-group `augment_args` frames are small
+again, and the `RUST_MIN_STACK` override has been removed. New stream
+ingress flags should be added to the relevant sub-struct, not the
+top-level `Cli`.
 
 ## Threat model & scope boundary
 

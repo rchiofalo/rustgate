@@ -60,7 +60,7 @@ pub(crate) async fn load_group_acl(
     Option<[u8; 32]>,
     Option<rustgate_admin::GroupAclFile>,
 )> {
-    let Some(ref acl_file) = cli.group_acl_file else {
+    let Some(ref acl_file) = cli.authz.group_acl_file else {
         return Ok((None, None, None));
     };
 
@@ -119,17 +119,17 @@ pub(crate) async fn load_group_acl(
 /// hitting the Workload API a second time.
 pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild> {
     #[cfg(feature = "spiffe")]
-    if cli.spiffe {
+    if cli.tls.spiffe {
         let spiffe_cfg = rustgate_tls::spiffe::SpiffeConfig {
-            workload_api_socket: cli.spiffe_workload_api_socket.clone(),
-            expected_trust_domain: cli.spiffe_trust_domain.clone(),
-            refresh_interval: std::time::Duration::from_secs(cli.spiffe_refresh_interval),
+            workload_api_socket: cli.tls.spiffe_workload_api_socket.clone(),
+            expected_trust_domain: cli.tls.spiffe_trust_domain.clone(),
+            refresh_interval: std::time::Duration::from_secs(cli.tls.spiffe_refresh_interval),
         };
         let identity = rustgate_tls::spiffe::fetch_initial_identity(&spiffe_cfg)
             .await
             .context("fetching initial SPIFFE X.509-SVID")?;
 
-        let tls_min_version = TlsMinVersion::from_str_version(&cli.tls_min_version)
+        let tls_min_version = TlsMinVersion::from_str_version(&cli.tls.tls_min_version)
             .context("parsing TLS minimum version")?;
         let mut tls_config = TlsConfig::from_pem(
             &identity.cert_pem,
@@ -138,14 +138,14 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
         )
         .context("building SPIFFE-backed TLS config")?;
         tls_config = tls_config.with_tls_min_version(tls_min_version);
-        tls_config = tls_config.with_crl_warn_stale(cli.crl_warn_stale);
+        tls_config = tls_config.with_crl_warn_stale(cli.tls.crl_warn_stale);
 
         // CRL support via SPIFFE is not defined by the SPIFFE spec; operators
         // that need CRLs can still point `--crl` at a static file alongside
         // `--spiffe`. This mirrors how OCSP stapling coexists with SPIFFE.
         // Note: the CRL is loaded once at startup and does not hot-reload
         // under `--spiffe`; restart to pick up new CRLs.
-        if let Some(ref crl_path) = cli.crl {
+        if let Some(ref crl_path) = cli.tls.crl {
             let crl_pem = tokio::fs::read_to_string(crl_path)
                 .await
                 .context("reading CRL file")?;
@@ -166,34 +166,34 @@ pub(crate) async fn build_tls_config(cli: &Cli) -> anyhow::Result<TlsConfigBuild
     }
 
     #[cfg(not(feature = "spiffe"))]
-    if cli.spiffe {
+    if cli.tls.spiffe {
         anyhow::bail!(
             "--spiffe was set but rustgate was built without the `spiffe` feature; \
              rebuild with --features spiffe to enable SPIFFE workload identity"
         );
     }
 
-    let cert_pem = tokio::fs::read_to_string(&cli.cert)
+    let cert_pem = tokio::fs::read_to_string(&cli.tls.cert)
         .await
         .context("reading server certificate")?;
     let key_pem = zeroize::Zeroizing::new(
-        tokio::fs::read_to_string(&cli.key)
+        tokio::fs::read_to_string(&cli.tls.key)
             .await
             .context("reading server private key")?,
     );
-    let ca_pem = tokio::fs::read_to_string(&cli.ca)
+    let ca_pem = tokio::fs::read_to_string(&cli.tls.ca)
         .await
         .context("reading CA certificate")?;
 
-    let tls_min_version = TlsMinVersion::from_str_version(&cli.tls_min_version)
+    let tls_min_version = TlsMinVersion::from_str_version(&cli.tls.tls_min_version)
         .context("parsing TLS minimum version")?;
 
     let mut tls_config =
         TlsConfig::from_pem(&cert_pem, &key_pem, &ca_pem).context("building TLS config")?;
     tls_config = tls_config.with_tls_min_version(tls_min_version);
-    tls_config = tls_config.with_crl_warn_stale(cli.crl_warn_stale);
+    tls_config = tls_config.with_crl_warn_stale(cli.tls.crl_warn_stale);
 
-    if let Some(ref crl_path) = cli.crl {
+    if let Some(ref crl_path) = cli.tls.crl {
         let crl_pem = tokio::fs::read_to_string(crl_path)
             .await
             .context("reading CRL file")?;
@@ -243,13 +243,13 @@ pub(crate) async fn bind_tls_listener(
     // startup (which would briefly leave the TlsConfig and CertReloader
     // tracking two different SVIDs).
     #[cfg(feature = "spiffe")]
-    let reloader = if cli.spiffe {
+    let reloader = if cli.tls.spiffe {
         let identity = spiffe_identity
             .ok_or_else(|| anyhow::anyhow!("SPIFFE enabled but no preloaded identity passed"))?;
         let spiffe_cfg = rustgate_tls::spiffe::SpiffeConfig {
-            workload_api_socket: cli.spiffe_workload_api_socket.clone(),
-            expected_trust_domain: cli.spiffe_trust_domain.clone(),
-            refresh_interval: std::time::Duration::from_secs(cli.spiffe_refresh_interval),
+            workload_api_socket: cli.tls.spiffe_workload_api_socket.clone(),
+            expected_trust_domain: cli.tls.spiffe_trust_domain.clone(),
+            refresh_interval: std::time::Duration::from_secs(cli.tls.spiffe_refresh_interval),
         };
         let reloader = identity.cert_reloader.clone();
 
@@ -278,12 +278,13 @@ pub(crate) async fn bind_tls_listener(
         );
         reloader
     } else {
-        CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?
+        CertReloader::new(&cli.tls.cert, &cli.tls.key)
+            .context("initializing certificate reloader")?
     };
 
     #[cfg(not(feature = "spiffe"))]
-    let reloader =
-        CertReloader::new(&cli.cert, &cli.key).context("initializing certificate reloader")?;
+    let reloader = CertReloader::new(&cli.tls.cert, &cli.tls.key)
+        .context("initializing certificate reloader")?;
 
     let inner_verifier = tls_config.build_default_verifier()?;
 
@@ -293,8 +294,10 @@ pub(crate) async fn bind_tls_listener(
     // wrapper is gated on `--features ocsp` because it reuses the
     // OCSP fetcher from the same upstream crate as server stapling.
     #[cfg(feature = "ocsp")]
-    let verifier: std::sync::Arc<dyn rustgate_transport::ClientCertVerifier> = if cli.client_ocsp
-        && !cli.air_gap
+    let verifier: std::sync::Arc<dyn rustgate_transport::ClientCertVerifier> = if cli
+        .tls
+        .client_ocsp
+        && !cli.tls.air_gap
     {
         #[cfg(feature = "metrics")]
         let on_hit: Option<rustgate_tls::client_ocsp::OnCacheHit> =
@@ -324,7 +327,7 @@ pub(crate) async fn bind_tls_listener(
         );
         wrapped as std::sync::Arc<dyn rustgate_transport::ClientCertVerifier>
     } else {
-        if cli.client_ocsp && cli.air_gap {
+        if cli.tls.client_ocsp && cli.tls.air_gap {
             rustgate_core::audit::air_gap_violation(
                 "client_ocsp",
                 "<aia-cert-extension>",
@@ -341,7 +344,7 @@ pub(crate) async fn bind_tls_listener(
     #[cfg(not(feature = "ocsp"))]
     let verifier = inner_verifier;
     #[cfg(not(feature = "ocsp"))]
-    if cli.client_ocsp {
+    if cli.tls.client_ocsp {
         tracing::warn!(
             "--client-ocsp set but the ocsp feature is not compiled in; \
              rebuild with --features ocsp to enable client OCSP verification"
@@ -355,8 +358,8 @@ pub(crate) async fn bind_tls_listener(
     let (resolver, ocsp_stapler): (
         std::sync::Arc<dyn rustgate_transport::ResolvesServerCert>,
         Option<std::sync::Arc<rustgate_tls::ocsp::Stapler>>,
-    ) = if cli.ocsp_stapling {
-        if cli.air_gap {
+    ) = if cli.tls.ocsp_stapling {
+        if cli.tls.air_gap {
             // Air-gap: OCSP stapling fetches from the issuing CA's OCSP
             // responder, an external endpoint we cannot enumerate at
             // config time (it lives in the AIA extension of the
@@ -393,7 +396,7 @@ pub(crate) async fn bind_tls_listener(
     let resolver: std::sync::Arc<dyn rustgate_transport::ResolvesServerCert> = reloader.clone();
 
     #[cfg(not(feature = "ocsp"))]
-    if cli.ocsp_stapling {
+    if cli.tls.ocsp_stapling {
         tracing::warn!(
             "--ocsp-stapling set but the ocsp feature is not compiled in; \
              rebuild with --features ocsp to enable OCSP stapling"
@@ -404,11 +407,11 @@ pub(crate) async fn bind_tls_listener(
         .build_reloadable_server_config(verifier, resolver)
         .context("building reloadable server config")?;
 
-    if cli.cert_reload_interval > 0 {
-        let interval = std::time::Duration::from_secs(cli.cert_reload_interval);
+    if cli.tls.cert_reload_interval > 0 {
+        let interval = std::time::Duration::from_secs(cli.tls.cert_reload_interval);
         reloader.spawn_watcher(interval);
         tracing::info!(
-            interval_secs = cli.cert_reload_interval,
+            interval_secs = cli.tls.cert_reload_interval,
             "certificate hot-reload polling enabled"
         );
     } else {
@@ -424,9 +427,9 @@ pub(crate) async fn bind_tls_listener(
     // the unused_mut here.
     #[allow(unused_mut)]
     let mut listener = TlsListener::bind_with_server_config(
-        &cli.bind,
+        &cli.tls.bind,
         Arc::new(server_config),
-        cli.max_concurrent_handshakes,
+        cli.limits.max_concurrent_handshakes,
     )
     .await
     .context("binding TLS listener with cert reloader")?;
@@ -478,8 +481,10 @@ pub(crate) struct TlsListenerHandle {
 /// `--encoding` disagree on the wire protocol.
 pub(crate) fn validate_framing(cli: &Cli) -> anyhow::Result<()> {
     #[cfg(not(feature = "proto"))]
-    if matches!(cli.framing, Framing::TakProtobuf | Framing::TakNegotiate)
-        || matches!(cli.encoding, Encoding::TakProtobuf)
+    if matches!(
+        cli.codec.framing,
+        Framing::TakProtobuf | Framing::TakNegotiate
+    ) || matches!(cli.codec.encoding, Encoding::TakProtobuf)
     {
         anyhow::bail!("TAK protobuf support requires --features proto");
     }
@@ -487,13 +492,16 @@ pub(crate) fn validate_framing(cli: &Cli) -> anyhow::Result<()> {
     // Reject ambiguous combinations where framing and encoding disagree on
     // the wire protocol. --encoding tak-protobuf implies 0xBF+varint framing,
     // which conflicts with non-protobuf --framing values.
-    if matches!(cli.encoding, Encoding::TakProtobuf)
-        && !matches!(cli.framing, Framing::TakProtobuf | Framing::TakNegotiate)
+    if matches!(cli.codec.encoding, Encoding::TakProtobuf)
+        && !matches!(
+            cli.codec.framing,
+            Framing::TakProtobuf | Framing::TakNegotiate
+        )
     {
         anyhow::bail!(
             "--encoding tak-protobuf requires --framing tak-protobuf or --framing tak-negotiate; \
              got --framing {:?}",
-            cli.framing
+            cli.codec.framing
         );
     }
 
@@ -505,15 +513,15 @@ pub(crate) fn validate_framing(cli: &Cli) -> anyhow::Result<()> {
 
 /// Build per-client rate-limiting configuration (if enabled).
 pub(crate) fn build_throttle_config(cli: &Cli) -> Option<ThrottleConfig> {
-    if cli.client_message_rate > 0 {
+    if cli.ratelimit.client_message_rate > 0 {
         tracing::info!(
-            rate = cli.client_message_rate,
-            burst = cli.client_burst,
+            rate = cli.ratelimit.client_message_rate,
+            burst = cli.ratelimit.client_burst,
             "per-client rate limiting enabled"
         );
         Some(ThrottleConfig::new(
-            cli.client_message_rate,
-            cli.client_burst,
+            cli.ratelimit.client_message_rate,
+            cli.ratelimit.client_burst,
         ))
     } else {
         None
@@ -558,23 +566,24 @@ pub(crate) struct NatsConnectOutcome {
 /// transport.
 #[cfg(feature = "nats")]
 pub(crate) async fn connect_nats(cli: &Cli, router: &Arc<Router>) -> Option<NatsConnectOutcome> {
-    let nats_url = cli.nats_url.as_ref()?;
+    let nats_url = cli.nats.nats_url.as_ref()?;
 
     let config = rustgate_nats::NatsConfig {
         url: nats_url.clone(),
-        credentials_file: cli.nats_credentials.clone(),
+        credentials_file: cli.nats.nats_credentials.clone(),
         tls: rustgate_nats::NatsTlsConfig {
-            client_cert: cli.nats_tls_cert.clone(),
-            client_key: cli.nats_tls_key.clone(),
-            ca_cert: cli.nats_tls_ca.clone(),
-            required: cli.nats_tls_required,
+            client_cert: cli.nats.nats_tls_cert.clone(),
+            client_key: cli.nats.nats_tls_key.clone(),
+            ca_cert: cli.nats.nats_tls_ca.clone(),
+            required: cli.nats.nats_tls_required,
         },
-        subscription_capacity: cli.nats_subscription_capacity,
-        live_stream: cli.nats_live_stream.clone(),
-        max_ack_pending: cli.nats_max_ack_pending,
-        max_deliver: cli.nats_max_deliver,
-        dead_letter_subject: cli.nats_dead_letter_subject.clone(),
+        subscription_capacity: cli.nats.nats_subscription_capacity,
+        live_stream: cli.nats.nats_live_stream.clone(),
+        max_ack_pending: cli.nats.nats_max_ack_pending,
+        max_deliver: cli.nats.nats_max_deliver,
+        dead_letter_subject: cli.nats.nats_dead_letter_subject.clone(),
         checkpoint_path: cli
+            .nats
             .nats_checkpoint_path
             .as_ref()
             .map(std::path::PathBuf::from),
@@ -694,7 +703,7 @@ pub(crate) fn start_nats_subscriber(
 /// Stub for when the `nats` feature is disabled.
 #[cfg(not(feature = "nats"))]
 pub(crate) fn warn_nats_disabled(cli: &Cli) {
-    if cli.nats_url.is_some() {
+    if cli.nats.nats_url.is_some() {
         tracing::warn!("--nats-url requires --features nats; ignoring");
     }
 }
@@ -712,7 +721,7 @@ pub(crate) fn warn_nats_disabled(cli: &Cli) {
 pub(crate) async fn connect_http(
     cli: &Cli,
 ) -> Option<(crate::session::HttpForwardFn, rustgate_http::HttpPublisher)> {
-    let config_path = cli.http_config_file.as_ref()?;
+    let config_path = cli.integrations.http_config_file.as_ref()?;
     let config_str = match tokio::fs::read_to_string(config_path).await {
         Ok(s) => s,
         Err(e) => {
@@ -736,7 +745,7 @@ pub(crate) async fn connect_http(
     // partial bring-up would be worse than no bring-up because
     // downstream observers might assume "no targets configured" rather
     // than "some targets refused."
-    if cli.air_gap {
+    if cli.tls.air_gap {
         let mut violations: Vec<String> = Vec::new();
         for target in &config.targets {
             let host = rustgate_core::air_gap::extract_host(&target.url);
@@ -781,7 +790,7 @@ pub(crate) async fn connect_http(
 /// Warn when --http-config is set but the `http` feature is disabled.
 #[cfg(not(feature = "http"))]
 pub(crate) fn warn_http_disabled(cli: &Cli) {
-    if cli.http_config_file.is_some() {
+    if cli.integrations.http_config_file.is_some() {
         tracing::warn!("--http-config requires --features http; ignoring");
     }
 }
@@ -792,7 +801,7 @@ pub(crate) fn warn_http_disabled(cli: &Cli) {
 
 /// Start the Anduril Lattice bridge.
 ///
-/// Reads the TOML config file under `cli.lattice_config_file`,
+/// Reads the TOML config file under `cli.integrations.lattice_config_file`,
 /// validates the `[lattice]` block, and spawns the inbound
 /// (subscribe-and-route) and outbound (publish-on-event) tasks
 /// against the configured backend. Returns the
@@ -818,7 +827,7 @@ pub(crate) async fn start_lattice(
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<()>,
 )> {
-    let config_path = cli.lattice_config_file.as_ref()?;
+    let config_path = cli.integrations.lattice_config_file.as_ref()?;
     let config_str = match tokio::fs::read_to_string(config_path).await {
         Ok(s) => s,
         Err(e) => {
@@ -896,7 +905,7 @@ pub(crate) async fn start_lattice(
 /// Warn when --lattice-config is set but the `lattice` feature is disabled.
 #[cfg(not(feature = "lattice"))]
 pub(crate) fn warn_lattice_disabled(cli: &Cli) {
-    if cli.lattice_config_file.is_some() {
+    if cli.integrations.lattice_config_file.is_some() {
         tracing::warn!("--lattice-config requires --features lattice; ignoring");
     }
 }
@@ -992,7 +1001,7 @@ pub(crate) fn init_dds_scaffold() {
 
 /// Start the OGC SensorThings v1.0 polling client.
 ///
-/// Reads the TOML config file under `cli.ogc_sensorthings_config_file`,
+/// Reads the TOML config file under `cli.integrations.ogc_sensorthings_config_file`,
 /// validates the `[sensorthings]` block, optionally loads the
 /// bearer token from `auth-token-path`, builds a
 /// [`rustgate_ogc_sensorthings::SensorThingsClient`], and spawns
@@ -1011,7 +1020,7 @@ pub(crate) async fn start_ogc_sensorthings(
     cli: &Cli,
     router: &Arc<Router>,
 ) -> Option<SubsystemHandle> {
-    let config_path = cli.ogc_sensorthings_config_file.as_ref()?;
+    let config_path = cli.integrations.ogc_sensorthings_config_file.as_ref()?;
     let config_str = match tokio::fs::read_to_string(config_path).await {
         Ok(s) => s,
         Err(e) => {
@@ -1082,7 +1091,7 @@ pub(crate) async fn start_ogc_sensorthings(
 /// `ogc-sensorthings` feature is disabled.
 #[cfg(not(feature = "ogc-sensorthings"))]
 pub(crate) fn warn_ogc_sensorthings_disabled(cli: &Cli) {
-    if cli.ogc_sensorthings_config_file.is_some() {
+    if cli.integrations.ogc_sensorthings_config_file.is_some() {
         tracing::warn!("--ogc-sensorthings-config requires --features ogc-sensorthings; ignoring");
     }
 }
@@ -1100,21 +1109,26 @@ pub(crate) async fn start_enrollment(
     key_pem: &str,
     router: &Arc<Router>,
 ) -> anyhow::Result<()> {
-    let enrollment_bind = match cli.enrollment_bind.as_ref() {
+    let enrollment_bind = match cli.enrollment.enrollment_bind.as_ref() {
         Some(b) => b,
         None => return Ok(()),
     };
 
     let ca_key_path = cli
+        .enrollment
         .ca_key
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--ca-key is required when --enrollment-bind is set"))?;
-    let enrollment_user = cli.enrollment_user.as_deref().ok_or_else(|| {
+    let enrollment_user = cli.enrollment.enrollment_user.as_deref().ok_or_else(|| {
         anyhow::anyhow!("--enrollment-user is required when --enrollment-bind is set")
     })?;
-    let enrollment_password = cli.enrollment_password.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("--enrollment-password is required when --enrollment-bind is set")
-    })?;
+    let enrollment_password = cli
+        .enrollment
+        .enrollment_password
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow::anyhow!("--enrollment-password is required when --enrollment-bind is set")
+        })?;
 
     // Closes #797: the CA private key is the most sensitive on-disk
     // material rustgate handles — route it through the shared
@@ -1132,9 +1146,12 @@ pub(crate) async fn start_enrollment(
     .map_err(|e| anyhow::anyhow!("blocking task panic: {e}"))?
     .context("reading CA private key for enrollment")?;
 
-    let signer =
-        rustgate_enrollment::CsrSigner::from_pem(ca_pem, &ca_key_pem, &cli.ca_organization)
-            .context("building CSR signer for enrollment")?;
+    let signer = rustgate_enrollment::CsrSigner::from_pem(
+        ca_pem,
+        &ca_key_pem,
+        &cli.enrollment.ca_organization,
+    )
+    .context("building CSR signer for enrollment")?;
     let credentials = rustgate_enrollment::Credentials::new(
         enrollment_user.to_string(),
         zeroize::Zeroizing::new(enrollment_password.to_string()),
@@ -1167,10 +1184,10 @@ pub(crate) async fn start_enrollment(
 
     let rate_window = std::time::Duration::from_secs(60);
     // 0 disables the throttle by treating it as effectively unbounded.
-    let rate_limit = if cli.enrollment_rate_limit == 0 {
+    let rate_limit = if cli.enrollment.enrollment_rate_limit == 0 {
         usize::MAX
     } else {
-        cli.enrollment_rate_limit as usize
+        cli.enrollment.enrollment_rate_limit as usize
     };
 
     let mut enrollment_server = rustgate_enrollment::EnrollmentServer::new(signer, credentials)
@@ -1178,7 +1195,7 @@ pub(crate) async fn start_enrollment(
         .with_rate_limit(rate_limit, rate_window);
 
     #[cfg(feature = "est")]
-    if cli.est_enabled {
+    if cli.enrollment.est_enabled {
         enrollment_server = enrollment_server.with_est();
         tracing::info!("EST (RFC 7030) endpoints enabled");
     }
@@ -1199,23 +1216,24 @@ pub(crate) async fn start_enrollment(
     }
 
     tracing::info!(
-        max_per_minute = cli.enrollment_rate_limit,
+        max_per_minute = cli.enrollment.enrollment_rate_limit,
         "enrollment CSR signing rate limit configured"
     );
 
-    if let Some(ref pkg_dir) = cli.data_package_dir {
+    if let Some(ref pkg_dir) = cli.enrollment.data_package_dir {
         let mut store =
             rustgate_enrollment::DataPackageStore::new(std::path::PathBuf::from(pkg_dir))
                 .await
                 .context("initializing data package store")?;
 
-        if cli.package_strict_signatures && cli.package_signature_ca.is_none() {
+        if cli.enrollment.package_strict_signatures && cli.enrollment.package_signature_ca.is_none()
+        {
             anyhow::bail!("--package-strict-signatures requires --package-signature-ca to be set");
         }
 
-        store = store.with_strict_signatures(cli.package_strict_signatures);
+        store = store.with_strict_signatures(cli.enrollment.package_strict_signatures);
 
-        if let Some(ref ca_path) = cli.package_signature_ca {
+        if let Some(ref ca_path) = cli.enrollment.package_signature_ca {
             let pem_data = tokio::fs::read_to_string(ca_path)
                 .await
                 .context("reading --package-signature-ca")?;
@@ -1234,7 +1252,7 @@ pub(crate) async fn start_enrollment(
         tracing::info!(dir = %pkg_dir, "data package storage enabled");
     }
 
-    if let Some(ref db_path) = cli.revocation_db {
+    if let Some(ref db_path) = cli.enrollment.revocation_db {
         let revocation_store = rustgate_enrollment::RevocationStore::new(
             std::path::PathBuf::from(db_path),
             cert_pem,
@@ -1242,14 +1260,14 @@ pub(crate) async fn start_enrollment(
         )
         .await
         .context("initializing revocation store")?
-        .with_crl_validity_days(cli.crl_validity_days);
+        .with_crl_validity_days(cli.enrollment.crl_validity_days);
 
         let revoked_count = revocation_store.count().await;
         enrollment_server = enrollment_server.with_revocation(revocation_store);
         tracing::info!(
             db = %db_path,
             revoked = revoked_count,
-            crl_validity_days = cli.crl_validity_days,
+            crl_validity_days = cli.enrollment.crl_validity_days,
             "certificate revocation enabled"
         );
     }
@@ -1277,7 +1295,7 @@ pub(crate) async fn start_enrollment(
 /// Warn when enrollment is requested without the feature.
 #[cfg(not(feature = "enrollment"))]
 pub(crate) fn warn_enrollment_disabled(cli: &Cli) {
-    if cli.enrollment_bind.is_some() {
+    if cli.enrollment.enrollment_bind.is_some() {
         tracing::warn!("--enrollment-bind requires --features enrollment; ignoring");
     }
 }
@@ -1354,7 +1372,7 @@ pub(crate) async fn start_metrics(
     // Load the optional CN allowlist for per-identity metric label
     // bucketing. When unset, all CNs collapse to the literal "other"
     // label, capping cardinality at 1.
-    let allowlist = if let Some(ref path) = cli.metrics_identity_allowlist {
+    let allowlist = if let Some(ref path) = cli.metrics.metrics_identity_allowlist {
         let set = metrics::load_identity_allowlist(path)
             .with_context(|| format!("loading metrics identity allowlist {}", path.display()))?;
         tracing::info!(
@@ -1367,21 +1385,21 @@ pub(crate) async fn start_metrics(
         None
     };
 
-    if cli.metrics_per_identity {
+    if cli.metrics.metrics_per_identity {
         metrics::init_per_identity().context("registering per-identity metrics")?;
         tracing::info!("Tier 2 per-identity metrics enabled");
     }
 
     let identity = Arc::new(metrics::MetricsIdentity::new(
         allowlist,
-        cli.metrics_per_identity,
+        cli.metrics.metrics_per_identity,
     ));
 
     // Load the optional metrics bearer token from file. When set,
     // requests to `/metrics` must present this token; when unset the
     // endpoint remains unauthenticated for backward compatibility.
     let metrics_token: Option<Arc<zeroize::Zeroizing<Vec<u8>>>> = if let Some(ref token_file) =
-        cli.metrics_token_file
+        cli.metrics.metrics_token_file
     {
         // Closes #797: route through the shared `read_secret_file`
         // helper so the metrics bearer-token file is subject to the
@@ -1404,7 +1422,7 @@ pub(crate) async fn start_metrics(
         None
     };
 
-    if let Some(ref metrics_bind) = cli.metrics_bind {
+    if let Some(ref metrics_bind) = cli.metrics.metrics_bind {
         let bind_addr: std::net::SocketAddr = metrics_bind
             .parse()
             .context("parsing --metrics-bind address")?;
@@ -1423,7 +1441,7 @@ pub(crate) async fn start_metrics(
         let correlation_api_for_metrics = Arc::clone(correlation_api_slot);
         let metrics_token_for_server = metrics_token.clone();
         let router_for_metrics = Arc::clone(router_slot);
-        let max_http_connections = cli.metrics_max_connections;
+        let max_http_connections = cli.metrics.metrics_max_connections;
         spawn_background("metrics-server", async move {
             if let Err(e) = rustgate_admin::serve(
                 bind_addr,
@@ -1456,16 +1474,16 @@ pub(crate) async fn start_metrics(
 /// Warn when metrics is requested without the feature.
 #[cfg(not(feature = "metrics"))]
 pub(crate) fn warn_metrics_disabled(cli: &Cli) {
-    if cli.metrics_bind.is_some() {
+    if cli.metrics.metrics_bind.is_some() {
         tracing::warn!("--metrics-bind requires --features metrics; ignoring");
     }
-    if cli.metrics_token_file.is_some() {
+    if cli.metrics.metrics_token_file.is_some() {
         tracing::warn!("--metrics-token-file requires --features metrics; ignoring");
     }
-    if cli.metrics_per_identity {
+    if cli.metrics.metrics_per_identity {
         tracing::warn!("--metrics-per-identity requires --features metrics; ignoring");
     }
-    if cli.metrics_identity_allowlist.is_some() {
+    if cli.metrics.metrics_identity_allowlist.is_some() {
         tracing::warn!("--metrics-identity-allowlist requires --features metrics; ignoring");
     }
 }
@@ -1480,7 +1498,7 @@ async fn build_federation_config(
     cli: &Cli,
     bind_addr: std::net::SocketAddr,
 ) -> anyhow::Result<rustgate_federation::config::FederationConfig> {
-    let peers = if let Some(ref peers_file) = cli.federation_peers_file {
+    let peers = if let Some(ref peers_file) = cli.federation.federation_peers_file {
         let data = tokio::fs::read_to_string(peers_file)
             .await
             .context("reading federation peers file")?;
@@ -1490,7 +1508,8 @@ async fn build_federation_config(
         Vec::new()
     };
 
-    let (v2_enabled, v2_listen_addr) = if let Some(ref v2_bind) = cli.federation_v2_bind {
+    let (v2_enabled, v2_listen_addr) = if let Some(ref v2_bind) = cli.federation.federation_v2_bind
+    {
         let addr: std::net::SocketAddr = v2_bind
             .parse()
             .context("parsing --federation-v2-bind address")?;
@@ -1506,7 +1525,7 @@ async fn build_federation_config(
     };
 
     Ok(rustgate_federation::config::FederationConfig {
-        federate_id: cli.federation_id.clone(),
+        federate_id: cli.federation.federation_id.clone(),
         v1_enabled: true,
         v1_listen_addr: bind_addr,
         v2_enabled,
@@ -1517,30 +1536,35 @@ async fn build_federation_config(
         // (range 1..=255) since #758, so widen to u32 here. The V2 inbound
         // service narrows back to u8 inside `FederationManager::start` —
         // single source of truth, two consumers.
-        max_hops: u32::from(cli.federation_max_hops),
-        skip_hostname_verify: cli.federation_skip_hostname_verify,
-        cert_file: cli.cert.clone().into(),
-        key_file: cli.key.clone().into(),
-        ca_file: cli.ca.clone().into(),
-        store_path: cli.federation_store_path.clone().map(Into::into),
-        trust_store_dir: cli.federation_trust_store_dir.clone().map(Into::into),
-        circuit_breaker_threshold: cli.federation_circuit_breaker_threshold,
+        max_hops: u32::from(cli.federation.federation_max_hops),
+        skip_hostname_verify: cli.federation.federation_skip_hostname_verify,
+        cert_file: cli.tls.cert.clone().into(),
+        key_file: cli.tls.key.clone().into(),
+        ca_file: cli.tls.ca.clone().into(),
+        store_path: cli.federation.federation_store_path.clone().map(Into::into),
+        trust_store_dir: cli
+            .federation
+            .federation_trust_store_dir
+            .clone()
+            .map(Into::into),
+        circuit_breaker_threshold: cli.federation.federation_circuit_breaker_threshold,
         circuit_breaker_timeout: std::time::Duration::from_secs(
-            cli.federation_circuit_breaker_timeout,
+            cli.federation.federation_circuit_breaker_timeout,
         ),
-        replay_buffer_capacity: cli.federation_replay_buffer_size,
-        replay_buffer_dir: cli.federation_replay_dir.clone(),
-        replay_max_bytes: cli.federation_replay_max_bytes,
-        pod_id: cli.federation_pod_id.clone().or_else(|| {
-            cli.federation_ha_nats_url
+        replay_buffer_capacity: cli.federation.federation_replay_buffer_size,
+        replay_buffer_dir: cli.federation.federation_replay_dir.clone(),
+        replay_max_bytes: cli.federation.federation_replay_max_bytes,
+        pod_id: cli.federation.federation_pod_id.clone().or_else(|| {
+            cli.federation
+                .federation_ha_nats_url
                 .as_ref()
-                .map(|_| cli.federation_id.clone())
+                .map(|_| cli.federation.federation_id.clone())
         }),
-        ha_nats_url: cli.federation_ha_nats_url.clone(),
-        local_region: cli.federation_region.clone(),
-        max_groups_per_peer: cli.federation_max_groups_per_peer,
-        max_group_name_length: cli.federation_max_group_name_length,
-        trust_peer_groups: cli.federation_trust_peer_groups,
+        ha_nats_url: cli.federation.federation_ha_nats_url.clone(),
+        local_region: cli.federation.federation_region.clone(),
+        max_groups_per_peer: cli.federation.federation_max_groups_per_peer,
+        max_group_name_length: cli.federation.federation_max_group_name_length,
+        trust_peer_groups: cli.federation.federation_trust_peer_groups,
         ..rustgate_federation::config::FederationConfig::default()
     })
 }
@@ -1557,13 +1581,15 @@ fn wire_federation_api(
     use rustgate_federation::trust_store::TrustStore;
 
     let store = Arc::new(std::sync::RwLock::new(FileStore::new(
-        cli.federation_store_path.clone().map(Into::into),
+        cli.federation.federation_store_path.clone().map(Into::into),
     )));
-    let trust_store = Arc::new(if let Some(ref dir) = cli.federation_trust_store_dir {
-        TrustStore::load_from_directory(std::path::Path::new(dir))?
-    } else {
-        TrustStore::new(None)
-    });
+    let trust_store = Arc::new(
+        if let Some(ref dir) = cli.federation.federation_trust_store_dir {
+            TrustStore::load_from_directory(std::path::Path::new(dir))?
+        } else {
+            TrustStore::new(None)
+        },
+    );
 
     let rwlock_for_status = Arc::clone(rwlock);
     let status_fn: Arc<dyn Fn() -> rustgate_federation::manager::FederationStatus + Send + Sync> =
@@ -1852,7 +1878,7 @@ pub(crate) async fn start_federation(
     Option<FedForwardFn>,
     Option<Arc<tokio::sync::RwLock<rustgate_federation::manager::FederationManager>>>,
 )> {
-    let v1_bind = match cli.federation_v1_bind.as_ref() {
+    let v1_bind = match cli.federation.federation_v1_bind.as_ref() {
         Some(b) => b,
         None => return Ok((None, None)),
     };
@@ -1899,7 +1925,7 @@ pub(crate) async fn start_federation(
         .start(on_inbound)
         .await
         .context("starting federation manager")?;
-    tracing::info!(addr = %bind_addr, id = %cli.federation_id, "federation started");
+    tracing::info!(addr = %bind_addr, id = %cli.federation.federation_id, "federation started");
 
     let rwlock = Arc::new(tokio::sync::RwLock::new(manager));
 
@@ -1937,10 +1963,10 @@ pub(crate) async fn start_federation(
 /// Warn when federation features are requested without the feature flags.
 #[cfg(not(feature = "federation"))]
 pub(crate) fn warn_federation_disabled(cli: &Cli) -> Option<FedForwardFn> {
-    if cli.federation_v1_bind.is_some() {
+    if cli.federation.federation_v1_bind.is_some() {
         tracing::warn!("--federation-v1-bind requires --features federation; ignoring");
     }
-    if cli.federation_v2_bind.is_some() {
+    if cli.federation.federation_v2_bind.is_some() {
         tracing::warn!("--federation-v2-bind requires --features federation; ignoring");
     }
     None
@@ -1966,7 +1992,7 @@ pub(crate) fn start_federation_peer_discovery(
 ) -> anyhow::Result<Option<tokio::sync::watch::Sender<bool>>> {
     use crate::cli::PeerDiscoveryBackend;
 
-    if cli.federation_peer_discovery == PeerDiscoveryBackend::None {
+    if cli.federation.federation_peer_discovery == PeerDiscoveryBackend::None {
         return Ok(None);
     }
 
@@ -1978,13 +2004,16 @@ pub(crate) fn start_federation_peer_discovery(
     {
         use rustgate_federation::discovery::PeerDiscovery;
 
-        let source: Arc<dyn PeerDiscovery> = match cli.federation_peer_discovery {
+        let source: Arc<dyn PeerDiscovery> = match cli.federation.federation_peer_discovery {
             PeerDiscoveryBackend::None => {
                 anyhow::bail!("peer discovery backend is None (should have been handled above)");
             }
             #[cfg(feature = "peer-discovery-dns-sd")]
             PeerDiscoveryBackend::DnsSd => {
-                let svc = cli.federation_peer_discovery_dns_sd_service.clone();
+                let svc = cli
+                    .federation
+                    .federation_peer_discovery_dns_sd_service
+                    .clone();
                 Arc::new(rustgate_federation::discovery::dns_sd::DnsSdDiscovery::new(
                     svc,
                 )?)
@@ -1997,9 +2026,9 @@ pub(crate) fn start_federation_peer_discovery(
             }
             #[cfg(feature = "peer-discovery-consul")]
             PeerDiscoveryBackend::Consul => {
-                if cli.air_gap {
+                if cli.tls.air_gap {
                     let host = rustgate_core::air_gap::extract_host(
-                        &cli.federation_peer_discovery_consul_addr,
+                        &cli.federation.federation_peer_discovery_consul_addr,
                     );
                     let permitted = host
                         .map(rustgate_core::air_gap::is_private_host)
@@ -2007,20 +2036,22 @@ pub(crate) fn start_federation_peer_discovery(
                     if !permitted {
                         rustgate_core::audit::air_gap_violation(
                             "peer_discovery_consul",
-                            &cli.federation_peer_discovery_consul_addr,
+                            &cli.federation.federation_peer_discovery_consul_addr,
                             "non-private host",
                         );
                         anyhow::bail!(
                             "--air-gap rejects --federation-peer-discovery-consul-addr `{}`: \
                              host is not in the private/loopback/link-local set.",
-                            cli.federation_peer_discovery_consul_addr
+                            cli.federation.federation_peer_discovery_consul_addr
                         );
                     }
                 }
                 Arc::new(
                     rustgate_federation::discovery::consul::ConsulDiscovery::new(
-                        cli.federation_peer_discovery_consul_addr.clone(),
-                        cli.federation_peer_discovery_consul_service.clone(),
+                        cli.federation.federation_peer_discovery_consul_addr.clone(),
+                        cli.federation
+                            .federation_peer_discovery_consul_service
+                            .clone(),
                     )?,
                 )
             }
@@ -2033,6 +2064,7 @@ pub(crate) fn start_federation_peer_discovery(
             #[cfg(feature = "peer-discovery-etcd")]
             PeerDiscoveryBackend::Etcd => {
                 let endpoints: Vec<String> = cli
+                    .federation
                     .federation_peer_discovery_etcd_endpoints
                     .split(',')
                     .map(|s| s.trim().to_string())
@@ -2043,7 +2075,7 @@ pub(crate) fn start_federation_peer_discovery(
                         "--federation-peer-discovery-etcd-endpoints must contain at least one endpoint"
                     );
                 }
-                if cli.air_gap {
+                if cli.tls.air_gap {
                     for ep in &endpoints {
                         let host = rustgate_core::air_gap::extract_host(ep);
                         let permitted = host
@@ -2064,7 +2096,7 @@ pub(crate) fn start_federation_peer_discovery(
                 }
                 Arc::new(rustgate_federation::discovery::etcd::EtcdDiscovery::new(
                     endpoints,
-                    cli.federation_peer_discovery_etcd_prefix.clone(),
+                    cli.federation.federation_peer_discovery_etcd_prefix.clone(),
                 ))
             }
             #[cfg(not(feature = "peer-discovery-etcd"))]
@@ -2075,7 +2107,8 @@ pub(crate) fn start_federation_peer_discovery(
             }
         };
 
-        let interval = std::time::Duration::from_secs(cli.federation_peer_discovery_interval);
+        let interval =
+            std::time::Duration::from_secs(cli.federation.federation_peer_discovery_interval);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = rustgate_federation::discovery::reconciler(
             Arc::clone(manager),
@@ -2086,8 +2119,8 @@ pub(crate) fn start_federation_peer_discovery(
         // Detached: the task owns itself until its shutdown receiver fires.
         std::mem::drop(handle);
         tracing::info!(
-            backend = ?cli.federation_peer_discovery,
-            interval_secs = cli.federation_peer_discovery_interval,
+            backend = ?cli.federation.federation_peer_discovery,
+            interval_secs = cli.federation.federation_peer_discovery_interval,
             "federation peer discovery reconciler started"
         );
         Ok(Some(shutdown_tx))
@@ -2110,7 +2143,7 @@ pub(crate) fn start_federation_peer_discovery(
 #[cfg(not(feature = "federation"))]
 pub(crate) fn warn_federation_peer_discovery_disabled(cli: &Cli) {
     use crate::cli::PeerDiscoveryBackend;
-    if cli.federation_peer_discovery != PeerDiscoveryBackend::None {
+    if cli.federation.federation_peer_discovery != PeerDiscoveryBackend::None {
         tracing::warn!("--federation-peer-discovery requires --features federation; ignoring");
     }
 }
@@ -2118,7 +2151,7 @@ pub(crate) fn warn_federation_peer_discovery_disabled(cli: &Cli) {
 /// Warn when federation-ha is requested without the feature.
 #[cfg(not(feature = "federation-ha"))]
 pub(crate) fn warn_federation_ha_disabled(cli: &Cli) {
-    if cli.federation_ha_nats_url.is_some() {
+    if cli.federation.federation_ha_nats_url.is_some() {
         tracing::warn!("--federation-ha-nats-url requires --features federation-ha; ignoring");
     }
 }
@@ -2161,7 +2194,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         throttle_config,
         replay_filter,
     } = setup;
-    let ws_bind = match cli.websocket_bind.as_ref() {
+    let ws_bind = match cli.websocket.websocket_bind.as_ref() {
         Some(b) => b,
         None => return Ok(None),
     };
@@ -2179,13 +2212,13 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
     let ws_session_hooks: Option<rustgate_websocket::WsSessionHooks> = None;
 
     let ws_config = rustgate_websocket::WsListenerConfig {
-        conn_rate_limit: cli.ws_rate_limit_max,
-        conn_rate_window: std::time::Duration::from_secs(cli.ws_rate_limit_window_secs),
-        max_frame_size: cli.ws_max_frame_size,
-        max_message_size: cli.ws_max_message_size,
-        supported_subprotocols: cli.ws_subprotocols.clone(),
-        subprotocol_strict: cli.ws_subprotocol_strict,
-        compression: if cli.ws_compression_disabled {
+        conn_rate_limit: cli.websocket.ws_rate_limit_max,
+        conn_rate_window: std::time::Duration::from_secs(cli.websocket.ws_rate_limit_window_secs),
+        max_frame_size: cli.websocket.ws_max_frame_size,
+        max_message_size: cli.websocket.ws_max_message_size,
+        supported_subprotocols: cli.websocket.ws_subprotocols.clone(),
+        subprotocol_strict: cli.websocket.ws_subprotocol_strict,
+        compression: if cli.websocket.ws_compression_disabled {
             rustgate_websocket::CompressionConfig::Disabled
         } else {
             rustgate_websocket::CompressionConfig::default()
@@ -2242,14 +2275,14 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
         },
         throttle_config,
         replay_filter: replay_filter.clone(),
-        circuit_breaker_threshold: cli.circuit_breaker_threshold,
-        ws_max_frames_per_sec: cli.ws_max_frames_per_sec,
-        ws_max_bytes_per_sec: cli.ws_max_bytes_per_sec,
-        ws_max_violations: cli.ws_max_violations,
-        max_write_buffer_bytes: cli.ws_max_write_buffer_bytes,
+        circuit_breaker_threshold: cli.ratelimit.circuit_breaker_threshold,
+        ws_max_frames_per_sec: cli.websocket.ws_max_frames_per_sec,
+        ws_max_bytes_per_sec: cli.websocket.ws_max_bytes_per_sec,
+        ws_max_violations: cli.websocket.ws_max_violations,
+        max_write_buffer_bytes: cli.websocket.ws_max_write_buffer_bytes,
         health_check: rustgate_websocket::health::HealthCheckConfig {
-            ping_interval: std::time::Duration::from_secs(cli.ws_ping_interval_secs),
-            pong_timeout: std::time::Duration::from_secs(cli.ws_pong_timeout_secs),
+            ping_interval: std::time::Duration::from_secs(cli.websocket.ws_ping_interval_secs),
+            pong_timeout: std::time::Duration::from_secs(cli.websocket.ws_pong_timeout_secs),
         },
         session_hooks: ws_session_hooks,
         // Closes #741. WebSocket sessions feed the same SA
@@ -2269,7 +2302,7 @@ pub(crate) fn start_websocket<P: NatsPublish + Send + Sync + 'static>(
 /// Warn when websocket is requested without the feature.
 #[cfg(not(feature = "websocket"))]
 pub(crate) fn warn_websocket_disabled(cli: &Cli) {
-    if cli.websocket_bind.is_some() {
+    if cli.websocket.websocket_bind.is_some() {
         tracing::warn!("--websocket-bind requires --features websocket; ignoring");
     }
 }
@@ -2311,12 +2344,12 @@ pub(crate) fn start_mqtt<P: NatsPublish + Send + Sync + 'static>(
         #[cfg(feature = "http")]
         http_forward,
     } = setup;
-    let mqtt_bind = match cli.mqtt_bind.as_ref() {
+    let mqtt_bind = match cli.mqtt.mqtt_bind.as_ref() {
         Some(b) => b,
         None => return Ok(None),
     };
 
-    if let Some(prefix) = cli.mqtt_topic_prefix.as_deref() {
+    if let Some(prefix) = cli.mqtt.mqtt_topic_prefix.as_deref() {
         rustgate_mqtt::validate_topic_prefix(prefix)
             .map_err(|e| anyhow::anyhow!("invalid --mqtt-topic-prefix: {e}"))?;
     }
@@ -2408,16 +2441,16 @@ pub(crate) fn start_mqtt<P: NatsPublish + Send + Sync + 'static>(
         router: Arc::clone(router),
         connection_limit: Arc::clone(connection_limit),
         shutdown: Arc::clone(&shutdown),
-        topic_prefix: cli.mqtt_topic_prefix.clone(),
-        max_packet_size: cli.mqtt_max_packet_size,
-        receive_max: cli.mqtt_receive_max,
-        topic_alias_max: cli.mqtt_topic_alias_max,
-        max_session_expiry_secs: cli.mqtt_max_session_expiry_secs,
-        max_retained_sessions: cli.mqtt_max_retained_sessions,
-        min_keep_alive_secs: cli.mqtt_min_keep_alive_secs,
-        server_keep_alive_secs: cli.mqtt_server_keep_alive_secs,
-        response_channel_capacity: cli.mqtt_response_channel_capacity,
-        wildcard_policy: cli.mqtt_wildcard_policy.into(),
+        topic_prefix: cli.mqtt.mqtt_topic_prefix.clone(),
+        max_packet_size: cli.mqtt.mqtt_max_packet_size,
+        receive_max: cli.mqtt.mqtt_receive_max,
+        topic_alias_max: cli.mqtt.mqtt_topic_alias_max,
+        max_session_expiry_secs: cli.mqtt.mqtt_max_session_expiry_secs,
+        max_retained_sessions: cli.mqtt.mqtt_max_retained_sessions,
+        min_keep_alive_secs: cli.mqtt.mqtt_min_keep_alive_secs,
+        server_keep_alive_secs: cli.mqtt.mqtt_server_keep_alive_secs,
+        response_channel_capacity: cli.mqtt.mqtt_response_channel_capacity,
+        wildcard_policy: cli.mqtt.mqtt_wildcard_policy.into(),
         on_accept,
         on_reject,
         session_hooks,
@@ -2432,7 +2465,7 @@ pub(crate) fn start_mqtt<P: NatsPublish + Send + Sync + 'static>(
 /// Warn when MQTT is requested without the feature.
 #[cfg(not(feature = "mqtt"))]
 pub(crate) fn warn_mqtt_disabled(cli: &Cli) {
-    if cli.mqtt_bind.is_some() {
+    if cli.mqtt.mqtt_bind.is_some() {
         tracing::warn!("--mqtt-bind requires --features mqtt; ignoring");
     }
 }
@@ -2463,7 +2496,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     replay_filter: &Option<Arc<rustgate_router::ReplayFilter>>,
     #[cfg(feature = "metrics")] metrics_identity: &Arc<metrics::MetricsIdentity>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
-    let tcp_bind = match cli.tcp_bind.as_ref() {
+    let tcp_bind = match cli.plaintext.tcp_bind.as_ref() {
         Some(b) => b,
         None => return Ok(None),
     };
@@ -2473,8 +2506,8 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     tracing::warn!(addr = %addr, "plaintext TCP input enabled — traffic is NOT encrypted");
 
     let identity_config = rustgate_tls::PlaintextIdentityConfig {
-        cn: cli.plaintext_cn.clone(),
-        default_group: cli.plaintext_group.clone(),
+        cn: cli.plaintext.plaintext_cn.clone(),
+        default_group: cli.plaintext.plaintext_group.clone(),
     };
 
     let pt_listener = rustgate_tls::PlaintextListener::bind(addr, identity_config)
@@ -2494,7 +2527,7 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
     // ran at startup in `Cli::validate`, so a parse failure here is a
     // bug — surface as a hard error rather than silently skipping.
     let default_classification: Option<rustgate_core::classification::ClassificationMarking> =
-        match cli.default_classification.as_ref() {
+        match cli.authz.default_classification.as_ref() {
             Some(banner) => Some(banner.parse().map_err(|e| {
                 anyhow::anyhow!(
                     "--default-classification ({banner:?}) parse failed for plaintext listener: {e}"
@@ -2514,11 +2547,11 @@ pub(crate) async fn start_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
         throttle_config,
         archiver: archiver.clone(),
         replay_filter: replay_filter.clone(),
-        circuit_breaker_threshold: cli.circuit_breaker_threshold,
+        circuit_breaker_threshold: cli.ratelimit.circuit_breaker_threshold,
         delta_config: crate::session::DeltaConfig {
-            enabled: cli.cot_delta_encoding,
-            cache_size: cli.cot_delta_cache_size,
-            epsilon_meters: cli.cot_delta_epsilon_meters,
+            enabled: cli.dedup.cot_delta_encoding,
+            cache_size: cli.dedup.cot_delta_cache_size,
+            epsilon_meters: cli.dedup.cot_delta_epsilon_meters,
         },
         shutdown: shutdown_clone,
         #[cfg(feature = "metrics")]
@@ -2545,7 +2578,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
     fed_forward: &Option<FedForwardFn>,
     replay_filter: &Option<Arc<rustgate_router::ReplayFilter>>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
-    let udp_bind = match cli.udp_bind.as_ref() {
+    let udp_bind = match cli.plaintext.udp_bind.as_ref() {
         Some(b) => b,
         None => return Ok(None),
     };
@@ -2559,18 +2592,18 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
         .context("binding UDP socket")?;
 
     let mut config = rustgate_transport::UdpInputConfig {
-        cn: cli.plaintext_cn.clone(),
-        default_group: cli.plaintext_group.clone(),
+        cn: cli.plaintext.plaintext_cn.clone(),
+        default_group: cli.plaintext.plaintext_group.clone(),
         ..Default::default()
     };
 
     // Apply CLI rate-limit flag (0 = disabled).
-    if cli.udp_rate_limit > 0 {
-        config.max_pps = Some(cli.udp_rate_limit as usize);
+    if cli.plaintext.udp_rate_limit > 0 {
+        config.max_pps = Some(cli.plaintext.udp_rate_limit as usize);
     }
 
     // Parse and apply CIDR allowlist from comma-separated string.
-    if let Some(ref cidrs_str) = cli.udp_allowed_cidrs {
+    if let Some(ref cidrs_str) = cli.plaintext.udp_allowed_cidrs {
         let mut cidrs = Vec::new();
         for entry in cidrs_str.split(',') {
             let trimmed = entry.trim();
@@ -2587,7 +2620,7 @@ pub(crate) async fn start_udp<P: NatsPublish + Send + Sync + 'static>(
         }
     }
 
-    config.max_identities = cli.udp_max_identities;
+    config.max_identities = cli.plaintext.udp_max_identities;
 
     // Closes #741. UDP datagrams feed the same SA auto-upgrade
     // counter family as the TLS / WebSocket listeners.
@@ -2665,7 +2698,7 @@ pub(crate) async fn start_udp_multicast(
     cli: &Cli,
     router: &Arc<Router>,
 ) -> anyhow::Result<Option<SubsystemHandle>> {
-    let groups_str = match cli.udp_multicast_groups.as_ref() {
+    let groups_str = match cli.plaintext.udp_multicast_groups.as_ref() {
         Some(s) if !s.trim().is_empty() => s,
         _ => return Ok(None),
     };
@@ -2685,22 +2718,26 @@ pub(crate) async fn start_udp_multicast(
         return Ok(None);
     }
 
-    let interface: std::net::Ipv4Addr = cli.udp_multicast_interface.parse().with_context(|| {
-        format!(
-            "parsing --udp-multicast-interface '{}'",
-            cli.udp_multicast_interface
-        )
-    })?;
+    let interface: std::net::Ipv4Addr = cli
+        .plaintext
+        .udp_multicast_interface
+        .parse()
+        .with_context(|| {
+            format!(
+                "parsing --udp-multicast-interface '{}'",
+                cli.plaintext.udp_multicast_interface
+            )
+        })?;
 
     let cfg = rustgate_transport::MulticastConfig {
         groups,
         interface,
-        multicast_loop: cli.udp_multicast_loop,
-        ttl: cli.udp_multicast_ttl,
-        cn: cli.plaintext_cn.clone(),
-        default_group: cli.plaintext_group.clone(),
-        rebroadcast: cli.udp_multicast_rebroadcast,
-        max_bps: cli.udp_multicast_max_bps,
+        multicast_loop: cli.plaintext.udp_multicast_loop,
+        ttl: cli.plaintext.udp_multicast_ttl,
+        cn: cli.plaintext.plaintext_cn.clone(),
+        default_group: cli.plaintext.plaintext_group.clone(),
+        rebroadcast: cli.plaintext.udp_multicast_rebroadcast,
+        max_bps: cli.plaintext.udp_multicast_max_bps,
     };
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -2907,7 +2944,7 @@ mod tests {
         // must return `None` so the session loop skips the allow() check
         // entirely — any `Some` here would make throttling always-on.
         let cli = parse_cli(&[]);
-        assert_eq!(cli.client_message_rate, 0, "test precondition");
+        assert_eq!(cli.ratelimit.client_message_rate, 0, "test precondition");
         assert!(build_throttle_config(&cli).is_none());
     }
 

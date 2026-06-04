@@ -204,7 +204,7 @@ pub(crate) fn build_snapshot(config: &Path) -> Result<Snapshot> {
 
     let (config_value, redacted_fields) = redact_config(&cli)?;
 
-    let crl_report = match cli.crl {
+    let crl_report = match cli.tls.crl {
         Some(ref p) if !p.is_empty() => {
             // Read CRL best-effort: a missing or malformed CRL is *not*
             // a fatal snapshot error — the snapshot's job is to surface
@@ -228,7 +228,7 @@ pub(crate) fn build_snapshot(config: &Path) -> Result<Snapshot> {
         _ => None,
     };
 
-    let audit_log = audit_snapshot_from_path(cli.audit_log.as_deref());
+    let audit_log = audit_snapshot_from_path(cli.observability.audit_log.as_deref());
 
     Ok(Snapshot {
         rustgate_version: env!("CARGO_PKG_VERSION").to_string(),

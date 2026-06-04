@@ -131,11 +131,11 @@ pub(crate) async fn start_dis(
 ) -> anyhow::Result<Option<SubsystemHandle>> {
     spawn(
         ProtocolIngress {
-            bind: cli.dis_bind.clone(),
-            group: cli.dis_group.clone(),
-            rate_limit_pps: cli.dis_rate_limit_pps,
-            allowed_cidrs: cli.dis_allowed_cidrs.clone(),
-            max_identities: cli.dis_max_identities,
+            bind: cli.ingress.dis_bind.clone(),
+            group: cli.ingress.dis_group.clone(),
+            rate_limit_pps: cli.ingress.dis_rate_limit_pps,
+            allowed_cidrs: cli.ingress.dis_allowed_cidrs.clone(),
+            max_identities: cli.ingress.dis_max_identities,
             cn_prefix: "dis-anonymous",
             source_protocol: "dis",
             // DIS Entity State PDUs are kinematic position/state reports.
@@ -154,11 +154,11 @@ pub(crate) async fn start_asterix(
 ) -> anyhow::Result<Option<SubsystemHandle>> {
     spawn(
         ProtocolIngress {
-            bind: cli.asterix_bind.clone(),
-            group: cli.asterix_group.clone(),
-            rate_limit_pps: cli.asterix_rate_limit_pps,
-            allowed_cidrs: cli.asterix_allowed_cidrs.clone(),
-            max_identities: cli.asterix_max_identities,
+            bind: cli.ingress.asterix_bind.clone(),
+            group: cli.ingress.asterix_group.clone(),
+            rate_limit_pps: cli.ingress.asterix_rate_limit_pps,
+            allowed_cidrs: cli.ingress.asterix_allowed_cidrs.clone(),
+            max_identities: cli.ingress.asterix_max_identities,
             cn_prefix: "asterix-anonymous",
             source_protocol: "asterix",
             // CAT-062 system tracks are surveillance position reports.
@@ -178,11 +178,11 @@ pub(crate) async fn start_vmf(
 ) -> anyhow::Result<Option<SubsystemHandle>> {
     spawn(
         ProtocolIngress {
-            bind: cli.vmf_bind.clone(),
-            group: cli.vmf_group.clone(),
-            rate_limit_pps: cli.vmf_rate_limit_pps,
-            allowed_cidrs: cli.vmf_allowed_cidrs.clone(),
-            max_identities: cli.vmf_max_identities,
+            bind: cli.ingress.vmf_bind.clone(),
+            group: cli.ingress.vmf_group.clone(),
+            rate_limit_pps: cli.ingress.vmf_rate_limit_pps,
+            allowed_cidrs: cli.ingress.vmf_allowed_cidrs.clone(),
+            max_identities: cli.ingress.vmf_max_identities,
             cn_prefix: "vmf-anonymous",
             source_protocol: "vmf",
             // K05.1 is a position report.
