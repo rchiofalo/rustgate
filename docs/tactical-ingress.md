@@ -2,20 +2,33 @@
 
 rustgate ships codecs for many tactical protocols, but most are only useful
 once the server can actually **receive** them off the wire. The *tactical
-codec ingress* is a generic, codec-pluggable **UDP listener** that turns
-datagram-oriented tactical traffic into routed messages — subject to the
-same ACL/authz, dedup, and egress as every other transport.
+codec ingress* is a pair of generic, codec-pluggable listeners that turn
+tactical traffic into routed messages — subject to the same ACL/authz,
+dedup, and egress as every other transport:
 
-Wired today: **DIS** (IEEE 1278.1 Entity State PDUs), **ASTERIX** (CAT-062
-system tracks), and **VMF** (MIL-STD-6017 K05.1 position reports) — all on
-the same listener and the same `--<proto>-*` flag shape. Link 16 / STANAG
-4586 / SAPIENT (stream-framed) and Meshtastic (LoRa) are separate ingress
-paths still to come. See the design note
-(`docs/design/tactical-codec-ingress.md`) and the tracking epic (#1473).
+- a **UDP listener** for datagram-oriented protocols (1 datagram = 1
+  message), and
+- a **TCP listener** for stream-framed protocols (a byte stream the listener
+  delimits into frames).
 
-> **Security warning:** These are unauthenticated, unencrypted UDP ingress
-> paths. There is no mTLS — anyone who can reach the bound port can submit
-> datagrams, and identity is synthetic. Deploy **only on a trusted network
+Wired today:
+
+| Protocol | Transport | Framing |
+|----------|-----------|---------|
+| **DIS** (IEEE 1278.1 Entity State) | UDP | one PDU per datagram |
+| **ASTERIX** (CAT-062 tracks) | UDP | one datablock per datagram |
+| **VMF** (MIL-STD-6017 K05.1) | UDP | one message per datagram |
+| **SAPIENT** (BSI Flex 335) | **TCP** | protobuf varint length-delimited |
+
+Link 16 / STANAG 4586 (stream-framed) and Meshtastic (LoRa) are separate
+ingress paths still to come. See the design notes
+(`docs/design/tactical-codec-ingress.md`,
+`docs/design/tactical-stream-ingress.md`) and the tracking epic (#1473).
+
+> **Security warning:** These are unauthenticated, unencrypted ingress
+> paths (UDP datagrams and TCP connections alike). There is no mTLS — anyone
+> who can reach the bound port can submit traffic, and identity is
+> synthetic. Deploy **only on a trusted network
 > segment**, always pair with a CIDR allowlist, and rely on group-level
 > ACL/authz for trust. This is the same posture as the plaintext
 > CoT-over-UDP listener.
@@ -63,8 +76,9 @@ rustgate-server \
 | **DIS** (IEEE 1278.1) | `dis` | UDP Entity State PDUs (≈3000) | `dis` |
 | **ASTERIX** (CAT-062) | `asterix` | UDP datablocks (≈8600) | `asterix` |
 | **VMF** (MIL-STD-6017 K05.1) | `vmf` | UDP position reports (≈1581) | `vmf` |
+| **SAPIENT** (BSI Flex 335) | `sapient` | **TCP** varint-delimited protobuf (≈8800) | `sapient` |
 
-Per-protocol flags (shown for `dis`; identical for `asterix` / `vmf`):
+Per-protocol UDP flags (shown for `dis`; identical for `asterix` / `vmf`):
 
 | Flag | Env | Default | Purpose |
 |------|-----|---------|---------|
@@ -73,6 +87,30 @@ Per-protocol flags (shown for `dis`; identical for `asterix` / `vmf`):
 | `--dis-rate-limit-pps` | `RUSTGATE_DIS_RATE_LIMIT_PPS` | `0` → secure default | Per-IP datagrams/sec (`0` = built-in default, not off) |
 | `--dis-allowed-cidrs` | `RUSTGATE_DIS_ALLOWED_CIDRS` | *(unset → warn)* | Comma-separated source CIDR allowlist |
 | `--dis-max-identities` | `RUSTGATE_DIS_MAX_IDENTITIES` | `1024` | Synthetic-identity LRU bound (new IPs rejected at cap) |
+
+### SAPIENT (stream / TCP)
+
+SAPIENT is **connection-oriented** (TCP), so its listener delimits a byte
+stream into protobuf frames (varint length prefix) and adds one extra knob —
+a concurrent-connection cap. The flag shape is otherwise identical:
+
+```bash
+rustgate-server --sapient-bind 0.0.0.0:8800 --sapient-allowed-cidrs 10.20.0.0/16
+```
+
+| Flag | Env | Default | Purpose |
+|------|-----|---------|---------|
+| `--sapient-bind` | `RUSTGATE_SAPIENT_BIND` | *(unset → disabled)* | **TCP** bind address |
+| `--sapient-group` | `RUSTGATE_SAPIENT_GROUP` | `sapient` | Destination group accepted frames route to |
+| `--sapient-rate-limit-pps` | `RUSTGATE_SAPIENT_RATE_LIMIT_PPS` | `0` → secure default | Per-IP **connection-accept** rate (conn/sec) |
+| `--sapient-allowed-cidrs` | `RUSTGATE_SAPIENT_ALLOWED_CIDRS` | *(unset → warn)* | Source CIDR allowlist (checked at accept) |
+| `--sapient-max-identities` | `RUSTGATE_SAPIENT_MAX_IDENTITIES` | `1024` | Synthetic-identity LRU bound |
+| `--sapient-max-connections` | `RUSTGATE_SAPIENT_MAX_CONNECTIONS` | `1024` | Max simultaneously-open connections |
+
+A slow client that opens a connection but never completes a frame is closed
+after the standard read timeout (slow-loris protection); a single malformed
+frame is dropped (and audited) without killing the connection, while a
+framing-level error (bad length prefix) closes it.
 
 ## How a datagram flows
 
@@ -104,11 +142,14 @@ Per-protocol flags (shown for `dis`; identical for `asterix` / `vmf`):
 - **One canonical message per datagram.** Each protocol's codec decodes a
   single canonical entity per datagram: DIS **Entity State PDUs** only,
   ASTERIX the **first CAT-062 track** of the datablock, VMF **K05.1**
-  position reports only. Other PDU/category/message types are dropped at the
-  validating decode until the codec maps them, and multi-record datagrams
-  (e.g. several ASTERIX tracks in one datablock) surface only their first
-  record for now.
+  position reports only, SAPIENT a **DetectionReport** (other message types
+  decode to the forward-compatible opaque arm). Other PDU/category/message
+  types are dropped at the validating decode until the codec maps them, and
+  multi-record datagrams (e.g. several ASTERIX tracks in one datablock)
+  surface only their first record for now.
 - **Unicast only** so far; multicast ingress (ASTERIX / DIS on an exercise
-  LAN) reuses the same controls and lands with the multicast follow-up.
-- Stream-framed protocols (Link 16 / STANAG 4586 / SAPIENT) and Meshtastic
-  (LoRa/serial) are distinct ingress paths, tracked under #1473.
+  LAN, Link 16 JREAP-A) reuses the same controls and lands with the
+  multicast follow-up.
+- **Remaining stream protocols** (Link 16 JREAP-C, STANAG 4586) and
+  **Meshtastic** (LoRa/serial) are distinct ingress paths, tracked under
+  #1473.

@@ -34,12 +34,14 @@ mod codecs;
 pub mod hw_identity;
 
 pub mod codec_ingress;
+pub mod codec_tcp_ingress;
 pub mod udp;
 pub mod udp_common;
 pub mod udp_multicast;
 
 pub use codec::{
-    FramedCodec, FramedCodecError, LengthPrefixedCodec, LineDelimitedCodec, XmlStreamCodec,
+    FramedCodec, FramedCodecError, LengthPrefixedCodec, LineDelimitedCodec, VarintDelimitedCodec,
+    XmlStreamCodec,
 };
 pub use codecs::{RawLengthPrefixedCodec, RawLineCodec, TakXmlCodec};
 pub use hw_identity::{
