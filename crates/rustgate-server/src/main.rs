@@ -2048,6 +2048,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let dis_shutdown = tactical_ingress::start_dis(&cli, &router).await?;
     let asterix_shutdown = tactical_ingress::start_asterix(&cli, &router).await?;
     let vmf_shutdown = tactical_ingress::start_vmf(&cli, &router).await?;
+    let stanag4586_shutdown = tactical_ingress::start_stanag4586(&cli, &router).await?;
     // SAPIENT is stream-framed (TCP), so it runs on the connection-oriented
     // CodecTcpInput listener rather than the UDP datagram one (#1473).
     let sapient_shutdown = tactical_ingress::start_sapient(&cli, &router).await?;
@@ -2428,6 +2429,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
     if let Some(handle) = vmf_shutdown {
         stop_subsystem("vmf", handle).await;
+    }
+    if let Some(handle) = stanag4586_shutdown {
+        stop_subsystem("stanag4586", handle).await;
     }
     if let Some(handle) = sapient_shutdown {
         stop_subsystem("sapient", handle).await;

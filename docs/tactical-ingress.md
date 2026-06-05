@@ -18,10 +18,12 @@ Wired today:
 | **DIS** (IEEE 1278.1 Entity State) | UDP | one PDU per datagram |
 | **ASTERIX** (CAT-062 tracks) | UDP | one datablock per datagram |
 | **VMF** (MIL-STD-6017 K05.1) | UDP | one message per datagram |
+| **STANAG 4586** (UCS/UAV) | UDP | one message per datagram |
 | **SAPIENT** (BSI Flex 335) | **TCP** | protobuf varint length-delimited |
 | **Link 16 / JREAP-C** (STANAG 5518) | **TCP** | 16-byte JREAP header carrying the body length |
 
-STANAG 4586 (stream-framed) and Meshtastic (LoRa) are separate
+STANAG 4586 is wired over **UDP** (one message per datagram); its
+**stream-framed** (TCP) variant and **Meshtastic** (LoRa) are separate
 ingress paths still to come. See the design notes
 (`docs/design/tactical-codec-ingress.md`,
 `docs/design/tactical-stream-ingress.md`) and the tracking epic (#1473).
@@ -77,6 +79,7 @@ rustgate-server \
 | **DIS** (IEEE 1278.1) | `dis` | UDP Entity State PDUs (≈3000) | `dis` |
 | **ASTERIX** (CAT-062) | `asterix` | UDP datablocks (≈8600) | `asterix` |
 | **VMF** (MIL-STD-6017 K05.1) | `vmf` | UDP position reports (≈1581) | `vmf` |
+| **STANAG 4586** (UCS/UAV) | `stanag4586` | UDP messages (≈8586) | `stanag4586` |
 | **SAPIENT** (BSI Flex 335) | `sapient` | **TCP** varint-delimited protobuf (≈8800) | `sapient` |
 | **Link 16 / JREAP-C** (STANAG 5518) | `link16` | **TCP** JREAP-header-framed (≈4444) | `link16` |
 
@@ -156,6 +159,9 @@ framing-level error (bad length prefix) closes it.
 - **Unicast only** so far; multicast ingress (ASTERIX / DIS on an exercise
   LAN, Link 16 JREAP-A) reuses the same controls and lands with the
   multicast follow-up.
-- **Remaining stream protocols** (Link 16 JREAP-C, STANAG 4586) and
-  **Meshtastic** (LoRa/serial) are distinct ingress paths, tracked under
-  #1473.
+- **STANAG 4586 is UDP-only here.** One STANAG message per datagram.
+  TCP-stream STANAG is deferred: its frame size is message-type-dependent
+  (no self-delimiting length prefix), so a stream needs a per-deployment
+  framing decision — tracked under #1473.
+- **Meshtastic** (LoRa/serial) is a distinct radio ingress path, tracked
+  under #1473.

@@ -1129,6 +1129,34 @@ pub(crate) struct TacticalIngressArgs {
     /// Maximum simultaneously-open Link 16 connections (TCP-only).
     #[arg(long, default_value = "1024", env = "RUSTGATE_LINK16_MAX_CONNECTIONS", value_parser = parse_nonzero_usize)]
     pub(crate) link16_max_connections: usize,
+
+    /// Bind address for STANAG 4586 (UCS/UAV) input over **UDP** (e.g.
+    /// 0.0.0.0:8586). One STANAG message per datagram. WARNING: datagrams
+    /// are UNAUTHENTICATED and NOT encrypted — use only on a trusted network
+    /// segment, and pair with `--stanag4586-allowed-cidrs`. When unset,
+    /// STANAG 4586 ingress is disabled. (TCP-stream STANAG, whose framing is
+    /// message-type-dependent, is a follow-up — see docs/tactical-ingress.md.)
+    #[arg(long, env = "RUSTGATE_STANAG4586_BIND", value_parser = parse_socket_addr)]
+    pub(crate) stanag4586_bind: Option<String>,
+
+    /// Destination group every accepted STANAG 4586 datagram routes to.
+    #[arg(long, default_value = "stanag4586", env = "RUSTGATE_STANAG4586_GROUP")]
+    pub(crate) stanag4586_group: String,
+
+    /// Per-IP rate limit in datagrams per second for STANAG 4586 input.
+    /// `0` (the default) applies the built-in secure default, not "unlimited".
+    #[arg(long, default_value = "0", env = "RUSTGATE_STANAG4586_RATE_LIMIT_PPS")]
+    pub(crate) stanag4586_rate_limit_pps: u32,
+
+    /// Comma-separated CIDR prefixes allowed to send STANAG 4586 datagrams.
+    /// Strongly recommended; unset starts the listener but warns it is
+    /// exposed to the whole reachable network.
+    #[arg(long, env = "RUSTGATE_STANAG4586_ALLOWED_CIDRS")]
+    pub(crate) stanag4586_allowed_cidrs: Option<String>,
+
+    /// Maximum concurrent synthetic STANAG 4586 identities tracked.
+    #[arg(long, default_value = "1024", env = "RUSTGATE_STANAG4586_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
+    pub(crate) stanag4586_max_identities: usize,
 }
 
 #[derive(Args, Serialize)]
@@ -2627,6 +2655,11 @@ define_config_file! {
     link16_allowed_cidrs in ingress: Option<String>,
     link16_max_identities in ingress: usize,
     link16_max_connections in ingress: usize,
+    stanag4586_bind in ingress: Option<String>,
+    stanag4586_group in ingress: String,
+    stanag4586_rate_limit_pps in ingress: u32,
+    stanag4586_allowed_cidrs in ingress: Option<String>,
+    stanag4586_max_identities in ingress: usize,
     tcp_bind in plaintext: Option<String>,
     udp_bind in plaintext: Option<String>,
     udp_rate_limit in plaintext: u32,
