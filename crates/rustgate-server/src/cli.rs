@@ -1098,6 +1098,37 @@ pub(crate) struct TacticalIngressArgs {
     /// resource use from connection floods).
     #[arg(long, default_value = "1024", env = "RUSTGATE_SAPIENT_MAX_CONNECTIONS", value_parser = parse_nonzero_usize)]
     pub(crate) sapient_max_connections: usize,
+
+    /// Bind address for Link 16 / JREAP-C (STANAG 5518) input over **TCP**
+    /// (e.g. 0.0.0.0:4444). Stream-framed (16-byte JREAP header carrying the
+    /// body length). WARNING: connections are UNAUTHENTICATED and NOT
+    /// encrypted — use only on a trusted network segment, and pair with
+    /// `--link16-allowed-cidrs`. When unset, Link 16 ingress is disabled.
+    #[arg(long, env = "RUSTGATE_LINK16_BIND", value_parser = parse_socket_addr)]
+    pub(crate) link16_bind: Option<String>,
+
+    /// Destination group every accepted Link 16 message routes to.
+    #[arg(long, default_value = "link16", env = "RUSTGATE_LINK16_GROUP")]
+    pub(crate) link16_group: String,
+
+    /// Per-IP connection-accept rate (connections/sec) for Link 16 input.
+    /// `0` (the default) applies the built-in secure default, not "unlimited".
+    #[arg(long, default_value = "0", env = "RUSTGATE_LINK16_RATE_LIMIT_PPS")]
+    pub(crate) link16_rate_limit_pps: u32,
+
+    /// Comma-separated CIDR prefixes allowed to connect for Link 16.
+    /// Strongly recommended; unset starts the listener but warns it is
+    /// exposed to the whole reachable network.
+    #[arg(long, env = "RUSTGATE_LINK16_ALLOWED_CIDRS")]
+    pub(crate) link16_allowed_cidrs: Option<String>,
+
+    /// Maximum concurrent synthetic Link 16 identities tracked.
+    #[arg(long, default_value = "1024", env = "RUSTGATE_LINK16_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
+    pub(crate) link16_max_identities: usize,
+
+    /// Maximum simultaneously-open Link 16 connections (TCP-only).
+    #[arg(long, default_value = "1024", env = "RUSTGATE_LINK16_MAX_CONNECTIONS", value_parser = parse_nonzero_usize)]
+    pub(crate) link16_max_connections: usize,
 }
 
 #[derive(Args, Serialize)]
@@ -2590,6 +2621,12 @@ define_config_file! {
     sapient_allowed_cidrs in ingress: Option<String>,
     sapient_max_identities in ingress: usize,
     sapient_max_connections in ingress: usize,
+    link16_bind in ingress: Option<String>,
+    link16_group in ingress: String,
+    link16_rate_limit_pps in ingress: u32,
+    link16_allowed_cidrs in ingress: Option<String>,
+    link16_max_identities in ingress: usize,
+    link16_max_connections in ingress: usize,
     tcp_bind in plaintext: Option<String>,
     udp_bind in plaintext: Option<String>,
     udp_rate_limit in plaintext: u32,

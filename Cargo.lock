@@ -4983,6 +4983,7 @@ dependencies = [
  "rustgate-http",
  "rustgate-inference",
  "rustgate-lattice",
+ "rustgate-link16",
  "rustgate-mavlink",
  "rustgate-meshtastic",
  "rustgate-metrics",

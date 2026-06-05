@@ -40,8 +40,8 @@ pub mod udp_common;
 pub mod udp_multicast;
 
 pub use codec::{
-    FramedCodec, FramedCodecError, LengthPrefixedCodec, LineDelimitedCodec, VarintDelimitedCodec,
-    XmlStreamCodec,
+    FramedCodec, FramedCodecError, HeaderLengthCodec, LengthPrefixedCodec, LineDelimitedCodec,
+    VarintDelimitedCodec, XmlStreamCodec,
 };
 pub use codecs::{RawLengthPrefixedCodec, RawLineCodec, TakXmlCodec};
 pub use hw_identity::{

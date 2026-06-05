@@ -25,6 +25,9 @@ pub enum FramedCodec {
     /// [`FramingStrategy`] auto-detection (a bare varint has no signature to
     /// detect), so it has no `try_from_strategy` arm.
     VarintDelimited(VarintDelimitedCodec),
+    /// Length-inside-a-fixed-header framing (Link 16 JREAP-C). Also
+    /// listener-selected, so no `try_from_strategy` arm.
+    HeaderLength(HeaderLengthCodec),
     #[cfg(feature = "proto")]
     TakProtobuf(rustgate_proto::TakFrameCodec),
     #[cfg(feature = "mavlink")]
@@ -109,6 +112,7 @@ impl Decoder for FramedCodec {
             Self::XmlStream(c) => c.decode(src),
             Self::LineDelimited(c) => c.decode(src),
             Self::VarintDelimited(c) => c.decode(src),
+            Self::HeaderLength(c) => c.decode(src),
             #[cfg(feature = "proto")]
             Self::TakProtobuf(c) => c.decode(src),
             #[cfg(feature = "mavlink")]
@@ -126,6 +130,7 @@ impl Encoder<BytesMut> for FramedCodec {
             Self::XmlStream(c) => c.encode(item, dst),
             Self::LineDelimited(c) => c.encode(item, dst),
             Self::VarintDelimited(c) => c.encode(item, dst),
+            Self::HeaderLength(c) => c.encode(item, dst),
             #[cfg(feature = "proto")]
             Self::TakProtobuf(c) => c.encode(item, dst),
             #[cfg(feature = "mavlink")]
@@ -372,6 +377,105 @@ impl Encoder<BytesMut> for VarintDelimitedCodec {
         }
         dst.extend_from_slice(&item);
         Ok(())
+    }
+}
+
+/// Framing where the payload length lives **inside** a fixed-size header at
+/// a fixed offset, and the delimited frame **includes** that header (the
+/// length field counts only the bytes *after* the header).
+///
+/// This is the Link 16 JREAP-C shape: a 16-byte header whose `body_length`
+/// `u32` sits at offset 12, with the body following. Unlike
+/// [`LengthPrefixedCodec`] (where the length is a leading prefix that is
+/// stripped), this yields `header + body` as one frame so the protocol codec
+/// can parse its own header.
+///
+/// # Security
+///
+/// The body length is bounded by `max_frame_size` **before** any buffer
+/// reservation — a hostile `body_length` cannot drive an unbounded
+/// allocation.
+///
+/// Decode-only: [`Encoder`] returns an error, because the header is
+/// protocol-owned (this codec does not know how to synthesize it).
+#[derive(Debug)]
+pub struct HeaderLengthCodec {
+    header_len: usize,
+    length_offset: usize,
+    length_size: HeaderSize,
+    max_frame_size: usize,
+}
+
+impl HeaderLengthCodec {
+    /// `header_len` = total header bytes; `length_offset` = byte offset of
+    /// the big-endian length field within the header; `length_size` = its
+    /// width. The length value counts bytes following the header.
+    pub fn new(header_len: usize, length_offset: usize, length_size: HeaderSize) -> Self {
+        Self {
+            header_len,
+            length_offset,
+            length_size,
+            max_frame_size: MAX_FRAME_SIZE,
+        }
+    }
+
+    /// Tighten the per-frame body cap below [`MAX_FRAME_SIZE`].
+    pub fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
+        self.max_frame_size = max_frame_size.min(MAX_FRAME_SIZE);
+        self
+    }
+
+    fn read_body_length(&self, header: &[u8]) -> usize {
+        let o = self.length_offset;
+        match self.length_size {
+            HeaderSize::One => header[o] as usize,
+            HeaderSize::Two => u16::from_be_bytes([header[o], header[o + 1]]) as usize,
+            HeaderSize::Four => {
+                u32::from_be_bytes([header[o], header[o + 1], header[o + 2], header[o + 3]])
+                    as usize
+            }
+        }
+    }
+}
+
+impl Decoder for HeaderLengthCodec {
+    type Item = BytesMut;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Need the whole header before the embedded length field is readable.
+        if src.len() < self.header_len {
+            return Ok(None);
+        }
+        let body_len = self.read_body_length(&src[..self.header_len]);
+        // Bound BEFORE reserving — no attacker-driven allocation.
+        if body_len > self.max_frame_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "frame body too large: {} bytes exceeds limit of {}",
+                    body_len, self.max_frame_size
+                ),
+            ));
+        }
+        let total = self.header_len + body_len;
+        if src.len() < total {
+            src.reserve(total - src.len());
+            return Ok(None);
+        }
+        // Yield the full frame (header + body).
+        Ok(Some(src.split_to(total)))
+    }
+}
+
+impl Encoder<BytesMut> for HeaderLengthCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, _item: BytesMut, _dst: &mut BytesMut) -> Result<(), Self::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "HeaderLengthCodec is decode-only: the header is protocol-owned",
+        ))
     }
 }
 
@@ -692,6 +796,63 @@ mod tests {
         codec.encode(payload.clone(), &mut wire).unwrap();
         let decoded = codec.decode(&mut wire).unwrap().unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    // ── HeaderLengthCodec (Link 16 JREAP-C shape: 16B header, u32 @ 12) ──
+
+    /// Build a JREAP-C-shaped frame: 16-byte header (body_length u32 BE at
+    /// offset 12) + `body`.
+    fn jreap_frame(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; 16];
+        out[12..16].copy_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn header_length_yields_full_frame_including_header() {
+        let mut codec = HeaderLengthCodec::new(16, 12, HeaderSize::Four);
+        let mut buf = BytesMut::from(jreap_frame(b"abcd").as_slice());
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        // The yielded frame includes the 16-byte header + 4-byte body.
+        assert_eq!(frame.len(), 20);
+        assert_eq!(&frame[16..], b"abcd");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn header_length_waits_for_header_then_body() {
+        let mut codec = HeaderLengthCodec::new(16, 12, HeaderSize::Four);
+        let wire = jreap_frame(b"hello-world");
+        let mut buf = BytesMut::new();
+        // Partial header → None.
+        buf.extend_from_slice(&wire[..10]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        // Full header but partial body → None.
+        buf.extend_from_slice(&wire[10..20]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        // Rest of the body → one full frame.
+        buf.extend_from_slice(&wire[20..]);
+        assert_eq!(codec.decode(&mut buf).unwrap().unwrap().len(), 16 + 11);
+    }
+
+    #[test]
+    fn header_length_rejects_oversized_body_before_allocating() {
+        let mut codec = HeaderLengthCodec::new(16, 12, HeaderSize::Four).with_max_frame_size(8);
+        let mut buf = BytesMut::from(jreap_frame(&[0u8; 9]).as_slice()); // body 9 > cap 8
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn header_length_encode_is_unsupported() {
+        let mut codec = HeaderLengthCodec::new(16, 12, HeaderSize::Four);
+        let mut dst = BytesMut::new();
+        let err = codec
+            .encode(BytesMut::from(&b"x"[..]), &mut dst)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     // ── XmlStreamCodec ──────────────────────────────────────────────
