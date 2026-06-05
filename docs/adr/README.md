@@ -52,6 +52,7 @@ does.
 | [0020](0020-mavlink-pq-rekey.md) | MAVLink integration with ML-KEM-768 rekey channel | Proposed |
 | [0021](0021-clean-room-tak-interop.md) | Clean-room interoperability policy for TAK and third-party protocols | Accepted |
 | [0022](0022-cross-domain-guard-egress-seam.md) | Cross-domain guard egress seam (central `OnEgressGuard` hook) | Accepted |
+| [0023](0023-tactical-codec-ingress-seam.md) | Tactical codec ingress seam (generic UDP/TCP codec-pluggable listeners) | Accepted |
 
 ## Authoring a new ADR
 
