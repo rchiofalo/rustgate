@@ -1157,6 +1157,37 @@ pub(crate) struct TacticalIngressArgs {
     /// Maximum concurrent synthetic STANAG 4586 identities tracked.
     #[arg(long, default_value = "1024", env = "RUSTGATE_STANAG4586_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
     pub(crate) stanag4586_max_identities: usize,
+    /// Bind address for NFFI (NATO Friendly Force Information, STANAG 5527)
+    /// XML input over **TCP** (e.g. 0.0.0.0:8500). Stream-framed at the XML
+    /// document boundary, so this is a connection-oriented listener. WARNING:
+    /// connections are UNAUTHENTICATED and NOT encrypted — use only on a
+    /// trusted network segment, and pair with `--nffi-allowed-cidrs`. When
+    /// unset, NFFI ingress is disabled.
+    #[arg(long, env = "RUSTGATE_NFFI_BIND", value_parser = parse_socket_addr)]
+    pub(crate) nffi_bind: Option<String>,
+
+    /// Destination group every accepted NFFI message routes to.
+    #[arg(long, default_value = "nffi", env = "RUSTGATE_NFFI_GROUP")]
+    pub(crate) nffi_group: String,
+
+    /// Per-IP connection-accept rate (connections/sec) for NFFI input.
+    /// `0` (the default) applies the built-in secure default, not "unlimited".
+    #[arg(long, default_value = "0", env = "RUSTGATE_NFFI_RATE_LIMIT_PPS")]
+    pub(crate) nffi_rate_limit_pps: u32,
+
+    /// Comma-separated CIDR prefixes allowed to connect for NFFI.
+    /// Strongly recommended; unset starts the listener but warns it is
+    /// exposed to the whole reachable network.
+    #[arg(long, env = "RUSTGATE_NFFI_ALLOWED_CIDRS")]
+    pub(crate) nffi_allowed_cidrs: Option<String>,
+
+    /// Maximum concurrent synthetic NFFI identities tracked.
+    #[arg(long, default_value = "1024", env = "RUSTGATE_NFFI_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
+    pub(crate) nffi_max_identities: usize,
+
+    /// Maximum simultaneously-open NFFI connections (TCP-only).
+    #[arg(long, default_value = "1024", env = "RUSTGATE_NFFI_MAX_CONNECTIONS", value_parser = parse_nonzero_usize)]
+    pub(crate) nffi_max_connections: usize,
 }
 
 #[derive(Args, Serialize)]
@@ -2660,6 +2691,12 @@ define_config_file! {
     stanag4586_rate_limit_pps in ingress: u32,
     stanag4586_allowed_cidrs in ingress: Option<String>,
     stanag4586_max_identities in ingress: usize,
+    nffi_bind in ingress: Option<String>,
+    nffi_group in ingress: String,
+    nffi_rate_limit_pps in ingress: u32,
+    nffi_allowed_cidrs in ingress: Option<String>,
+    nffi_max_identities in ingress: usize,
+    nffi_max_connections in ingress: usize,
     tcp_bind in plaintext: Option<String>,
     udp_bind in plaintext: Option<String>,
     udp_rate_limit in plaintext: u32,

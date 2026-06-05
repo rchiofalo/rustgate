@@ -355,6 +355,38 @@ pub(crate) async fn start_link16(
     .await
 }
 
+/// Start NFFI (NATO Friendly Force Information, STANAG 5527) ingress over TCP
+/// if `--nffi-bind` is set. NFFI is an XML format, so frames are delimited at
+/// the XML document boundary (the same stream framing CoT-over-TCP uses); each
+/// document is validated with the `NffiCodec` before routing.
+pub(crate) async fn start_nffi(
+    cli: &Cli,
+    router: &Arc<Router>,
+) -> anyhow::Result<Option<SubsystemHandle>> {
+    // NFFI documents are XML; the stream is delimited at the document boundary
+    // that XmlStreamCodec already locates (shared with CoT-over-TCP).
+    let framing: FramingFactory =
+        Arc::new(|| FramedCodec::XmlStream(rustgate_transport::XmlStreamCodec::new()));
+    spawn_tcp(
+        TcpProtocolIngress {
+            bind: cli.ingress.nffi_bind.clone(),
+            group: cli.ingress.nffi_group.clone(),
+            rate_limit_pps: cli.ingress.nffi_rate_limit_pps,
+            allowed_cidrs: cli.ingress.nffi_allowed_cidrs.clone(),
+            max_identities: cli.ingress.nffi_max_identities,
+            max_connections: cli.ingress.nffi_max_connections,
+            cn_prefix: "nffi-anonymous",
+            source_protocol: "nffi",
+            // NFFI friendly-force tracks are position reports.
+            message_type: MessageType::Position,
+            codec: Arc::new(rustgate_nffi::NffiCodec),
+            framing,
+        },
+        router,
+    )
+    .await
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {

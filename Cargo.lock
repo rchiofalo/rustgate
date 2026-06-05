@@ -4989,6 +4989,7 @@ dependencies = [
  "rustgate-metrics",
  "rustgate-mqtt",
  "rustgate-nats",
+ "rustgate-nffi",
  "rustgate-ogc-sensorthings",
  "rustgate-proto",
  "rustgate-router",

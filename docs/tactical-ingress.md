@@ -21,6 +21,7 @@ Wired today:
 | **STANAG 4586** (UCS/UAV) | UDP | one message per datagram |
 | **SAPIENT** (BSI Flex 335) | **TCP** | protobuf varint length-delimited |
 | **Link 16 / JREAP-C** (STANAG 5518) | **TCP** | 16-byte JREAP header carrying the body length |
+| **NFFI** (STANAG 5527) | **TCP** | XML document boundary |
 
 STANAG 4586 is wired over **UDP** (one message per datagram); its
 **stream-framed** (TCP) variant and **Meshtastic** (LoRa) are separate
@@ -82,6 +83,7 @@ rustgate-server \
 | **STANAG 4586** (UCS/UAV) | `stanag4586` | UDP messages (≈8586) | `stanag4586` |
 | **SAPIENT** (BSI Flex 335) | `sapient` | **TCP** varint-delimited protobuf (≈8800) | `sapient` |
 | **Link 16 / JREAP-C** (STANAG 5518) | `link16` | **TCP** JREAP-header-framed (≈4444) | `link16` |
+| **NFFI** (STANAG 5527) | `nffi` | **TCP** XML-document-delimited (≈8500) | `nffi` |
 
 Per-protocol UDP flags (shown for `dis`; identical for `asterix` / `vmf`):
 
@@ -93,15 +95,18 @@ Per-protocol UDP flags (shown for `dis`; identical for `asterix` / `vmf`):
 | `--dis-allowed-cidrs` | `RUSTGATE_DIS_ALLOWED_CIDRS` | *(unset → warn)* | Comma-separated source CIDR allowlist |
 | `--dis-max-identities` | `RUSTGATE_DIS_MAX_IDENTITIES` | `1024` | Synthetic-identity LRU bound (new IPs rejected at cap) |
 
-### Stream protocols (TCP): SAPIENT, Link 16
+### Stream protocols (TCP): SAPIENT, Link 16, NFFI
 
-SAPIENT and **Link 16 / JREAP-C** are **connection-oriented** (TCP), so their
-listeners delimit a byte stream into frames — SAPIENT by a protobuf varint
-length prefix, Link 16 by the body-length field inside the 16-byte JREAP
-header — and add one extra knob over the UDP protocols: a
-`--<proto>-max-connections` concurrent-connection cap. Both use the identical
+SAPIENT, **Link 16 / JREAP-C**, and **NFFI** (STANAG 5527) are
+**connection-oriented** (TCP), so their listeners delimit a byte stream into
+frames — SAPIENT by a protobuf varint length prefix, Link 16 by the
+body-length field inside the 16-byte JREAP header, NFFI at the XML document
+boundary (the same stream framing CoT-over-TCP uses) — and add one extra knob
+over the UDP protocols: a `--<proto>-max-connections` concurrent-connection
+cap. All three use the identical
 `--<proto>-{bind,group,rate-limit-pps,allowed-cidrs,max-identities,max-connections}`
-flag shape (`sapient` / `link16`); the SAPIENT flags below stand for both.
+flag shape (`sapient` / `link16` / `nffi`); the SAPIENT flags below stand for
+all three.
 
 ```bash
 rustgate-server --sapient-bind 0.0.0.0:8800 --sapient-allowed-cidrs 10.20.0.0/16
@@ -152,10 +157,11 @@ framing-level error (bad length prefix) closes it.
   single canonical entity per datagram: DIS **Entity State PDUs** only,
   ASTERIX the **first CAT-062 track** of the datablock, VMF **K05.1**
   position reports only, SAPIENT a **DetectionReport** (other message types
-  decode to the forward-compatible opaque arm). Other PDU/category/message
-  types are dropped at the validating decode until the codec maps them, and
-  multi-record datagrams (e.g. several ASTERIX tracks in one datablock)
-  surface only their first record for now.
+  decode to the forward-compatible opaque arm), NFFI the **first `<track>`**
+  of the document. Other PDU/category/message types are dropped at the
+  validating decode until the codec maps them, and multi-record datagrams
+  (e.g. several ASTERIX tracks in one datablock, several NFFI tracks in one
+  document) surface only their first record for now.
 - **Unicast only** so far; multicast ingress (ASTERIX / DIS on an exercise
   LAN, Link 16 JREAP-A) reuses the same controls and lands with the
   multicast follow-up.
