@@ -1240,19 +1240,61 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(not(all(feature = "metrics", feature = "correlation")))]
     let correlation_callback: Option<rustgate_router::OnRouted> = None;
 
-    // Compose video + correlation callbacks into the single `OnRouted`
-    // slot the router exposes. Both callbacks are `Arc<dyn Fn(...)>`,
-    // so chaining is trivial — invoke each in turn.
-    match (video_callback, correlation_callback) {
-        (Some(v), Some(c)) => {
+    // Behind `--features inference` (plus a backend such as
+    // `inference-mock`), build the edge ML inference pipeline's
+    // back-annotation callback. `start_inference` reads the
+    // `[inference]` config block, builds the `Pipeline`, and wires a
+    // re-injection sink onto the shared `entity_codec_registry` so
+    // every routed message that decodes to an `Entity` is run through
+    // the registered models; each `InferenceResult` is re-injected via
+    // `Router::route` (ACL / authz / dedup / egress re-apply) and the
+    // crate's `source_protocol = "inference"` loop guard stops the
+    // synthesized events from being re-inferred. Closes #858.
+    #[cfg(feature = "inference")]
+    let inference_callback: Option<rustgate_router::OnRouted> =
+        setup::start_inference(&cli, &router, &entity_codec_registry).await;
+    #[cfg(not(feature = "inference"))]
+    let inference_callback: Option<rustgate_router::OnRouted> = None;
+    #[cfg(not(feature = "inference"))]
+    setup::warn_inference_disabled(&cli);
+
+    // Compose video + correlation + inference callbacks into the single
+    // `OnRouted` slot the router exposes. Each is `Arc<dyn Fn(...)>`, so
+    // chaining is trivial — invoke each in turn. Inference runs last so
+    // its re-injected entities are not themselves passed to the video /
+    // correlation callbacks within the same invocation (the re-injection
+    // goes back through `Router::route`, which fires `OnRouted` afresh,
+    // where the inference loop guard then skips them).
+    match (video_callback, correlation_callback, inference_callback) {
+        (Some(v), Some(c), Some(i)) => {
+            router.set_on_routed(Some(std::sync::Arc::new(move |msg| {
+                v(Arc::clone(&msg));
+                c(Arc::clone(&msg));
+                i(msg);
+            })));
+        }
+        (Some(v), Some(c), None) => {
             router.set_on_routed(Some(std::sync::Arc::new(move |msg| {
                 v(Arc::clone(&msg));
                 c(msg);
             })));
         }
-        (Some(v), None) => router.set_on_routed(Some(v)),
-        (None, Some(c)) => router.set_on_routed(Some(c)),
-        (None, None) => {}
+        (Some(v), None, Some(i)) => {
+            router.set_on_routed(Some(std::sync::Arc::new(move |msg| {
+                v(Arc::clone(&msg));
+                i(msg);
+            })));
+        }
+        (None, Some(c), Some(i)) => {
+            router.set_on_routed(Some(std::sync::Arc::new(move |msg| {
+                c(Arc::clone(&msg));
+                i(msg);
+            })));
+        }
+        (Some(v), None, None) => router.set_on_routed(Some(v)),
+        (None, Some(c), None) => router.set_on_routed(Some(c)),
+        (None, None, Some(i)) => router.set_on_routed(Some(i)),
+        (None, None, None) => {}
     }
 
     #[cfg(feature = "metrics")]
@@ -1807,12 +1849,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     #[cfg(not(feature = "ogc-sensorthings"))]
     setup::warn_ogc_sensorthings_disabled(&cli);
 
-    // Edge ML inference pipeline (closes #858). MVP — the helper
-    // is a stub that logs the feature is compiled in. Binary-side
-    // wiring of the back-annotation callback lands in a follow-up
-    // once an operator deployment shape is selected.
-    #[cfg(feature = "inference")]
-    setup::start_inference();
+    // The edge ML inference pipeline (#858) is wired earlier, alongside
+    // the video / correlation `OnRouted` callbacks, because its
+    // back-annotation callback shares the router's single `OnRouted`
+    // slot with them and must be composed before installation.
 
     // ── Federation ──────────────────────────────────────────────────
     //

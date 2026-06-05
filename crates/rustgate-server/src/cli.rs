@@ -486,6 +486,18 @@ pub(crate) struct IntegrationArgs {
     /// unreadable. Required whenever `--packages-dir` is set. Refs #860.
     #[arg(long, env = "RUSTGATE_PACKAGES_INTEGRITY_KEY_FILE")]
     pub(crate) packages_integrity_key_file: Option<std::path::PathBuf>,
+
+    /// Path to the TOML edge ML inference config (`[inference]` block:
+    /// `models-dir`, `reload-interval-secs`, and one or more
+    /// `[[inference.pipeline]]` model stages). When set, the inference
+    /// pipeline is installed on the router's `OnRouted` callback so every
+    /// routed message that decodes to an entity is run through the
+    /// registered models and the results are re-injected through the
+    /// normal routing path. Requires the `inference` build feature plus a
+    /// backend (`inference-mock` today; the ONNX backend is a follow-up)
+    /// (#858). When unset, no inference pipeline is installed.
+    #[arg(long, env = "RUSTGATE_INFERENCE_CONFIG")]
+    pub(crate) inference_config_file: Option<String>,
 }
 
 #[derive(Args, Serialize)]
@@ -2713,6 +2725,7 @@ define_config_file! {
     mavlink_pq_bootstrap_file in mavlink: Option<String>,
     mavlink_v1_fallback_cn in mavlink: Option<String>,
     guard_config_file in integrations: Option<String>,
+    inference_config_file in integrations: Option<String>,
     dis_bind in ingress: Option<String>,
     dis_group in ingress: String,
     dis_rate_limit_pps in ingress: u32,
