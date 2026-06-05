@@ -192,33 +192,16 @@ pub use rustgate_router::OnMulticastForward;
 /// Bind a UDP socket to `0.0.0.0:port`, set `SO_REUSEADDR`, then call
 /// `join_multicast_v4(group, interface)`.
 ///
-/// The `SO_REUSEADDR` flag lets multiple processes (e.g. ATAK + the
-/// router on the same host during test) bind the same multicast port.
-/// On Linux the equivalent `SO_REUSEPORT` would be stricter; we stay on
-/// `SO_REUSEADDR` for portability.
-///
-/// Returns the bound socket on success; the caller is responsible for
-/// applying additional options (`set_multicast_loop_v4`,
+/// Delegates to [`crate::udp_common::bind_multicast_socket_v4`], the shared
+/// single source of truth for the multicast receive-socket setup (also used
+/// by the generic [`crate::codec_ingress`] listener). The caller is
+/// responsible for applying additional options (`set_multicast_loop_v4`,
 /// `set_multicast_ttl_v4`) before entering the receive loop.
 fn bind_multicast_socket(
     group: &MulticastGroup,
     interface: Ipv4Addr,
 ) -> std::io::Result<UdpSocket> {
-    use socket2::{Domain, Protocol, Socket, Type};
-
-    let domain = Domain::IPV4;
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    // Bind to `0.0.0.0:port`. Binding to the multicast address itself
-    // is portable on Linux but rejected on Windows; binding to the
-    // wildcard works everywhere and is what tokio examples use.
-    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, group.port);
-    socket.bind(&bind_addr.into())?;
-    socket.set_nonblocking(true)?;
-    let std_socket: std::net::UdpSocket = socket.into();
-    let tokio_socket = UdpSocket::from_std(std_socket)?;
-    tokio_socket.join_multicast_v4(group.addr, interface)?;
-    Ok(tokio_socket)
+    crate::udp_common::bind_multicast_socket_v4(group.addr, group.port, interface)
 }
 
 /// Run the receive loop for one multicast group socket.

@@ -37,7 +37,7 @@
 //! `docs/tactical-ingress.md`.
 
 use std::collections::BTreeSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -91,6 +91,21 @@ pub struct CodecIngressConfig {
     /// Maximum accepted datagram size in bytes (clamped to the UDP max and
     /// to [`MAX_FRAME_SIZE`]); larger datagrams are dropped before decode.
     pub max_datagram_size: usize,
+    /// Optional IPv4 multicast group to join for ingress (decision D4). When
+    /// `Some`, [`CodecIngressConfig::bind_socket`] binds with `SO_REUSEADDR`
+    /// and `join_multicast_v4(group, interface)` so DIS/ASTERIX/VMF can be
+    /// received on an exercise-LAN multicast address; admission and
+    /// validate-and-drop apply identically. When `None` (the default) the
+    /// listener does a plain unicast bind — behaviour is unchanged. The
+    /// address must be in `224.0.0.0/4`; a non-multicast address is rejected
+    /// at bind time.
+    pub multicast_group: Option<Ipv4Addr>,
+    /// IPv4 interface address for the multicast join (the local NIC the
+    /// kernel should join on). Only consulted when [`Self::multicast_group`]
+    /// is `Some`. Defaults to `0.0.0.0` (let the kernel pick the default
+    /// routed interface); operators on multi-NIC hosts can pin a specific
+    /// interface.
+    pub multicast_interface: Ipv4Addr,
 }
 
 impl Default for CodecIngressConfig {
@@ -102,6 +117,8 @@ impl Default for CodecIngressConfig {
             allowed_cidrs: None,
             max_identities: DEFAULT_INGRESS_MAX_IDENTITIES,
             max_datagram_size: MAX_UDP_DATAGRAM,
+            multicast_group: None,
+            multicast_interface: Ipv4Addr::UNSPECIFIED,
         }
     }
 }
@@ -117,6 +134,39 @@ impl CodecIngressConfig {
         self.max_datagram_size
             .min(MAX_UDP_DATAGRAM)
             .min(MAX_FRAME_SIZE)
+    }
+
+    /// Bind the ingress socket for `addr`, honouring the optional multicast
+    /// join (decision D4).
+    ///
+    /// When [`Self::multicast_group`] is `Some`, the socket is bound with
+    /// `SO_REUSEADDR` on `addr`'s port and joins the group via the shared
+    /// [`crate::udp_common::bind_multicast_socket_v4`] helper (the same
+    /// reviewed setup the CoT multicast listener uses); the group must be a
+    /// valid `224.0.0.0/4` address or the bind is rejected. When `None`, a
+    /// plain unicast [`UdpSocket::bind`] is performed and behaviour is
+    /// identical to the pre-multicast listener.
+    ///
+    /// The returned socket feeds [`CodecUdpInput::run`]; admission and
+    /// validate-and-drop are applied identically regardless of how the
+    /// socket was bound.
+    pub async fn bind_socket(&self, addr: SocketAddr) -> std::io::Result<UdpSocket> {
+        match self.multicast_group {
+            Some(group) => {
+                if !group.is_multicast() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("multicast group `{group}` is not in 224.0.0.0/4"),
+                    ));
+                }
+                crate::udp_common::bind_multicast_socket_v4(
+                    group,
+                    addr.port(),
+                    self.multicast_interface,
+                )
+            }
+            None => UdpSocket::bind(addr).await,
+        }
     }
 }
 
@@ -150,8 +200,18 @@ impl CodecUdpInput {
         warn!(
             protocol = %source_protocol,
             local_addr = ?local,
+            multicast_group = ?config.multicast_group,
             "tactical codec ingress active — datagrams are UNAUTHENTICATED and NOT encrypted"
         );
+        if let Some(group) = config.multicast_group {
+            tracing::info!(
+                protocol = %source_protocol,
+                local_addr = ?local,
+                multicast_group = %group,
+                multicast_interface = %config.multicast_interface,
+                "tactical codec ingress joined IPv4 multicast group"
+            );
+        }
         if config.allowed_cidrs.is_none() {
             warn!(
                 protocol = %source_protocol,
@@ -295,5 +355,39 @@ mod tests {
         let cap = cfg.effective_size_cap();
         assert!(cap <= MAX_UDP_DATAGRAM);
         assert!(cap <= MAX_FRAME_SIZE);
+    }
+
+    #[test]
+    fn default_config_has_no_multicast_join() {
+        // Multicast is opt-in: the default config does a plain unicast bind
+        // so existing DIS/ASTERIX/VMF deployments are unaffected.
+        let cfg = CodecIngressConfig::default();
+        assert!(cfg.multicast_group.is_none());
+        assert_eq!(cfg.multicast_interface, Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[tokio::test]
+    async fn bind_socket_unicast_when_no_group() {
+        // No multicast group ⇒ plain unicast bind on an ephemeral port.
+        let cfg = CodecIngressConfig::default();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let socket = cfg.bind_socket(addr).await.expect("unicast bind");
+        assert!(socket.local_addr().is_ok());
+    }
+
+    #[tokio::test]
+    async fn bind_socket_rejects_non_multicast_group() {
+        // A non-multicast address configured as the group is a fail-closed
+        // bind error, not a silent unicast fallback.
+        let cfg = CodecIngressConfig {
+            multicast_group: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ..Default::default()
+        };
+        let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let err = cfg
+            .bind_socket(addr)
+            .await
+            .expect_err("must reject unicast group");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

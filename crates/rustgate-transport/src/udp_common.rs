@@ -24,14 +24,53 @@
 //! per-protocol listener. Order matters: cheapest/most-decisive check
 //! first (CIDR), then rate limit, then the lock-taking identity cap.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustgate_resilience::SlidingWindowLimiter;
+use tokio::net::UdpSocket;
 
 use crate::udp::CidrPrefix;
+
+/// Bind an IPv4 UDP socket to `0.0.0.0:port` with `SO_REUSEADDR`, then join
+/// the multicast group `group` on `interface`.
+///
+/// This is the **single source of truth** for the connectionless multicast
+/// receive-socket setup shared by every UDP listener that can optionally
+/// join a group: the CoT-specific [`crate::udp_multicast`] listener and the
+/// generic codec listener ([`crate::codec_ingress`]). Factoring it here keeps
+/// the `SO_REUSEADDR` + wildcard-bind + `join_multicast_v4` sequence written,
+/// reviewed, and corrected once rather than copied (the same D1 single-path
+/// argument as [`UdpAdmission`]).
+///
+/// `SO_REUSEADDR` lets multiple processes (e.g. a sensor app and the router
+/// on one host during an exercise) bind the same multicast port. The socket
+/// binds the wildcard address rather than the group address itself: binding
+/// to the multicast address is portable on Linux but rejected on Windows,
+/// whereas the wildcard works everywhere.
+///
+/// Returns the joined, non-blocking [`UdpSocket`]; the caller applies any
+/// further options (e.g. `set_multicast_loop_v4`) before entering its
+/// receive loop.
+pub fn bind_multicast_socket_v4(
+    group: Ipv4Addr,
+    port: u16,
+    interface: Ipv4Addr,
+) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+    socket.bind(&bind_addr.into())?;
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    let tokio_socket = UdpSocket::from_std(std_socket)?;
+    tokio_socket.join_multicast_v4(group, interface)?;
+    Ok(tokio_socket)
+}
 
 /// Outcome of an admission check for a single datagram's source IP.
 ///

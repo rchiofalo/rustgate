@@ -15,7 +15,7 @@
 //! enters the CN or an authz decision**. Off by default; unauthenticated
 //! and trusted-network-only (see `docs/tactical-ingress.md`).
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -43,6 +43,9 @@ struct ProtocolIngress {
     allowed_cidrs: Option<String>,
     /// `--<proto>-max-identities` synthetic-identity LRU bound.
     max_identities: usize,
+    /// `--<proto>-multicast-group` (IPv4); `Some` ⇒ join that group on bind
+    /// instead of a plain unicast bind (decision D4). `None` ⇒ unicast.
+    multicast_group: Option<Ipv4Addr>,
     /// Synthetic-identity CN prefix, e.g. `"dis-anonymous"`.
     cn_prefix: &'static str,
     /// `source_protocol` tag (must match the `EntityCodecRegistry` key).
@@ -75,10 +78,15 @@ async fn spawn(
         max_pps: (p.rate_limit_pps > 0).then_some(p.rate_limit_pps as usize),
         allowed_cidrs,
         max_identities: p.max_identities,
+        // `Some` joins the IPv4 multicast group on bind; `None` is a plain
+        // unicast bind (decision D4). The socket setup is the only thing that
+        // differs — admission + validate-and-drop are identical.
+        multicast_group: p.multicast_group,
         ..Default::default()
     };
 
-    let socket = tokio::net::UdpSocket::bind(addr)
+    let socket = config
+        .bind_socket(addr)
         .await
         .with_context(|| format!("binding {} UDP socket on {addr}", p.source_protocol))?;
 
@@ -126,6 +134,28 @@ fn parse_cidrs(s: Option<&str>, proto: &str) -> anyhow::Result<Option<Vec<CidrPr
     Ok((!cidrs.is_empty()).then_some(cidrs))
 }
 
+/// Parse an optional `--<proto>-multicast-group` IPv4 address, rejecting a
+/// non-multicast (`224.0.0.0/4`) value as a startup error (fail-closed
+/// config, decision D4). `None`/empty ⇒ unicast bind.
+fn parse_multicast_group(s: Option<&str>, proto: &str) -> anyhow::Result<Option<Ipv4Addr>> {
+    let Some(s) = s else {
+        return Ok(None);
+    };
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let addr: Ipv4Addr = trimmed
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --{proto}-multicast-group '{trimmed}': {e}"))?;
+    if !addr.is_multicast() {
+        anyhow::bail!(
+            "--{proto}-multicast-group '{trimmed}' is not in 224.0.0.0/4 (not multicast)"
+        );
+    }
+    Ok(Some(addr))
+}
+
 /// Start DIS (IEEE 1278.1) Entity State PDU ingress if `--dis-bind` is set.
 pub(crate) async fn start_dis(
     cli: &Cli,
@@ -138,6 +168,10 @@ pub(crate) async fn start_dis(
             rate_limit_pps: cli.ingress.dis_rate_limit_pps,
             allowed_cidrs: cli.ingress.dis_allowed_cidrs.clone(),
             max_identities: cli.ingress.dis_max_identities,
+            multicast_group: parse_multicast_group(
+                cli.ingress.dis_multicast_group.as_deref(),
+                "dis",
+            )?,
             cn_prefix: "dis-anonymous",
             source_protocol: "dis",
             // DIS Entity State PDUs are kinematic position/state reports.
@@ -163,6 +197,9 @@ pub(crate) async fn start_stanag4586(
             rate_limit_pps: cli.ingress.stanag4586_rate_limit_pps,
             allowed_cidrs: cli.ingress.stanag4586_allowed_cidrs.clone(),
             max_identities: cli.ingress.stanag4586_max_identities,
+            // STANAG 4586 multicast is out of scope for this wave (no
+            // `--stanag4586-multicast-group` flag); always a unicast bind.
+            multicast_group: None,
             cn_prefix: "stanag4586-anonymous",
             source_protocol: "stanag4586",
             // Vehicle-position / status reports carry a located entity.
@@ -186,6 +223,10 @@ pub(crate) async fn start_asterix(
             rate_limit_pps: cli.ingress.asterix_rate_limit_pps,
             allowed_cidrs: cli.ingress.asterix_allowed_cidrs.clone(),
             max_identities: cli.ingress.asterix_max_identities,
+            multicast_group: parse_multicast_group(
+                cli.ingress.asterix_multicast_group.as_deref(),
+                "asterix",
+            )?,
             cn_prefix: "asterix-anonymous",
             source_protocol: "asterix",
             // CAT-062 system tracks are surveillance position reports.
@@ -210,6 +251,10 @@ pub(crate) async fn start_vmf(
             rate_limit_pps: cli.ingress.vmf_rate_limit_pps,
             allowed_cidrs: cli.ingress.vmf_allowed_cidrs.clone(),
             max_identities: cli.ingress.vmf_max_identities,
+            multicast_group: parse_multicast_group(
+                cli.ingress.vmf_multicast_group.as_deref(),
+                "vmf",
+            )?,
             cn_prefix: "vmf-anonymous",
             source_protocol: "vmf",
             // K05.1 is a position report.

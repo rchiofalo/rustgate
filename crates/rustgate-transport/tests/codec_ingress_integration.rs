@@ -97,6 +97,8 @@ async fn spawn_listener() -> (
         allowed_cidrs: None,
         max_identities: 64,
         max_datagram_size: 65_535,
+        multicast_group: None,
+        multicast_interface: std::net::Ipv4Addr::UNSPECIFIED,
     };
     let shutdown = Arc::new(Notify::new());
     let shutdown_clone = Arc::clone(&shutdown);
