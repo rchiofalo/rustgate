@@ -149,6 +149,31 @@ pub(crate) async fn start_dis(
     .await
 }
 
+/// Start STANAG 4586 (UCS/UAV) ingress over UDP if `--stanag4586-bind` is
+/// set. One STANAG message per datagram (TCP-stream STANAG, whose framing is
+/// message-type-dependent, is a deferred follow-up).
+pub(crate) async fn start_stanag4586(
+    cli: &Cli,
+    router: &Arc<Router>,
+) -> anyhow::Result<Option<SubsystemHandle>> {
+    spawn(
+        ProtocolIngress {
+            bind: cli.ingress.stanag4586_bind.clone(),
+            group: cli.ingress.stanag4586_group.clone(),
+            rate_limit_pps: cli.ingress.stanag4586_rate_limit_pps,
+            allowed_cidrs: cli.ingress.stanag4586_allowed_cidrs.clone(),
+            max_identities: cli.ingress.stanag4586_max_identities,
+            cn_prefix: "stanag4586-anonymous",
+            source_protocol: "stanag4586",
+            // Vehicle-position / status reports carry a located entity.
+            message_type: MessageType::Position,
+            codec: Arc::new(rustgate_stanag4586::entity::Stanag4586EntityCodec),
+        },
+        router,
+    )
+    .await
+}
+
 /// Start ASTERIX (CAT-062) datablock ingress if `--asterix-bind` is set.
 pub(crate) async fn start_asterix(
     cli: &Cli,
