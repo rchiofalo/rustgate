@@ -1038,6 +1038,15 @@ pub(crate) struct TacticalIngressArgs {
     #[arg(long, default_value = "1024", env = "RUSTGATE_DIS_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
     pub(crate) dis_max_identities: usize,
 
+    /// IPv4 multicast group to join for DIS ingress (e.g. `239.2.3.1`). When
+    /// set, the listener binds with `SO_REUSEADDR` on the `--dis-bind` port
+    /// and joins this group, so DIS can be received on an exercise-LAN
+    /// multicast address; admission and validate-and-drop apply identically.
+    /// Must be in `224.0.0.0/4`; a non-multicast value is a startup error.
+    /// Empty/unset (the default) does a plain unicast bind. Inbound only.
+    #[arg(long, env = "RUSTGATE_DIS_MULTICAST_GROUP")]
+    pub(crate) dis_multicast_group: Option<String>,
+
     /// Bind address for ASTERIX (CAT-062) datablock input over UDP
     /// (e.g. 0.0.0.0:8600). WARNING: datagrams are UNAUTHENTICATED and NOT
     /// encrypted — use only on a trusted network segment, and pair with
@@ -1064,6 +1073,16 @@ pub(crate) struct TacticalIngressArgs {
     #[arg(long, default_value = "1024", env = "RUSTGATE_ASTERIX_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
     pub(crate) asterix_max_identities: usize,
 
+    /// IPv4 multicast group to join for ASTERIX ingress (e.g. `239.2.3.1`).
+    /// When set, the listener binds with `SO_REUSEADDR` on the
+    /// `--asterix-bind` port and joins this group, so ASTERIX can be received
+    /// on an exercise-LAN multicast address; admission and validate-and-drop
+    /// apply identically. Must be in `224.0.0.0/4`; a non-multicast value is
+    /// a startup error. Empty/unset (the default) does a plain unicast bind.
+    /// Inbound only.
+    #[arg(long, env = "RUSTGATE_ASTERIX_MULTICAST_GROUP")]
+    pub(crate) asterix_multicast_group: Option<String>,
+
     /// Bind address for VMF (MIL-STD-6017 K05.1) position-report input over
     /// UDP (e.g. 0.0.0.0:1581). WARNING: datagrams are UNAUTHENTICATED and
     /// NOT encrypted — use only on a trusted network segment, and pair with
@@ -1089,6 +1108,15 @@ pub(crate) struct TacticalIngressArgs {
     /// Maximum concurrent synthetic VMF identities tracked.
     #[arg(long, default_value = "1024", env = "RUSTGATE_VMF_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
     pub(crate) vmf_max_identities: usize,
+
+    /// IPv4 multicast group to join for VMF ingress (e.g. `239.2.3.1`). When
+    /// set, the listener binds with `SO_REUSEADDR` on the `--vmf-bind` port
+    /// and joins this group, so VMF can be received on an exercise-LAN
+    /// multicast address; admission and validate-and-drop apply identically.
+    /// Must be in `224.0.0.0/4`; a non-multicast value is a startup error.
+    /// Empty/unset (the default) does a plain unicast bind. Inbound only.
+    #[arg(long, env = "RUSTGATE_VMF_MULTICAST_GROUP")]
+    pub(crate) vmf_multicast_group: Option<String>,
 
     /// Bind address for SAPIENT (BSI Flex 335) protobuf input over **TCP**
     /// (e.g. 0.0.0.0:8800). Stream-framed (varint length-delimited), so this
@@ -2690,16 +2718,19 @@ define_config_file! {
     dis_rate_limit_pps in ingress: u32,
     dis_allowed_cidrs in ingress: Option<String>,
     dis_max_identities in ingress: usize,
+    dis_multicast_group in ingress: Option<String>,
     asterix_bind in ingress: Option<String>,
     asterix_group in ingress: String,
     asterix_rate_limit_pps in ingress: u32,
     asterix_allowed_cidrs in ingress: Option<String>,
     asterix_max_identities in ingress: usize,
+    asterix_multicast_group in ingress: Option<String>,
     vmf_bind in ingress: Option<String>,
     vmf_group in ingress: String,
     vmf_rate_limit_pps in ingress: u32,
     vmf_allowed_cidrs in ingress: Option<String>,
     vmf_max_identities in ingress: usize,
+    vmf_multicast_group in ingress: Option<String>,
     sapient_bind in ingress: Option<String>,
     sapient_group in ingress: String,
     sapient_rate_limit_pps in ingress: u32,

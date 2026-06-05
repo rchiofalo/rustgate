@@ -63,7 +63,8 @@ ingress paths still to come. See the design notes
 
 ## Enabling ingress
 
-Each protocol has the same five flags under its own `--<proto>-` prefix.
+Each protocol has the same core flags under its own `--<proto>-` prefix
+(the three UDP codecs add an optional `--<proto>-multicast-group`).
 Set the `--<proto>-bind` to enable it; leaving it unset disables that
 protocol (default-deny). All flags have matching `RUSTGATE_<PROTO>_*`
 environment variables and TOML config-file keys.
@@ -94,6 +95,36 @@ Per-protocol UDP flags (shown for `dis`; identical for `asterix` / `vmf`):
 | `--dis-rate-limit-pps` | `RUSTGATE_DIS_RATE_LIMIT_PPS` | `0` → secure default | Per-IP datagrams/sec (`0` = built-in default, not off) |
 | `--dis-allowed-cidrs` | `RUSTGATE_DIS_ALLOWED_CIDRS` | *(unset → warn)* | Comma-separated source CIDR allowlist |
 | `--dis-max-identities` | `RUSTGATE_DIS_MAX_IDENTITIES` | `1024` | Synthetic-identity LRU bound (new IPs rejected at cap) |
+| `--dis-multicast-group` | `RUSTGATE_DIS_MULTICAST_GROUP` | *(unset → unicast)* | IPv4 group to join on the `--dis-bind` port (`224.0.0.0/4`); inbound only |
+
+#### Multicast ingress (UDP only)
+
+DIS, ASTERIX, and VMF can be received on an IPv4 multicast group instead of
+(or in addition to) unicast — useful when sensors flood tracks onto an
+exercise-LAN multicast address rather than addressing the router directly.
+Set `--<proto>-multicast-group` to a `224.0.0.0/4` address; the listener
+then binds with `SO_REUSEADDR` on the **`--<proto>-bind` port** and joins
+that group. The group address is validated at startup — a non-multicast
+value is a hard configuration error, never a silent unicast fallback.
+
+```bash
+# Receive DIS on the exercise multicast group 239.2.3.1:3000.
+rustgate-server \
+  --dis-bind 0.0.0.0:3000 --dis-multicast-group 239.2.3.1 \
+  --dis-allowed-cidrs 10.20.0.0/16
+```
+
+The port comes from `--<proto>-bind`; there is no separate multicast-port
+flag. Source-CIDR allowlisting, per-IP rate limiting, the synthetic-identity
+cap, and the validating decode all apply to multicast datagrams exactly as
+they do to unicast — the only difference is how the socket is bound.
+`SO_REUSEADDR` lets a co-located sensor app and the router share the port on
+one host. The join happens on the kernel's default routed interface
+(`0.0.0.0`); a per-protocol interface override is not exposed for the codec
+ingress (the separate `--udp-multicast-interface` flag pins only the CoT
+multicast listener). Multicast here is **inbound only** — the router never
+re-broadcasts to a multicast destination from a codec ingress path. STANAG
+4586 (also UDP) has no multicast flag.
 
 ### Stream protocols (TCP): SAPIENT, Link 16, NFFI
 
@@ -162,9 +193,12 @@ framing-level error (bad length prefix) closes it.
   validating decode until the codec maps them, and multi-record datagrams
   (e.g. several ASTERIX tracks in one datablock, several NFFI tracks in one
   document) surface only their first record for now.
-- **Unicast only** so far; multicast ingress (ASTERIX / DIS on an exercise
-  LAN, Link 16 JREAP-A) reuses the same controls and lands with the
-  multicast follow-up.
+- **Multicast is inbound only.** The UDP codecs (DIS / ASTERIX / VMF) can
+  *join* an IPv4 multicast group via `--<proto>-multicast-group` to receive
+  on an exercise LAN (see above), but the server never re-broadcasts to a
+  multicast destination from these paths. STANAG 4586 (also UDP) and the
+  stream protocols (SAPIENT, Link 16 / JREAP-C, all TCP) have no multicast
+  flag.
 - **STANAG 4586 is UDP-only here.** One STANAG message per datagram.
   TCP-stream STANAG is deferred: its frame size is message-type-dependent
   (no self-delimiting length prefix), so a stream needs a per-deployment
