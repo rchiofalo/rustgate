@@ -23,8 +23,9 @@ use rustgate_core::entity::DynEntityCodec;
 use rustgate_core::message::MessageType;
 use rustgate_core::tasks::SubsystemHandle;
 use rustgate_router::Router;
-use rustgate_transport::CidrPrefix;
 use rustgate_transport::codec_ingress::{CodecIngressConfig, CodecUdpInput};
+use rustgate_transport::codec_tcp_ingress::{CodecTcpIngressConfig, CodecTcpInput, FramingFactory};
+use rustgate_transport::{CidrPrefix, FramedCodec, VarintDelimitedCodec};
 use tokio::sync::Notify;
 
 use crate::cli::Cli;
@@ -188,6 +189,108 @@ pub(crate) async fn start_vmf(
             // K05.1 is a position report.
             message_type: MessageType::Position,
             codec: Arc::new(rustgate_vmf::VmfCodec),
+        },
+        router,
+    )
+    .await
+}
+
+/// One stream (TCP) protocol's resolved ingress parameters.
+struct TcpProtocolIngress {
+    bind: Option<String>,
+    group: String,
+    rate_limit_pps: u32,
+    allowed_cidrs: Option<String>,
+    max_identities: usize,
+    max_connections: usize,
+    cn_prefix: &'static str,
+    source_protocol: &'static str,
+    message_type: MessageType,
+    /// Per-frame validation codec (same instance the router re-decodes with).
+    codec: Arc<dyn DynEntityCodec>,
+    /// Produces a fresh per-connection frame delimiter.
+    framing: FramingFactory,
+}
+
+/// Bind a TCP listener and spawn the shared stream-ingress listener, or
+/// return `Ok(None)` when its `--<proto>-bind` is unset.
+async fn spawn_tcp(
+    p: TcpProtocolIngress,
+    router: &Arc<Router>,
+) -> anyhow::Result<Option<SubsystemHandle>> {
+    let Some(bind) = p.bind.as_ref() else {
+        return Ok(None);
+    };
+    let addr: SocketAddr = bind
+        .parse()
+        .with_context(|| format!("parsing --{}-bind `{bind}`", p.source_protocol))?;
+
+    let allowed_cidrs = parse_cidrs(p.allowed_cidrs.as_deref(), p.source_protocol)?;
+    let config = CodecTcpIngressConfig {
+        cn_prefix: p.cn_prefix.to_string(),
+        group: p.group,
+        // 0 means "secure default", not "off".
+        max_accepts_per_sec: (p.rate_limit_pps > 0).then_some(p.rate_limit_pps as usize),
+        allowed_cidrs,
+        max_identities: p.max_identities,
+        max_connections: p.max_connections,
+    };
+
+    // Per-connection socket hardening (configure_tactical_socket) is applied
+    // to every accepted stream inside CodecTcpInput::run, not here — this
+    // call only binds the listening socket.
+    let listener = tokio::net::TcpListener::bind(addr) // playbook-drift-ok: per-stream config in CodecTcpInput::run
+        .await
+        .with_context(|| format!("binding {} TCP socket on {addr}", p.source_protocol))?;
+
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_clone = Arc::clone(&shutdown);
+    let router = Arc::clone(router);
+    let source_protocol = p.source_protocol.to_string();
+    let codec = p.codec;
+    let framing = p.framing;
+    let message_type = p.message_type;
+
+    let task = tokio::spawn(async move {
+        CodecTcpInput::run(
+            listener,
+            router,
+            codec,
+            framing,
+            source_protocol,
+            message_type,
+            config,
+            shutdown_clone,
+        )
+        .await;
+    });
+
+    Ok(Some(SubsystemHandle::new(shutdown, task)))
+}
+
+/// Start SAPIENT (BSI Flex 335) protobuf ingress over TCP if `--sapient-bind`
+/// is set. Frames are varint length-delimited; each frame is validated with
+/// the `SapientCodec` before routing.
+pub(crate) async fn start_sapient(
+    cli: &Cli,
+    router: &Arc<Router>,
+) -> anyhow::Result<Option<SubsystemHandle>> {
+    let framing: FramingFactory =
+        Arc::new(|| FramedCodec::VarintDelimited(VarintDelimitedCodec::new()));
+    spawn_tcp(
+        TcpProtocolIngress {
+            bind: cli.ingress.sapient_bind.clone(),
+            group: cli.ingress.sapient_group.clone(),
+            rate_limit_pps: cli.ingress.sapient_rate_limit_pps,
+            allowed_cidrs: cli.ingress.sapient_allowed_cidrs.clone(),
+            max_identities: cli.ingress.sapient_max_identities,
+            max_connections: cli.ingress.sapient_max_connections,
+            cn_prefix: "sapient-anonymous",
+            source_protocol: "sapient",
+            // SAPIENT detection reports carry a located entity.
+            message_type: MessageType::Position,
+            codec: Arc::new(rustgate_sapient::SapientCodec),
+            framing,
         },
         router,
     )

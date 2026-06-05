@@ -1065,6 +1065,39 @@ pub(crate) struct TacticalIngressArgs {
     /// Maximum concurrent synthetic VMF identities tracked.
     #[arg(long, default_value = "1024", env = "RUSTGATE_VMF_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
     pub(crate) vmf_max_identities: usize,
+
+    /// Bind address for SAPIENT (BSI Flex 335) protobuf input over **TCP**
+    /// (e.g. 0.0.0.0:8800). Stream-framed (varint length-delimited), so this
+    /// is a connection-oriented listener. WARNING: connections are
+    /// UNAUTHENTICATED and NOT encrypted — use only on a trusted network
+    /// segment, and pair with `--sapient-allowed-cidrs`. When unset, SAPIENT
+    /// ingress is disabled.
+    #[arg(long, env = "RUSTGATE_SAPIENT_BIND", value_parser = parse_socket_addr)]
+    pub(crate) sapient_bind: Option<String>,
+
+    /// Destination group every accepted SAPIENT message routes to.
+    #[arg(long, default_value = "sapient", env = "RUSTGATE_SAPIENT_GROUP")]
+    pub(crate) sapient_group: String,
+
+    /// Per-IP connection-accept rate (connections/sec) for SAPIENT input.
+    /// `0` (the default) applies the built-in secure default, not "unlimited".
+    #[arg(long, default_value = "0", env = "RUSTGATE_SAPIENT_RATE_LIMIT_PPS")]
+    pub(crate) sapient_rate_limit_pps: u32,
+
+    /// Comma-separated CIDR prefixes allowed to connect for SAPIENT.
+    /// Strongly recommended; unset starts the listener but warns it is
+    /// exposed to the whole reachable network.
+    #[arg(long, env = "RUSTGATE_SAPIENT_ALLOWED_CIDRS")]
+    pub(crate) sapient_allowed_cidrs: Option<String>,
+
+    /// Maximum concurrent synthetic SAPIENT identities tracked.
+    #[arg(long, default_value = "1024", env = "RUSTGATE_SAPIENT_MAX_IDENTITIES", value_parser = parse_nonzero_usize)]
+    pub(crate) sapient_max_identities: usize,
+
+    /// Maximum simultaneously-open SAPIENT connections (TCP-only; bounds
+    /// resource use from connection floods).
+    #[arg(long, default_value = "1024", env = "RUSTGATE_SAPIENT_MAX_CONNECTIONS", value_parser = parse_nonzero_usize)]
+    pub(crate) sapient_max_connections: usize,
 }
 
 #[derive(Args, Serialize)]
@@ -2551,6 +2584,12 @@ define_config_file! {
     vmf_rate_limit_pps in ingress: u32,
     vmf_allowed_cidrs in ingress: Option<String>,
     vmf_max_identities in ingress: usize,
+    sapient_bind in ingress: Option<String>,
+    sapient_group in ingress: String,
+    sapient_rate_limit_pps in ingress: u32,
+    sapient_allowed_cidrs in ingress: Option<String>,
+    sapient_max_identities in ingress: usize,
+    sapient_max_connections in ingress: usize,
     tcp_bind in plaintext: Option<String>,
     udp_bind in plaintext: Option<String>,
     udp_rate_limit in plaintext: u32,

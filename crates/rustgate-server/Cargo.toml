@@ -23,7 +23,7 @@ workspace = true
 # will add the explicit `register(...)` calls. The crates ship in the binary
 # regardless so the integrations are available the moment the registrations
 # land. Refs #865, #869, #851, #870.
-ignored = ["rustgate-meshtastic", "rustgate-sapient", "rustgate-foundry", "rustgate-dds"]
+ignored = ["rustgate-meshtastic", "rustgate-foundry", "rustgate-dds"]
 
 [features]
 nats = ["dep:rustgate-nats", "rustgate-admin/nats"]

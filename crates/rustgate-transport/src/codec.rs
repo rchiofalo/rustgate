@@ -19,6 +19,12 @@ pub enum FramedCodec {
     LengthPrefixed(LengthPrefixedCodec),
     XmlStream(XmlStreamCodec),
     LineDelimited(LineDelimitedCodec),
+    /// Protobuf varint length-delimited framing (no magic prefix) — used by
+    /// SAPIENT and other plain length-delimited protobuf streams. Selected
+    /// directly by the tactical stream-ingress listener rather than via
+    /// [`FramingStrategy`] auto-detection (a bare varint has no signature to
+    /// detect), so it has no `try_from_strategy` arm.
+    VarintDelimited(VarintDelimitedCodec),
     #[cfg(feature = "proto")]
     TakProtobuf(rustgate_proto::TakFrameCodec),
     #[cfg(feature = "mavlink")]
@@ -102,6 +108,7 @@ impl Decoder for FramedCodec {
             Self::LengthPrefixed(c) => c.decode(src),
             Self::XmlStream(c) => c.decode(src),
             Self::LineDelimited(c) => c.decode(src),
+            Self::VarintDelimited(c) => c.decode(src),
             #[cfg(feature = "proto")]
             Self::TakProtobuf(c) => c.decode(src),
             #[cfg(feature = "mavlink")]
@@ -118,6 +125,7 @@ impl Encoder<BytesMut> for FramedCodec {
             Self::LengthPrefixed(c) => c.encode(item, dst),
             Self::XmlStream(c) => c.encode(item, dst),
             Self::LineDelimited(c) => c.encode(item, dst),
+            Self::VarintDelimited(c) => c.encode(item, dst),
             #[cfg(feature = "proto")]
             Self::TakProtobuf(c) => c.encode(item, dst),
             #[cfg(feature = "mavlink")]
@@ -237,6 +245,131 @@ impl Encoder<BytesMut> for LengthPrefixedCodec {
         }
         dst.reserve(self.header_bytes() + item.len());
         self.write_length(item.len(), dst);
+        dst.extend_from_slice(&item);
+        Ok(())
+    }
+}
+
+/// Protobuf varint length-delimited framing: a base-128 LEB-encoded payload
+/// length, then exactly that many payload bytes. No magic prefix — used by
+/// SAPIENT (BSI Flex 335) and other plain length-delimited protobuf streams.
+///
+/// # Security
+///
+/// The decoded length is bounded **before** any buffer reservation: a
+/// length-prefix above `max_frame_size` is rejected with `InvalidData`
+/// rather than allocated, and a varint that does not terminate within 10
+/// bytes (the maximum for a 64-bit value) is rejected — so a hostile peer
+/// cannot drive an unbounded allocation or an unbounded prefix scan.
+#[derive(Debug)]
+pub struct VarintDelimitedCodec {
+    max_frame_size: usize,
+}
+
+impl Default for VarintDelimitedCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VarintDelimitedCodec {
+    /// Maximum number of bytes a base-128 varint may occupy for a 64-bit
+    /// length. A prefix longer than this is malformed (or hostile padding).
+    const MAX_VARINT_BYTES: usize = 10;
+
+    /// Codec with the global [`MAX_FRAME_SIZE`] cap.
+    pub fn new() -> Self {
+        Self {
+            max_frame_size: MAX_FRAME_SIZE,
+        }
+    }
+
+    /// Codec with a tighter per-frame cap than [`MAX_FRAME_SIZE`].
+    pub fn with_max_frame_size(mut self, max_frame_size: usize) -> Self {
+        self.max_frame_size = max_frame_size.min(MAX_FRAME_SIZE);
+        self
+    }
+}
+
+impl Decoder for VarintDelimitedCodec {
+    type Item = BytesMut;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Parse the LEB128 length prefix at the front WITHOUT consuming it,
+        // so a partially-arrived frame leaves the buffer intact for the
+        // next read. Re-parsing the (≤10-byte) prefix per call is cheap.
+        let mut payload_len: u64 = 0;
+        let mut shift: u32 = 0;
+        let mut header = 0usize;
+        loop {
+            if header >= src.len() {
+                // Varint not fully arrived yet — wait for more bytes.
+                return Ok(None);
+            }
+            if header >= Self::MAX_VARINT_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "varint length prefix exceeds 10 bytes (malformed)",
+                ));
+            }
+            let byte = src[header];
+            header += 1;
+            payload_len |= u64::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "frame length overflows usize")
+        })?;
+        // Bound BEFORE reserving — no allocation driven by an attacker length.
+        if payload_len > self.max_frame_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "frame too large: {} bytes exceeds limit of {}",
+                    payload_len, self.max_frame_size
+                ),
+            ));
+        }
+
+        let total = header + payload_len;
+        if src.len() < total {
+            src.reserve(total - src.len());
+            return Ok(None);
+        }
+
+        // Drop the length prefix, then split off exactly one payload frame.
+        src.advance(header);
+        Ok(Some(src.split_to(payload_len)))
+    }
+}
+
+impl Encoder<BytesMut> for VarintDelimitedCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: BytesMut, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        if item.len() > self.max_frame_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame too large: {} > {}", item.len(), self.max_frame_size),
+            ));
+        }
+        let mut len = item.len() as u64;
+        loop {
+            let mut byte = (len & 0x7F) as u8;
+            len >>= 7;
+            if len != 0 {
+                byte |= 0x80;
+            }
+            dst.put_u8(byte);
+            if len == 0 {
+                break;
+            }
+        }
         dst.extend_from_slice(&item);
         Ok(())
     }
@@ -462,8 +595,104 @@ impl Encoder<BytesMut> for LineDelimitedCodec {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // ── VarintDelimitedCodec ────────────────────────────────────────
+
+    /// Encode `len` as a base-128 varint (test helper mirroring the wire).
+    fn varint(mut len: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (len & 0x7F) as u8;
+            len >>= 7;
+            if len != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if len == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn varint_decodes_single_frame() {
+        let mut codec = VarintDelimitedCodec::new();
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&varint(3));
+        buf.extend_from_slice(b"abc");
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(&frame[..], b"abc");
+        assert!(buf.is_empty());
+        // Buffer drained → next decode needs more bytes.
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn varint_decodes_back_to_back_frames() {
+        let mut codec = VarintDelimitedCodec::new();
+        let mut buf = BytesMut::new();
+        for body in [&b"one"[..], &b"twotwo"[..], &b"3"[..]] {
+            buf.extend_from_slice(&varint(body.len() as u64));
+            buf.extend_from_slice(body);
+        }
+        assert_eq!(&codec.decode(&mut buf).unwrap().unwrap()[..], b"one");
+        assert_eq!(&codec.decode(&mut buf).unwrap().unwrap()[..], b"twotwo");
+        assert_eq!(&codec.decode(&mut buf).unwrap().unwrap()[..], b"3");
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn varint_waits_for_partial_prefix_and_body() {
+        let mut codec = VarintDelimitedCodec::new();
+        // Frame body is 200 bytes → 2-byte varint prefix (0xC8 0x01).
+        let body = [0x5Au8; 200];
+        let mut buf = BytesMut::new();
+        // Only the first prefix byte (continuation set) → incomplete.
+        buf.extend_from_slice(&[0xC8]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        // Complete the prefix + partial body → still incomplete.
+        buf.extend_from_slice(&[0x01]);
+        buf.extend_from_slice(&body[..100]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        // Deliver the rest → one full frame.
+        buf.extend_from_slice(&body[100..]);
+        assert_eq!(codec.decode(&mut buf).unwrap().unwrap().len(), 200);
+    }
+
+    #[test]
+    fn varint_rejects_oversized_length_before_allocating() {
+        let mut codec = VarintDelimitedCodec::new().with_max_frame_size(16);
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&varint(17)); // one over the cap
+        buf.extend_from_slice(&[0u8; 4]); // only a few body bytes present
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn varint_rejects_non_terminating_prefix() {
+        let mut codec = VarintDelimitedCodec::new();
+        let mut buf = BytesMut::new();
+        // 11 continuation bytes — never terminates within the 10-byte cap.
+        buf.extend_from_slice(&[0x80u8; 11]);
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn varint_encode_decode_round_trip() {
+        let mut codec = VarintDelimitedCodec::new();
+        let mut wire = BytesMut::new();
+        let payload = BytesMut::from(&b"round-trip-payload"[..]);
+        codec.encode(payload.clone(), &mut wire).unwrap();
+        let decoded = codec.decode(&mut wire).unwrap().unwrap();
+        assert_eq!(decoded, payload);
+    }
 
     // ── XmlStreamCodec ──────────────────────────────────────────────
 

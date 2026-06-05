@@ -1004,6 +1004,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         );
         registry.register("dis", std::sync::Arc::new(rustgate_dis::DisCodec));
         registry.register("vmf", std::sync::Arc::new(rustgate_vmf::VmfCodec));
+        registry.register(
+            "sapient",
+            std::sync::Arc::new(rustgate_sapient::SapientCodec),
+        );
         Arc::new(registry)
     };
 
@@ -2043,6 +2047,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let dis_shutdown = tactical_ingress::start_dis(&cli, &router).await?;
     let asterix_shutdown = tactical_ingress::start_asterix(&cli, &router).await?;
     let vmf_shutdown = tactical_ingress::start_vmf(&cli, &router).await?;
+    // SAPIENT is stream-framed (TCP), so it runs on the connection-oriented
+    // CodecTcpInput listener rather than the UDP datagram one (#1473).
+    let sapient_shutdown = tactical_ingress::start_sapient(&cli, &router).await?;
 
     // ── Management REST API ────────────────────────────────────────
     //
@@ -2419,6 +2426,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
     if let Some(handle) = vmf_shutdown {
         stop_subsystem("vmf", handle).await;
+    }
+    if let Some(handle) = sapient_shutdown {
+        stop_subsystem("sapient", handle).await;
     }
     if let Some(handle) = archive_rotation_handle {
         handle.abort();
