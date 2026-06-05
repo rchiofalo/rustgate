@@ -774,6 +774,15 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let correlation_api_slot: Arc<std::sync::OnceLock<rustgate_admin::CorrelationApiHandler>> =
         Arc::new(std::sync::OnceLock::new());
 
+    // Slot for the TAK data-package REST API (#860). Held empty until
+    // the `--packages-dir` wiring below builds the `PackageStore` and
+    // registers the handler; the dispatcher in
+    // `rustgate-admin::server::serve` short-circuits the `/api/packages`
+    // path to a 404 while the slot is still empty.
+    #[cfg(all(feature = "metrics", feature = "missions"))]
+    let missions_api_slot: Arc<std::sync::OnceLock<rustgate_admin::MissionsApiHandler>> =
+        Arc::new(std::sync::OnceLock::new());
+
     // Shared shutdown notifier driven by either SIGTERM/Ctrl-C
     // (`shutdown_signal()`) or `POST /api/drain` (closes #791). The
     // accept loop awaits on `shutdown_signal()` which races a tokio
@@ -800,6 +809,8 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
         &video_api_slot,
         #[cfg(feature = "correlation")]
         &correlation_api_slot,
+        #[cfg(feature = "missions")]
+        &missions_api_slot,
         &router_slot,
     )
     .await?;
@@ -1581,6 +1592,107 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
     #[cfg(not(feature = "metrics"))]
     let _ = acl_file_parsed;
+
+    // ── TAK data-package REST API (/api/packages) ───────────────────
+    //
+    // Behind `--features missions,metrics`, mount the bearer-token-
+    // authenticated package surface (upload, list, download, delete)
+    // on the admin HTTP server when `--packages-dir` is set. The store
+    // is an on-disk `rustgate_missions::PackageStore` whose sidecar
+    // metadata is HMAC-SHA256-tagged with the key from
+    // `--packages-integrity-key-file`. The bearer token is the same
+    // operator-managed `--metrics-token-file` that already gates the
+    // metrics port — the route lives on that listener, so a second
+    // token would be redundant surface; `Cli::validate` requires the
+    // token file whenever `--packages-dir` is set. The handler is
+    // registered into `missions_api_slot`, which the dispatcher in
+    // `rustgate-admin::server::serve` short-circuits to a 404 while
+    // empty. Refs #860.
+    #[cfg(all(feature = "metrics", feature = "missions"))]
+    if let Some(ref packages_dir) = cli.integrations.packages_dir {
+        // Validated as `Some` alongside `--packages-dir` in
+        // `Cli::validate`; treat an unexpected `None` as a hard config
+        // error rather than silently downgrading integrity.
+        let key_path = cli
+            .integrations
+            .packages_integrity_key_file
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--packages-integrity-key-file is required when --packages-dir is set"
+                )
+            })?;
+        let integrity_key = read_packages_integrity_key_file(key_path)?;
+
+        // Reuse the metrics bearer token as the package-API credential.
+        // Required when the package API is enabled so the mutating
+        // upload/delete surface is never exposed unauthenticated.
+        let token_file = cli.metrics.metrics_token_file.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--metrics-token-file is required when --packages-dir is set: the \
+                 /api/packages REST surface (upload, download, delete) is bearer-token \
+                 authenticated and shares the metrics-endpoint token"
+            )
+        })?;
+        let token_str =
+            rustgate_core::read_secret_file(token_file, &rustgate_core::SecretFileOpts::default())
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to read metrics token file {token_file}: {e}")
+                })?;
+        let auth_token = zeroize::Zeroizing::new(token_str.as_bytes().to_vec());
+        rustgate_admin::validate_bearer_token_length(&auth_token, "data-package API")
+            .map_err(|e| anyhow::anyhow!("{e} (from {token_file})"))?;
+
+        let store = rustgate_missions::PackageStore::new(
+            packages_dir.clone(),
+            integrity_key.to_vec(),
+            rustgate_missions::StoreLimits::default(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "initializing data-package store at {}",
+                packages_dir.display()
+            )
+        })?;
+
+        let state = Arc::new(rustgate_admin::MissionsApiState { store, auth_token });
+        let handler: rustgate_admin::MissionsApiHandler =
+            Arc::new(move |method, path, auth, content_type, body| {
+                let state = Arc::clone(&state);
+                let method = method.clone();
+                let path = path.to_string();
+                let auth = auth.map(str::to_string);
+                let content_type = content_type.map(str::to_string);
+                let body = body.to_vec();
+                Box::pin(async move {
+                    rustgate_admin::missions_api::handle_request(
+                        &method,
+                        &path,
+                        auth.as_deref(),
+                        content_type.as_deref(),
+                        &body,
+                        &state,
+                    )
+                    .await
+                })
+            });
+        let _ = missions_api_slot.set(handler);
+        tracing::warn!(
+            dir = %packages_dir.display(),
+            "TAK data-package REST API enabled at /api/packages — exposes upload, \
+             download, and delete; bind the metrics endpoint to a trusted network only"
+        );
+    } else {
+        // No `--packages-dir`: leave the slot empty so the dispatcher
+        // 404s every `/api/packages` request. Warn so an operator who
+        // built with `--features missions` but forgot the directory
+        // flag is not left wondering why the route is dark.
+        tracing::warn!(
+            "TAK data-package REST API disabled: --packages-dir is unset; /api/packages \
+             will return 404"
+        );
+    }
 
     let connection_limit = Arc::new(Semaphore::new(max_connections as usize));
 
@@ -2917,6 +3029,50 @@ fn read_queue_key_file(path: &std::path::Path) -> anyhow::Result<zeroize::Zeroiz
     hex::decode_to_slice(trimmed.as_bytes(), &mut *key)
         .map_err(|e| anyhow::anyhow!("client-queue key file `{display}` is not valid hex: {e}"))?;
     Ok(key)
+}
+
+/// Read the data-package store integrity key file and return the decoded
+/// 32-byte key wrapped in [`zeroize::Zeroizing`]. The file must contain
+/// exactly 64 hex characters (case-insensitive) with optional trailing
+/// whitespace. On Unix the file must be mode 0600/0400 and owned by the
+/// running process's effective UID.
+///
+/// Mirrors [`read_queue_key_file`] — same perm/size/empty/UTF-8
+/// discipline via [`rustgate_core::read_secret_file`] and the same
+/// 64-hex-char contract — but returns the key as a `Zeroizing<Vec<u8>>`
+/// because [`rustgate_missions::PackageStore::new`] consumes a `Vec<u8>`
+/// for HMAC-SHA256 sidecar tagging. Refs #860.
+#[cfg(all(feature = "metrics", feature = "missions"))]
+fn read_packages_integrity_key_file(
+    path: &std::path::Path,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let display = path.display().to_string();
+    let mut opts = rustgate_core::SecretFileOpts {
+        max_bytes: MAX_QUEUE_KEY_FILE_BYTES,
+        ..rustgate_core::SecretFileOpts::default()
+    };
+    #[cfg(unix)]
+    {
+        opts.require_owner_uid = Some(rustix::process::geteuid().as_raw());
+    }
+    let trimmed = rustgate_core::read_secret_file(path, &opts)
+        .map_err(|e| anyhow::anyhow!("data-package integrity key file `{display}`: {e}"))?;
+
+    if trimmed.len() != 64 {
+        anyhow::bail!(
+            "data-package integrity key file `{display}` must contain exactly 64 hex \
+             characters (got {})",
+            trimmed.len()
+        );
+    }
+
+    // Decode into a zeroizing 32-byte buffer first, then copy into the
+    // owned `Vec` the store takes. Both buffers are wiped on drop.
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(trimmed.as_bytes(), &mut *key).map_err(|e| {
+        anyhow::anyhow!("data-package integrity key file `{display}` is not valid hex: {e}")
+    })?;
+    Ok(zeroize::Zeroizing::new(key.to_vec()))
 }
 
 /// Read the on-disk PEM material for a `test-connection --tls` probe

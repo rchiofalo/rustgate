@@ -825,6 +825,7 @@ pub async fn serve(
     #[cfg(feature = "management-api")] management_api: Arc<OnceLock<ManagementApiHandler>>,
     #[cfg(feature = "video")] video_api: Arc<OnceLock<VideoApiHandler>>,
     #[cfg(feature = "correlation")] correlation_api: Arc<OnceLock<CorrelationApiHandler>>,
+    #[cfg(feature = "missions")] missions_api: Arc<OnceLock<crate::MissionsApiHandler>>,
     metrics_token: Option<Arc<Zeroizing<Vec<u8>>>>,
     router_slot: RouterSlot,
     max_http_connections: usize,
@@ -872,6 +873,8 @@ pub async fn serve(
         let video_api = Arc::clone(&video_api);
         #[cfg(feature = "correlation")]
         let correlation_api = Arc::clone(&correlation_api);
+        #[cfg(feature = "missions")]
+        let missions_api = Arc::clone(&missions_api);
         let metrics_token = metrics_token.clone();
         let router_slot = Arc::clone(&router_slot);
         spawn_background("metrics-http-conn", async move {
@@ -894,6 +897,8 @@ pub async fn serve(
                         let video_api = Arc::clone(&video_api);
                         #[cfg(feature = "correlation")]
                         let correlation_api = Arc::clone(&correlation_api);
+                        #[cfg(feature = "missions")]
+                        let missions_api = Arc::clone(&missions_api);
                         let metrics_token = metrics_token.clone();
                         let router_slot = Arc::clone(&router_slot);
                         async move {
@@ -954,6 +959,56 @@ pub async fn serve(
                                     .map(|b| b.to_bytes())
                                     .unwrap_or_default();
                                 if let Some(resp) = handler(&method, &path, &body) {
+                                    return Ok(resp);
+                                }
+                                return Ok(Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::from("not found")))
+                                    .unwrap_or_else(|_| internal_error_response()));
+                            }
+                            // Delegate /api/packages and /api/packages/{hash}
+                            // to the TAK data-package handler (#860). The
+                            // handler is async (it `.await`s the on-disk
+                            // package store) and bearer-token authenticated;
+                            // it owns the multipart/raw-zip upload, listing,
+                            // download, and delete surface. Unlike the
+                            // read-only video/correlation slots, this one
+                            // needs the `Authorization` and `Content-Type`
+                            // headers, so both are threaded through. The
+                            // handler returns its own structured
+                            // 401/404/405 envelopes; a `None` here means the
+                            // path fell outside the prefix, so fall through
+                            // to the bare 404 like the slots above.
+                            #[cfg(feature = "missions")]
+                            if (req.uri().path() == "/api/packages"
+                                || req.uri().path().starts_with("/api/packages/"))
+                                && let Some(handler) = missions_api.get()
+                            {
+                                let method = req.method().clone();
+                                let path = req.uri().path().to_string();
+                                let auth = req
+                                    .headers()
+                                    .get(hyper::header::AUTHORIZATION)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|s| s.to_string());
+                                let content_type = req
+                                    .headers()
+                                    .get(hyper::header::CONTENT_TYPE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|s| s.to_string());
+                                let body = http_body_util::BodyExt::collect(req.into_body())
+                                    .await
+                                    .map(|b| b.to_bytes())
+                                    .unwrap_or_default();
+                                if let Some(resp) = handler(
+                                    &method,
+                                    &path,
+                                    auth.as_deref(),
+                                    content_type.as_deref(),
+                                    &body,
+                                )
+                                .await
+                                {
                                     return Ok(resp);
                                 }
                                 return Ok(Response::builder()

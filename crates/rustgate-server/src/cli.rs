@@ -462,6 +462,30 @@ pub(crate) struct IntegrationArgs {
     /// `guard` build feature (#1457). When unset, no guard is installed.
     #[arg(long, env = "RUSTGATE_GUARD_CONFIG")]
     pub(crate) guard_config_file: Option<String>,
+
+    /// Directory backing the lightweight TAK data-package store. When
+    /// set (and the binary is built with `--features missions,metrics`),
+    /// the bearer-token-authenticated `/api/packages` REST surface is
+    /// mounted on the admin HTTP server: upload (multipart or raw ZIP),
+    /// list, download by SHA-256 hash, and delete. The directory is
+    /// created if missing. Each package body is stored alongside an
+    /// HMAC-SHA256-tagged sidecar keyed by `--packages-integrity-key-file`
+    /// so tampering with on-disk files is detected on read. The REST
+    /// surface is bearer-token authenticated and reuses the
+    /// `--metrics-token-file` credential. Requires both
+    /// `--packages-integrity-key-file` and `--metrics-token-file`. When
+    /// unset, the package API is not mounted. Refs #860.
+    #[arg(long, env = "RUSTGATE_PACKAGES_DIR")]
+    pub(crate) packages_dir: Option<std::path::PathBuf>,
+
+    /// Path to the file holding the data-package store integrity key
+    /// (64 hex characters → 32 raw bytes). Read once at startup into a
+    /// zeroizing buffer and used for HMAC-SHA256 tagging of package
+    /// sidecars. The same key must be supplied across restarts or the
+    /// existing sidecars fail verification and their packages become
+    /// unreadable. Required whenever `--packages-dir` is set. Refs #860.
+    #[arg(long, env = "RUSTGATE_PACKAGES_INTEGRITY_KEY_FILE")]
+    pub(crate) packages_integrity_key_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Serialize)]
@@ -2601,6 +2625,8 @@ define_config_file! {
     http_config_file in integrations: Option<String>,
     lattice_config_file in integrations: Option<String>,
     ogc_sensorthings_config_file in integrations: Option<String>,
+    packages_dir in integrations: Option<std::path::PathBuf>,
+    packages_integrity_key_file in integrations: Option<std::path::PathBuf>,
     enrollment_bind in enrollment: Option<String>,
     ca_key in enrollment: Option<String>,
     enrollment_user in enrollment: Option<String>,
@@ -2890,6 +2916,36 @@ impl Cli {
         // matching the authz_reload_interval check above.
         if self.authz.group_acl_file.is_some() && self.authz.acl_reload_interval == 0 {
             anyhow::bail!("--acl-reload-interval must be >= 1 when --group-acl-file is set");
+        }
+
+        // The data-package store HMAC-tags every sidecar with the key
+        // from --packages-integrity-key-file; without it the store
+        // cannot guarantee on-disk integrity, and a generated ephemeral
+        // key would make every package unreadable after a restart. So
+        // the key file is mandatory whenever the directory is set. Refs
+        // #860.
+        if self.integrations.packages_dir.is_some()
+            && self.integrations.packages_integrity_key_file.is_none()
+        {
+            anyhow::bail!(
+                "--packages-integrity-key-file is required when --packages-dir is set \
+                 (the package store HMAC-tags sidecar metadata; the same key must be \
+                 supplied across restarts)"
+            );
+        }
+
+        // The /api/packages REST surface (upload, download, delete)
+        // shares the metrics-endpoint bearer token rather than carrying
+        // its own — the route is mounted on the same admin/metrics
+        // listener. The mutating surface must never be exposed
+        // unauthenticated, so the token file is mandatory whenever the
+        // package store is enabled. Refs #860.
+        if self.integrations.packages_dir.is_some() && self.metrics.metrics_token_file.is_none() {
+            anyhow::bail!(
+                "--metrics-token-file is required when --packages-dir is set: the \
+                 /api/packages REST surface is bearer-token authenticated and shares the \
+                 metrics-endpoint token"
+            );
         }
 
         // CoT archive rotation cadence must not be too aggressive. Short
