@@ -112,7 +112,7 @@ mock-able (`*-mock`) for local development without external infra.
 | `lattice` | Anduril Lattice SDK integration umbrella | `lattice-mock`, `lattice-real` | Use `lattice-mock` for dev/CI; `lattice-real` requires an SDK token. |
 | `foundry` | Palantir Foundry data-egress integration umbrella | `foundry-mock` | Mock-only in workspace (real path is enterprise). |
 | `dds` | OMG DDS / ROS 2 bridge umbrella | `dds-mock` | Mock-only in workspace; `dds-real` enables `rustdds` + `ros2-client`. |
-| `inference` | ML-inference adapter (rustgate-inference) | `inference-mock` | Mock-only in workspace. |
+| `inference` | Edge ML inference pipeline (rustgate-inference) | `inference-mock` | Wired into the router's `OnRouted` callback; needs a backend (`inference-mock` today; ONNX is a follow-up). See `docs/inference.md`. |
 | `correlation` | Cross-domain entity-correlation engine | — | Implies `rustgate-correlation`. |
 | `missions` | TAK data-package REST API (`/api/packages`) | — | Implies `rustgate-missions` + `rustgate-admin/missions`. Needs `metrics` + `--packages-dir`; reuses `--metrics-token-file` for auth. |
 | `ogc-sensorthings` | OGC SensorThings API ingest | — | OGC standard for IoT sensor data. |

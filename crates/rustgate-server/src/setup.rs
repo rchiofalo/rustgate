@@ -2787,38 +2787,156 @@ pub(crate) async fn start_udp_multicast(
 
 /// Start the optional edge ML inference pipeline (closes #858).
 ///
-/// MVP stub — the binary-side wiring (loading the `[inference]`
-/// config block, building the `Pipeline`, wiring the
-/// `OnRouted` back-annotation callback, and supervising the model
-/// reload task) lands in a follow-up issue once an operator
-/// deployment shape is selected (single-server vs federation-of-
-/// inference-nodes — these have different preferred sinks for the
-/// re-injected annotated messages). For the MVP this helper is a
-/// no-op that simply logs that the inference feature was compiled
-/// in. The crate-level surface (`InferenceModel`, `Pipeline`,
-/// `wiring::router_callback`) is fully implemented and tested in
-/// `rustgate-inference`; only the binary-side glue is deferred.
+/// Reads the TOML config file under `cli.integrations.inference_config_file`,
+/// parses and validates its `[inference]` block into a
+/// [`rustgate_inference::InferenceConfig`], builds a hot-reloadable
+/// [`rustgate_inference::Pipeline`] populated from the selected backend,
+/// and returns the [`rustgate_router::OnRouted`] back-annotation callback
+/// that the binary installs on the router. The callback decodes each
+/// admitted message via the supplied
+/// [`rustgate_core::entity::EntityCodecRegistry`], runs the resulting
+/// entity through the pipeline, and re-injects one annotated
+/// `RoutableMessage` per [`rustgate_inference::InferenceResult`] through
+/// `Router::route` — so the synthesized events traverse the normal
+/// ACL / authz / dedup / egress path exactly as the source message did.
+/// The crate-supplied loop guard (`source_protocol = "inference"`) stops
+/// the re-injected events from being re-inferred.
 ///
-/// Intentionally infallible — a missing or invalid inference block
-/// must not block server startup. Operators who want a hard-fail
-/// behaviour should drive the validation from a CLI flag, which is
-/// the natural follow-up.
+/// **Backend selection.** This wiring activates the in-tree, deterministic
+/// `inference-mock` backend when the `inference-mock` feature is enabled:
+/// one `MockInferenceModel` (plain-backticked because the `mock` module is
+/// feature-gated, and a feature-conditional intra-doc link would break the
+/// workspace `rustdoc::broken_intra_doc_links` gate) is registered per
+/// `[[inference.pipeline]]` entry, keyed by the entry's `model-name` and
+/// labelled by its `target`. The ONNX / `ort` real backend is separate
+/// deferred work and lands behind a future `inference-onnx` feature without
+/// churning this call site. With only the umbrella `inference` feature
+/// enabled and no backend, this helper warns and returns `None` — the rest
+/// of the server keeps running unchanged.
+///
+/// Returns `None` when no config block is present, when the file cannot be
+/// read or parsed, when validation fails, or when no backend is selected.
+/// Intentionally infallible — a missing or invalid inference block must not
+/// block server startup; failures log via `tracing::warn!` and the server
+/// continues without the pipeline.
 #[cfg(feature = "inference")]
-pub fn start_inference() {
-    // Touch the crate's public surface so the optional dep does not
-    // appear unused to `cargo machete`. The constant is `&str`, so
-    // the `let _ = …` is free.
-    let _: &str = rustgate_inference::SOURCE_INFERENCE;
-    // WARN, not INFO (issue #1456): an operator who built `--features
-    // inference` expecting an active ML pipeline gets a no-op. Surfacing
-    // this at WARN makes the "compiled-in but NOT active" gap visible in
-    // startup logs instead of lost among info-level diagnostics.
-    tracing::warn!(
-        target: "rustgate.inference",
-        "rustgate-inference is COMPILED IN but NOT ACTIVE — this build performs no \
-         inference (the binary-side pipeline wiring is a follow-up, see #858). \
-         Any `[inference]` configuration is ignored.",
-    );
+pub(crate) async fn start_inference(
+    cli: &Cli,
+    router: &Arc<Router>,
+    registry: &Arc<rustgate_core::entity::EntityCodecRegistry>,
+) -> Option<rustgate_router::OnRouted> {
+    let config_path = cli.integrations.inference_config_file.as_ref()?;
+    let config_str = match tokio::fs::read_to_string(config_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(path = %config_path, error = %e, "failed to read --inference-config");
+            return None;
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        inference: rustgate_inference::InferenceConfig,
+    }
+
+    let cfg: rustgate_inference::InferenceConfig = match toml::from_str::<Wrapper>(&config_str) {
+        Ok(w) => w.inference,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse [inference] config");
+            return None;
+        }
+    };
+
+    if let Err(e) = cfg.validate() {
+        tracing::warn!(error = %e, "[inference] config validation failed");
+        return None;
+    }
+
+    // Backend selection. Only the mock backend ships today behind
+    // `inference-mock`. The ONNX/`ort` backend will land behind a future
+    // `inference-onnx` feature and join this `cfg!(feature = ...)` cascade
+    // without churning the call site.
+    #[cfg(not(feature = "inference-mock"))]
+    {
+        // With no backend feature enabled the pipeline is never built and
+        // neither `router` nor `registry` is wired, but both are part of
+        // the public function shape for the `inference-mock` / future
+        // `inference-onnx` paths below — consume them to stay warning-clean.
+        let _ = (router, registry);
+        tracing::warn!(
+            target: "rustgate.inference",
+            "[inference] config block present but no backend feature is enabled; \
+             enable --features inference-mock for the deterministic in-memory backend \
+             (the ONNX backend lands behind a future inference-onnx feature). \
+             No inference runs in this build."
+        );
+        return None;
+    }
+
+    #[cfg(feature = "inference-mock")]
+    {
+        use arc_swap::ArcSwap;
+        use rustgate_inference::Pipeline;
+        use rustgate_inference::mock::MockInferenceModel;
+        use rustgate_inference::model::InferenceModel;
+
+        // Build one deterministic mock model per pipeline entry. The mock
+        // does not load `model-path` from disk — it emits a fixed label
+        // (the entry's `target` tag) and confidence keyed by the entry's
+        // `model-name`, which is enough to exercise the end-to-end
+        // back-annotation path. The real backend will load the model file.
+        let models: Vec<Arc<dyn InferenceModel>> = cfg
+            .pipeline
+            .iter()
+            .map(|entry| {
+                Arc::new(MockInferenceModel::new(
+                    entry.model_name.clone(),
+                    Some(entry.target.as_str().to_string()),
+                    entry.confidence_threshold.unwrap_or(1.0),
+                )) as Arc<dyn InferenceModel>
+            })
+            .collect();
+
+        let model_count = models.len();
+        let pipeline = Pipeline::with_default_threshold();
+        pipeline.reload(models);
+        let pipeline = Arc::new(ArcSwap::from_pointee(pipeline));
+
+        // Re-injection sink: hand each annotated message back to the
+        // router so ACL / authz / dedup / egress re-apply. `Router::route`
+        // is async and takes the message by value, so we clone out of the
+        // `Arc` and dispatch on a background task to keep the `OnRouted`
+        // critical path non-blocking. The crate's loop guard
+        // (`source_protocol = "inference"`) prevents re-inference.
+        let sink_router = Arc::clone(router);
+        let sink: rustgate_inference::wiring::InferenceSink =
+            Arc::new(move |msg: Arc<rustgate_core::message::RoutableMessage>| {
+                let router = Arc::clone(&sink_router);
+                rustgate_core::tasks::spawn_background("inference-reinject", async move {
+                    router.route(msg.as_ref().clone()).await;
+                });
+            });
+
+        let callback =
+            rustgate_inference::wiring::router_callback(pipeline, Arc::clone(registry), sink);
+
+        tracing::info!(
+            models = model_count,
+            backend = "mock",
+            "edge ML inference pipeline enabled (mock backend); annotated \
+             entities re-injected through the router"
+        );
+        Some(callback)
+    }
+}
+
+/// Warn when --inference-config is set but the `inference` feature is
+/// disabled.
+#[cfg(not(feature = "inference"))]
+pub(crate) fn warn_inference_disabled(cli: &Cli) {
+    if cli.integrations.inference_config_file.is_some() {
+        tracing::warn!("--inference-config requires --features inference; ignoring");
+    }
 }
 
 #[cfg(test)]

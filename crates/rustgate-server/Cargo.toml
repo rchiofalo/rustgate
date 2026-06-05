@@ -100,14 +100,18 @@ correlation = ["dep:rustgate-correlation", "rustgate-admin/correlation"]
 # handler. Requires `--features metrics` to expose the route, and a
 # `--packages-dir` to enable it at runtime.
 missions = ["dep:rustgate-missions", "rustgate-admin/missions"]
-# Edge ML inference pipeline. Pulls the optional
-# `rustgate-inference` crate and exposes its trait surface to the
-# server binary. Closes #858. The MVP wires the crate into the
-# build but the binary-side `setup::start_inference` helper is a
-# stub that becomes a no-op when no `[inference]` block is
-# present in the runtime config — full binary wiring lands in a
-# follow-up issue once an operator deployment shape is selected.
+# Edge ML inference pipeline. The `inference` feature pulls the
+# optional `rustgate-inference` crate and turns on the binary-side
+# `setup::start_inference` wiring that reads the `[inference]` config
+# block, builds the `Pipeline`, and installs the back-annotation
+# `OnRouted` callback. A backend feature selects the model executor:
+# `inference-mock` activates the in-memory deterministic backend used
+# by tests and local development (the only implementation today — the
+# ONNX/`ort` real backend ships behind a future `inference-onnx`
+# flag). With only the umbrella `inference` feature and no backend,
+# the wiring warns and installs nothing. Closes #858.
 inference = ["dep:rustgate-inference"]
+inference-mock = ["inference", "rustgate-inference/inference-mock"]
 # Marti API compatibility shim (`/Marti/api/*`) for drop-in TAK Server
 # replacement (closes #863). Pulls the upstream feature on
 # `rustgate-admin` and the optional subsystems it depends on.

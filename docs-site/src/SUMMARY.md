@@ -20,6 +20,7 @@
 - [MQTT Transport](./architecture/mqtt.md)
 - [MAVLink Integration](./architecture/mavlink.md)
 - [Tactical Codec Ingress](./architecture/tactical-ingress.md)
+- [Inference Pipeline](./architecture/inference.md)
 
 # Operations
 
