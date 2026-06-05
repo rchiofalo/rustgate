@@ -21,11 +21,12 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use rustgate_core::entity::DynEntityCodec;
 use rustgate_core::message::MessageType;
+use rustgate_core::protocol::HeaderSize;
 use rustgate_core::tasks::SubsystemHandle;
 use rustgate_router::Router;
 use rustgate_transport::codec_ingress::{CodecIngressConfig, CodecUdpInput};
 use rustgate_transport::codec_tcp_ingress::{CodecTcpIngressConfig, CodecTcpInput, FramingFactory};
-use rustgate_transport::{CidrPrefix, FramedCodec, VarintDelimitedCodec};
+use rustgate_transport::{CidrPrefix, FramedCodec, HeaderLengthCodec, VarintDelimitedCodec};
 use tokio::sync::Notify;
 
 use crate::cli::Cli;
@@ -290,6 +291,38 @@ pub(crate) async fn start_sapient(
             // SAPIENT detection reports carry a located entity.
             message_type: MessageType::Position,
             codec: Arc::new(rustgate_sapient::SapientCodec),
+            framing,
+        },
+        router,
+    )
+    .await
+}
+
+/// Start Link 16 / JREAP-C (STANAG 5518) ingress over TCP if `--link16-bind`
+/// is set. Frames are delimited by the 16-byte JREAP header's `body_length`
+/// field (u32 BE at offset 12); each full frame is validated with the
+/// `Link16Codec` before routing.
+pub(crate) async fn start_link16(
+    cli: &Cli,
+    router: &Arc<Router>,
+) -> anyhow::Result<Option<SubsystemHandle>> {
+    // JREAP-C: 16-byte header, body_length u32 (HeaderSize::Four) at offset 12;
+    // the delimited frame includes the header so Link16Codec can parse it.
+    let framing: FramingFactory =
+        Arc::new(|| FramedCodec::HeaderLength(HeaderLengthCodec::new(16, 12, HeaderSize::Four)));
+    spawn_tcp(
+        TcpProtocolIngress {
+            bind: cli.ingress.link16_bind.clone(),
+            group: cli.ingress.link16_group.clone(),
+            rate_limit_pps: cli.ingress.link16_rate_limit_pps,
+            allowed_cidrs: cli.ingress.link16_allowed_cidrs.clone(),
+            max_identities: cli.ingress.link16_max_identities,
+            max_connections: cli.ingress.link16_max_connections,
+            cn_prefix: "link16-anonymous",
+            source_protocol: "link16",
+            // J-series air tracks are position reports.
+            message_type: MessageType::Position,
+            codec: Arc::new(rustgate_link16::Link16Codec),
             framing,
         },
         router,

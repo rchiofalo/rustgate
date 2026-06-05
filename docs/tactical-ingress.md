@@ -19,8 +19,9 @@ Wired today:
 | **ASTERIX** (CAT-062 tracks) | UDP | one datablock per datagram |
 | **VMF** (MIL-STD-6017 K05.1) | UDP | one message per datagram |
 | **SAPIENT** (BSI Flex 335) | **TCP** | protobuf varint length-delimited |
+| **Link 16 / JREAP-C** (STANAG 5518) | **TCP** | 16-byte JREAP header carrying the body length |
 
-Link 16 / STANAG 4586 (stream-framed) and Meshtastic (LoRa) are separate
+STANAG 4586 (stream-framed) and Meshtastic (LoRa) are separate
 ingress paths still to come. See the design notes
 (`docs/design/tactical-codec-ingress.md`,
 `docs/design/tactical-stream-ingress.md`) and the tracking epic (#1473).
@@ -77,6 +78,7 @@ rustgate-server \
 | **ASTERIX** (CAT-062) | `asterix` | UDP datablocks (≈8600) | `asterix` |
 | **VMF** (MIL-STD-6017 K05.1) | `vmf` | UDP position reports (≈1581) | `vmf` |
 | **SAPIENT** (BSI Flex 335) | `sapient` | **TCP** varint-delimited protobuf (≈8800) | `sapient` |
+| **Link 16 / JREAP-C** (STANAG 5518) | `link16` | **TCP** JREAP-header-framed (≈4444) | `link16` |
 
 Per-protocol UDP flags (shown for `dis`; identical for `asterix` / `vmf`):
 
@@ -88,11 +90,15 @@ Per-protocol UDP flags (shown for `dis`; identical for `asterix` / `vmf`):
 | `--dis-allowed-cidrs` | `RUSTGATE_DIS_ALLOWED_CIDRS` | *(unset → warn)* | Comma-separated source CIDR allowlist |
 | `--dis-max-identities` | `RUSTGATE_DIS_MAX_IDENTITIES` | `1024` | Synthetic-identity LRU bound (new IPs rejected at cap) |
 
-### SAPIENT (stream / TCP)
+### Stream protocols (TCP): SAPIENT, Link 16
 
-SAPIENT is **connection-oriented** (TCP), so its listener delimits a byte
-stream into protobuf frames (varint length prefix) and adds one extra knob —
-a concurrent-connection cap. The flag shape is otherwise identical:
+SAPIENT and **Link 16 / JREAP-C** are **connection-oriented** (TCP), so their
+listeners delimit a byte stream into frames — SAPIENT by a protobuf varint
+length prefix, Link 16 by the body-length field inside the 16-byte JREAP
+header — and add one extra knob over the UDP protocols: a
+`--<proto>-max-connections` concurrent-connection cap. Both use the identical
+`--<proto>-{bind,group,rate-limit-pps,allowed-cidrs,max-identities,max-connections}`
+flag shape (`sapient` / `link16`); the SAPIENT flags below stand for both.
 
 ```bash
 rustgate-server --sapient-bind 0.0.0.0:8800 --sapient-allowed-cidrs 10.20.0.0/16
