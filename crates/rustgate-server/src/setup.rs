@@ -1336,6 +1336,9 @@ pub(crate) async fn start_metrics(
     #[cfg(feature = "correlation")] correlation_api_slot: &Arc<
         std::sync::OnceLock<rustgate_admin::CorrelationApiHandler>,
     >,
+    #[cfg(feature = "missions")] missions_api_slot: &Arc<
+        std::sync::OnceLock<rustgate_admin::MissionsApiHandler>,
+    >,
     router_slot: &rustgate_admin::RouterSlot,
 ) -> anyhow::Result<Arc<metrics::MetricsIdentity>> {
     // Aggregate every domain crate's `init()` callback into a single
@@ -1439,6 +1442,8 @@ pub(crate) async fn start_metrics(
         let video_api_for_metrics = Arc::clone(video_api_slot);
         #[cfg(feature = "correlation")]
         let correlation_api_for_metrics = Arc::clone(correlation_api_slot);
+        #[cfg(feature = "missions")]
+        let missions_api_for_metrics = Arc::clone(missions_api_slot);
         let metrics_token_for_server = metrics_token.clone();
         let router_for_metrics = Arc::clone(router_slot);
         let max_http_connections = cli.metrics.metrics_max_connections;
@@ -1457,6 +1462,8 @@ pub(crate) async fn start_metrics(
                 video_api_for_metrics,
                 #[cfg(feature = "correlation")]
                 correlation_api_for_metrics,
+                #[cfg(feature = "missions")]
+                missions_api_for_metrics,
                 metrics_token_for_server,
                 router_for_metrics,
                 max_http_connections,

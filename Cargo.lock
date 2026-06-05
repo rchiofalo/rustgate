@@ -4987,6 +4987,7 @@ dependencies = [
  "rustgate-mavlink",
  "rustgate-meshtastic",
  "rustgate-metrics",
+ "rustgate-missions",
  "rustgate-mqtt",
  "rustgate-nats",
  "rustgate-nffi",

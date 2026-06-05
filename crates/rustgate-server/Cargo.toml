@@ -91,6 +91,15 @@ video = ["rustgate-admin/video"]
 # the live snapshot at `GET /api/correlation/fused-entities` via the
 # admin HTTP server. MVP — closes #848.
 correlation = ["dep:rustgate-correlation", "rustgate-admin/correlation"]
+# Lightweight TAK data-package REST API (Feature 17 of #860). Mounts the
+# bearer-token-authenticated `/api/packages` surface (upload, list,
+# download, delete) on the admin HTTP server, backed by an on-disk
+# `rustgate_missions::PackageStore` with HMAC-tagged sidecar integrity.
+# Pulls in `rustgate-missions` (the server binary builds the store and
+# its `StoreLimits` directly) plus the `rustgate-admin/missions`
+# handler. Requires `--features metrics` to expose the route, and a
+# `--packages-dir` to enable it at runtime.
+missions = ["dep:rustgate-missions", "rustgate-admin/missions"]
 # Edge ML inference pipeline. Pulls the optional
 # `rustgate-inference` crate and exposes its trait surface to the
 # server binary. Closes #858. The MVP wires the crate into the
@@ -210,6 +219,7 @@ rustgate-foundry = { workspace = true, optional = true }
 rustgate-dds = { workspace = true, optional = true }
 rustgate-ogc-sensorthings = { workspace = true, optional = true }
 rustgate-correlation = { workspace = true, optional = true }
+rustgate-missions = { workspace = true, optional = true }
 rustgate-inference = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }

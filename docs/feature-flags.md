@@ -12,7 +12,7 @@ build-time and runtime cost of each, see `docs/performance-tuning.md`.
 
 ## How feature flags work
 
-- **Top-level surface**: 39 features are declared on `rustgate-server`
+- **Top-level surface**: 41 features are declared on `rustgate-server`
   (the binary). These are what an operator selects with `--features`
   at `cargo build` time, or what a Helm chart sets via
   `image.build.features`.
@@ -114,6 +114,7 @@ mock-able (`*-mock`) for local development without external infra.
 | `dds` | OMG DDS / ROS 2 bridge umbrella | `dds-mock` | Mock-only in workspace; `dds-real` enables `rustdds` + `ros2-client`. |
 | `inference` | ML-inference adapter (rustgate-inference) | `inference-mock` | Mock-only in workspace. |
 | `correlation` | Cross-domain entity-correlation engine | — | Implies `rustgate-correlation`. |
+| `missions` | TAK data-package REST API (`/api/packages`) | — | Implies `rustgate-missions` + `rustgate-admin/missions`. Needs `metrics` + `--packages-dir`; reuses `--metrics-token-file` for auth. |
 | `ogc-sensorthings` | OGC SensorThings API ingest | — | OGC standard for IoT sensor data. |
 | `meshtastic` | Meshtastic LoRa mesh bridge | — | LoRaWAN-adjacent low-bandwidth bridge. |
 | `sapient` | UK MOD SAPIENT ASE/ASM bridge | — | Sensor data over publish/subscribe. |
