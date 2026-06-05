@@ -193,6 +193,7 @@ rustgate-sapient = { workspace = true }
 rustgate-dis = { workspace = true }
 rustgate-vmf = { workspace = true }
 rustgate-link16 = { workspace = true }
+rustgate-nffi = { workspace = true }
 rustgate-tls = { workspace = true }
 rustgate-transport = { workspace = true }
 rustgate-router = { workspace = true }

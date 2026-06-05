@@ -1009,6 +1009,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             std::sync::Arc::new(rustgate_sapient::SapientCodec),
         );
         registry.register("link16", std::sync::Arc::new(rustgate_link16::Link16Codec));
+        registry.register("nffi", std::sync::Arc::new(rustgate_nffi::NffiCodec));
         Arc::new(registry)
     };
 
@@ -2053,6 +2054,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // CodecTcpInput listener rather than the UDP datagram one (#1473).
     let sapient_shutdown = tactical_ingress::start_sapient(&cli, &router).await?;
     let link16_shutdown = tactical_ingress::start_link16(&cli, &router).await?;
+    let nffi_shutdown = tactical_ingress::start_nffi(&cli, &router).await?;
 
     // ── Management REST API ────────────────────────────────────────
     //
@@ -2438,6 +2440,9 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     }
     if let Some(handle) = link16_shutdown {
         stop_subsystem("link16", handle).await;
+    }
+    if let Some(handle) = nffi_shutdown {
+        stop_subsystem("nffi", handle).await;
     }
     if let Some(handle) = archive_rotation_handle {
         handle.abort();
