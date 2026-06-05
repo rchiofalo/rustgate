@@ -92,6 +92,8 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-tls`](crates/rustgate-tls/README.md) | TLS/mTLS configuration, X.509 identity extraction, OCSP, SPIFFE, TCP listeners |
 | [`rustgate-router`](crates/rustgate-router/README.md) | Routing engine: Router, ACL, dedup, store-and-forward, position cache, throttling, quota, obligations, egress |
 | [`rustgate-transport`](crates/rustgate-transport/README.md) | Codec / framing primitives, hardware identity, UDP / multicast — pure post-handshake |
+| [`rustgate-codec-schema`](crates/rustgate-codec-schema/README.md) | Declarative schema format + generic `SchemaCodec` runtime for tactical wire formats |
+| [`rustgate-resilience`](crates/rustgate-resilience/README.md) | Circuit breakers, backoff, rate limiters, token buckets |
 | [`rustgate-websocket`](crates/rustgate-websocket/README.md) | WebSocket (wss://) listener with mTLS client authentication |
 | [`rustgate-mqtt`](crates/rustgate-mqtt/README.md) | MQTT 5.0/3.1.1 transport adapter with mTLS and dynamic subscriptions |
 | [`rustgate-mavlink`](crates/rustgate-mavlink/README.md) | MAVLink v1/v2 wire-frame codec (listeners and signing land in follow-up PRs) |
@@ -101,6 +103,8 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-nffi`](crates/rustgate-nffi/README.md) | NFFI (NATO Friendly Force Information, STANAG 5527) Blue Force Tracking XML codec — `<positionalData>` / `<identificationData>` decoded, 15-char APP-6A SIDC parsed, unknown siblings carried opaque (refs #869; transport binding in follow-up) |
 | [`rustgate-dis`](crates/rustgate-dis/README.md) | DIS (IEEE 1278.1) Entity State PDU codec for LVC training simulators (other PDU types land in follow-up PRs) |
 | [`rustgate-link16`](crates/rustgate-link16/README.md) | Link 16 / JREAP-C (STANAG 5518) frame codec — J2.2 Air Track today, other J-series via `JseriesMessage::Other` placeholder |
+| [`rustgate-stanag4586`](crates/rustgate-stanag4586/README.md) | STANAG 4586 LOI 2-3 telemetry codec (NATO UAS interop) |
+| [`rustgate-asterix`](crates/rustgate-asterix/README.md) | ASTERIX (Eurocontrol surveillance) CAT-062 binary codec |
 | [`rustgate-lattice`](crates/rustgate-lattice/README.md) | Anduril Lattice bidirectional adapter — bridge trait, mock backend, and router wiring (real Lattice gRPC SDK is partner-NDA-gated; deferred behind the `lattice-real` feature) |
 | [`rustgate-foundry`](crates/rustgate-foundry/README.md) | Bidirectional REST/WebSocket bridge between rustgate entities and Palantir Foundry / Gotham ontology objects (trait + mock + wiring; partner-gated SDK behind `foundry-real`) |
 | [`rustgate-dds`](crates/rustgate-dds/README.md) | DDS Pub/Sub bridge for NGVA (NATO STANAG 4754) / VICTORY in-vehicle data buses — bridge trait, in-memory mock, NGVA Land Data Model topic mapping; real DDS SDK behind `dds-real` (closes #870 alongside the GeoJSON output that landed in #1326) |
@@ -108,6 +112,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-correlation`](crates/rustgate-correlation/README.md) | Multi-sensor track correlation engine — fuses CoT / Link 16 / MAVLink / DIS / SAPIENT reports of the same physical object into a single `FusedEntity` (spatial + temporal + kinematic + type gating, inverse-variance position fusion, RTree spatial index, LRU cap; closes #848) |
 | [`rustgate-operator`](crates/rustgate-operator/README.md) | Kubernetes operator for the `RustgateCluster` CRD — manifest renderer (StatefulSet, Service, ConfigMap, cert-manager Certificate), federation auto-discovery from pod DNS, golden-render snapshot tests; one-command Helm chart deployment (closes #874) |
 | [`rustgate-inference`](crates/rustgate-inference/README.md) | Edge ML inference pipeline — pluggable `InferenceModel` trait, hot-reloadable `Pipeline` with per-model confidence thresholds, mock backend for tests, and an `OnRouted` back-annotation callback that re-injects model results as `RoutableMessage`s (ONNX runtime backend deferred to follow-up; closes #858) |
+| [`rustgate-guard`](crates/rustgate-guard/README.md) | Cross-domain content inspection guard: rate limit, marking, dedicated egress |
 | [`rustgate-nats`](crates/rustgate-nats/README.md) | NATS/JetStream bridge for cross-instance message delivery |
 | [`rustgate-enrollment`](crates/rustgate-enrollment/README.md) | HTTPS certificate enrollment server (CSR signing, PKCS#12) |
 | [`rustgate-proto`](crates/rustgate-proto/README.md) | Protobuf message translation (XML ↔ proto) |
