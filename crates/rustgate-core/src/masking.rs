@@ -21,11 +21,18 @@
 /// assert_eq!(mask_cert_serial("SHORT"), "SHORT");
 /// ```
 pub fn mask_cert_serial(serial: &str) -> String {
-    if serial.len() <= 10 {
+    // Count by `char`, not byte: a multi-byte UTF-8 serial would otherwise
+    // make the byte-index slices below land mid-codepoint and panic, turning
+    // an unusual cert serial into a remote denial-of-service via any audit
+    // event that masks it.
+    if serial.chars().count() <= 10 {
         return serial.to_string();
     }
-    let prefix = &serial[..4];
-    let suffix = &serial[serial.len() - 4..];
+    let prefix: String = serial.chars().take(4).collect();
+    let suffix: String = {
+        let tail: Vec<char> = serial.chars().rev().take(4).collect();
+        tail.into_iter().rev().collect()
+    };
     format!("{prefix}...{suffix}")
 }
 
@@ -135,10 +142,14 @@ pub fn hash_cn(cn: &str) -> String {
 /// assert_eq!(mask_credential("ab"), "********");
 /// ```
 pub fn mask_credential(s: &str) -> String {
-    if s.len() < 3 {
-        return "********".to_string();
+    // Count by `char`, not byte: slicing `&s[..2]` on a multi-byte UTF-8
+    // value can land mid-codepoint and panic. Only reveal a prefix when at
+    // least three characters are present.
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(a), Some(b)) if chars.next().is_some() => format!("{a}{b}********"),
+        _ => "********".to_string(),
     }
-    format!("{}********", &s[..2])
 }
 
 #[cfg(test)]
@@ -170,6 +181,14 @@ mod tests {
     #[test]
     fn serial_eleven_chars_is_masked() {
         assert_eq!(mask_cert_serial("12345678901"), "1234...8901");
+    }
+
+    #[test]
+    fn serial_multibyte_utf8_does_not_panic() {
+        // Regression: byte-slicing `&serial[..4]` landed mid-codepoint on a
+        // multi-byte serial and panicked — a remote DoS via any audit event
+        // that masked it. '€' is 3 bytes, so it straddles the 4-byte slice.
+        assert_eq!(mask_cert_serial("€€€€abcd€€€€"), "€€€€...€€€€");
     }
 
     // ── mask_ip ─────────────────────────────────────────────────────
@@ -229,6 +248,13 @@ mod tests {
     #[test]
     fn credential_single_char() {
         assert_eq!(mask_credential("x"), "********");
+    }
+
+    #[test]
+    fn credential_multibyte_utf8_does_not_panic() {
+        // Regression: `&s[..2]` split a multi-byte leading codepoint and
+        // panicked. '€' is 3 bytes, so the old byte slice landed inside it.
+        assert_eq!(mask_credential("€xy"), "€x********");
     }
 
     // ── hash_cn ─────────────────────────────────────────────────────
