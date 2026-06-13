@@ -50,7 +50,7 @@ rustgate is an mTLS message router that accepts connections from clients over fo
 | S1 | Attacker impersonates a legitimate client | mTLS: client must present a certificate signed by the trusted CA | Mitigated |
 | S2 | Attacker uses a revoked certificate | CRL checking at TLS handshake (`--crl`) rejects revoked certs before application layer | Mitigated |
 | S3 | Attacker spoofs identity on plaintext listener | Plaintext connections are assigned a fixed synthetic identity (`--plaintext-cn`); group isolation limits blast radius | Partially mitigated |
-| S4 | Attacker impersonates a federation peer | Federation uses mTLS with separate trust store (`--federation-trust-store-dir`); optional per-peer CN pinning (`trust_cert_cn`) | Mitigated |
+| S4 | Attacker impersonates a federation peer | Federation uses mTLS with a separate trust store (`--federation-trust-store-dir`). Chain validation alone does not bind a connection to a peer *identity*, so V1 outbound clients additionally **pin the peer certificate CN** (SEC-1): per-peer `trust_cert_cn`, or every peer's `id` under `--federation-require-peer-cn-match`; mismatch fails closed. **V2 (gRPC) CN pinning is a tracked follow-up** (#1544). | Mitigated (V1); V2 pending |
 | S5 | Enrollment server issues cert to unauthorized user | HTTP Basic Auth on enrollment endpoint; Subject DN enforcement (CN set from authenticated username, CSR subject ignored) | Mitigated |
 
 **Note on WebSocket (port 8443):** The WebSocket listener uses the same mTLS handshake as the primary TLS path — all spoofing mitigations (S1–S5) apply identically. The WebSocket upgrade occurs over the already-authenticated TLS connection, so no additional origin header checking is needed.

@@ -110,6 +110,15 @@ pub struct FederationManager {
     peers: HashMap<PeerId, Arc<PeerHandle>>,
     running: bool,
 
+    /// SEC-1: when set, every outbound peer without an explicit
+    /// [`crate::config::PeerConfig::trust_cert_cn`] is pinned to its
+    /// configured `id`; peers that *do* set `trust_cert_cn` are always
+    /// pinned regardless. Off by default (only explicit `trust_cert_cn`
+    /// pins are enforced). Wired from `--federation-require-peer-cn-match`
+    /// via [`FederationManager::with_require_peer_cn_match`]. Enforcement
+    /// currently covers V1 peers; V2 (gRPC) is a tracked follow-up.
+    require_peer_cn_match: bool,
+
     // Connection materials stored during start() for reuse by adopt_peer()
     on_inbound: Option<OnInbound>,
     v1_dedup: Option<Arc<Mutex<MessageDedup>>>,
@@ -225,6 +234,31 @@ fn peers_equal(a: &crate::config::PeerConfig, b: &crate::config::PeerConfig) -> 
         && a.priority == b.priority
 }
 
+/// Resolve the pinned certificate CN for an outbound V1 peer (SEC-1).
+///
+/// Precedence:
+/// 1. An explicit, non-empty [`crate::config::PeerConfig::trust_cert_cn`]
+///    is **always** the pin (per-peer opt-in, honoured regardless of the
+///    global flag).
+/// 2. Otherwise, when `require_match` is set, the peer is pinned to its
+///    configured `id`.
+/// 3. Otherwise the peer is unpinned (`None`) — chain-only validation, the
+///    historical default.
+///
+/// A blank `trust_cert_cn` (`Some("")`) is treated as unset and falls
+/// through to the flag-driven default rather than pinning to the empty
+/// string (which no certificate CN can legitimately match).
+fn resolve_pinned_peer_cn(
+    require_match: bool,
+    peer_config: &crate::config::PeerConfig,
+) -> Option<String> {
+    match peer_config.trust_cert_cn.as_deref() {
+        Some(cn) if !cn.trim().is_empty() => Some(cn.to_string()),
+        _ if require_match => Some(peer_config.id.to_string()),
+        _ => None,
+    }
+}
+
 impl FederationManager {
     /// Create a new federation manager from configuration.
     ///
@@ -239,6 +273,7 @@ impl FederationManager {
             clients: HashMap::new(),
             peers: HashMap::new(),
             running: false,
+            require_peer_cn_match: false,
             on_inbound: None,
             v1_dedup: None,
             #[cfg(feature = "v2")]
@@ -258,6 +293,27 @@ impl FederationManager {
             #[cfg(feature = "mesh-routing")]
             mesh: None,
         }
+    }
+
+    /// Require every outbound peer's presented certificate CN to match a
+    /// pinned identity (SEC-1).
+    ///
+    /// When `true`, a peer with no explicit
+    /// [`crate::config::PeerConfig::trust_cert_cn`] is pinned to its
+    /// configured `id`; a peer that *does* set `trust_cert_cn` is always
+    /// pinned to that value regardless of this flag. When `false` (the
+    /// default), only peers that set `trust_cert_cn` are pinned, preserving
+    /// historical chain-only behaviour for everyone else.
+    ///
+    /// Enforcement currently covers **V1** peers via a post-handshake CN
+    /// comparison. V2 (gRPC) enforcement is a tracked follow-up; while it is
+    /// pending, [`Self::start`] logs a warning if pinning is requested and
+    /// any outbound V2 peer is configured, so operators do not assume V2
+    /// peers are pinned.
+    #[must_use]
+    pub fn with_require_peer_cn_match(mut self, require: bool) -> Self {
+        self.require_peer_cn_match = require;
+        self
     }
 
     /// Install a mesh router. Must be called before [`Self::start`] so
@@ -680,6 +736,30 @@ impl FederationManager {
             self.ha_lost_rx = Some(lost_rx);
         }
 
+        // SEC-1: certificate-CN pinning is enforced for V1 peers only. V2
+        // (gRPC) enforcement is a tracked follow-up. If pinning is active
+        // (the global flag, or any per-peer `trust_cert_cn`) while an
+        // outbound V2 peer is configured, warn loudly so operators do not
+        // assume those peers are bound to a certificate CN.
+        #[cfg(feature = "v2")]
+        if self.require_peer_cn_match || self.config.peers.iter().any(|p| p.trust_cert_cn.is_some())
+        {
+            let v2_peer_count = self
+                .config
+                .peers
+                .iter()
+                .filter(|p| p.enabled && p.is_outbound && p.protocol_version == 2)
+                .count();
+            if v2_peer_count > 0 {
+                warn!(
+                    v2_peer_count,
+                    "federation certificate-CN pinning is enforced for V1 peers only; \
+                     V2 (gRPC) peers are NOT yet pinned (tracked follow-up) — do not \
+                     assume V2 peer identity is bound to a certificate CN"
+                );
+            }
+        }
+
         // Connect to all enabled outbound peers
         for peer_config in &self.config.peers {
             if !peer_config.enabled || !peer_config.is_outbound {
@@ -741,6 +821,10 @@ impl FederationManager {
                             max_reconnects: self.config.max_reconnects,
                             on_message: on_v1_client,
                             replay_drain: Some(replay_drain),
+                            pinned_peer_cn: resolve_pinned_peer_cn(
+                                self.require_peer_cn_match,
+                                peer_config,
+                            ),
                         },
                     );
 
@@ -1682,6 +1766,10 @@ impl FederationManager {
                         max_reconnects: self.config.max_reconnects,
                         on_message: on_v1_client,
                         replay_drain: Some(replay_drain),
+                        pinned_peer_cn: resolve_pinned_peer_cn(
+                            self.require_peer_cn_match,
+                            peer_config,
+                        ),
                     },
                 );
 
@@ -2100,6 +2188,65 @@ mod tests {
             tenants: Default::default(),
             topology_role: Default::default(),
         }
+    }
+
+    // ── SEC-1: pinned-CN resolution table ───────────────────────────
+
+    #[test]
+    fn pin_resolution_explicit_trust_cn_always_wins() {
+        // An explicit `trust_cert_cn` is honoured regardless of the global
+        // strict flag — it is the per-peer opt-in and must never be
+        // overridden by the peer `id` fallback.
+        let mut cfg = test_peer_config("peer-id-7", vec!["Alpha".into()]);
+        cfg.trust_cert_cn = Some("federation-prod-east".into());
+
+        assert_eq!(
+            resolve_pinned_peer_cn(false, &cfg),
+            Some("federation-prod-east".to_string()),
+            "explicit trust_cert_cn must pin even with the flag off"
+        );
+        assert_eq!(
+            resolve_pinned_peer_cn(true, &cfg),
+            Some("federation-prod-east".to_string()),
+            "explicit trust_cert_cn must not be overridden by the id fallback"
+        );
+    }
+
+    #[test]
+    fn pin_resolution_strict_flag_pins_to_id() {
+        // No explicit CN + strict flag → pin to the configured peer id.
+        let cfg = test_peer_config("peer-id-7", vec!["Alpha".into()]);
+        assert_eq!(
+            resolve_pinned_peer_cn(true, &cfg),
+            Some("peer-id-7".to_string())
+        );
+    }
+
+    #[test]
+    fn pin_resolution_default_is_unpinned() {
+        // No explicit CN + flag off → unpinned (historical chain-only
+        // behaviour). This is the non-breaking default.
+        let cfg = test_peer_config("peer-id-7", vec!["Alpha".into()]);
+        assert_eq!(resolve_pinned_peer_cn(false, &cfg), None);
+    }
+
+    #[test]
+    fn pin_resolution_blank_trust_cn_is_treated_as_unset() {
+        // A blank/whitespace `trust_cert_cn` must not pin to the empty
+        // string (no certificate CN can match it) — it falls through to
+        // the flag-driven default.
+        let mut cfg = test_peer_config("peer-id-7", vec!["Alpha".into()]);
+        cfg.trust_cert_cn = Some("   ".into());
+        assert_eq!(
+            resolve_pinned_peer_cn(false, &cfg),
+            None,
+            "blank trust_cert_cn with flag off must be unpinned"
+        );
+        assert_eq!(
+            resolve_pinned_peer_cn(true, &cfg),
+            Some("peer-id-7".to_string()),
+            "blank trust_cert_cn with flag on must fall back to the id"
+        );
     }
 
     #[test]

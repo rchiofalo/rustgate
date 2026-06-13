@@ -78,9 +78,9 @@ openssl crl -in crl.pem -text -noout | grep -A1 $(openssl x509 -in client.pem -n
 
 ### CN Mismatch in Federation
 
-**Symptom:** Federation peer connections fail with TLS errors. Logs show `V1 federation peer session error`.
+**Symptom:** A V1 federation peer never reaches the connected state and keeps reconnecting. Logs show `refusing V1 federation peer: certificate CN does not match pinned identity`, accompanied by a `federation.peer_rejected` audit event (CNs are hashed).
 
-**Likely Cause:** The peer's certificate CN does not match the expected value in `trust_cert_cn` in the peers JSON config.
+**Likely Cause:** The peer's certificate CN does not match the pinned identity (SEC-1). The connection is pinned when either `trust_cert_cn` is set for that peer, or `--federation-require-peer-cn-match` is on (which pins every peer to its configured `id`). Chain validation passed, but the CN pin failed — a fail-closed identity check that is **independent of** TLS hostname verification.
 
 **Diagnosis:**
 
@@ -88,14 +88,17 @@ openssl crl -in crl.pem -text -noout | grep -A1 $(openssl x509 -in client.pem -n
 # Check the remote peer's certificate CN
 openssl s_client -connect <peer-host>:9000 </dev/null 2>/dev/null | openssl x509 -noout -subject
 
-# Compare with your peers.json config
-cat peers.json | grep trust_cert_cn
+# Compare with the pinned value: trust_cert_cn in peers.json, or the
+# peer's id when --federation-require-peer-cn-match is set.
+cat peers.json | grep -E 'trust_cert_cn|"id"'
 ```
 
 **Resolution:**
-1. Update `trust_cert_cn` in the peers JSON to match the actual certificate CN.
-2. As a temporary workaround, set `--federation-skip-hostname-verify` (not recommended for production).
+1. Update `trust_cert_cn` in the peers JSON to match the actual certificate CN (or, under `--federation-require-peer-cn-match`, ensure the peer's `id` equals its certificate CN).
+2. If CN pinning is not intended for this peer, remove its `trust_cert_cn` and leave `--federation-require-peer-cn-match` off. Note that `--federation-skip-hostname-verify` does **not** bypass the CN pin — the two checks are independent.
 3. Reload the peer configuration via the REST API: `curl -X POST http://localhost:9090/api/federation/federates -H "Content-Type: application/json" -d '<updated peer config>'`.
+
+> **Note:** CN pinning currently applies to **V1** peers. V2 (gRPC) pinning is a tracked follow-up; if pinning is enabled with V2 peers configured, the server logs a startup warning to that effect.
 
 ## Federation Reconnection Loops
 
