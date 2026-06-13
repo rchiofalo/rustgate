@@ -453,7 +453,12 @@ jobs:
           fi
 
       - name: Run tests
-        run: cargo nextest run --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http
+        # `schema` is included so the config-schema drift guard
+        # (`rustgate-server/tests/schema_export.rs`, gated on `#[cfg(feature
+        # = "schema")]`) actually compiles and runs here — it re-emits the
+        # JSON schema and asserts the checked-in `schemas/rustgate-v0.8.json`
+        # matches byte-for-byte, catching a forgotten regen in CI.
+        run: cargo nextest run --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http,schema
 
       - name: Authz P99 budget gate (release)
         run: cargo nextest run --locked --release -p rustgate-authz --run-ignored all perf_budget

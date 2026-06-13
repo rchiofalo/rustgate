@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ConfigFile",
-  "description": "All-optional mirror of [`Cli`] used for TOML deserialization.",
+  "description": "All-optional mirror of [`Cli`] used for TOML deserialization.\n\nStays a single flat struct (one key per CLI flag) even though\n[`Cli`] now groups its flags into `#[command(flatten)]`\nsub-structs — the `in <group>` tag only routes the merge below\nto the right sub-struct field. TOML keys and `generate-config`\noutput are therefore unchanged.",
   "type": "object",
   "properties": {
     "access-log": {
@@ -26,6 +26,13 @@
       "format": "uint64",
       "default": null,
       "minimum": 0
+    },
+    "air-gap": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
     },
     "archive-dir": {
       "type": [
@@ -74,6 +81,52 @@
         "null"
       ],
       "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
+    "asterix-allowed-cidrs": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "asterix-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "asterix-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "asterix-max-identities": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "asterix-multicast-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "asterix-rate-limit-pps": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
       "default": null,
       "minimum": 0
     },
@@ -256,6 +309,13 @@
       ],
       "default": null
     },
+    "cnsa2": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "cot-delta-cache-size": {
       "type": [
         "integer",
@@ -341,6 +401,52 @@
         "null"
       ],
       "default": null
+    },
+    "dis-allowed-cidrs": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "dis-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "dis-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "dis-max-identities": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "dis-multicast-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "dis-rate-limit-pps": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
     },
     "encoding": {
       "anyOf": [
@@ -560,6 +666,13 @@
       "default": null,
       "minimum": 0
     },
+    "federation-require-peer-cn-match": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "federation-skip-hostname-verify": {
       "type": [
         "boolean",
@@ -627,7 +740,21 @@
       ],
       "default": null
     },
+    "guard-config-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
     "http-config-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "inference-config-file": {
       "type": [
         "string",
         "null"
@@ -666,6 +793,61 @@
       ],
       "default": null
     },
+    "lattice-config-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "link16-allowed-cidrs": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "link16-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "link16-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "link16-max-connections": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "link16-max-identities": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "link16-rate-limit-pps": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
     "mavlink-allow-v1": {
       "type": [
         "boolean",
@@ -673,9 +855,51 @@
       ],
       "default": null
     },
+    "mavlink-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mavlink-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mavlink-pq-bootstrap-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
     "mavlink-require-signing": {
       "type": [
         "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "mavlink-signing-key-file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mavlink-tcp-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "mavlink-v1-fallback-cn": {
+      "type": [
+        "string",
         "null"
       ],
       "default": null
@@ -958,9 +1182,64 @@
       "default": null,
       "minimum": 0
     },
+    "nffi-allowed-cidrs": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nffi-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nffi-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "nffi-max-connections": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "nffi-max-identities": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "nffi-rate-limit-pps": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
     "ocsp-stapling": {
       "type": [
         "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "ogc-sensorthings-config-file": {
+      "type": [
+        "string",
         "null"
       ],
       "default": null
@@ -1014,6 +1293,20 @@
     "package-strict-signatures": {
       "type": [
         "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "packages-dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "packages-integrity-key-file": {
+      "type": [
+        "string",
         "null"
       ],
       "default": null
@@ -1080,6 +1373,54 @@
       ],
       "default": null
     },
+    "sapient-allowed-cidrs": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "sapient-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "sapient-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "sapient-max-connections": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "sapient-max-identities": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "sapient-rate-limit-pps": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
     "shutdown-drain-timeout": {
       "type": [
         "integer",
@@ -1118,6 +1459,45 @@
         "null"
       ],
       "default": null
+    },
+    "stanag4586-allowed-cidrs": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "stanag4586-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "stanag4586-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "stanag4586-max-identities": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "stanag4586-rate-limit-pps": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
     },
     "tcp-bind": {
       "type": [
@@ -1210,6 +1590,52 @@
       "minimum": 0
     },
     "udp-rate-limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 0
+    },
+    "vmf-allowed-cidrs": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "vmf-bind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "vmf-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "vmf-max-identities": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
+    "vmf-multicast-group": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "vmf-rate-limit-pps": {
       "type": [
         "integer",
         "null"
