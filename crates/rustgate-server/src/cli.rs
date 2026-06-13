@@ -1408,6 +1408,20 @@ pub(crate) struct FederationArgs {
     )]
     pub(crate) federation_skip_hostname_verify: bool,
 
+    /// Require every outbound federation peer's presented certificate CN to
+    /// match a pinned identity (SEC-1). A peer that sets `trust_cert_cn` is
+    /// always pinned to that value; with this flag on, every remaining peer
+    /// is additionally pinned to its configured `id`. Off by default
+    /// (non-breaking: only explicit `trust_cert_cn` pins are enforced).
+    /// Enforcement currently covers V1 peers; V2 (gRPC) is a tracked
+    /// follow-up and logs a warning while pending.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_FEDERATION_REQUIRE_PEER_CN_MATCH"
+    )]
+    pub(crate) federation_require_peer_cn_match: bool,
+
     /// Maximum federation hops before an inbound message is dropped
     /// (loop prevention). Closes #758. Range is `1..=255`; the default
     /// of 8 preserves the historical inbound enforcement bound that
@@ -2786,6 +2800,7 @@ define_config_file! {
     federation_peers_file in federation: Option<String>,
     federation_peers_reload_interval in federation: u64,
     federation_skip_hostname_verify in federation: bool,
+    federation_require_peer_cn_match in federation: bool,
     federation_max_hops in federation: u8,
     federation_store_path in federation: Option<String>,
     federation_trust_store_dir in federation: Option<String>,
@@ -3339,6 +3354,7 @@ mod tests {
         assert_eq!(cli.federation.federation_id, "rustgate-federation-1");
         assert!(cli.federation.federation_peers_file.is_none());
         assert!(!cli.federation.federation_skip_hostname_verify);
+        assert!(!cli.federation.federation_require_peer_cn_match);
         // Default is 8, matching the historical hard-coded
         // MAX_FEDERATION_HOPS that was the inbound enforcement bound
         // before #758. See `cli_federation_max_hops_default_eight` for
@@ -3478,6 +3494,22 @@ mod tests {
         ])
         .expect("should parse");
         assert!(cli.federation.federation_skip_hostname_verify);
+    }
+
+    #[test]
+    fn cli_federation_require_peer_cn_match() {
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            "c.pem",
+            "--key",
+            "k.pem",
+            "--ca",
+            "ca.pem",
+            "--federation-require-peer-cn-match",
+        ])
+        .expect("should parse");
+        assert!(cli.federation.federation_require_peer_cn_match);
     }
 
     #[test]

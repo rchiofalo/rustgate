@@ -68,6 +68,17 @@ pub struct V1ClientConfig {
     /// to retrieve and resend buffered messages before entering the live
     /// session loop.
     pub replay_drain: Option<ReplayDrain>,
+    /// SEC-1: expected peer-certificate CN to pin this connection to.
+    ///
+    /// The certificate *chain* is always validated against the federation
+    /// CA by the connector; this pins the connection to a specific peer
+    /// *identity* on top of that. When `Some`, the peer's presented
+    /// leaf-certificate CN must match (case-insensitively) or the
+    /// connection is refused before it joins the active pool. `None` (the
+    /// historical default) keeps chain-only validation. The manager
+    /// resolves this per-peer from [`crate::config::PeerConfig::trust_cert_cn`]
+    /// and the `--federation-require-peer-cn-match` flag.
+    pub pinned_peer_cn: Option<String>,
 }
 
 impl fmt::Debug for V1ClientConfig {
@@ -80,6 +91,7 @@ impl fmt::Debug for V1ClientConfig {
             .field("heartbeat_timeout", &self.heartbeat_timeout)
             .field("reconnect_delay", &self.reconnect_delay)
             .field("max_reconnects", &self.max_reconnects)
+            .field("pinned_peer_cn", &self.pinned_peer_cn)
             .finish_non_exhaustive()
     }
 }
@@ -277,6 +289,58 @@ async fn connection_loop(
                     }
                 }
             };
+
+            // SEC-1: bind this connection to the expected peer identity.
+            // The connector has already validated the certificate *chain*
+            // against the federation CA, but without a CN pin any holder of
+            // a CA-issued certificate can impersonate any peer (peer
+            // addresses are frequently IP literals and federation
+            // deliberately tolerates hostname mismatch). Fail closed: drop
+            // the authenticated-but-unpinned stream before it joins the
+            // active pool and fall through to the normal reconnect/backoff
+            // path — a transient address-poisoning may clear, while a
+            // persistent mismatch simply never connects.
+            if let Some(ref expected_cn) = config.pinned_peer_cn
+                && !identity.cn.eq_ignore_ascii_case(expected_cn)
+            {
+                let reason = format!(
+                    "peer certificate CN mismatch (expected {}, presented {})",
+                    hash_cn(expected_cn),
+                    hash_cn(&identity.cn)
+                );
+                rustgate_core::audit::federation_peer_rejected(&config.addr.to_string(), &reason);
+                warn!(
+                    peer_id = %hash_cn(peer_id.as_str()),
+                    addr = %config.addr,
+                    expected_cn = %hash_cn(expected_cn),
+                    presented_cn = %hash_cn(&identity.cn),
+                    "refusing V1 federation peer: certificate CN does not match pinned identity"
+                );
+                peer.set_state(PeerState::Reconnecting);
+                peer.set_error(&reason);
+
+                // Close the impersonator's connection immediately rather
+                // than holding it open across the backoff sleep below.
+                drop(tls_stream);
+
+                if should_stop_reconnecting(config.max_reconnects, reconnect_count) {
+                    error!(
+                        peer_id = %hash_cn(peer_id.as_str()),
+                        max_reconnects = config.max_reconnects,
+                        "max reconnection attempts reached after CN-pin rejection, giving up"
+                    );
+                    peer.set_state(PeerState::Disconnected);
+                    return;
+                }
+
+                let delay = backoff_delay(config.reconnect_delay, reconnect_count);
+                reconnect_count += 1;
+
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => continue,
+                    _ = shutdown_rx.changed() => return,
+                }
+            }
 
             // Connected successfully
             peer.mark_connected();
@@ -533,6 +597,7 @@ mod tests {
             max_reconnects: 3,
             on_message: on_msg,
             replay_drain: None,
+            pinned_peer_cn: None,
         }
     }
 
@@ -690,6 +755,7 @@ mod tests {
                 max_reconnects: 0,
                 on_message: on_msg,
                 replay_drain: None,
+                pinned_peer_cn: None,
             },
         );
         let rendered = format!("{client:?}");
@@ -776,6 +842,7 @@ mod tests {
                 max_reconnects: 0,
                 on_message: on_msg,
                 replay_drain: None,
+                pinned_peer_cn: None,
             },
         );
 
@@ -844,6 +911,7 @@ mod tests {
                 max_reconnects: 0,
                 on_message: on_msg,
                 replay_drain: None,
+                pinned_peer_cn: None,
             },
         );
         let handle_a: &PeerHandle = client.peer();
@@ -910,6 +978,7 @@ mod tests {
                 max_reconnects: 0,
                 on_message: on_msg,
                 replay_drain: None,
+                pinned_peer_cn: None,
             },
         );
         client.shutdown().await;
@@ -986,6 +1055,7 @@ mod tests {
                 max_reconnects: 0, // no reconnects — should give up quickly
                 on_message: on_msg,
                 replay_drain: None,
+                pinned_peer_cn: None,
             },
         );
 
@@ -1049,6 +1119,7 @@ mod tests {
                 max_reconnects: 0,
                 on_message: on_msg,
                 replay_drain: None,
+                pinned_peer_cn: None,
             },
         );
 
@@ -1115,6 +1186,7 @@ mod tests {
                 max_reconnects: 0,
                 on_message: on_msg,
                 replay_drain: None,
+                pinned_peer_cn: None,
             },
         );
 
@@ -1197,6 +1269,7 @@ mod tests {
                 max_reconnects: 0, // no reconnects
                 on_message: on_msg,
                 replay_drain: None,
+                pinned_peer_cn: None,
             },
         );
 
@@ -1262,6 +1335,7 @@ mod tests {
                 max_reconnects: 0,
                 on_message: on_msg,
                 replay_drain: None,
+                pinned_peer_cn: None,
             },
         );
 
@@ -1270,5 +1344,169 @@ mod tests {
         assert_eq!(client.peer().config.groups, vec!["Beta"]);
 
         client.shutdown().await;
+    }
+
+    // ── SEC-1: post-handshake peer-certificate CN pinning ───────────
+
+    /// Start a V1 client that dials `addr` with the given `pinned_peer_cn`.
+    ///
+    /// Uses `skip_hostname_verify = true` so the certificate *chain* is
+    /// validated against the CA but hostname/SAN is not — making the CN pin
+    /// the *only* identity check. This mirrors real federation, which
+    /// tolerates hostname mismatch via `NoHostnameVerifier`, and isolates
+    /// the behaviour under test.
+    fn spawn_pinned_client(
+        ca: &rustgate_test_utils::certs::TestCa,
+        addr: SocketAddr,
+        pinned_cn: Option<&str>,
+        max_reconnects: i32,
+    ) -> (Arc<PeerHandle>, V1Client) {
+        use crate::config::{PeerConfig, RoutingMode};
+        let client_cert = ca.issue_client_cert("pinning-client", &["Alpha"]);
+        let connector = PeerConnector::from_pem(
+            &client_cert.cert_pem,
+            &client_cert.key_pem,
+            &ca.cert_pem,
+            true,
+        )
+        .expect("connector");
+        let peer_config = PeerConfig {
+            id: "pinning-peer".into(),
+            address: addr.to_string(),
+            groups: vec!["Alpha".into()],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::default(),
+            protocol_version: 1,
+            jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
+            compression: None,
+            tenants: Default::default(),
+            topology_role: Default::default(),
+        };
+        let peer = Arc::new(PeerHandle::new(peer_config));
+        let on_msg: OnMessage = Arc::new(|_id, _data| {});
+        let client = V1Client::start(
+            Arc::clone(&peer),
+            V1ClientConfig {
+                connector: OutboundConnector::Static(connector),
+                addr,
+                server_name: addr.ip().to_string(),
+                server_uid: "pinning-client-uid".into(),
+                heartbeat_interval: Duration::from_secs(30),
+                heartbeat_timeout: Duration::from_secs(90),
+                reconnect_delay: Duration::from_millis(50),
+                max_reconnects,
+                on_message: on_msg,
+                replay_drain: None,
+                pinned_peer_cn: pinned_cn.map(str::to_string),
+            },
+        );
+        (peer, client)
+    }
+
+    /// Poll `pred` every 20 ms until it returns true or `timeout` elapses.
+    async fn poll_until(timeout: Duration, pred: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if pred() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_cn_connects_on_match_and_is_refused_on_mismatch() {
+        use rustgate_test_utils::certs::TestCa;
+        use rustgate_tls::{TlsConfig, TlsListener};
+
+        use crate::v1::server::{OnMessage as ServerOnMessage, V1Server};
+
+        // A real V1 federation server whose leaf-cert CN is `real-peer-cn`.
+        let ca = TestCa::new("Peer Pinning CA");
+        let server_cert = ca.issue_server_cert("real-peer-cn", &["localhost"]);
+        let tls_config =
+            TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+                .expect("server tls config");
+
+        // Bind on an ephemeral port and learn the address so clients can
+        // dial it (`V1Server::start` does not surface its local_addr).
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let listener = TlsListener::bind(bind_addr, &tls_config)
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let srv_on_msg: ServerOnMessage = Arc::new(|_id, _data| {});
+        let mut server = V1Server::start_with_listener(
+            listener,
+            "pinning-server-uid".into(),
+            Duration::from_secs(30),
+            Duration::from_secs(90),
+            srv_on_msg,
+            None,
+        )
+        .expect("start server");
+
+        // 1) Exact-match pin → connects.
+        let (peer_ok, mut client_ok) = spawn_pinned_client(&ca, addr, Some("real-peer-cn"), 0);
+        assert!(
+            poll_until(Duration::from_secs(5), || peer_ok.state()
+                == PeerState::Connected)
+            .await,
+            "a client whose pinned CN matches the peer cert must connect"
+        );
+        client_ok.shutdown().await;
+
+        // 2) Case-different pin → still connects (case-insensitive compare).
+        let (peer_ci, mut client_ci) = spawn_pinned_client(&ca, addr, Some("REAL-PEER-CN"), 0);
+        assert!(
+            poll_until(Duration::from_secs(5), || peer_ci.state()
+                == PeerState::Connected)
+            .await,
+            "CN pin comparison must be case-insensitive"
+        );
+        client_ci.shutdown().await;
+
+        // 3) Mismatched pin → refused. The deterministic signal is the
+        // recorded CN-mismatch error, set *before* `mark_connected()`; once
+        // observed, the connection provably never joined the active pool.
+        let (peer_bad, mut client_bad) = spawn_pinned_client(&ca, addr, Some("imposter-cn"), 0);
+        let rejected = poll_until(Duration::from_secs(5), || {
+            peer_bad
+                .last_error()
+                .is_some_and(|e| e.contains("CN mismatch"))
+        })
+        .await;
+        assert!(
+            rejected,
+            "a client whose pinned CN mismatches the peer cert must record a CN-mismatch rejection"
+        );
+        assert_ne!(
+            peer_bad.state(),
+            PeerState::Connected,
+            "a CN-rejected peer must never report Connected"
+        );
+        client_bad.shutdown().await;
+
+        // 4) No pin (None) → connects regardless of CN (legacy default).
+        let (peer_unpinned, mut client_unpinned) = spawn_pinned_client(&ca, addr, None, 0);
+        assert!(
+            poll_until(Duration::from_secs(5), || peer_unpinned.state()
+                == PeerState::Connected)
+            .await,
+            "an unpinned client must preserve historical chain-only behaviour"
+        );
+        client_unpinned.shutdown().await;
+
+        server.shutdown().await;
     }
 }

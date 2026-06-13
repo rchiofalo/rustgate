@@ -1895,7 +1895,9 @@ pub(crate) async fn start_federation(
         .context("parsing --federation-v1-bind address")?;
 
     let config = build_federation_config(cli, bind_addr).await?;
-    let mut manager = rustgate_federation::manager::FederationManager::new(config);
+    let mut manager = rustgate_federation::manager::FederationManager::new(config)
+        // SEC-1: pin outbound peer identities to their certificate CN.
+        .with_require_peer_cn_match(cli.federation.federation_require_peer_cn_match);
 
     // on_inbound: route messages from federation peers to local
     // clients AND fan out to optional NATS / HTTP egress sinks.

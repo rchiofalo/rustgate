@@ -510,6 +510,7 @@ All flags support environment variables (CLI takes precedence):
 | `--federation-peer-discovery-etcd-endpoints` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_ENDPOINTS` | `http://127.0.0.1:2379` (comma-separated) |
 | `--federation-peer-discovery-etcd-prefix` | `RUSTGATE_FEDERATION_PEER_DISCOVERY_ETCD_PREFIX` | `rustgate/peers/` |
 | `--federation-skip-hostname-verify` | `RUSTGATE_FEDERATION_SKIP_HOSTNAME_VERIFY` | `false` |
+| `--federation-require-peer-cn-match` | `RUSTGATE_FEDERATION_REQUIRE_PEER_CN_MATCH` | `false` |
 | `--federation-max-hops` | `RUSTGATE_FEDERATION_MAX_HOPS` | `10` |
 | `--federation-store-path` | `RUSTGATE_FEDERATION_STORE_PATH` | — |
 | `--federation-trust-store-dir` | `RUSTGATE_FEDERATION_TRUST_STORE_DIR` | — |
