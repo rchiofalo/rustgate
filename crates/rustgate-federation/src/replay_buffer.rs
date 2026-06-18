@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use tracing::warn;
+use rustgate_core::masking::hash_cn;
+use tracing::{debug, warn};
 
 use crate::replay_persist::{ReplayStore, RestoredEntry};
 
@@ -43,8 +44,9 @@ pub struct BufferedMessage {
     pub groups: Vec<String>,
     /// Wall-clock time (Unix milliseconds) at which the message was
     /// first buffered. Persisted to disk so TTL can be re-evaluated on
-    /// rehydrate (#557 follow-up): without it, persistence would
-    /// silently bypass `Metadata::is_expired()` across restarts.
+    /// rehydrate and on the drain path via
+    /// [`BufferedMessage::is_expired_at`] (SEC-2) — without it, persistence
+    /// would silently bypass `Metadata::is_expired()` across restarts.
     pub enqueued_at_unix_ms: u64,
     /// Original TTL in milliseconds, or `None` if the message had no
     /// TTL when it was buffered.
@@ -61,6 +63,26 @@ pub struct BufferedMessage {
     /// `+1` lazily before the limit check. Always `false` for buffers
     /// populated by [`ReplayBuffer::push_with_hops`] in this build.
     pub is_legacy_pre_increment: bool,
+}
+
+impl BufferedMessage {
+    /// SEC-2: returns `true` if this message carried a TTL that has lapsed
+    /// by `now_unix_ms`.
+    ///
+    /// Evaluated from the persisted Unix-ms snapshot
+    /// (`enqueued_at_unix_ms` + `ttl_ms`) rather than a reconstructed
+    /// [`rustgate_core::message::Metadata`] (whose `received_at` is a
+    /// monotonic instant that cannot survive a restart), so TTL is honoured
+    /// both across restarts and while a message sits in the buffer. The
+    /// semantics mirror `Metadata::is_expired`: no TTL never expires, the
+    /// comparison is strict (`elapsed > ttl`), and a clock that has moved
+    /// backwards (now before the enqueue time) is treated as *not* expired.
+    pub fn is_expired_at(&self, now_unix_ms: u64) -> bool {
+        match self.ttl_ms {
+            Some(ttl) => now_unix_ms > self.enqueued_at_unix_ms.saturating_add(ttl),
+            None => false,
+        }
+    }
 }
 
 /// Bounded ring buffer for storing recent federation messages.
@@ -119,10 +141,27 @@ impl ReplayBuffer {
     where
         I: IntoIterator<Item = BufferedMessage>,
     {
+        let now = now_unix_ms();
         let mut max_seq: u64 = 0;
+        let mut dropped_expired: usize = 0;
         for msg in records {
             if msg.seq > max_seq {
                 max_seq = msg.seq;
+            }
+            // SEC-2: drop messages whose TTL lapsed while the process was
+            // down. Persistence must not bypass `Metadata::is_expired()`
+            // across restarts — replaying stale tactical / TTL-bounded
+            // traffic past its intended lifetime is the defect. `max_seq` is
+            // updated above first, so a reconnecting peer's `messages_since`
+            // continuity is preserved even when the tail entries expire.
+            if msg.is_expired_at(now) {
+                dropped_expired += 1;
+                if let Some(store) = self.store.as_ref()
+                    && let Err(e) = store.delete(&self.peer_id, msg.seq)
+                {
+                    warn!(error = %e, "failed to delete expired replay entry on rehydrate");
+                }
+                continue;
             }
             if self.capacity == 0 {
                 if let Some(store) = self.store.as_ref()
@@ -143,6 +182,13 @@ impl ReplayBuffer {
         }
         if max_seq > 0 {
             self.next_seq.store(max_seq + 1, Ordering::Relaxed);
+        }
+        if dropped_expired > 0 {
+            debug!(
+                peer_id = %hash_cn(&self.peer_id),
+                dropped_expired,
+                "dropped expired replay entries on rehydrate (SEC-2)"
+            );
         }
     }
 
@@ -252,16 +298,26 @@ impl ReplayBuffer {
     /// Used during reconnection: the peer reports its last seen sequence
     /// and the buffer returns all messages after that point.
     pub fn messages_since(&self, since_seq: u64) -> Vec<BufferedMessage> {
+        // SEC-2: never replay a message whose TTL has lapsed, whether it
+        // expired in memory or was restored from disk after a restart.
+        let now = now_unix_ms();
         self.buffer
             .iter()
-            .filter(|m| m.seq > since_seq)
+            .filter(|m| m.seq > since_seq && !m.is_expired_at(now))
             .cloned()
             .collect()
     }
 
     /// Return all buffered messages (for full replay on first connect).
+    ///
+    /// SEC-2: TTL-expired messages are excluded.
     pub fn all_messages(&self) -> Vec<BufferedMessage> {
-        self.buffer.iter().cloned().collect()
+        let now = now_unix_ms();
+        self.buffer
+            .iter()
+            .filter(|m| !m.is_expired_at(now))
+            .cloned()
+            .collect()
     }
 
     /// Current number of buffered messages.
@@ -303,9 +359,14 @@ impl ReplayBuffer {
     /// first occurrence (lowest sequence number). This prevents resending
     /// the same content multiple times during replay.
     pub fn all_messages_deduped(&self) -> Vec<BufferedMessage> {
+        // SEC-2: drop TTL-expired messages before dedup so they are never
+        // replayed to a reconnecting peer (this is the drain hot-path used by
+        // the V1/V2 replay callbacks).
+        let now = now_unix_ms();
         let mut seen = HashSet::new();
         self.buffer
             .iter()
+            .filter(|m| !m.is_expired_at(now))
             .filter(|m| seen.insert(m.payload.clone()))
             .cloned()
             .collect()
@@ -620,5 +681,162 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].payload, Bytes::from_static(b"c"));
         assert_eq!(pending[1].payload, Bytes::from_static(b"d"));
+    }
+
+    // ── SEC-2: TTL expiry across rehydrate + on the drain path ─────────
+
+    #[test]
+    fn is_expired_at_matches_metadata_semantics() {
+        let no_ttl = BufferedMessage {
+            seq: 1,
+            payload: Bytes::from_static(b"x"),
+            groups: vec![],
+            enqueued_at_unix_ms: 10_000,
+            ttl_ms: None,
+            current_hops: 1,
+            is_legacy_pre_increment: false,
+        };
+        // No TTL never expires, even arbitrarily far in the future.
+        assert!(!no_ttl.is_expired_at(u64::MAX));
+
+        let ttl = BufferedMessage {
+            ttl_ms: Some(1_000),
+            ..no_ttl.clone()
+        };
+        // Enqueued 10_000 + TTL 1_000 → boundary at 11_000.
+        assert!(!ttl.is_expired_at(10_500), "within TTL");
+        assert!(
+            !ttl.is_expired_at(11_000),
+            "exactly at the boundary is not expired (strict >, mirrors Metadata)"
+        );
+        assert!(ttl.is_expired_at(11_001), "past TTL");
+        // Clock moved backwards (now before enqueue) → not expired (tolerant).
+        assert!(!ttl.is_expired_at(5_000));
+    }
+
+    #[test]
+    fn drain_paths_skip_expired_in_memory() {
+        let now = now_unix_ms();
+        let mut buf = ReplayBuffer::new(10);
+        let _fresh =
+            buf.push_with_metadata(Bytes::from_static(b"fresh"), vec![], now, Some(60_000));
+        let _expired = buf.push_with_metadata(
+            Bytes::from_static(b"stale"),
+            vec![],
+            now.saturating_sub(10_000),
+            Some(1_000),
+        );
+        // Physically present, but never surfaced for replay on any read path.
+        assert_eq!(buf.len(), 2);
+        let drained = buf.all_messages_deduped();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload, Bytes::from_static(b"fresh"));
+        assert_eq!(buf.all_messages().len(), 1);
+        assert_eq!(buf.messages_since(0).len(), 1);
+    }
+
+    #[test]
+    fn hydrate_drops_expired_records_and_deletes_from_store() {
+        let (_dir, store) = open_store();
+        let now = now_unix_ms();
+        // seq 1: expired (enqueued long ago, short TTL).
+        store
+            .put(
+                "peer-a",
+                1,
+                now.saturating_sub(10_000),
+                Some(1_000),
+                1,
+                &[],
+                &Bytes::from_static(b"old"),
+            )
+            .unwrap();
+        // seq 2: fresh (long TTL).
+        store
+            .put(
+                "peer-a",
+                2,
+                now,
+                Some(60_000),
+                1,
+                &[],
+                &Bytes::from_static(b"new"),
+            )
+            .unwrap();
+        // seq 3: no TTL (never expires) even though enqueued long ago.
+        store
+            .put(
+                "peer-a",
+                3,
+                now.saturating_sub(10_000),
+                None,
+                1,
+                &[],
+                &Bytes::from_static(b"forever"),
+            )
+            .unwrap();
+
+        let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
+        let restored: Vec<BufferedMessage> = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.peer_id == "peer-a")
+            .map(BufferedMessage::from)
+            .collect();
+        buf.hydrate_from_records(restored);
+
+        // Only the non-expired entries remain.
+        let payloads: Vec<Bytes> = buf
+            .all_messages()
+            .iter()
+            .map(|m| m.payload.clone())
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![Bytes::from_static(b"new"), Bytes::from_static(b"forever")]
+        );
+        // The expired entry was purged from the store, not left to rot.
+        let on_disk: Vec<u64> = store.load_all().unwrap().iter().map(|e| e.seq).collect();
+        assert_eq!(on_disk, vec![2, 3]);
+        // next_seq still advances past the highest restored seq (incl. the
+        // expired one) so a reconnecting peer's sequence continuity holds.
+        assert_eq!(buf.push(Bytes::from_static(b"d"), vec![]), 4);
+    }
+
+    #[test]
+    fn restart_drops_expired_and_cleans_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path();
+        let now = now_unix_ms();
+        {
+            let store = Arc::new(ReplayStore::open(store_path, 1024 * 1024).unwrap());
+            let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
+            let _ = buf.push_with_metadata(
+                Bytes::from_static(b"stale"),
+                vec![],
+                now.saturating_sub(10_000),
+                Some(1_000),
+            );
+            let _ =
+                buf.push_with_metadata(Bytes::from_static(b"fresh"), vec![], now, Some(3_600_000));
+        }
+        // "Restart" — reopen the store and rehydrate.
+        let store = Arc::new(ReplayStore::open(store_path, 1024 * 1024).unwrap());
+        let mut buf = ReplayBuffer::with_store(10, "peer-a", Arc::clone(&store));
+        let restored: Vec<BufferedMessage> = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.peer_id == "peer-a")
+            .map(BufferedMessage::from)
+            .collect();
+        buf.hydrate_from_records(restored);
+
+        let pending = buf.messages_since(0);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].payload, Bytes::from_static(b"fresh"));
+        // The expired entry was purged from disk on rehydrate.
+        assert_eq!(store.load_all().unwrap().len(), 1);
     }
 }
