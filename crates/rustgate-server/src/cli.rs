@@ -1413,8 +1413,8 @@ pub(crate) struct FederationArgs {
     /// always pinned to that value; with this flag on, every remaining peer
     /// is additionally pinned to its configured `id`. Off by default
     /// (non-breaking: only explicit `trust_cert_cn` pins are enforced).
-    /// Enforcement currently covers V1 peers; V2 (gRPC) is a tracked
-    /// follow-up and logs a warning while pending.
+    /// Enforced on both V1 (post-handshake CN check) and V2 (gRPC, via a
+    /// CN-pinning TLS verifier on the channel).
     #[arg(
         long,
         default_value_t = false,

@@ -57,27 +57,25 @@ connects rather than silently impersonating).
   `connector.connect()` returns `(stream, identity)` and **before**
   `peer.mark_connected()`. The pinned CN is carried per-connection on
   `V1ClientConfig.pinned_peer_cn` (the connector/`ClientConfig` is shared
-  across peers, so the per-peer value cannot live in the connector). **This
-  note's PR implements V1.**
+  across peers, so the per-peer value cannot live in the connector).
+  **Implemented** (first shipped V1-only, #1564).
 
 - **V2 (tonic gRPC, the default protocol):** tonic's `ClientTlsConfig`
-  (`manager.rs:621`, `.ca_certificate().identity()`) **does not surface the
-  server's leaf certificate** to the client application, so the V1
-  post-handshake comparison is not available. V2 enforcement must happen
-  **inside the TLS layer** via a custom rustls `ServerCertVerifier` that
-  performs chain validation *and* the CN-pin, installed on the channel. This
-  requires either feeding tonic a raw `rustls::ClientConfig` (confirm tonic
-  0.14 exposes this) or building the channel from a custom connector. **This
-  is the tracked follow-up (#1544 part 2);** until it lands, V2 deployments
-  must not assume CN pinning is active — surfaced loudly (see below).
-
-### Honesty guard while V2 is pending
-
-Because V2 is the default and is *not* yet enforced, the implementation must
-not let an operator believe a V2 peer is pinned when it isn't. While the
-follow-up is open, starting with `--federation-require-peer-cn-match` and any
-V2 peer logs a prominent `warn!` that CN pinning is V1-only for now. (Once V2
-lands, this warning is removed.)
+  (`.ca_certificate().identity()`) **does not surface the server's leaf
+  certificate** to the client application, so the V1 post-handshake comparison
+  is not available. V2 enforcement therefore happens **inside the TLS layer**:
+  `connector::PinnedServerCertVerifier` wraps the CA-only `NoHostnameVerifier`
+  (full chain validation, hostname tolerated) and adds the CN-pin, returning a
+  rustls `ApplicationVerificationFailure` on mismatch so the gRPC channel never
+  opens. It is installed via tonic 0.14's public
+  `Endpoint::tls_config_with_verifier(tls_config, verifier)` — confirmed to
+  accept an `Arc<dyn rustls::client::danger::ServerCertVerifier>` — so no
+  custom connector is needed. The verifier is built per-peer by the manager
+  (`build_pinned_server_cert_verifier`) from the federation CA PEM + the
+  resolved CN, and carried on `V2ClientConfig.pin_verifier`. When no pin
+  applies the channel keeps tonic's default verifier. **Implemented** (this
+  PR) — the same `--federation-require-peer-cn-match` flag and per-peer
+  `trust_cert_cn` drive both transports.
 
 ## Alternatives considered
 
@@ -86,11 +84,13 @@ lands, this warning is removed.)
   per-peer. A per-peer `ClientConfig` (with a pinning verifier) is the V2
   mechanism but is wasteful for V1 where the post-handshake identity is
   already in hand.
-- **Verifier-based enforcement for V1 too (uniform with V2).** Deferred: it
-  would mean a per-peer `ClientConfig` rebuild on V1 as well; the
+- **Verifier-based enforcement for V1 too (uniform with V2).** Not adopted:
+  it would mean a per-peer `ClientConfig` rebuild on V1 as well; the V1
   post-handshake check is simpler, cheaper, and matches the audit's wording
-  ("post-handshake before a connection joins the active pool"). The verifier
-  built for V2 can later subsume V1 if uniformity is preferred.
+  ("post-handshake before a connection joins the active pool"). The two
+  transports share the CN-resolution logic (`resolve_pinned_peer_cn`) and the
+  CA-only chain validator (`NoHostnameVerifier`), so the duplication is small;
+  the V2 verifier could later subsume V1 if uniformity is preferred.
 - **Default `--federation-require-peer-cn-match` on.** Rejected as the
   default: existing deployments may run peers whose cert CN matches neither
   `trust_cert_cn` (unset) nor `peer.id`. Default off + per-peer
@@ -100,10 +100,11 @@ lands, this warning is removed.)
 ## Consequences
 
 - Per-peer `trust_cert_cn` becomes load-bearing (was inert). Setting it now
-  rejects impersonators for V1 peers.
+  rejects impersonators on **both** V1 and V2 peers.
 - A new global `--federation-require-peer-cn-match` (off by default) pins
-  every peer to its `id` when no explicit CN is set.
-- V2 remains unpinned until the follow-up; the startup warning prevents a
-  false sense of coverage.
-- Once V2's verifier lands, document the seam in an ADR (sibling to ADR 0022
-  guard / ADR 0023 ingress) and drop the V1-only warning.
+  every peer to its `id` when no explicit CN is set, across both transports.
+- SEC-1 is fully closed: chain validation no longer stands alone — a
+  connection is bound to a specific peer identity on V1 and V2 alike.
+- V1 shipped first (#1564); V2 followed in the same `[Unreleased]` cycle. The
+  short-lived "V2 not yet pinned" startup warning from the V1-only step is
+  removed now that V2 is enforced.

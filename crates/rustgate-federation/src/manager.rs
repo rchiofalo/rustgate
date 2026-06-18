@@ -305,11 +305,11 @@ impl FederationManager {
     /// default), only peers that set `trust_cert_cn` are pinned, preserving
     /// historical chain-only behaviour for everyone else.
     ///
-    /// Enforcement currently covers **V1** peers via a post-handshake CN
-    /// comparison. V2 (gRPC) enforcement is a tracked follow-up; while it is
-    /// pending, [`Self::start`] logs a warning if pinning is requested and
-    /// any outbound V2 peer is configured, so operators do not assume V2
-    /// peers are pinned.
+    /// Enforcement covers both transports: **V1** via a post-handshake CN
+    /// comparison (`v1/client.rs`), and **V2** (gRPC) via a CN-pinning rustls
+    /// [`rustls::client::danger::ServerCertVerifier`] installed on the tonic
+    /// channel (`connector::build_pinned_server_cert_verifier`), since tonic
+    /// never surfaces the server leaf certificate to application code.
     #[must_use]
     pub fn with_require_peer_cn_match(mut self, require: bool) -> Self {
         self.require_peer_cn_match = require;
@@ -736,30 +736,6 @@ impl FederationManager {
             self.ha_lost_rx = Some(lost_rx);
         }
 
-        // SEC-1: certificate-CN pinning is enforced for V1 peers only. V2
-        // (gRPC) enforcement is a tracked follow-up. If pinning is active
-        // (the global flag, or any per-peer `trust_cert_cn`) while an
-        // outbound V2 peer is configured, warn loudly so operators do not
-        // assume those peers are bound to a certificate CN.
-        #[cfg(feature = "v2")]
-        if self.require_peer_cn_match || self.config.peers.iter().any(|p| p.trust_cert_cn.is_some())
-        {
-            let v2_peer_count = self
-                .config
-                .peers
-                .iter()
-                .filter(|p| p.enabled && p.is_outbound && p.protocol_version == 2)
-                .count();
-            if v2_peer_count > 0 {
-                warn!(
-                    v2_peer_count,
-                    "federation certificate-CN pinning is enforced for V1 peers only; \
-                     V2 (gRPC) peers are NOT yet pinned (tracked follow-up) — do not \
-                     assume V2 peer identity is bound to a certificate CN"
-                );
-            }
-        }
-
         // Connect to all enabled outbound peers
         for peer_config in &self.config.peers {
             if !peer_config.enabled || !peer_config.is_outbound {
@@ -851,6 +827,25 @@ impl FederationManager {
                     );
                     let replay_drain = Self::create_v2_replay_drain(&self.replay_buffers);
 
+                    // SEC-1: build the CN-pin verifier for this V2 peer (if
+                    // pinned). Fail closed — skip the peer rather than connect
+                    // it unpinned if a required verifier cannot be built.
+                    let pin_verifier = match Self::build_v2_pin_verifier(
+                        self.require_peer_cn_match,
+                        self.ca_pem.as_deref(),
+                        peer_config,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(
+                                peer_id = %hash_cn(peer_config.id.as_str()),
+                                error = %e,
+                                "failed to build V2 CN-pin verifier; skipping peer"
+                            );
+                            continue;
+                        }
+                    };
+
                     let client = crate::v2::client::V2Client::start(
                         Arc::clone(&peer),
                         crate::v2::client::V2ClientConfig {
@@ -865,6 +860,7 @@ impl FederationManager {
                             replay_drain: Some(replay_drain),
                             max_hops: self.config.max_hops,
                             compression: peer_config.compression,
+                            pin_verifier,
                         },
                     );
 
@@ -1586,6 +1582,35 @@ impl FederationManager {
         })
     }
 
+    /// SEC-1: build the CN-pinning server-certificate verifier for a V2
+    /// (gRPC) peer, or `None` when the peer is not pinned.
+    ///
+    /// Returns `Ok(None)` when no pin applies (the historical default).
+    /// Returns `Err` only when a pin *is* required but the verifier cannot be
+    /// built (e.g. no CA PEM) — callers must treat this as fail-closed and
+    /// skip the peer rather than connecting it unpinned.
+    #[cfg(feature = "v2")]
+    fn build_v2_pin_verifier(
+        require_match: bool,
+        ca_pem: Option<&str>,
+        peer_config: &crate::config::PeerConfig,
+    ) -> Result<Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>> {
+        match resolve_pinned_peer_cn(require_match, peer_config) {
+            Some(expected_cn) => {
+                let ca = ca_pem.ok_or_else(|| {
+                    FederationError::other("no CA PEM available to build V2 CN-pin verifier")
+                })?;
+                let verifier = crate::connector::build_pinned_server_cert_verifier(
+                    ca,
+                    expected_cn,
+                    peer_config.address.clone(),
+                )?;
+                Ok(Some(verifier))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Create a V1 dedup-wrapping message callback.
     ///
     /// Returns a callback that checks incoming messages against the shared
@@ -1802,6 +1827,15 @@ impl FederationManager {
                 );
                 let replay_drain = Self::create_v2_replay_drain(&self.replay_buffers);
 
+                // SEC-1: build the CN-pin verifier for this V2 peer (if
+                // pinned). Fail closed — a required-but-unbuildable verifier
+                // propagates as an error rather than connecting unpinned.
+                let pin_verifier = Self::build_v2_pin_verifier(
+                    self.require_peer_cn_match,
+                    self.ca_pem.as_deref(),
+                    peer_config,
+                )?;
+
                 let client = crate::v2::client::V2Client::start(
                     Arc::clone(&peer),
                     crate::v2::client::V2ClientConfig {
@@ -1816,6 +1850,7 @@ impl FederationManager {
                         replay_drain: Some(replay_drain),
                         max_hops: self.config.max_hops,
                         compression: peer_config.compression,
+                        pin_verifier,
                     },
                 );
 

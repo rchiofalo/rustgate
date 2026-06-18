@@ -78,7 +78,7 @@ openssl crl -in crl.pem -text -noout | grep -A1 $(openssl x509 -in client.pem -n
 
 ### CN Mismatch in Federation
 
-**Symptom:** A V1 federation peer never reaches the connected state and keeps reconnecting. Logs show `refusing V1 federation peer: certificate CN does not match pinned identity`, accompanied by a `federation.peer_rejected` audit event (CNs are hashed).
+**Symptom:** A federation peer never reaches the connected state and keeps reconnecting, with a `federation.peer_rejected` audit event (CNs are hashed). On **V1** the log reads `refusing V1 federation peer: certificate CN does not match pinned identity`; on **V2 (gRPC)** the channel fails to open with a TLS `ApplicationVerificationFailure` surfaced as a `gRPC connect error`.
 
 **Likely Cause:** The peer's certificate CN does not match the pinned identity (SEC-1). The connection is pinned when either `trust_cert_cn` is set for that peer, or `--federation-require-peer-cn-match` is on (which pins every peer to its configured `id`). Chain validation passed, but the CN pin failed — a fail-closed identity check that is **independent of** TLS hostname verification.
 
@@ -98,7 +98,7 @@ cat peers.json | grep -E 'trust_cert_cn|"id"'
 2. If CN pinning is not intended for this peer, remove its `trust_cert_cn` and leave `--federation-require-peer-cn-match` off. Note that `--federation-skip-hostname-verify` does **not** bypass the CN pin — the two checks are independent.
 3. Reload the peer configuration via the REST API: `curl -X POST http://localhost:9090/api/federation/federates -H "Content-Type: application/json" -d '<updated peer config>'`.
 
-> **Note:** CN pinning currently applies to **V1** peers. V2 (gRPC) pinning is a tracked follow-up; if pinning is enabled with V2 peers configured, the server logs a startup warning to that effect.
+> **Note:** CN pinning is enforced on **both** V1 (post-handshake CN check) and V2 (gRPC, via a CN-pinning TLS verifier installed on the channel). The resolution above applies to either transport.
 
 ## Federation Reconnection Loops
 

@@ -73,6 +73,17 @@ pub struct V2ClientConfig {
     /// cross-region WAN links opt in to compression while low-latency LAN
     /// links stay on the uncompressed fast path.
     pub compression: Option<CompressionKind>,
+    /// SEC-1: optional CN-pinning server-certificate verifier. When `Some`,
+    /// the gRPC channel is built with
+    /// [`tonic::transport::Endpoint::tls_config_with_verifier`] so the peer's
+    /// leaf-certificate CN is pinned (and chain-validated) inside the TLS
+    /// layer — tonic never surfaces the server leaf cert to application code,
+    /// so this is the V2 counterpart to V1's post-handshake check. `None`
+    /// keeps tonic's default verifier (historical chain + hostname behaviour).
+    /// Built per-peer by the manager from
+    /// [`crate::config::PeerConfig::trust_cert_cn`] and
+    /// `--federation-require-peer-cn-match`.
+    pub pin_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
 }
 
 /// Translate a [`CompressionKind`] into tonic's wire-level codec enum.
@@ -96,6 +107,7 @@ impl fmt::Debug for V2ClientConfig {
             .field("reconnect_delay", &self.reconnect_delay)
             .field("max_reconnects", &self.max_reconnects)
             .field("compression", &self.compression)
+            .field("pinned", &self.pin_verifier.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -499,7 +511,13 @@ async fn connection_loop(
         info!(peer = %peer.id, address = %config.address, "connecting to remote peer");
 
         // Build the gRPC channel
-        let channel = match build_channel(&config.address, config.tls_config.clone()).await {
+        let channel = match build_channel(
+            &config.address,
+            config.tls_config.clone(),
+            config.pin_verifier.clone(),
+        )
+        .await
+        {
             Ok(ch) => ch,
             Err(e) => {
                 rustgate_core::audit::federation_connect_failed(&peer.id, &e.to_string());
@@ -618,15 +636,33 @@ async fn connection_loop(
 }
 
 /// Build a tonic gRPC channel with TLS.
-async fn build_channel(address: &str, tls_config: ClientTlsConfig) -> Result<Channel> {
+///
+/// When `pin_verifier` is `Some` (SEC-1), the channel is built with
+/// [`Endpoint::tls_config_with_verifier`] so the supplied
+/// [`rustls::client::danger::ServerCertVerifier`] performs both chain
+/// validation and the peer-CN pin inside the TLS layer — tonic otherwise
+/// never exposes the server leaf certificate to application code. When
+/// `None`, tonic's default verifier is used (historical behaviour).
+async fn build_channel(
+    address: &str,
+    tls_config: ClientTlsConfig,
+    pin_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+) -> Result<Channel> {
     // Parse the address and ensure it has the https scheme
     let uri: Uri = format!("https://{address}")
         .parse()
         .map_err(|e| FederationError::other(format!("invalid address: {e}")))?;
 
-    let endpoint = Endpoint::from(uri)
-        .tls_config(tls_config)
-        .map_err(|e| FederationError::other(format!("TLS config error: {e}")))?
+    let tls_endpoint = match pin_verifier {
+        Some(verifier) => Endpoint::from(uri)
+            .tls_config_with_verifier(tls_config, verifier)
+            .map_err(|e| FederationError::other(format!("TLS config (CN-pinned) error: {e}")))?,
+        None => Endpoint::from(uri)
+            .tls_config(tls_config)
+            .map_err(|e| FederationError::other(format!("TLS config error: {e}")))?,
+    };
+
+    let endpoint = tls_endpoint
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(300))
         // gRPC keepalive: ping every 10s, timeout after 5s, allow while idle.
@@ -1300,6 +1336,7 @@ mod tests {
                 replay_drain: None,
                 max_hops: 10,
                 compression: None,
+                pin_verifier: None,
             },
         );
 
@@ -1336,6 +1373,7 @@ mod tests {
                 replay_drain: None,
                 max_hops: 10,
                 compression: None,
+                pin_verifier: None,
             },
         );
 
@@ -1382,6 +1420,7 @@ mod tests {
                 replay_drain: None,
                 max_hops: 10,
                 compression: None,
+                pin_verifier: None,
             },
         );
 
@@ -1410,6 +1449,7 @@ mod tests {
                 replay_drain: None,
                 max_hops: 10,
                 compression: None,
+                pin_verifier: None,
             },
         );
 
@@ -1440,6 +1480,7 @@ mod tests {
                 replay_drain: None,
                 max_hops: 10,
                 compression: None,
+                pin_verifier: None,
             },
         );
 
