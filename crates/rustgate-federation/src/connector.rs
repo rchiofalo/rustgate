@@ -507,6 +507,128 @@ impl rustls::client::danger::ServerCertVerifier for NoHostnameVerifier {
     }
 }
 
+/// Server-certificate verifier that performs full chain validation **and**
+/// pins the peer's leaf-certificate Common Name to an expected value (SEC-1).
+///
+/// This is the V2 (gRPC / tonic) counterpart to the V1 post-handshake CN
+/// check in `v1/client.rs`. tonic's `ClientTlsConfig` never surfaces the
+/// server leaf certificate to application code, so for V2 the pin must run
+/// inside the TLS layer — installed via
+/// [`tonic::transport::Endpoint::tls_config_with_verifier`].
+///
+/// Chain validation is delegated to [`NoHostnameVerifier`], so hostname/SNI
+/// mismatch is tolerated exactly as elsewhere in federation (peers commonly
+/// use descriptive CNs / IP-literal addresses) — the CN pin, not the
+/// hostname, is the identity binding. On mismatch the handshake fails closed
+/// with a rustls `ApplicationVerificationFailure`, so the gRPC channel never
+/// opens, and an `audit::federation_peer_rejected` event is emitted.
+///
+/// Gated on `v2` — tonic (the gRPC transport) is the only consumer; without
+/// it this would be dead code.
+#[cfg(feature = "v2")]
+#[derive(Debug)]
+pub(crate) struct PinnedServerCertVerifier {
+    inner: NoHostnameVerifier,
+    expected_cn: String,
+    /// Configured peer address, for the audit trail on rejection. Not a
+    /// secret — it is the operator's own peer config.
+    peer_addr: String,
+}
+
+#[cfg(feature = "v2")]
+impl PinnedServerCertVerifier {
+    fn new(roots: RootCertStore, expected_cn: String, peer_addr: String) -> Self {
+        Self {
+            inner: NoHostnameVerifier::new(roots),
+            expected_cn,
+            peer_addr,
+        }
+    }
+}
+
+#[cfg(feature = "v2")]
+impl rustls::client::danger::ServerCertVerifier for PinnedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // 1. Full chain validation against the federation CA (hostname
+        //    tolerated — see `NoHostnameVerifier`).
+        let verified = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+
+        // 2. Pin the leaf-certificate CN. The chain is trusted, but without
+        //    this any CA-issued certificate could impersonate any peer.
+        let identity = extract_identity(end_entity).map_err(|e| {
+            rustls::Error::General(format!("peer certificate CN extraction failed: {e}"))
+        })?;
+        if !identity.cn.eq_ignore_ascii_case(&self.expected_cn) {
+            rustgate_core::audit::federation_peer_rejected(
+                &self.peer_addr,
+                &format!(
+                    "V2 peer certificate CN mismatch (expected {}, presented {})",
+                    hash_cn(&self.expected_cn),
+                    hash_cn(&identity.cn)
+                ),
+            );
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Build a CN-pinning server-certificate verifier for V2 (gRPC) federation
+/// from the federation CA PEM, the expected peer CN, and the peer address
+/// (SEC-1). Returns a trait object ready to hand to
+/// [`tonic::transport::Endpoint::tls_config_with_verifier`].
+#[cfg(feature = "v2")]
+pub(crate) fn build_pinned_server_cert_verifier(
+    ca_pem: &str,
+    expected_cn: String,
+    peer_addr: String,
+) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>> {
+    let roots = parse_ca_store(ca_pem.as_bytes())
+        .map_err(|e| FederationError::other(format!("building CN-pin verifier root store: {e}")))?;
+    Ok(Arc::new(PinnedServerCertVerifier::new(
+        roots,
+        expected_cn,
+        peer_addr,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -967,5 +1089,109 @@ mod tests {
         // Verify debug output
         let debug = format!("{connector:?}");
         assert!(debug.contains("Dynamic"));
+    }
+
+    // ── SEC-1: V2 CN-pinning server-certificate verifier ────────────
+
+    /// Issue a server cert with `cert_cn`, parse its chain, and build a
+    /// verifier pinned to `expected_cn` (CA = the issuing CA).
+    #[cfg(feature = "v2")]
+    fn pin_verifier_fixture(
+        cert_cn: &str,
+        expected_cn: &str,
+    ) -> (
+        Vec<CertificateDer<'static>>,
+        Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = TestCa::new("V2 Pin CA");
+        let server_cert = ca.issue_server_cert(cert_cn, &["localhost"]);
+        let chain = parse_certs(server_cert.cert_pem.as_bytes()).expect("parse server cert");
+        let verifier = build_pinned_server_cert_verifier(
+            &ca.cert_pem,
+            expected_cn.to_string(),
+            "192.0.2.10:9001".to_string(),
+        )
+        .expect("build verifier");
+        (chain, verifier)
+    }
+
+    #[cfg(feature = "v2")]
+    fn run_verify(
+        chain: &[CertificateDer<'static>],
+        verifier: &Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    ) -> std::result::Result<(), rustls::Error> {
+        let (end_entity, intermediates) = chain.split_first().expect("non-empty chain");
+        let server_name = ServerName::try_from("localhost").expect("server name");
+        verifier
+            .verify_server_cert(
+                end_entity,
+                intermediates,
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map(|_| ())
+    }
+
+    #[cfg(feature = "v2")]
+    #[test]
+    fn pinned_verifier_accepts_matching_cn() {
+        let (chain, verifier) = pin_verifier_fixture("real-v2-peer", "real-v2-peer");
+        assert!(
+            run_verify(&chain, &verifier).is_ok(),
+            "matching CN must pass chain + pin verification"
+        );
+    }
+
+    #[cfg(feature = "v2")]
+    #[test]
+    fn pinned_verifier_matches_cn_case_insensitively() {
+        let (chain, verifier) = pin_verifier_fixture("real-v2-peer", "REAL-V2-PEER");
+        assert!(
+            run_verify(&chain, &verifier).is_ok(),
+            "CN pin must be case-insensitive"
+        );
+    }
+
+    #[cfg(feature = "v2")]
+    #[test]
+    fn pinned_verifier_rejects_mismatched_cn() {
+        // Chain is valid against the CA, but the CN does not match the pin —
+        // the exact SEC-1 impersonation case. Must fail closed.
+        let (chain, verifier) = pin_verifier_fixture("real-v2-peer", "imposter-peer");
+        let err = run_verify(&chain, &verifier).expect_err("mismatched CN must be rejected");
+        assert!(
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ApplicationVerificationFailure
+                )
+            ),
+            "mismatch must surface as ApplicationVerificationFailure, got: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "v2")]
+    #[test]
+    fn pinned_verifier_rejects_cert_from_wrong_ca_even_if_cn_matches() {
+        // Defense in depth: chain validation still runs. A cert with the
+        // right CN but signed by a different CA must fail at the chain step,
+        // not slip through on the CN match alone.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let real_ca = TestCa::new("Real CA");
+        let rogue_ca = TestCa::new("Rogue CA");
+        let rogue_cert = rogue_ca.issue_server_cert("real-v2-peer", &["localhost"]);
+        let chain = parse_certs(rogue_cert.cert_pem.as_bytes()).expect("parse rogue cert");
+        let verifier = build_pinned_server_cert_verifier(
+            &real_ca.cert_pem,
+            "real-v2-peer".to_string(),
+            "192.0.2.10:9001".to_string(),
+        )
+        .expect("build verifier");
+        assert!(
+            run_verify(&chain, &verifier).is_err(),
+            "a cert from an untrusted CA must be rejected even if the CN matches"
+        );
     }
 }
