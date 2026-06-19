@@ -1054,8 +1054,9 @@ pub(crate) struct TacticalIngressArgs {
     /// set, the listener binds with `SO_REUSEADDR` on the `--dis-bind` port
     /// and joins this group, so DIS can be received on an exercise-LAN
     /// multicast address; admission and validate-and-drop apply identically.
-    /// Must be in `224.0.0.0/4`; a non-multicast value is a startup error.
-    /// Empty/unset (the default) does a plain unicast bind. Inbound only.
+    /// Must be in `224.0.0.0/4` excluding the reserved `224.0.0.0/24` control
+    /// block; an out-of-range value is a startup error. Empty/unset (the
+    /// default) does a plain unicast bind. Inbound only.
     #[arg(long, env = "RUSTGATE_DIS_MULTICAST_GROUP")]
     pub(crate) dis_multicast_group: Option<String>,
 
@@ -1089,8 +1090,9 @@ pub(crate) struct TacticalIngressArgs {
     /// When set, the listener binds with `SO_REUSEADDR` on the
     /// `--asterix-bind` port and joins this group, so ASTERIX can be received
     /// on an exercise-LAN multicast address; admission and validate-and-drop
-    /// apply identically. Must be in `224.0.0.0/4`; a non-multicast value is
-    /// a startup error. Empty/unset (the default) does a plain unicast bind.
+    /// apply identically. Must be in `224.0.0.0/4` excluding the reserved
+    /// `224.0.0.0/24` control block; an out-of-range value is a startup
+    /// error. Empty/unset (the default) does a plain unicast bind.
     /// Inbound only.
     #[arg(long, env = "RUSTGATE_ASTERIX_MULTICAST_GROUP")]
     pub(crate) asterix_multicast_group: Option<String>,
@@ -1125,8 +1127,9 @@ pub(crate) struct TacticalIngressArgs {
     /// set, the listener binds with `SO_REUSEADDR` on the `--vmf-bind` port
     /// and joins this group, so VMF can be received on an exercise-LAN
     /// multicast address; admission and validate-and-drop apply identically.
-    /// Must be in `224.0.0.0/4`; a non-multicast value is a startup error.
-    /// Empty/unset (the default) does a plain unicast bind. Inbound only.
+    /// Must be in `224.0.0.0/4` excluding the reserved `224.0.0.0/24` control
+    /// block; an out-of-range value is a startup error. Empty/unset (the
+    /// default) does a plain unicast bind. Inbound only.
     #[arg(long, env = "RUSTGATE_VMF_MULTICAST_GROUP")]
     pub(crate) vmf_multicast_group: Option<String>,
 
