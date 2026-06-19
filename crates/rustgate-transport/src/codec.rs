@@ -447,6 +447,31 @@ impl Decoder for HeaderLengthCodec {
         if src.len() < self.header_len {
             return Ok(None);
         }
+        // SEC-8: the length field must lie fully within the header, or
+        // `read_body_length` indexes past `header_len` and panics. `new` is
+        // intentionally infallible (it is built inside a non-fallible
+        // ingress closure), so a misconfigured offset/size is caught here
+        // and reported as `InvalidData` rather than aborting the task.
+        let length_width = match self.length_size {
+            HeaderSize::One => 1usize,
+            HeaderSize::Two => 2,
+            HeaderSize::Four => 4,
+        };
+        // `overflowing_add` (not `saturating_add`) so a pathological
+        // `length_offset` near `usize::MAX` is treated as out-of-bounds
+        // rather than silently saturating to a value that could equal
+        // `header_len`.
+        let (length_field_end, offset_overflowed) =
+            self.length_offset.overflowing_add(length_width);
+        if offset_overflowed || length_field_end > self.header_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "length field at offset {} (+{length_width} bytes) does not fit in {}-byte header",
+                    self.length_offset, self.header_len
+                ),
+            ));
+        }
         let body_len = self.read_body_length(&src[..self.header_len]);
         // Bound BEFORE reserving — no attacker-driven allocation.
         if body_len > self.max_frame_size {
@@ -843,6 +868,48 @@ mod tests {
         let err = codec.decode(&mut buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn header_length_rejects_length_field_past_header() {
+        // SEC-8: offset 12 + 4-byte length = 16 > 8-byte header. Before the
+        // fix this indexed out of bounds in `read_body_length` and panicked
+        // the task; now it must surface InvalidData.
+        let mut codec = HeaderLengthCodec::new(8, 12, HeaderSize::Four);
+        let mut buf = BytesMut::from(&[0u8; 8][..]);
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("header"));
+    }
+
+    #[test]
+    fn header_length_rejects_length_field_one_byte_past_header() {
+        // SEC-8: 12 + 4 = 16 > 15 — the bound is `>`, so a field ending one
+        // byte past the header is still rejected.
+        let mut codec = HeaderLengthCodec::new(15, 12, HeaderSize::Four);
+        let mut buf = BytesMut::from(&[0u8; 15][..]);
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn header_length_accepts_length_field_flush_with_header_end() {
+        // SEC-8: 12 + 4 = 16 == 16 — the field fits exactly and must decode
+        // normally (the bound is inclusive at the header boundary).
+        let mut codec = HeaderLengthCodec::new(16, 12, HeaderSize::Four);
+        let mut buf = BytesMut::from(jreap_frame(b"abcd").as_slice());
+        let frame = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(frame.len(), 20);
+    }
+
+    #[test]
+    fn header_length_rejects_out_of_bounds_for_non_four_width() {
+        // SEC-8: the width-aware bound must reject a too-wide field for
+        // every HeaderSize, not just Four. offset 1 + 2-byte field = 3 > 2.
+        let mut codec = HeaderLengthCodec::new(2, 1, HeaderSize::Two);
+        let mut buf = BytesMut::from(&[0u8; 2][..]);
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
