@@ -37,11 +37,12 @@
 //! crate plug Prometheus counters in without forcing this crate to depend
 //! on the metrics stack. They are no-ops when omitted.
 
-use std::collections::HashMap;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lru::LruCache;
 use rustgate_core::tasks::spawn_background;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::pki_types::{CertificateDer, UnixTime};
@@ -131,7 +132,12 @@ enum CachedStatus {
 /// See the module-level documentation for design notes.
 pub struct ClientOcspVerifier {
     inner: Arc<dyn ClientCertVerifier>,
-    cache: parking_lot::Mutex<HashMap<Vec<u8>, CachedStatus>>,
+    // SEC-6: bounded LRU rather than an unbounded `HashMap`. One entry per
+    // distinct presented client cert; an adversary rotating many CA-issued
+    // certs would otherwise grow this without limit for the process lifetime.
+    // A `get` on the hot verify path bumps recency, so actively-connecting
+    // peers stay cached and only idle entries are evicted under pressure.
+    cache: parking_lot::Mutex<LruCache<Vec<u8>, CachedStatus>>,
     fetch_tx: mpsc::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     on_hit: Option<OnCacheHit>,
     on_miss: Option<OnCacheMiss>,
@@ -153,6 +159,15 @@ impl std::fmt::Debug for ClientOcspVerifier {
 /// dropped (the verifier still serves cached entries normally).
 const FETCH_QUEUE_CAPACITY: usize = 256;
 
+/// Maximum number of cached OCSP statuses (SEC-6).
+///
+/// Bounds the per-verifier cache so an adversary rotating many distinct
+/// CA-issued client certificates cannot grow it without limit. Each entry is
+/// a 32-byte fingerprint + a one-byte status, so 4096 entries is well under
+/// ~200 KiB while comfortably covering realistic distinct-client populations.
+/// Least-recently-used entries are evicted once the cap is reached.
+const OCSP_CACHE_CAPACITY: usize = 4096;
+
 impl ClientOcspVerifier {
     /// Wrap an inner verifier with the OCSP cache and background fetcher.
     ///
@@ -168,9 +183,13 @@ impl ClientOcspVerifier {
         let (fetch_tx, mut fetch_rx) =
             mpsc::channel::<(Vec<u8>, Vec<u8>, Vec<u8>)>(FETCH_QUEUE_CAPACITY);
 
+        // `unwrap_or(MIN)` keeps the construction panic-free even if the
+        // const were ever set to 0; OCSP_CACHE_CAPACITY is non-zero so MIN
+        // is never actually reached.
+        let cap = NonZeroUsize::new(OCSP_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
         let verifier = Arc::new(Self {
             inner,
-            cache: parking_lot::Mutex::new(HashMap::new()),
+            cache: parking_lot::Mutex::new(LruCache::new(cap)),
             fetch_tx,
             on_hit,
             on_miss,
@@ -186,11 +205,11 @@ impl ClientOcspVerifier {
                 match fetcher_clone.fetch(&leaf, &issuer).await {
                     Ok(true) => {
                         debug!(?cert_fp, "client OCSP: cached as Good");
-                        let _ = this.cache.lock().insert(cert_fp, CachedStatus::Good);
+                        let _ = this.cache.lock().put(cert_fp, CachedStatus::Good);
                     }
                     Ok(false) => {
                         warn!(?cert_fp, "client OCSP: certificate reported as revoked");
-                        let _ = this.cache.lock().insert(cert_fp, CachedStatus::Revoked);
+                        let _ = this.cache.lock().put(cert_fp, CachedStatus::Revoked);
                     }
                     Err(e) => {
                         debug!(?cert_fp, error = %e, "client OCSP: fetch failed");
@@ -475,6 +494,31 @@ mod tests {
     #[test]
     fn fetch_queue_capacity_is_256() {
         assert_eq!(FETCH_QUEUE_CAPACITY, 256);
+    }
+
+    /// SEC-6: the OCSP status cache is a bounded LRU. Inserting beyond the
+    /// capacity must evict least-recently-used entries rather than grow the
+    /// map without limit (an adversary rotating distinct CA-issued certs).
+    #[tokio::test]
+    async fn cache_is_bounded_to_capacity() {
+        let (inner, _) = build_inner_and_certs();
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        // Insert well beyond the cap directly through the (in-module) cache.
+        {
+            let mut cache = verifier.cache.lock();
+            for i in 0..(OCSP_CACHE_CAPACITY + 100) {
+                let _ = cache.put((i as u64).to_le_bytes().to_vec(), CachedStatus::Good);
+            }
+        }
+        assert_eq!(
+            verifier.cache_len(),
+            OCSP_CACHE_CAPACITY,
+            "cache must be bounded to OCSP_CACHE_CAPACITY, not grow without limit"
+        );
     }
 
     /// `cache_key` must be SHA-256 of the input, not an alternative hash.

@@ -5058,6 +5058,7 @@ version = "0.9.0"
 dependencies = [
  "arc-swap",
  "futures",
+ "lru",
  "ocsp-stapler",
  "parking_lot",
  "rustgate-core",
