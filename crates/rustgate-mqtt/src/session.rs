@@ -427,6 +427,7 @@ pub(crate) async fn handle_mqtt_session(
         retain_store: &retain_store,
         subscriptions: &subscriptions,
         topic_alias_max,
+        receive_max,
     };
 
     // Each branch returns a matched type so the `select!` macro can
@@ -1166,6 +1167,10 @@ struct ReadLoopParams<'a> {
     /// feature is disabled and any PUBLISH carrying a topic alias
     /// is rejected.
     topic_alias_max: u16,
+    /// SEC-3: MQTT 5.0 Receive Maximum advertised in CONNACK — the server's
+    /// inbound QoS 2 admission cap. Enforced by [`qos2_admit`] so the
+    /// per-session inflight map cannot grow past it.
+    receive_max: u16,
 }
 
 /// Outcome of the read loop. Used by the caller to decide whether to
@@ -1229,6 +1234,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
     let mut topic_alias_table: std::collections::HashMap<u16, String> =
         std::collections::HashMap::new();
     let topic_alias_max = params.topic_alias_max;
+    let receive_max = params.receive_max;
     loop {
         let packet = match tokio::time::timeout(keep_alive, reader.read_packet()).await {
             Ok(Ok(pkt)) => pkt,
@@ -1294,6 +1300,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
                         forwarding_hooks,
                         retain_store,
                         &mut qos2_inflight_v5,
+                        receive_max,
                         publish,
                     )
                     .await?;
@@ -1399,6 +1406,7 @@ async fn mqtt_read_loop(params: &mut ReadLoopParams<'_>) -> Result<ReadLoopOutco
                         forwarding_hooks,
                         retain_store,
                         &mut qos2_inflight_v4,
+                        receive_max,
                         publish,
                     )
                     .await?;
@@ -1484,6 +1492,7 @@ async fn handle_publish_v5(
     forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
     retain_store: &RetainStore,
     qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV5>,
+    receive_max: u16,
     publish: mqttbytes::v5::Publish,
 ) -> Result<(), MqttError> {
     #[cfg(feature = "metrics")]
@@ -1503,6 +1512,7 @@ async fn handle_publish_v5(
         forwarding_hooks,
         retain_store,
         qos2_inflight,
+        receive_max,
         publish,
     )
     .await;
@@ -1531,6 +1541,7 @@ async fn handle_publish_v5_inner(
     forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
     retain_store: &RetainStore,
     qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV5>,
+    receive_max: u16,
     publish: mqttbytes::v5::Publish,
 ) -> Result<(), MqttError> {
     if let Err(e) = topic::validate_publish_topic(&publish.topic) {
@@ -1618,11 +1629,32 @@ async fn handle_publish_v5_inner(
         // the saved state untouched and re-emit PUBREC. `entry`
         // expresses this directly: the closure runs only on vacant,
         // so a duplicate-pkid PUBLISH is a no-op state-wise.
+        // SEC-3: enforce MQTT 5.0 Receive Maximum on inbound QoS 2. Sweep
+        // timed-out entries, then refuse a *new* packet id once the inflight
+        // map is at the cap with PUBREC `0x97 Quota Exceeded` — bounding the
+        // map to `receive_max` entries instead of letting one client park
+        // the whole 65 535-pkid keyspace × max-packet-size of unacked state.
+        if !qos2_admit(
+            qos2_inflight,
+            publish.pkid,
+            receive_max,
+            QOS2_INFLIGHT_TIMEOUT,
+        ) {
+            fire_publish_reject(session_hooks);
+            send_pubrec_v5(
+                resp_tx,
+                publish.pkid,
+                mqttbytes::v5::PubRecReason::QuotaExceeded,
+            )
+            .await?;
+            return Ok(());
+        }
         let _ = qos2_inflight
             .entry(publish.pkid)
             .or_insert_with(|| Qos2InflightV5 {
                 publish: publish.clone(),
                 group: group.into_owned(),
+                received_at: std::time::Instant::now(),
             });
         send_pubrec_v5(resp_tx, publish.pkid, mqttbytes::v5::PubRecReason::Success).await?;
         return Ok(());
@@ -1673,6 +1705,47 @@ async fn handle_publish_v5_inner(
     ack_publish_v5(resp_tx, &publish).await
 }
 
+/// SEC-3: maximum time a QoS 2 PUBLISH may sit in the per-session inflight
+/// map awaiting its PUBREL before it is swept.
+///
+/// Bounds how long an abandoned four-step handshake holds a Receive-Maximum
+/// slot (and its buffered payload) when the client never completes it but
+/// keeps the connection alive. Swept lazily on each new QoS 2 admission, so
+/// stuck slots are reclaimed for legitimate traffic without a dedicated
+/// timer. Memory is bounded by the Receive-Maximum cap regardless; this
+/// just stops a misbehaving client from parking the whole window forever.
+const QOS2_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// SEC-3: shared accessor so the generic [`qos2_admit`] cap/sweep logic
+/// works over both the v5 and v4 inflight entry types.
+trait Qos2Entry {
+    fn received_at(&self) -> std::time::Instant;
+}
+
+/// SEC-3: enforce the inbound QoS 2 Receive Maximum on a per-session
+/// inflight map, sweeping timed-out entries first.
+///
+/// Returns `true` if `pkid` may be stored — either it is already tracked (a
+/// DUP retransmit, which must be re-acked without double-counting), or there
+/// is room under `receive_max` after the timeout sweep. Returns `false` when
+/// the cap is reached, so the caller refuses the PUBLISH (v5: PUBREC
+/// `0x97 Quota Exceeded`; v4: disconnect, since 3.1.1 PUBREC carries no
+/// reason code). `receive_max` is floored at 1 so a degenerate `0` cannot
+/// wedge QoS 2 entirely. The map is thereby bounded to `receive_max` entries
+/// instead of the full 65 535-pkid keyspace × max-packet-size of state.
+fn qos2_admit<V: Qos2Entry>(
+    inflight: &mut std::collections::HashMap<u16, V>,
+    pkid: u16,
+    receive_max: u16,
+    timeout: std::time::Duration,
+) -> bool {
+    inflight.retain(|_, v| v.received_at().elapsed() < timeout);
+    if inflight.contains_key(&pkid) {
+        return true;
+    }
+    (inflight.len() as u64) < u64::from(receive_max.max(1))
+}
+
 /// Per-session state for an in-flight QoS 2 v5 PUBLISH awaiting PUBREL.
 ///
 /// Holds the original `Publish` (so retain-store update on PUBREL sees
@@ -1683,6 +1756,14 @@ async fn handle_publish_v5_inner(
 struct Qos2InflightV5 {
     publish: mqttbytes::v5::Publish,
     group: String,
+    /// SEC-3: arrival time, for the Receive-Maximum timeout sweep.
+    received_at: std::time::Instant,
+}
+
+impl Qos2Entry for Qos2InflightV5 {
+    fn received_at(&self) -> std::time::Instant {
+        self.received_at
+    }
 }
 
 /// Send a v5 PUBREC with the given reason code.
@@ -1839,6 +1920,7 @@ async fn handle_publish_v4(
     forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
     retain_store: &RetainStore,
     qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV4>,
+    receive_max: u16,
     publish: mqttbytes::v4::Publish,
 ) -> Result<(), MqttError> {
     #[cfg(feature = "metrics")]
@@ -1858,6 +1940,7 @@ async fn handle_publish_v4(
         forwarding_hooks,
         retain_store,
         qos2_inflight,
+        receive_max,
         publish,
     )
     .await;
@@ -1886,6 +1969,7 @@ async fn handle_publish_v4_inner(
     forwarding_hooks: Option<&crate::config::MqttForwardingHooks>,
     retain_store: &RetainStore,
     qos2_inflight: &mut std::collections::HashMap<u16, Qos2InflightV4>,
+    receive_max: u16,
     publish: mqttbytes::v4::Publish,
 ) -> Result<(), MqttError> {
     // v3.1.1 has no per-publish reason codes — a topic / authz failure
@@ -1923,12 +2007,30 @@ async fn handle_publish_v4_inner(
                 "QoS 2 PUBLISH with packet identifier 0".into(),
             ));
         }
+        // SEC-3: enforce the same inbound QoS 2 cap as v5. MQTT 3.1.1 has no
+        // Receive Maximum and its PUBREC carries no reason code, so a client
+        // that floods QoS 2 PUBLISHes without PUBREL past the cap is
+        // disconnected with a typed error — the only spec-compliant signal
+        // available in v3.1.1 — rather than refused per-packet.
+        if !qos2_admit(
+            qos2_inflight,
+            publish.pkid,
+            receive_max,
+            QOS2_INFLIGHT_TIMEOUT,
+        ) {
+            fire_publish_reject(session_hooks);
+            return Err(MqttError::Malformed(format!(
+                "QoS 2 inflight limit ({}) exceeded (receive maximum)",
+                receive_max.max(1)
+            )));
+        }
         // See `handle_publish_v5` for the duplicate-pkid rationale.
         let _ = qos2_inflight
             .entry(publish.pkid)
             .or_insert_with(|| Qos2InflightV4 {
                 publish: publish.clone(),
                 group: group.into_owned(),
+                received_at: std::time::Instant::now(),
             });
         send_pubrec_v4(resp_tx, publish.pkid).await?;
         return Ok(());
@@ -1984,6 +2086,14 @@ async fn handle_publish_v4_inner(
 struct Qos2InflightV4 {
     publish: mqttbytes::v4::Publish,
     group: String,
+    /// SEC-3: arrival time, for the Receive-Maximum timeout sweep.
+    received_at: std::time::Instant,
+}
+
+impl Qos2Entry for Qos2InflightV4 {
+    fn received_at(&self) -> std::time::Instant {
+        self.received_at
+    }
 }
 
 /// Send a v4 PUBREC. v3.1.1 PUBREC has no reason code field — just a
@@ -4016,5 +4126,77 @@ mod tests {
             "distinct CNs must produce distinct hashes; \
              a regression collapsing them would defeat correlation"
         );
+    }
+
+    // ── SEC-3: QoS 2 Receive-Maximum admission (qos2_admit) ────────────
+
+    /// Minimal [`Qos2Entry`] so the cap/sweep logic can be exercised
+    /// without constructing full MQTT PUBLISH packets.
+    struct TestEntry(std::time::Instant);
+    impl Qos2Entry for TestEntry {
+        fn received_at(&self) -> std::time::Instant {
+            self.0
+        }
+    }
+
+    #[test]
+    fn qos2_admit_caps_new_pkids_at_receive_max() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let no_sweep = Duration::from_secs(3600);
+        let mut map: HashMap<u16, TestEntry> = HashMap::new();
+        let cap = 3u16;
+        for pkid in 1..=3u16 {
+            assert!(
+                qos2_admit(&mut map, pkid, cap, no_sweep),
+                "pkid {pkid} within the cap must be admitted"
+            );
+            let _ = map.insert(pkid, TestEntry(Instant::now()));
+        }
+        assert!(
+            !qos2_admit(&mut map, 4, cap, no_sweep),
+            "a new packet id past the cap must be refused"
+        );
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn qos2_admit_allows_dup_pkid_even_at_cap() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let no_sweep = Duration::from_secs(3600);
+        let mut map: HashMap<u16, TestEntry> = HashMap::new();
+        let _ = map.insert(1, TestEntry(Instant::now()));
+        let _ = map.insert(2, TestEntry(Instant::now()));
+        // A DUP retransmit of a tracked pkid is idempotent — always admitted.
+        assert!(qos2_admit(&mut map, 1, 2, no_sweep));
+        // A genuinely new pkid at the cap is refused.
+        assert!(!qos2_admit(&mut map, 9, 2, no_sweep));
+    }
+
+    #[test]
+    fn qos2_admit_timeout_sweep_frees_the_window() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let mut map: HashMap<u16, TestEntry> = HashMap::new();
+        for pkid in 1..=3u16 {
+            let _ = map.insert(pkid, TestEntry(Instant::now()));
+        }
+        // A zero timeout treats every (already-elapsed) entry as timed-out,
+        // so the sweep clears the window and a fresh pkid is admitted.
+        assert!(qos2_admit(&mut map, 50, 3, Duration::ZERO));
+        assert_eq!(map.len(), 0, "all timed-out entries are swept");
+    }
+
+    #[test]
+    fn qos2_admit_floors_receive_max_at_one() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let no_sweep = Duration::from_secs(3600);
+        let mut map: HashMap<u16, TestEntry> = HashMap::new();
+        // receive_max 0 must not wedge QoS 2 entirely — floored to 1.
+        assert!(qos2_admit(&mut map, 1, 0, no_sweep));
+        let _ = map.insert(1, TestEntry(Instant::now()));
+        assert!(!qos2_admit(&mut map, 2, 0, no_sweep));
     }
 }
