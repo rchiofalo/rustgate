@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use rustgate_core::tasks::spawn_background;
+use rustgate_resilience::reconnect::backoff_delay;
 use tracing::{debug, info, warn};
 
 use crate::config::RoutingMode;
@@ -21,6 +22,14 @@ use crate::store::{FederateInfo, FederateStore, FederateUpdate};
 
 const KV_BUCKET: &str = "federation-peers";
 const STATS_FLUSH_INTERVAL_SECS: u64 = 5;
+
+/// SEC-4: bounded retry for write-through KV mutations. The in-memory cache
+/// is updated optimistically (read-your-writes), so a silently-dropped KV
+/// write would diverge local and KV state until restart. Retrying recovers
+/// the common transient-NATS case; a permanent give-up is surfaced via the
+/// `kv_write_failures` metric so operators can alert and reconcile.
+const KV_WRITE_MAX_ATTEMPTS: u32 = 4;
+const KV_WRITE_RETRY_BASE: Duration = Duration::from_millis(100);
 
 /// Pending statistics update for a federate.
 #[derive(Debug, Default, Clone)]
@@ -157,28 +166,61 @@ impl KvStore {
         Ok(())
     }
 
-    /// Write a federate to the KV bucket.
+    /// Write a federate to the KV bucket (SEC-4: retried, failure-surfaced).
+    ///
+    /// The async write is retried with bounded backoff so a transient NATS
+    /// failure doesn't silently diverge the optimistically-updated local
+    /// cache from the KV store. A permanent give-up increments the
+    /// `kv_write_failures` metric (and logs loudly) so operators can alert;
+    /// the watch loop + load-on-restart reconcile the cache from KV.
     fn put_kv(&self, info: &FederateInfo) -> Result<()> {
         let data = serde_json::to_vec(info)
             .map_err(|e| FederationError::serde("failed to serialize federate", e))?;
         let kv = self.kv.clone();
         let key = info.id.clone();
-        // Fire-and-forget async write
+        let value = bytes::Bytes::from(data);
         spawn_background("fed-kv-put", async move {
-            if let Err(e) = kv.put(&key, data.into()).await {
-                warn!(key = %key, error = %e, "failed to write federate to KV");
+            let ok = write_with_retry(KV_WRITE_MAX_ATTEMPTS, KV_WRITE_RETRY_BASE, || {
+                let kv = kv.clone();
+                let key = key.clone();
+                let value = value.clone();
+                async move { kv.put(&key, value).await.map(|_| ()) }
+            })
+            .await;
+            if !ok {
+                warn!(
+                    key = %key,
+                    attempts = KV_WRITE_MAX_ATTEMPTS,
+                    "federate KV write permanently failed — local cache and KV store have \
+                     diverged; reconcile on watch reconnect / restart"
+                );
+                #[cfg(feature = "api")]
+                crate::metrics::kv_write_failures().inc();
             }
         });
         Ok(())
     }
 
-    /// Delete a federate from the KV bucket.
+    /// Delete a federate from the KV bucket (SEC-4: retried, failure-surfaced).
     fn delete_kv(&self, id: &str) {
         let kv = self.kv.clone();
         let key = id.to_string();
         spawn_background("fed-kv-delete", async move {
-            if let Err(e) = kv.delete(&key).await {
-                warn!(key = %key, error = %e, "failed to delete federate from KV");
+            let ok = write_with_retry(KV_WRITE_MAX_ATTEMPTS, KV_WRITE_RETRY_BASE, || {
+                let kv = kv.clone();
+                let key = key.clone();
+                async move { kv.delete(&key).await.map(|_| ()) }
+            })
+            .await;
+            if !ok {
+                warn!(
+                    key = %key,
+                    attempts = KV_WRITE_MAX_ATTEMPTS,
+                    "federate KV delete permanently failed — local cache and KV store have \
+                     diverged; reconcile on watch reconnect / restart"
+                );
+                #[cfg(feature = "api")]
+                crate::metrics::kv_write_failures().inc();
             }
         });
     }
@@ -383,6 +425,41 @@ impl FederateStore for KvStore {
     fn count(&self) -> usize {
         self.federates.read().map(|f| f.len()).unwrap_or(0)
     }
+}
+
+/// Retry an async KV write up to `max_attempts` times with exponential
+/// backoff between attempts. Returns `true` on the first success, `false`
+/// if every attempt failed (SEC-4).
+///
+/// Generic over the write closure so it is unit-testable without a live
+/// NATS server: the closure is re-invoked per attempt and must produce a
+/// fresh future each time. Bounds how long the optimistically-updated local
+/// cache can diverge from the KV store on a transient failure; a permanent
+/// give-up (`false`) is surfaced by the caller via the failure metric.
+async fn write_with_retry<F, Fut, E>(max_attempts: u32, base: Duration, mut attempt_fn: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let max_attempts = max_attempts.max(1);
+    for attempt in 0..max_attempts {
+        match attempt_fn().await {
+            Ok(()) => return true,
+            Err(e) => {
+                warn!(
+                    attempt = attempt + 1,
+                    max_attempts,
+                    error = %e,
+                    "KV write attempt failed"
+                );
+                if attempt + 1 < max_attempts {
+                    tokio::time::sleep(backoff_delay(base, attempt)).await;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Watch loop: receives KV mutations and updates the local cache.
@@ -600,5 +677,85 @@ mod tests {
         // Original should be empty
         let stats = pending.lock().expect("lock");
         assert!(stats.is_empty());
+    }
+
+    // ── SEC-4: bounded write retry ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_with_retry_succeeds_on_first_attempt() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        let ok = write_with_retry(4, Duration::from_millis(1), || {
+            let c = Arc::clone(&c);
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), String>(())
+            }
+        })
+        .await;
+        assert!(ok);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no retry needed on success"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_with_retry_recovers_after_transient_failures() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        // Fail the first two attempts, succeed on the third.
+        let ok = write_with_retry(4, Duration::from_millis(1), || {
+            let c = Arc::clone(&c);
+            async move {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err("transient NATS error".to_string())
+                } else {
+                    Ok::<(), String>(())
+                }
+            }
+        })
+        .await;
+        assert!(ok, "should recover once a retry succeeds");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn write_with_retry_gives_up_after_max_attempts() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        let ok = write_with_retry(4, Duration::from_millis(1), || {
+            let c = Arc::clone(&c);
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err::<(), String>("permanent failure".into())
+            }
+        })
+        .await;
+        assert!(!ok, "should give up after exhausting attempts");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn write_with_retry_floors_attempts_at_one() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&calls);
+        // max_attempts = 0 must still attempt once (floored at 1).
+        let ok = write_with_retry(0, Duration::from_millis(1), || {
+            let c = Arc::clone(&c);
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err::<(), String>("fail".into())
+            }
+        })
+        .await;
+        assert!(!ok);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -38,6 +38,8 @@ static FORWARD_TTL_EXPIRED: OnceLock<IntCounter> = OnceLock::new();
 static REPLAY_PERSISTED: OnceLock<IntCounter> = OnceLock::new();
 static REPLAY_RESTORED: OnceLock<IntCounter> = OnceLock::new();
 static REPLAY_RESTORED_SKIPPED_TTL: OnceLock<IntCounter> = OnceLock::new();
+
+static KV_WRITE_FAILURES: OnceLock<IntCounter> = OnceLock::new();
 static REPLAY_BUFFER_BYTES: OnceLock<IntGauge> = OnceLock::new();
 
 static PEER_LATENCY_NANOS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
@@ -169,6 +171,14 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(replay_persisted.clone()))?;
     let _ = REPLAY_PERSISTED.set(replay_persisted);
+
+    let kv_write_failures = IntCounter::with_opts(Opts::new(
+        "rustgate_federation_kv_write_failures_total",
+        "Total HA federate-store KV writes that permanently failed after retries (SEC-4) — \
+         local cache and the distributed KV store have diverged; alert and reconcile",
+    ))?;
+    registry.register(Box::new(kv_write_failures.clone()))?;
+    let _ = KV_WRITE_FAILURES.set(kv_write_failures);
 
     let replay_restored = IntCounter::with_opts(Opts::new(
         "rustgate_federation_replay_restored_total",
@@ -388,6 +398,15 @@ pub fn forward_ttl_expired() -> &'static IntCounter {
 pub fn replay_persisted() -> &'static IntCounter {
     REPLAY_PERSISTED
         .get_or_init(|| fallback_counter("rustgate_federation_replay_persisted_total", "fallback"))
+}
+
+/// HA federate-store KV writes that permanently failed after retries (SEC-4).
+/// A non-zero value means the local in-memory cache and the distributed KV
+/// store have diverged — alert on this and reconcile (the watch loop + load
+/// on restart re-sync from KV).
+pub fn kv_write_failures() -> &'static IntCounter {
+    KV_WRITE_FAILURES
+        .get_or_init(|| fallback_counter("rustgate_federation_kv_write_failures_total", "fallback"))
 }
 
 /// Replay buffer entries restored from disk on startup (counter).
