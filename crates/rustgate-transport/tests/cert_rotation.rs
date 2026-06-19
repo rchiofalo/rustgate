@@ -50,6 +50,17 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 
+/// SEC-5: `CertReloader` reads the key via the shared secrets gate, which
+/// rejects group/other-readable keys — test keys must be owner-only.
+fn write_key_0600(path: &std::path::Path, contents: &[u8]) {
+    std::fs::write(path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 // ── audit capture plumbing ──────────────────────────────────────────────
 //
 // `audit::cert_rotation_*` helpers emit through `tracing` against the
@@ -192,7 +203,7 @@ async fn build_fixture() -> RotationFixture {
     let cert_path = dir.path().join("server.pem");
     let key_path = dir.path().join("server.key");
     std::fs::write(&cert_path, &initial_cert.cert_pem).unwrap();
-    std::fs::write(&key_path, &initial_cert.key_pem).unwrap();
+    write_key_0600(&key_path, initial_cert.key_pem.as_bytes());
 
     let tls_config =
         TlsConfig::from_pem(&initial_cert.cert_pem, &initial_cert.key_pem, &ca.cert_pem).unwrap();
@@ -228,7 +239,7 @@ async fn build_fixture() -> RotationFixture {
 fn write_rotated_cert(fixture: &RotationFixture) -> TestCert {
     let new_cert = fixture.ca.issue_server_cert("localhost", &["localhost"]);
     std::fs::write(&fixture.cert_path, &new_cert.cert_pem).unwrap();
-    std::fs::write(&fixture.key_path, &new_cert.key_pem).unwrap();
+    write_key_0600(&fixture.key_path, new_cert.key_pem.as_bytes());
     new_cert
 }
 
@@ -546,7 +557,7 @@ async fn rotation_with_concurrent_handshakes_does_not_race() {
 fn write_server_cert_files(ca: &TestCa, cn: &str, dir: &std::path::Path) {
     let cert = ca.issue_server_cert(cn, &[cn]);
     std::fs::write(dir.join("cert.pem"), &cert.cert_pem).unwrap();
-    std::fs::write(dir.join("key.pem"), &cert.key_pem).unwrap();
+    write_key_0600(&dir.join("key.pem"), cert.key_pem.as_bytes());
 }
 
 #[tokio::test]
