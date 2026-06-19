@@ -97,8 +97,9 @@ pub struct CodecIngressConfig {
     /// received on an exercise-LAN multicast address; admission and
     /// validate-and-drop apply identically. When `None` (the default) the
     /// listener does a plain unicast bind — behaviour is unchanged. The
-    /// address must be in `224.0.0.0/4`; a non-multicast address is rejected
-    /// at bind time.
+    /// address must be in `224.0.0.0/4` and outside the reserved
+    /// `224.0.0.0/24` link-local control block; an invalid address is
+    /// rejected at bind time.
     pub multicast_group: Option<Ipv4Addr>,
     /// IPv4 interface address for the multicast join (the local NIC the
     /// kernel should join on). Only consulted when [`Self::multicast_group`]
@@ -143,7 +144,8 @@ impl CodecIngressConfig {
     /// `SO_REUSEADDR` on `addr`'s port and joins the group via the shared
     /// [`crate::udp_common::bind_multicast_socket_v4`] helper (the same
     /// reviewed setup the CoT multicast listener uses); the group must be a
-    /// valid `224.0.0.0/4` address or the bind is rejected. When `None`, a
+    /// valid `224.0.0.0/4` address outside the reserved `224.0.0.0/24`
+    /// control block, or the bind is rejected. When `None`, a
     /// plain unicast [`UdpSocket::bind`] is performed and behaviour is
     /// identical to the pre-multicast listener.
     ///
@@ -157,6 +159,21 @@ impl CodecIngressConfig {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!("multicast group `{group}` is not in 224.0.0.0/4"),
+                    ));
+                }
+                // SEC-12: reject the reserved link-local control block
+                // 224.0.0.0/24 (224.0.0.1 all-hosts, 224.0.0.2 all-routers,
+                // 224.0.0.251 mDNS, …). Joining one of these subscribes the
+                // listener to local control-plane chatter that floods it and
+                // is never a valid tactical-data group. Stable Rust has no
+                // `Ipv4Addr::is_reserved_multicast`, so test the octets.
+                let o = group.octets();
+                if o[0] == 224 && o[1] == 0 && o[2] == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "multicast group `{group}` is in the reserved link-local control block 224.0.0.0/24"
+                        ),
                     ));
                 }
                 crate::udp_common::bind_multicast_socket_v4(
@@ -389,5 +406,23 @@ mod tests {
             .await
             .expect_err("must reject unicast group");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn bind_socket_rejects_reserved_control_block() {
+        // SEC-12: 224.0.0.1 (all-hosts) IS a valid multicast address but sits
+        // in the reserved link-local control block 224.0.0.0/24 — rejected
+        // fail-closed so the ingress cannot subscribe to control-plane chatter.
+        let cfg = CodecIngressConfig {
+            multicast_group: Some(Ipv4Addr::new(224, 0, 0, 1)),
+            ..Default::default()
+        };
+        let addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let err = cfg
+            .bind_socket(addr)
+            .await
+            .expect_err("must reject reserved control-block group");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("224.0.0.0/24"));
     }
 }

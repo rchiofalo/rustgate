@@ -42,7 +42,11 @@ ingress paths still to come. See the design notes
 - **No transport authentication.** Each accepted datagram is routed under a
   synthetic, transport-derived identity (`dis-anonymous-<peer>`); the
   **destination group is the only trust decision**, and it is
-  operator-assigned via `--dis-group`, never derived from the wire.
+  operator-assigned via `--dis-group`, never derived from the wire. The
+  `<peer>` embedded in that CN is the UDP source address, which is trivially
+  spoofable on an unauthenticated datagram — it is **not** an authorization
+  input. Operators MUST NOT write ACLs against these synthetic CNs, nor treat
+  the embedded source as reliable forensic attribution.
 - **Wire identifiers are not credentials.** DIS entity/site/application IDs
   are spoofable and are **never** used for authorization or folded into the
   identity CN — they survive only inside the decoded entity for
@@ -105,7 +109,11 @@ exercise-LAN multicast address rather than addressing the router directly.
 Set `--<proto>-multicast-group` to a `224.0.0.0/4` address; the listener
 then binds with `SO_REUSEADDR` on the **`--<proto>-bind` port** and joins
 that group. The group address is validated at startup — a non-multicast
-value is a hard configuration error, never a silent unicast fallback.
+value, **or one in the reserved link-local control block `224.0.0.0/24`**
+(`224.0.0.1` all-hosts, `224.0.0.2` all-routers, `224.0.0.251` mDNS, …), is
+a hard configuration error, never a silent unicast fallback. Those reserved
+addresses carry local control-plane traffic, not tactical data, so joining
+one would only flood the listener.
 
 ```bash
 # Receive DIS on the exercise multicast group 239.2.3.1:3000.

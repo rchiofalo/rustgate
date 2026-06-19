@@ -135,8 +135,9 @@ fn parse_cidrs(s: Option<&str>, proto: &str) -> anyhow::Result<Option<Vec<CidrPr
 }
 
 /// Parse an optional `--<proto>-multicast-group` IPv4 address, rejecting a
-/// non-multicast (`224.0.0.0/4`) value as a startup error (fail-closed
-/// config, decision D4). `None`/empty ⇒ unicast bind.
+/// non-multicast (`224.0.0.0/4`) value — or one in the reserved
+/// `224.0.0.0/24` link-local control block — as a startup error
+/// (fail-closed config, decision D4). `None`/empty ⇒ unicast bind.
 fn parse_multicast_group(s: Option<&str>, proto: &str) -> anyhow::Result<Option<Ipv4Addr>> {
     let Some(s) = s else {
         return Ok(None);
@@ -151,6 +152,15 @@ fn parse_multicast_group(s: Option<&str>, proto: &str) -> anyhow::Result<Option<
     if !addr.is_multicast() {
         anyhow::bail!(
             "--{proto}-multicast-group '{trimmed}' is not in 224.0.0.0/4 (not multicast)"
+        );
+    }
+    // SEC-12: reject the reserved link-local control block 224.0.0.0/24
+    // (all-hosts, all-routers, mDNS, …) — not a valid tactical-data group and
+    // a source of control-plane flooding. Caught at startup, fail-closed.
+    let o = addr.octets();
+    if o[0] == 224 && o[1] == 0 && o[2] == 0 {
+        anyhow::bail!(
+            "--{proto}-multicast-group '{trimmed}' is in the reserved link-local control block 224.0.0.0/24"
         );
     }
     Ok(Some(addr))
@@ -457,5 +467,30 @@ mod tests {
         let err = parse_cidrs(Some("10.0.0.0/8,not-a-cidr"), "vmf").unwrap_err();
         // The protocol name is threaded into the diagnostic.
         assert!(err.to_string().contains("vmf"));
+    }
+
+    #[test]
+    fn parse_multicast_group_accepts_valid_and_empty() {
+        let g = parse_multicast_group(Some("239.2.3.1"), "dis")
+            .unwrap()
+            .unwrap();
+        assert_eq!(g, Ipv4Addr::new(239, 2, 3, 1));
+        assert!(parse_multicast_group(None, "dis").unwrap().is_none());
+        assert!(parse_multicast_group(Some("  "), "dis").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_multicast_group_rejects_non_multicast() {
+        let err = parse_multicast_group(Some("10.0.0.1"), "asterix").unwrap_err();
+        assert!(err.to_string().contains("224.0.0.0/4"));
+    }
+
+    #[test]
+    fn parse_multicast_group_rejects_reserved_control_block() {
+        // SEC-12: 224.0.0.251 (mDNS) is a valid multicast address but sits in
+        // the reserved link-local control block 224.0.0.0/24 — rejected at
+        // startup, fail-closed.
+        let err = parse_multicast_group(Some("224.0.0.251"), "vmf").unwrap_err();
+        assert!(err.to_string().contains("224.0.0.0/24"));
     }
 }
