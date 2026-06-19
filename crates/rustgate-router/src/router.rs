@@ -493,6 +493,10 @@ fn emit_access(msg: &RoutableMessage, outcome: &'static str) {
     let uid = extract_cot_uid(&msg.payload);
     tracing::info!(
         target: ACCESS_LOG_TARGET,
+        // src_cn is intentionally the raw authenticated source identity: the
+        // access log's purpose is forensic attribution of who sent what. The
+        // destination CN below is hashed (it is another client's identity).
+        // This asymmetry is asserted by tests/access_log.rs — do not hash here.
         src_cn = %msg.source.cn,
         dst = %dst,
         msg_uid = %uid,
@@ -916,7 +920,7 @@ impl SessionHandle {
             let count = self.consecutive_drops.fetch_add(1, Ordering::Relaxed) + 1;
             if count >= self.max_consecutive_drops {
                 warn!(
-                    session = %self.identity.cn,
+                    session = %hash_cn(&self.identity.cn),
                     consecutive_drops = count,
                     threshold = self.max_consecutive_drops,
                     "circuit breaker tripped: disconnecting slow session"
@@ -937,7 +941,7 @@ impl SessionHandle {
         let count = self.consecutive_drops.fetch_add(1, Ordering::Relaxed) + 1;
         if count >= self.max_consecutive_drops {
             warn!(
-                session = %self.identity.cn,
+                session = %hash_cn(&self.identity.cn),
                 consecutive_drops = count,
                 threshold = self.max_consecutive_drops,
                 "circuit breaker tripped: disconnecting slow session"
@@ -2550,7 +2554,7 @@ impl Router {
                 .unwrap_or(crate::quota::DEFAULT_TENANT_KEY);
             if !tracker.check_and_record_connection(tenant_key) {
                 warn!(
-                    cn = %cn,
+                    cn = %hash_cn(&cn),
                     tenant = %tenant_key,
                     "connection rejected: tenant quota exceeded"
                 );
@@ -2580,7 +2584,7 @@ impl Router {
             // Enforce per-CN group limit
             if joined >= state.max_groups_per_cn {
                 warn!(
-                    cn = %cn,
+                    cn = %hash_cn(&cn),
                     limit = state.max_groups_per_cn,
                     requested = new_groups.len(),
                     "group join rejected: CN exceeded max groups per CN limit"
@@ -2591,7 +2595,7 @@ impl Router {
             // Enforce total group limit (only for new groups not yet tracked)
             if !state.groups.contains_key(group) && state.groups.len() >= state.max_total_groups {
                 warn!(
-                    cn = %cn,
+                    cn = %hash_cn(&cn),
                     group = %group,
                     limit = state.max_total_groups,
                     "group join rejected: router exceeded max total groups limit"
@@ -2671,7 +2675,7 @@ impl Router {
         let current_count = state.cn_group_count.get(cn).copied().unwrap_or(0);
         if current_count >= state.max_groups_per_cn {
             warn!(
-                cn = %cn,
+                cn = %hash_cn(cn),
                 group = %group,
                 limit = state.max_groups_per_cn,
                 "dynamic join rejected: CN exceeded max groups per CN limit"
@@ -2682,7 +2686,7 @@ impl Router {
         // Enforce total group limit for new groups.
         if !state.groups.contains_key(group) && state.groups.len() >= state.max_total_groups {
             warn!(
-                cn = %cn,
+                cn = %hash_cn(cn),
                 group = %group,
                 limit = state.max_total_groups,
                 "dynamic join rejected: router exceeded max total groups limit"
@@ -3133,7 +3137,7 @@ impl Router {
                 && dedup.check_message(&msg)
             {
                 debug!(
-                    source = %msg.source.cn,
+                    source = %hash_cn(&msg.source.cn),
                     message_type = %msg.metadata.message_type,
                     "duplicate message suppressed by cross-path dedup",
                 );
@@ -3151,7 +3155,7 @@ impl Router {
         // Drop messages that expired while waiting in the ingest pipeline
         if crate::cache::is_expired(&msg) {
             debug!(
-                source = %msg.source.cn,
+                source = %hash_cn(&msg.source.cn),
                 message_type = %msg.metadata.message_type,
                 "message expired before delivery — dropping",
             );
@@ -3210,7 +3214,7 @@ impl Router {
                     .map(|g| Arc::<str>::from(g.as_str()))
                     .collect();
                 debug!(
-                    source = %msg.source.cn,
+                    source = %hash_cn(&msg.source.cn),
                     groups = ?groups,
                     "SA auto-multicast: upgrading group destination to multicast",
                 );
@@ -3483,7 +3487,7 @@ impl Router {
                 warn!(
                     count = groups.len(),
                     limit = MAX_MULTICAST_GROUPS,
-                    source = %envelope.source.cn,
+                    source = %hash_cn(&envelope.source.cn),
                     "multicast group list exceeds limit, dropping message",
                 );
                 // Closes #741: notify the metrics callback so the
@@ -4281,7 +4285,7 @@ impl Router {
                         Err(e) => {
                             debug!(
                                 err = %e,
-                                session = %cn,
+                                session = %hash_cn(cn),
                                 "direct send dropped: receive obligation actuation failed"
                             );
                             self.emit_dropped("obligation_failed");
@@ -4335,9 +4339,9 @@ impl Router {
                     // The circuit breaker inside `try_send` disconnects
                     // truly slow sessions after N consecutive failures.
                     if handle.is_closed() {
-                        warn!(session = %cn, "session channel closed, persisting for offline");
+                        warn!(session = %hash_cn(cn), "session channel closed, persisting for offline");
                     } else {
-                        debug!(session = %cn, "session channel full, persisting for offline");
+                        debug!(session = %hash_cn(cn), "session channel full, persisting for offline");
                     }
                     // Closes #768: live channel rejected the enqueue
                     // (full or closed) — counts as a backpressure-side
@@ -4381,7 +4385,7 @@ impl Router {
     fn persist_for_offline(&self, cn: &str, msg: &RoutableMessage) {
         let Some(queue) = self.client_queue.as_ref() else {
             warn!(
-                cn = %cn,
+                cn = %hash_cn(cn),
                 msg_type = %msg.metadata.message_type,
                 "direct message dropped: no store-forward queue configured",
             );
@@ -4389,10 +4393,10 @@ impl Router {
         };
         match queue.enqueue(cn, msg) {
             Ok(_dropped) => {
-                debug!(cn, "message persisted to client queue for offline delivery");
+                debug!(cn = %hash_cn(cn), "message persisted to client queue for offline delivery");
             }
             Err(e) => {
-                warn!(cn, error = %e, "client queue enqueue failed");
+                warn!(cn = %hash_cn(cn), error = %e, "client queue enqueue failed");
             }
         }
     }
@@ -4407,7 +4411,7 @@ impl Router {
     async fn send_to_group(&self, group: &str, msg: RoutedMessage) -> u64 {
         if !msg.source.is_member_of(group) {
             tracing::warn!(
-                sender = %msg.source.cn,
+                sender = %hash_cn(&msg.source.cn),
                 group = %group,
                 "rejected cross-group message: sender not a member"
             );
@@ -4425,7 +4429,7 @@ impl Router {
             && !acl.is_send_authorized(group, &msg.source.cn)
         {
             tracing::warn!(
-                sender = %msg.source.cn,
+                sender = %hash_cn(&msg.source.cn),
                 group = %group,
                 "rejected group message: sender not authorized to send"
             );
@@ -4802,7 +4806,7 @@ impl Router {
     ) -> u64 {
         if !msg.source.is_member_of(group) {
             tracing::warn!(
-                sender = %msg.source.cn,
+                sender = %hash_cn(&msg.source.cn),
                 group = %group,
                 "rejected cross-group message: sender not a member"
             );
@@ -4817,7 +4821,7 @@ impl Router {
             && !acl.is_send_authorized(group, &msg.source.cn)
         {
             tracing::warn!(
-                sender = %msg.source.cn,
+                sender = %hash_cn(&msg.source.cn),
                 group = %group,
                 "rejected group message: sender not authorized to send"
             );
