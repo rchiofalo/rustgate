@@ -16,6 +16,7 @@ use reqwest::header::HeaderName;
 use rustgate_core::b64;
 use rustgate_core::message::RoutableMessage;
 use rustgate_core::sanitize::sanitize_for_log;
+use rustgate_core::secrets::{SecretFileOpts, read_secret_file};
 use rustgate_core::tasks::spawn_background;
 use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use rustgate_resilience::circuit::{
@@ -881,12 +882,13 @@ fn build_standard_client(
                     source: e,
                 })?);
 
-            let key_pem =
-                Zeroizing::new(std::fs::read(key_path).map_err(|e| HttpError::TlsFile {
-                    target: tc.name.clone(),
-                    path: key_path.clone(),
-                    source: e,
-                })?);
+            // SEC-5: the private key goes through the shared secrets gate
+            // (mode-0o077 + 16 KiB size cap) instead of raw std::fs::read;
+            // the public cert above stays on plain std::fs::read.
+            let key_pem = {
+                let mut k = read_secret_file(key_path, &SecretFileOpts::with_max_bytes(16 * 1024))?;
+                Zeroizing::new(std::mem::take(&mut *k).into_bytes())
+            };
 
             // reqwest::Identity::from_pem expects cert+key concatenated
             identity_pem.extend_from_slice(&key_pem);
@@ -978,11 +980,12 @@ fn build_pinned_client(
                 path: cert_path.clone(),
                 source: e,
             })?);
-        let key_pem = Zeroizing::new(std::fs::read(key_path).map_err(|e| HttpError::TlsFile {
-            target: tc.name.clone(),
-            path: key_path.clone(),
-            source: e,
-        })?);
+        // SEC-5: private key via the shared secrets gate (mode-0o077 +
+        // 16 KiB cap); the public cert above stays on plain std::fs::read.
+        let key_pem = {
+            let mut k = read_secret_file(key_path, &SecretFileOpts::with_max_bytes(16 * 1024))?;
+            Zeroizing::new(std::mem::take(&mut *k).into_bytes())
+        };
 
         let certs = crate::pinning::parse_pem_certs(&cert_pem);
         let key = crate::pinning::parse_pem_private_key(&key_pem).ok_or_else(|| {

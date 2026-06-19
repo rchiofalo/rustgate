@@ -81,6 +81,17 @@ mod tests {
     use super::*;
     use crate::CertReloader;
 
+    /// SEC-5: `CertReloader` reads the key via the shared secrets gate, which
+    /// rejects group/other-readable keys — test keys must be owner-only.
+    fn write_key_0600(path: &std::path::Path, contents: &[u8]) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     /// The wrapped resolver should still resolve the underlying certificate
     /// (just without a stapled OCSP entry, since no responder is reachable in
     /// tests). This verifies the delegation path works end-to-end.
@@ -93,7 +104,7 @@ mod tests {
         let cert_path = dir.path().join("server.crt");
         let key_path = dir.path().join("server.key");
         std::fs::write(&cert_path, leaf.cert_pem.as_bytes()).unwrap();
-        std::fs::write(&key_path, leaf.key_pem.as_bytes()).unwrap();
+        write_key_0600(&key_path, leaf.key_pem.as_bytes());
 
         let reloader = CertReloader::new(&cert_path, &key_path).unwrap();
         let inner: Arc<dyn ResolvesServerCert> = reloader;
@@ -117,7 +128,7 @@ mod tests {
         let cert_path = dir.path().join("server.crt");
         let key_path = dir.path().join("server.key");
         std::fs::write(&cert_path, leaf.cert_pem.as_bytes()).unwrap();
-        std::fs::write(&key_path, leaf.key_pem.as_bytes()).unwrap();
+        write_key_0600(&key_path, leaf.key_pem.as_bytes());
         let reloader = CertReloader::new(&cert_path, &key_path).unwrap();
         (reloader, dir)
     }
@@ -178,7 +189,7 @@ mod tests {
         let cert_path = dir.path().join("server.crt");
         let key_path = dir.path().join("server.key");
         std::fs::write(&cert_path, leaf.cert_pem.as_bytes()).unwrap();
-        std::fs::write(&key_path, leaf.key_pem.as_bytes()).unwrap();
+        write_key_0600(&key_path, leaf.key_pem.as_bytes());
         let reloader = CertReloader::new(&cert_path, &key_path).unwrap();
         let ckey = reloader
             .certified_key()

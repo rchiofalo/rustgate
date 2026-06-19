@@ -1141,6 +1141,19 @@ mod tests {
 
     use super::*;
 
+    /// SEC-5: `CertReloader` now reads the key via the shared secrets gate,
+    /// which rejects group/other-readable keys. Test keys must be owner-only
+    /// (`0o600`) or the reloader fails with `PermissionsTooOpen`.
+    fn write_key_secure(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).expect("write key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod key 0600");
+        }
+    }
+
     #[test]
     fn internal_error_response_returns_500() {
         let resp = internal_error_response();
@@ -1276,7 +1289,7 @@ mod tests {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, &server.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &server.key_pem).expect("write key");
+        write_key_secure(&key_path, &server.key_pem);
 
         let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         let check = check_tls_cert(&reloader);
@@ -1294,7 +1307,7 @@ mod tests {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, &expired.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &expired.key_pem).expect("write key");
+        write_key_secure(&key_path, &expired.key_pem);
 
         let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         let check = check_tls_cert(&reloader);
@@ -1314,7 +1327,7 @@ mod tests {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, &near_expiry.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &near_expiry.key_pem).expect("write key");
+        write_key_secure(&key_path, &near_expiry.key_pem);
 
         let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         let check = check_tls_cert(&reloader);
@@ -1367,7 +1380,7 @@ mod tests {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, &server.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &server.key_pem).expect("write key");
+        write_key_secure(&key_path, &server.key_pem);
 
         let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         let _ = check_tls_cert(&reloader);
@@ -1388,7 +1401,7 @@ mod tests {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, &expired.cert_pem).expect("write cert");
-        std::fs::write(&key_path, &expired.key_pem).expect("write key");
+        write_key_secure(&key_path, &expired.key_pem);
 
         let reloader = rustgate_tls::CertReloader::new(&cert_path, &key_path).expect("reloader");
         let _ = check_tls_cert(&reloader);

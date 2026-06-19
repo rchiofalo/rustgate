@@ -25,6 +25,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rustgate_core::error::{ConfigError, Result, RustgateError};
+use rustgate_core::secrets::{SecretFileOpts, read_secret_file};
 use rustgate_core::tasks::spawn_background;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::ResolvesServerCert;
@@ -63,12 +64,19 @@ impl CertReloader {
                 cert_path.display()
             )))
         })?;
-        let key_bytes = Zeroizing::new(std::fs::read(&key_path).map_err(|e| {
-            RustgateError::from(ConfigError::Other(format!(
-                "failed to read key file {}: {e}",
-                key_path.display()
-            )))
-        })?);
+        // SEC-5: the private key goes through the shared secrets gate
+        // (mode-0o077 + 16 KiB size cap) rather than raw std::fs::read; the
+        // public certificate above stays on plain std::fs::read.
+        let key_bytes = {
+            let mut k = read_secret_file(&key_path, &SecretFileOpts::with_max_bytes(16 * 1024))
+                .map_err(|e| {
+                    RustgateError::from(ConfigError::Other(format!(
+                        "failed to read key file {}: {e}",
+                        key_path.display()
+                    )))
+                })?;
+            Zeroizing::new(std::mem::take(&mut *k).into_bytes())
+        };
 
         let hash = Self::compute_hash(&cert_bytes, &key_bytes);
         let certified_key = Self::build_certified_key(&cert_bytes, &key_bytes)?;
@@ -165,12 +173,19 @@ impl CertReloader {
                 cert_path.display()
             )))
         })?;
-        let key_bytes = Zeroizing::new(std::fs::read(key_path).map_err(|e| {
-            RustgateError::from(ConfigError::Other(format!(
-                "failed to read key file {}: {e}",
-                key_path.display()
-            )))
-        })?);
+        // SEC-5: same shared secrets gate on the rotation/poll path as in
+        // `new` — a mis-pointed or over-readable key must be rejected on
+        // every reload, not just at startup.
+        let key_bytes = {
+            let mut k = read_secret_file(key_path, &SecretFileOpts::with_max_bytes(16 * 1024))
+                .map_err(|e| {
+                    RustgateError::from(ConfigError::Other(format!(
+                        "failed to read key file {}: {e}",
+                        key_path.display()
+                    )))
+                })?;
+            Zeroizing::new(std::mem::take(&mut *k).into_bytes())
+        };
 
         let new_hash = Self::compute_hash(&cert_bytes, &key_bytes);
 
@@ -421,7 +436,15 @@ mod tests {
     fn write_server_cert(ca: &rustgate_test_utils::certs::TestCa, cn: &str, dir: &std::path::Path) {
         let cert = ca.issue_server_cert(cn, &[cn]);
         std::fs::write(dir.join("cert.pem"), &cert.cert_pem).unwrap();
-        std::fs::write(dir.join("key.pem"), &cert.key_pem).unwrap();
+        let key_path = dir.join("key.pem");
+        std::fs::write(&key_path, &cert.key_pem).unwrap();
+        // SEC-5: the reloader now reads the key via `read_secret_file`, which
+        // rejects group/other-readable keys. Test keys must be owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     #[test]
@@ -440,6 +463,31 @@ mod tests {
         assert!(
             !guard.0.cert.is_empty(),
             "should have at least one certificate"
+        );
+    }
+
+    /// SEC-5: a group/other-readable private key is refused by the shared
+    /// secrets gate, both at construction and on reload.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_world_readable_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let ca = rustgate_test_utils::certs::TestCa::new("Reload Test CA");
+        let dir = tempfile::tempdir().unwrap();
+        let cert = ca.issue_server_cert("server.test", &["server.test"]);
+        std::fs::write(dir.path().join("cert.pem"), &cert.cert_pem).unwrap();
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&key_path, &cert.key_pem).unwrap();
+        // 0o644 — group/other can read the private key.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = CertReloader::new(dir.path().join("cert.pem"), &key_path).unwrap_err();
+        assert!(
+            format!("{err}").contains("key file"),
+            "over-readable key must be rejected, got: {err}"
         );
     }
 
