@@ -283,34 +283,47 @@ mod tests {
         );
     }
 
-    /// Signing the same message twice must return signatures of
-    /// equal *length* — rcgen's default ECDSA P-256 signer emits a
-    /// DER-encoded `SEQUENCE { r, s }` where r and s are 256-bit
-    /// integers; the exact byte length may vary by one byte when
-    /// the high bit of r or s flips, but the variance is bounded
-    /// (70–72 bytes for P-256). A regression that returned
-    /// progressively-longer signatures each call would indicate a
-    /// counter-mode-like state leak and would fail here.
+    /// Signing the same message twice must return well-formed, bounded-length
+    /// DER signatures — rcgen's default ECDSA P-256 signer emits
+    /// `SEQUENCE { INTEGER r, INTEGER s }` where r and s are ~256-bit
+    /// integers DER-encoded minimally. The total length is usually 70–72
+    /// bytes but legitimately dips to 68–69 when r or s happens to have a
+    /// leading zero byte (each ~1/256), so pinning a `>= 70` lower bound
+    /// makes the test flaky. Instead we assert the DER structure exactly
+    /// (SEQUENCE tag + a length byte that matches the content) and a hard
+    /// `<= 72` upper bound. A regression that returned progressively-longer
+    /// signatures each call (a counter-mode-like state leak) would blow past
+    /// 72 bytes and fail here.
     #[test]
     fn sign_same_message_twice_returns_bounded_length_signatures() {
         let wrapped = ZeroizingKeyPair::new(fresh_key());
         let sig1 = wrapped.sign(b"stable-input").expect("sign1");
         let sig2 = wrapped.sign(b"stable-input").expect("sign2");
-        // P-256 DER signatures are 70–72 bytes.
-        assert!(
-            (70..=72).contains(&sig1.len()),
-            "sig1 length out of DER P-256 range: {}",
-            sig1.len()
-        );
-        assert!(
-            (70..=72).contains(&sig2.len()),
-            "sig2 length out of DER P-256 range: {}",
-            sig2.len()
-        );
-        assert!(
-            sig1.len().abs_diff(sig2.len()) <= 2,
-            "signature length must be stable across calls (modulo DER high-bit jitter)",
-        );
+        for (label, sig) in [("sig1", &sig1), ("sig2", &sig2)] {
+            // Validate the DER structure exactly instead of pinning a magic
+            // lower bound (the source of the old flake): a P-256 ECDSA
+            // signature is a DER SEQUENCE whose content is always < 128
+            // bytes, so the short-form length byte equals the content length.
+            assert_eq!(
+                sig.first(),
+                Some(&0x30),
+                "{label} must be a DER SEQUENCE (tag 0x30), got {sig:02x?}",
+            );
+            assert_eq!(
+                sig.get(1).copied(),
+                Some((sig.len() - 2) as u8),
+                "{label} DER length byte must equal content length ({} bytes)",
+                sig.len() - 2,
+            );
+            // Hard upper bound for P-256: SEQUENCE(2) + two INTEGERs of at
+            // most 35 bytes (tag+len+33) each. Catches a state-leak regression
+            // that would grow the signature past this.
+            assert!(
+                sig.len() <= 72,
+                "{label} exceeds the 72-byte P-256 DER maximum: {} bytes",
+                sig.len(),
+            );
+        }
     }
 
     /// `der_bytes()` on the wrapper must return the raw public-key
