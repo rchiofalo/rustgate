@@ -689,6 +689,50 @@ fn main() -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(run(cli, audit_anchor_handle))
 }
 
+/// Build the canonical [`rustgate_core::entity::EntityCodecRegistry`] wired
+/// with every protocol codec the router can classify. Extracted from `run`
+/// so a unit test can pin the full set: a codec that exists but is never
+/// registered (as the Meshtastic codec was — F-186/#1530) silently loses
+/// `entity_kind` classification, by-kind metrics, and cross-protocol type
+/// info. Codec instances are zero-sized, so each `Arc::new(...)` is a
+/// zero-cost canonical handle.
+fn build_entity_codec_registry() -> rustgate_core::entity::EntityCodecRegistry {
+    let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
+    registry.register(
+        "cot",
+        std::sync::Arc::new(rustgate_cot::entity::CotEntityCodec),
+    );
+    registry.register(
+        rustgate_core::message::SOURCE_MAVLINK,
+        std::sync::Arc::new(rustgate_mavlink::entity::MavlinkEntityCodec),
+    );
+    registry.register(
+        "asterix",
+        std::sync::Arc::new(rustgate_asterix::entity::AsterixEntityCodec),
+    );
+    registry.register(
+        "stanag4586",
+        std::sync::Arc::new(rustgate_stanag4586::entity::Stanag4586EntityCodec),
+    );
+    registry.register("dis", std::sync::Arc::new(rustgate_dis::DisCodec));
+    registry.register("vmf", std::sync::Arc::new(rustgate_vmf::VmfCodec));
+    registry.register(
+        "sapient",
+        std::sync::Arc::new(rustgate_sapient::SapientCodec),
+    );
+    registry.register("link16", std::sync::Arc::new(rustgate_link16::Link16Codec));
+    registry.register("nffi", std::sync::Arc::new(rustgate_nffi::NffiCodec));
+    // F-186 (#1530): the Meshtastic codec already exists in
+    // `rustgate-meshtastic` but was never registered here, so Meshtastic
+    // traffic lost entity-kind classification. This is just the registry
+    // wiring of the existing codec — the LoRa *ingress* path is #1491.
+    registry.register(
+        "meshtastic",
+        std::sync::Arc::new(rustgate_meshtastic::MeshtasticCodec),
+    );
+    registry
+}
+
 async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow::Result<()> {
     // ── TLS setup ───────────────────────────────────────────────────
     let tls_build = setup::build_tls_config(&cli).await?;
@@ -995,34 +1039,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     // allocation churn. Codec instances are zero-sized — the
     // per-protocol `Arc::new(...)` here is the canonical zero-cost
     // handle.
-    let entity_codec_registry = {
-        let mut registry = rustgate_core::entity::EntityCodecRegistry::new();
-        registry.register(
-            "cot",
-            std::sync::Arc::new(rustgate_cot::entity::CotEntityCodec),
-        );
-        registry.register(
-            rustgate_core::message::SOURCE_MAVLINK,
-            std::sync::Arc::new(rustgate_mavlink::entity::MavlinkEntityCodec),
-        );
-        registry.register(
-            "asterix",
-            std::sync::Arc::new(rustgate_asterix::entity::AsterixEntityCodec),
-        );
-        registry.register(
-            "stanag4586",
-            std::sync::Arc::new(rustgate_stanag4586::entity::Stanag4586EntityCodec),
-        );
-        registry.register("dis", std::sync::Arc::new(rustgate_dis::DisCodec));
-        registry.register("vmf", std::sync::Arc::new(rustgate_vmf::VmfCodec));
-        registry.register(
-            "sapient",
-            std::sync::Arc::new(rustgate_sapient::SapientCodec),
-        );
-        registry.register("link16", std::sync::Arc::new(rustgate_link16::Link16Codec));
-        registry.register("nffi", std::sync::Arc::new(rustgate_nffi::NffiCodec));
-        Arc::new(registry)
-    };
+    let entity_codec_registry = Arc::new(build_entity_codec_registry());
 
     let router = Arc::new({
         let base = (match group_acl {
@@ -3384,6 +3401,34 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn entity_codec_registry_wires_every_protocol() {
+        // Pins the full registered set so a codec that exists but is left
+        // unregistered (F-186/#1530, Meshtastic) is caught here rather than
+        // silently dropping entity-kind classification in production.
+        let registry = build_entity_codec_registry();
+        for proto in [
+            "cot",
+            rustgate_core::message::SOURCE_MAVLINK,
+            "asterix",
+            "stanag4586",
+            "dis",
+            "vmf",
+            "sapient",
+            "link16",
+            "nffi",
+            "meshtastic",
+        ] {
+            assert!(
+                registry.get(proto).is_some(),
+                "entity codec registry is missing `{proto}`",
+            );
+        }
+        // Guard against an accidental extra/duplicate registration drifting
+        // from the asserted set above.
+        assert_eq!(registry.len(), 10, "unexpected registered codec count");
+    }
 
     #[tokio::test]
     async fn reload_all_configs_tolerates_all_none() {
