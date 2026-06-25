@@ -509,7 +509,15 @@ impl XmlStreamCodec {
         Self::default()
     }
 
-    fn find_element_end(&mut self, src: &[u8]) -> Option<usize> {
+    /// Scan for the end of the current top-level element.
+    ///
+    /// `Ok(Some(end))` — a complete element ends at `end` (depth returned to
+    /// 0). `Ok(None)` — the buffer holds a well-formed but *incomplete*
+    /// element; the caller should wait for more bytes. `Err(..)` — the stream
+    /// is malformed (a close tag with no matching open element); the framing
+    /// can no longer be trusted, so the caller must drop the connection rather
+    /// than buffer forever (#1507).
+    fn find_element_end(&mut self, src: &[u8]) -> Result<Option<usize>, io::Error> {
         let mut i = 0;
         while i < src.len() {
             if src[i] != b'<' {
@@ -518,35 +526,51 @@ impl XmlStreamCodec {
             }
 
             if i + 1 >= src.len() {
-                return None;
+                return Ok(None);
             }
 
             match src[i + 1] {
                 b'/' => {
-                    let close = self.find_tag_end(src, i)?;
+                    let Some(close) = self.find_tag_end(src, i) else {
+                        return Ok(None);
+                    };
                     if self.depth == 0 {
-                        return None;
+                        // A close tag at depth 0 has no matching open element.
+                        // Returning "need more bytes" here (the old behaviour)
+                        // wedged the connection forever — the stray tag is
+                        // never consumed and never errors. Treat it as a fatal
+                        // framing error so the listener drops + audits it.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "stray XML close tag with no matching open element",
+                        ));
                     }
                     self.depth -= 1;
                     if self.depth == 0 {
-                        return Some(close + 1);
+                        return Ok(Some(close + 1));
                     }
                     i = close + 1;
                 }
                 b'?' => {
-                    let close = self.find_pi_end(src, i)?;
+                    let Some(close) = self.find_pi_end(src, i) else {
+                        return Ok(None);
+                    };
                     i = close;
                 }
                 b'!' => {
-                    let close = self.find_markup_end(src, i)?;
+                    let Some(close) = self.find_markup_end(src, i) else {
+                        return Ok(None);
+                    };
                     i = close;
                 }
                 _ => {
-                    let close = self.find_tag_end(src, i)?;
+                    let Some(close) = self.find_tag_end(src, i) else {
+                        return Ok(None);
+                    };
                     let is_self_closing = close > 0 && src[close - 1] == b'/';
                     if is_self_closing {
                         if self.depth == 0 {
-                            return Some(close + 1);
+                            return Ok(Some(close + 1));
                         }
                     } else {
                         self.depth += 1;
@@ -555,7 +579,7 @@ impl XmlStreamCodec {
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     fn find_tag_end(&self, src: &[u8], start: usize) -> Option<usize> {
@@ -650,23 +674,26 @@ impl Decoder for XmlStreamCodec {
         }
 
         let initial_depth = self.depth;
-        if let Some(end) = self.find_element_end(src) {
-            // Explicitly reset depth after emitting a complete message.
-            // find_element_end returns Some only when depth reaches 0,
-            // but resetting defensively prevents any future parser change
-            // from leaking depth state into the next message.
-            self.depth = 0;
-            Ok(Some(src.split_to(end)))
-        } else {
-            // Reject streams with pathological nesting depth
-            if self.depth > MAX_XML_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "XML nesting depth limit exceeded",
-                ));
+        match self.find_element_end(src)? {
+            Some(end) => {
+                // Explicitly reset depth after emitting a complete message.
+                // find_element_end returns Some only when depth reaches 0,
+                // but resetting defensively prevents any future parser change
+                // from leaking depth state into the next message.
+                self.depth = 0;
+                Ok(Some(src.split_to(end)))
             }
-            self.depth = initial_depth;
-            Ok(None)
+            None => {
+                // Reject streams with pathological nesting depth
+                if self.depth > MAX_XML_DEPTH {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "XML nesting depth limit exceeded",
+                    ));
+                }
+                self.depth = initial_depth;
+                Ok(None)
+            }
         }
     }
 }
@@ -1046,6 +1073,41 @@ mod tests {
             err.to_string().contains("depth"),
             "error should mention depth: {err}"
         );
+    }
+
+    #[test]
+    fn xml_stray_close_tag_is_rejected() {
+        // A close tag with no matching open element used to make the framer
+        // return "need more bytes" forever, wedging the connection (#1507).
+        // It must now surface a fatal framing error so the listener drops it.
+        let mut codec = XmlStreamCodec::new();
+        let mut buf = BytesMut::from("</event>");
+        let err = codec
+            .decode(&mut buf)
+            .expect_err("a stray close tag must be a framing error, not a wedge");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("close tag"),
+            "error should mention the stray close tag: {err}"
+        );
+    }
+
+    #[test]
+    fn xml_stray_close_after_complete_element_is_rejected() {
+        // A valid element followed by a stray close tag: the first element
+        // decodes normally, and the trailing stray tag is rejected rather
+        // than silently wedging behind it.
+        let mut codec = XmlStreamCodec::new();
+        let mut buf = BytesMut::from("<event/></bogus>");
+        let first = codec
+            .decode(&mut buf)
+            .expect("decode ok")
+            .expect("first element");
+        assert_eq!(&first[..], b"<event/>");
+        let err = codec
+            .decode(&mut buf)
+            .expect_err("trailing stray close tag must error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
