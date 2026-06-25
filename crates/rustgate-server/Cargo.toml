@@ -119,6 +119,12 @@ marti-compat = [
     "rustgate-admin/marti-compat",
     "enrollment",
     "video",
+    # rustgate-admin's `marti-compat` enables admin's `missions` (and
+    # `video`); the metrics-server `serve()` call site in setup.rs gates the
+    # `missions_api` argument on rustgate-server's own `missions` feature, so
+    # that feature must be enabled here too or the call supplies one fewer
+    # argument than `serve()` declares (E0061) under `marti-compat`.
+    "missions",
 ]
 # Expanded management REST API (closes #875). Adds /api/config,
 # /api/config/reload, /api/clients, /api/clients/{cn}, /api/metrics/summary,
