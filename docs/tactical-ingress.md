@@ -160,10 +160,16 @@ rustgate-server --sapient-bind 0.0.0.0:8800 --sapient-allowed-cidrs 10.20.0.0/16
 | `--sapient-max-identities` | `RUSTGATE_SAPIENT_MAX_IDENTITIES` | `1024` | Synthetic-identity LRU bound |
 | `--sapient-max-connections` | `RUSTGATE_SAPIENT_MAX_CONNECTIONS` | `1024` | Max simultaneously-open connections |
 
-A slow client that opens a connection but never completes a frame is closed
-after the standard read timeout (slow-loris protection); a single malformed
-frame is dropped (and audited) without killing the connection, while a
-framing-level error (bad length prefix) closes it.
+A slow client that holds a connection without doing useful work is closed by
+one of two independent deadlines: the standard per-read timeout (slow-loris —
+no bytes arrive at all) and an **incomplete-frame cap** (slow-drip — bytes
+dribble in but a *partial* frame sits buffered longer than 60s without
+completing). The incomplete-frame cap only runs while a partial frame is
+pending, so a healthy low-rate sensor that completes a frame and then idles
+between reports is never disconnected (it is bounded only by the much longer
+per-read timeout). A single malformed frame is dropped (and audited) without
+killing the connection, while a framing-level error (bad length prefix)
+closes it.
 
 ## How a datagram flows
 
@@ -186,6 +192,10 @@ framing-level error (bad length prefix) closes it.
 - Drops are audited by class: `client.rejected` with reason
   `cidr_not_allowed` / `identity_cap_reached` / `datagram_too_large` /
   `malformed_datagram`, and `security.rate_limited` for rate-limit drops.
+  Stream (TCP) connections add `read_timeout` (no bytes within the per-read
+  deadline), `incomplete_frame_timeout` (slow-drip: a partial frame buffered
+  longer than the 60s dwell cap), and `malformed_frame` (unrecoverable framing
+  error).
 - Accepted datagrams appear in the access log and audit trail like any
   routed message (with their `source_protocol`), and the router's
   `EntityCodecRegistry` surfaces the canonical entity kind.

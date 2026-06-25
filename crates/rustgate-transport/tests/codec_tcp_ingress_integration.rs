@@ -23,7 +23,7 @@ use rustgate_core::message::MessageType;
 use rustgate_router::{RoutedMessage, Router, SessionHandle};
 use rustgate_transport::codec_tcp_ingress::{CodecTcpIngressConfig, CodecTcpInput, FramingFactory};
 use rustgate_transport::{FramedCodec, VarintDelimitedCodec};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
 
@@ -221,6 +221,97 @@ async fn malformed_frame_is_dropped_but_connection_survives() {
     assert!(
         recv_one(&mut prx, &mut nrx).await.is_none(),
         "the malformed frame must not produce a routed message"
+    );
+
+    shutdown.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+}
+
+// SEC-10 (#1553): a slow-drip peer that buffers an incomplete frame and never
+// completes it must be closed by the incomplete-frame cap. The per-read
+// READ_TIMEOUT resets on every byte, so without a separate dwell deadline this
+// peer would hold a connection — and a concurrency-cap slot — open forever.
+//
+// `start_paused` lets the mock clock auto-advance to the server's
+// `sleep_until(INCOMPLETE_FRAME_TIMEOUT)` deadline the moment both ends park,
+// so the 60s cap elapses in zero wall-clock time.
+#[tokio::test(start_paused = true)]
+async fn slow_drip_incomplete_frame_is_closed_by_dwell_cap() {
+    let (local, mut prx, mut nrx, shutdown, task) = spawn_listener().await;
+
+    let mut client = TcpStream::connect(local).await.expect("connect");
+    // A varint length prefix promising a 50-byte body, but only 3 body bytes
+    // are ever delivered. The codec reads the prefix, buffers the 3 bytes,
+    // and waits forever for the remaining 47 — the partial frame never
+    // completes, yet bytes *were* read, so READ_TIMEOUT never fires.
+    client
+        .write_all(&[50u8, b'G', b'O', b'O'])
+        .await
+        .expect("write partial frame");
+    client.flush().await.expect("flush");
+
+    // No frame should route (the body never arrives).
+    assert!(
+        recv_one(&mut prx, &mut nrx).await.is_none(),
+        "an incomplete frame must not route"
+    );
+
+    // The server must close the connection once INCOMPLETE_FRAME_TIMEOUT
+    // elapses. The 120s virtual bound only trips (failing the test) if the
+    // close never happens — i.e. if the dwell cap regressed.
+    let mut sink = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(120), client.read(&mut sink))
+        .await
+        .expect("connection must be closed by the dwell cap, not hang")
+        .expect("read after server-side close");
+    assert_eq!(
+        n, 0,
+        "server must close the slow-drip connection (observed as EOF)"
+    );
+
+    shutdown.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+}
+
+// SEC-10 regression guard: a healthy low-rate sensor — one that completes a
+// frame, then idles well past INCOMPLETE_FRAME_TIMEOUT on a clean frame
+// boundary, then sends another frame — must NOT be disconnected by the cap.
+// (A naive "time since last completed frame" cap would wrongly kill it.) The
+// dwell cap only runs while a *partial* frame is pending, so an empty buffer
+// between frames is fine up to the much longer READ_TIMEOUT.
+#[tokio::test(start_paused = true)]
+async fn idle_between_complete_frames_is_not_closed_by_dwell_cap() {
+    let (local, mut prx, mut nrx, shutdown, task) = spawn_listener().await;
+
+    let mut client = TcpStream::connect(local).await.expect("connect");
+    // First complete frame → buffer drains to a clean boundary.
+    client
+        .write_all(&frame(b"GOODfirst"))
+        .await
+        .expect("write 1");
+    assert_eq!(
+        recv_one(&mut prx, &mut nrx)
+            .await
+            .expect("first frame routes")
+            .metadata
+            .source_protocol,
+        "test-stream",
+    );
+
+    // With nothing buffered (a clean frame boundary), the connection must NOT
+    // be closed by the incomplete-frame cap no matter how long it idles, short
+    // of the 5-min READ_TIMEOUT. Assert the server emits no EOF within a window
+    // well past the 60s cap: a client read must still be *pending* at 180s, not
+    // observe EOF. The mock clock auto-advances to the 180s deadline while both
+    // ends park (this asserts a timeout, which paused time handles exactly — no
+    // reliance on real-I/O delivery). A regressed time-since-frame cap would
+    // close the connection at 60s and the read would return Ok(0) instead.
+    let mut sink = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(180), client.read(&mut sink)).await;
+    assert!(
+        read.is_err(),
+        "connection must stay open while idle past the 60s cap, but the client \
+         read returned {read:?} (Ok(0) would mean the server wrongly closed it)",
     );
 
     shutdown.notify_one();

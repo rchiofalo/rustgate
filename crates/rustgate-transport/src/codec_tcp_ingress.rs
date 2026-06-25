@@ -13,9 +13,14 @@
 //!    accept time** (decision D3 of the stream-ingress design note, #1473).
 //! 2. **Concurrent-connection cap** — a semaphore bounds how many
 //!    connections may be open at once; over-cap accepts are dropped + audited.
-//! 3. **Framed read loop** — a `FramedCodec` finds frame boundaries; a
-//!    read timeout ([`READ_TIMEOUT`]) closes a slow-loris peer that holds a
-//!    connection open without completing a frame.
+//! 3. **Framed read loop** — a `FramedCodec` finds frame boundaries. Two
+//!    independent deadlines close a stalled peer: the per-read
+//!    [`READ_TIMEOUT`] (no bytes arrive at all) and an
+//!    `INCOMPLETE_FRAME_TIMEOUT` (a *partial* frame sits buffered too long
+//!    without completing). Together they stop both a slow-loris and a
+//!    slow-drip peer from squatting a concurrency-cap slot, while a healthy
+//!    connection — including a low-rate sensor idling between complete
+//!    frames — is never penalised.
 //! 4. **Per-frame validate-and-drop** — each delimited frame is decoded with
 //!    the *same* `DynEntityCodec` the router holds for `source_protocol`; a
 //!    frame that does not decode is dropped + audited and the connection
@@ -30,6 +35,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustgate_core::audit;
 use rustgate_core::constants::READ_TIMEOUT;
@@ -43,7 +49,7 @@ use rustgate_router::Router;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::bytes::{Bytes, BytesMut};
 use tokio_util::codec::Decoder;
 use tracing::warn;
@@ -58,6 +64,19 @@ pub const DEFAULT_INGRESS_MAX_CONNECTIONS: usize = 1024;
 
 /// Initial per-connection read buffer (grows as needed up to the frame cap).
 const READ_BUFFER_INIT: usize = 4096;
+
+/// Maximum wall-clock time an **incomplete** frame may sit buffered before the
+/// connection is closed. This bounds the slow-drip / slow-loris signature — a
+/// peer that holds bytes which never complete a frame, squatting a
+/// concurrency-cap slot — without penalising a healthy connection: the clock
+/// only runs while a *partial* frame is pending. A connection sitting on a
+/// clean frame boundary (empty buffer) is not subject to it and may idle up to
+/// the per-read [`READ_TIMEOUT`] between frames, so a legitimate low-rate
+/// sensor (one report every few minutes) is never disconnected. Dribbling more
+/// bytes does not reset it (the anchor is the partial frame's start, not the
+/// last byte), so a byte-at-a-time attacker cannot defeat it; only *completing*
+/// a frame — real progress — clears it.
+const INCOMPLETE_FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Factory that produces a fresh, per-connection [`FramedCodec`].
 ///
@@ -257,9 +276,16 @@ async fn handle_connection(
 ) {
     let masked = mask_ip(&peer.to_string());
     let mut buf = BytesMut::with_capacity(READ_BUFFER_INIT);
+    // Anchor for the incomplete-frame cap: when the current *partial* frame
+    // first began buffering, or `None` while the buffer sits on a clean frame
+    // boundary. See [`INCOMPLETE_FRAME_TIMEOUT`] for why this (not
+    // time-since-last-frame, which would close idle low-rate sensors, nor
+    // time-since-last-byte, which a dribble would defeat) is the right anchor.
+    let mut partial_since: Option<Instant> = None;
 
     loop {
         // Drain every complete frame currently in the buffer.
+        let mut completed_frame = false;
         loop {
             match framed.decode(&mut buf) {
                 Ok(Some(frame)) => {
@@ -275,6 +301,7 @@ async fn handle_connection(
                         &masked,
                     )
                     .await;
+                    completed_frame = true;
                 }
                 Ok(None) => break, // need more bytes
                 Err(e) => {
@@ -291,6 +318,20 @@ async fn handle_connection(
             }
         }
 
+        // Maintain the incomplete-frame dwell anchor:
+        //  - empty buffer  -> clean boundary; clear the cap (idle is fine, up
+        //    to READ_TIMEOUT — a low-rate sensor between reports is healthy).
+        //  - bytes remain  -> a partial frame is pending. Start its clock when
+        //    it is fresh (a frame just completed, or none was tracked); an
+        //    already-tracked, still-growing partial keeps its ORIGINAL start
+        //    so dribbling more bytes cannot push the deadline out.
+        if buf.is_empty() {
+            partial_since = None;
+        } else if completed_frame || partial_since.is_none() {
+            partial_since = Some(Instant::now());
+        }
+        let dwell_deadline = partial_since.map(|since| since + INCOMPLETE_FRAME_TIMEOUT);
+
         tokio::select! {
             read = timeout(READ_TIMEOUT, stream.read_buf(&mut buf)) => {
                 match read {
@@ -301,12 +342,27 @@ async fn handle_connection(
                         return;
                     }
                     Err(_) => {
-                        // Slow-loris: no progress within READ_TIMEOUT.
+                        // No bytes at all within READ_TIMEOUT (slow-loris).
                         audit::connection_rejected(peer, "read_timeout");
                         tracing::debug!(protocol = %source_protocol, peer = %masked, "stream ingress connection closed: read timeout");
                         return;
                     }
                 }
+            }
+            // Armed only while a partial frame is pending (otherwise this
+            // branch parks forever via `pending()`). Fires when an incomplete
+            // frame has dwelled past the cap: bytes may keep arriving so
+            // READ_TIMEOUT never trips, yet the frame never completes —
+            // slow-drip squatting a concurrency slot.
+            () = async {
+                match dwell_deadline {
+                    Some(deadline) => sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                audit::connection_rejected(peer, "incomplete_frame_timeout");
+                tracing::debug!(protocol = %source_protocol, peer = %masked, "stream ingress connection closed: incomplete frame exceeded dwell cap");
+                return;
             }
             _ = shutdown.notified() => return,
         }
