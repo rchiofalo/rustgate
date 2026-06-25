@@ -360,9 +360,15 @@ impl CorrelationEngine {
     }
 
     fn find_same_source(&self, entity: &Entity) -> Option<FusedEntityId> {
+        // A source is identified by the tuple (source_id, source_protocol):
+        // the same wire UID arriving over two different protocols is two
+        // distinct sensors, not one. Matching on source_id alone (#1501) would
+        // wrongly treat a DIS entity 1234 and a VMF entity 1234 as updates of
+        // each other instead of independent tracks to correlate/fuse.
+        let proto = source_protocol_attr(entity).unwrap_or_else(|| "unknown".to_string());
         for cand in self.entities.iter() {
             for src in &cand.value().sources {
-                if src.source_id == entity.uid {
+                if src.source_id == entity.uid && src.source_protocol == proto {
                     return Some(*cand.key());
                 }
             }
@@ -372,10 +378,13 @@ impl CorrelationEngine {
 
     fn update_source(&self, id: FusedEntityId, entity: Entity, now: SystemTime) {
         if let Some(mut fused) = self.entities.get_mut(&id) {
+            let proto = source_protocol_attr(&entity).unwrap_or_else(|| "unknown".to_string());
             let weight = position_weight(&entity);
             let mut replaced = false;
             for src in fused.sources.iter_mut() {
-                if src.source_id == entity.uid {
+                // Same (source_id, source_protocol) — replace this source's
+                // track in place (see `find_same_source`).
+                if src.source_id == entity.uid && src.source_protocol == proto {
                     src.original_entity = entity.clone();
                     src.weight = weight;
                     src.last_seen = now;
@@ -385,10 +394,11 @@ impl CorrelationEngine {
             }
             if !replaced {
                 // Defensive: if the source vanished between
-                // find_same_source and the write, append it.
+                // find_same_source and the write, append it (with its real
+                // protocol so a later update matches it correctly).
                 fused.sources.push(SourceTrack {
                     source_id: entity.uid.clone(),
-                    source_protocol: "unknown".into(),
+                    source_protocol: proto,
                     original_entity: entity.clone(),
                     weight,
                     last_seen: now,
@@ -695,6 +705,53 @@ mod tests {
         );
         assert_eq!(outcome2, CorrelationOutcome::Updated(id_created));
         assert_eq!(engine.len(), 1);
+    }
+
+    #[test]
+    fn submit_same_uid_different_protocol_is_a_distinct_source_not_an_update() {
+        use rustgate_core::entity::AttributeValue;
+        let engine = CorrelationEngine::new();
+        let now = SystemTime::UNIX_EPOCH;
+
+        let mut dis = entity("a", EntityKind::Ground, 38.0, -77.0);
+        let _ = dis.attributes.insert(
+            "correlation.source_protocol".to_string(),
+            AttributeValue::Str("dis".into()),
+        );
+        let id = match engine.submit_at(dis, now) {
+            CorrelationOutcome::Created(id) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        // Same wire UID "a" but a DIFFERENT protocol (vmf) at the same spot is
+        // a SEPARATE sensor: it must fuse as a distinct source, not silently
+        // update the dis track in place as if it were the same source (#1501).
+        let mut vmf = entity("a", EntityKind::Ground, 38.000010, -77.000010);
+        let _ = vmf.attributes.insert(
+            "correlation.source_protocol".to_string(),
+            AttributeValue::Str("vmf".into()),
+        );
+        let outcome = engine.submit_at(vmf, now + Duration::from_secs(1));
+        assert!(
+            !matches!(outcome, CorrelationOutcome::Updated(_)),
+            "same uid + different protocol must not be an in-place update, got {outcome:?}",
+        );
+        assert_eq!(outcome, CorrelationOutcome::Merged(id));
+
+        // One fused entity carrying TWO distinct sources (dis + vmf).
+        let snap = engine.snapshot();
+        assert_eq!(snap.len(), 1);
+        let protos: std::collections::BTreeSet<&str> = snap[0]
+            .sources
+            .iter()
+            .map(|s| s.source_protocol.as_str())
+            .collect();
+        assert_eq!(
+            protos,
+            ["dis", "vmf"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
     }
 
     #[test]
