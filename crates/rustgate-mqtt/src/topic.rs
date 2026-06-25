@@ -121,10 +121,24 @@ pub fn topic_to_group<'a>(topic: &'a str, prefix: Option<&str>) -> Result<Cow<'a
 
 /// Validate that a topic prefix is well-formed.
 ///
-/// MQTT topic prefixes must end with `/` to ensure clean level-boundary
-/// stripping. An empty prefix is treated as no prefix.
+/// Rules:
+/// - An **empty** prefix is treated as "no prefix" (the documented default).
+/// - A non-empty prefix must **end with `/`** for clean level-boundary
+///   stripping.
+/// - A non-empty prefix must **not begin with `$`**. MQTT reserves topics
+///   whose first level starts with `$` (`$SYS/…`, `$share/…`) for the broker;
+///   a prefix in that space would put every routed topic into broker-reserved
+///   names and collide with (or be silently dropped by) the broker.
 pub fn validate_topic_prefix(prefix: &str) -> Result<(), MqttError> {
-    if !prefix.is_empty() && !prefix.ends_with('/') {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    if prefix.starts_with('$') {
+        return Err(MqttError::InvalidTopic(format!(
+            "topic prefix must not start with the MQTT-reserved '$': got '{prefix}'"
+        )));
+    }
+    if !prefix.ends_with('/') {
         return Err(MqttError::InvalidTopic(format!(
             "topic prefix must end with '/': got '{prefix}'"
         )));
@@ -493,6 +507,18 @@ mod tests {
         assert!(validate_topic_prefix("").is_ok());
         assert!(validate_topic_prefix("rustgate").is_err());
         assert!(validate_topic_prefix("r").is_err());
+    }
+
+    #[test]
+    fn prefix_rejects_mqtt_reserved_dollar() {
+        // MQTT reserves topics whose first level starts with `$` for the
+        // broker (`$SYS/`, `$share/`) — a prefix there collides with reserved
+        // names. F-192 (#1532).
+        assert!(validate_topic_prefix("$SYS/").is_err());
+        assert!(validate_topic_prefix("$share/group/").is_err());
+        assert!(validate_topic_prefix("$/").is_err());
+        // A `$` that is not the first character is fine (not topic-level 0).
+        assert!(validate_topic_prefix("rustgate/$x/").is_ok());
     }
 
     #[test]
