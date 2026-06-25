@@ -260,6 +260,12 @@ fn run_controller(args: RunArgs) -> ExitCode {
         // SIGINT.
         let signal_task = {
             let shutdown_tx = shutdown_tx.clone();
+            // Also watch the shutdown flag itself: if the controller returns
+            // for a non-signal reason (error / natural completion) and flips
+            // the watch, this task must stop waiting for a signal that may
+            // never arrive — otherwise the `signal_task.await` below hangs the
+            // process forever (#1505).
+            let mut shutdown_rx = shutdown_tx.subscribe();
             tokio::spawn(async move {
                 use tokio::signal::unix::{SignalKind, signal};
                 let mut term = match signal(SignalKind::terminate()) {
@@ -277,10 +283,18 @@ fn run_controller(args: RunArgs) -> ExitCode {
                     }
                 };
                 tokio::select! {
-                    _ = term.recv() => tracing::info!(target: "operator", "SIGTERM received; draining"),
-                    _ = intr.recv() => tracing::info!(target: "operator", "SIGINT received; draining"),
+                    _ = term.recv() => {
+                        tracing::info!(target: "operator", "SIGTERM received; draining");
+                        let _ = shutdown_tx.send(true);
+                    }
+                    _ = intr.recv() => {
+                        tracing::info!(target: "operator", "SIGINT received; draining");
+                        let _ = shutdown_tx.send(true);
+                    }
+                    // Shutdown already triggered elsewhere — exit so the outer
+                    // `signal_task.await` can complete.
+                    _ = shutdown_rx.changed() => {}
                 }
-                let _ = shutdown_tx.send(true);
             })
         };
 
