@@ -150,6 +150,17 @@ pub const TENANT_OVERFLOW_LABEL: &str = "_overflow";
 /// is at most ~1500 child metrics.
 pub const MAX_TENANT_LABELS: usize = 256;
 
+/// Cap on the number of entries in an inference pipeline config.
+///
+/// The inference pipeline spawns one async task per model per entity,
+/// and the wiring spawns one background task per routed message — so an
+/// unbounded pipeline lets a single hostile (or fat-fingered) config
+/// turn every message into an arbitrary fan-out of tasks and model
+/// allocations (task / memory DoS). 256 is far above any real pipeline
+/// (operational pipelines run 1–10 models) while keeping the per-message
+/// fan-out bounded. Mirrors [`MAX_TENANT_LABELS`].
+pub const MAX_PIPELINE_ENTRIES: usize = 256;
+
 #[cfg(test)]
 mod tests {
     use super::*;
