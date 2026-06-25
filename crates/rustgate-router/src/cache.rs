@@ -61,6 +61,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -86,12 +87,25 @@ rustgate_core::on_callback!(
     usize
 );
 
+/// A cached position plus the monotonic sequence number assigned when it was
+/// (last) stored. Capacity eviction ranks by `seq`, not the message's
+/// wall-clock `received_at`, so an NTP step-back cannot make a freshly-stored
+/// entry look "oldest" and get it evicted on arrival (#1542).
+struct PositionEntry {
+    msg: RoutableMessage,
+    seq: u64,
+}
+
 /// Stores the most recent position report per client CN.
 pub struct PositionCache {
     /// Keyed by `Arc<str>` so insert/remove on the SA-replay hot path
     /// reuse the sender's existing CN allocation (refcount bump) rather
     /// than copying the bytes into a fresh `String`. Closes #784.
-    entries: RwLock<HashMap<Arc<str>, RoutableMessage>>,
+    entries: RwLock<HashMap<Arc<str>, PositionEntry>>,
+    /// Monotonic counter handed out on every `store`. Strictly increasing and
+    /// independent of the wall clock, so it gives a stable least-recently-
+    /// stored ordering for capacity eviction.
+    next_seq: AtomicU64,
     /// Maximum number of entries before oldest-entry eviction kicks in.
     max_entries: usize,
     /// Lock-free hot-swappable size-change observer. `None` when unset;
@@ -135,6 +149,7 @@ impl Default for PositionCache {
     fn default() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            next_seq: AtomicU64::new(0),
             max_entries: DEFAULT_MAX_ENTRIES,
             on_size: ArcSwap::new(Arc::new(None)),
         }
@@ -150,6 +165,7 @@ impl PositionCache {
     pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            next_seq: AtomicU64::new(0),
             max_entries,
             on_size: ArcSwap::new(Arc::new(None)),
         }
@@ -172,8 +188,9 @@ impl PositionCache {
 
     /// Store a position report, replacing any previous entry for this CN.
     ///
-    /// If the cache is at capacity and this is a new CN, the oldest entry
-    /// (by `received_at` time) is evicted first.
+    /// If the cache is at capacity and this is a new CN, the
+    /// least-recently-stored entry is evicted first (ranked by a monotonic
+    /// sequence number, not the wall clock).
     pub async fn store(&self, msg: RoutableMessage) {
         let cn = msg.source.cn.clone();
         let size = {
@@ -181,22 +198,27 @@ impl PositionCache {
 
             // If this CN already exists, replacing it won't grow the cache.
             if !entries.contains_key(&cn) && entries.len() >= self.max_entries {
-                // Evict the oldest entry by received_at time.
+                // Evict the least-recently-stored entry by monotonic seq —
+                // NOT the wall-clock received_at. An NTP step-back can give a
+                // freshly-stored entry an earlier received_at than entries
+                // already cached; ranking by received_at would then evict the
+                // brand-new entry on arrival (#1542).
                 if let Some(oldest_cn) = entries
                     .iter()
-                    .min_by_key(|(_, m)| m.metadata.received_at)
+                    .min_by_key(|(_, e)| e.seq)
                     .map(|(cn, _)| cn.clone())
                 {
                     tracing::warn!(
                         evicted_cn = %hash_cn(&oldest_cn),
                         size = entries.len(),
                         max = self.max_entries,
-                        "position cache at capacity, evicting oldest entry",
+                        "position cache at capacity, evicting least-recently-stored entry",
                     );
                     let _ = entries.remove(&oldest_cn);
                 }
             }
-            let _ = entries.insert(cn, msg);
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let _ = entries.insert(cn, PositionEntry { msg, seq });
             entries.len()
         };
         self.notify_size(size);
@@ -210,8 +232,8 @@ impl PositionCache {
         let entries = self.entries.read().await;
         entries
             .values()
-            .filter(|msg| !is_expired(msg))
-            .cloned()
+            .filter(|e| !is_expired(&e.msg))
+            .map(|e| e.msg.clone())
             .collect()
     }
 
@@ -232,7 +254,7 @@ impl PositionCache {
         let (removed, size) = {
             let mut entries = self.entries.write().await;
             let before = entries.len();
-            entries.retain(|_, msg| !is_expired(msg));
+            entries.retain(|_, e| !is_expired(&e.msg));
             let after = entries.len();
             (before - after, after)
         };
@@ -320,6 +342,15 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event/>"),
             metadata,
+        }
+    }
+
+    fn make_position_at(cn: &str, received_at: SystemTime) -> RoutableMessage {
+        RoutableMessage {
+            source: make_identity(cn),
+            destination: Destination::Broadcast,
+            payload: Bytes::from_static(b"<event/>"),
+            metadata: Metadata::new(received_at, "cot".to_string(), MessageType::Position),
         }
     }
 
@@ -494,6 +525,43 @@ mod tests {
         assert!(!cns.contains(&"alice"), "alice should have been evicted");
         assert!(cns.contains(&"bob"));
         assert!(cns.contains(&"charlie"));
+    }
+
+    #[tokio::test]
+    async fn capacity_eviction_uses_insertion_order_not_wall_clock() {
+        // NTP step-back: a freshly-stored entry can carry an EARLIER
+        // received_at than entries already cached. Eviction must rank by the
+        // monotonic store sequence, so the genuinely-oldest entry is evicted
+        // and the fresh insert survives — not the reverse (#1542).
+        let cache = PositionCache::with_max_entries(2);
+        let base = SystemTime::now();
+        cache.store(make_position_at("alice", base)).await;
+        cache
+            .store(make_position_at("bob", base + Duration::from_secs(1)))
+            .await;
+        // carol is stored LAST (newest), but the clock stepped back so her
+        // received_at is the EARLIEST of the three — pre-fix she'd be evicted
+        // on arrival.
+        cache
+            .store(make_position_at("carol", base - Duration::from_secs(60)))
+            .await;
+        assert_eq!(cache.len().await, 2, "should not exceed capacity");
+
+        let cns: BTreeSet<String> = cache
+            .get_all()
+            .await
+            .into_iter()
+            .map(|m| m.source.cn.to_string())
+            .collect();
+        assert!(
+            cns.contains("carol"),
+            "the freshly-stored entry must NOT be evicted despite an older wall-clock timestamp",
+        );
+        assert!(cns.contains("bob"));
+        assert!(
+            !cns.contains("alice"),
+            "the first-stored entry (lowest seq) should be the eviction victim",
+        );
     }
 
     #[tokio::test]
