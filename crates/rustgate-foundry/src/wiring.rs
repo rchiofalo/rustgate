@@ -61,7 +61,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
-use crate::bridge::{FoundryBridge, ObjectChange};
+use crate::bridge::{ChangeType, FoundryBridge, ObjectChange};
 use crate::config::{FoundryConfig, ObjectTypeMapping};
 use crate::error::FoundryError;
 use crate::mapper::{EntityOverlay, PropertyMapper};
@@ -438,6 +438,21 @@ fn change_to_message(
     entity_type: &str,
     mapper: &PropertyMapper,
 ) -> Option<RoutableMessage> {
+    // A `Deleted` ontology change must NOT be re-projected as a live
+    // Broadcast entity — re-injecting the last-seen property bag
+    // resurrects the object downstream (#1499). rustgate has no
+    // cross-protocol delete/tombstone convention yet (the `Entity`
+    // shape carries no deleted marker), so the conservative fix is to
+    // drop the change here; downstream consumers age the entity out via
+    // its own stale-time. Emitting a typed delete is a follow-up that
+    // needs a delete-message design across the codec layer.
+    if change.change_type == ChangeType::Deleted {
+        debug!(
+            entity_type,
+            "foundry inbound: dropping Deleted change (not re-injected as a live entity)"
+        );
+        return None;
+    }
     let overlay = mapper.foundry_to_entity_overlay(&change.properties);
     let entity = build_entity_from_overlay(entity_type, change, overlay);
     let payload = serde_json::to_vec(&entity).unwrap_or_default();
@@ -625,5 +640,37 @@ mod tests {
         assert_eq!(q.len(), OFFLINE_QUEUE_CAPACITY);
         assert_eq!(q.front().unwrap().uid, "1"); // "0" was evicted
         assert_eq!(q.back().unwrap().uid, "overflow");
+    }
+
+    fn change_with_type(change_type: ChangeType) -> ObjectChange {
+        ObjectChange {
+            type_id: "mil-track".into(),
+            object_id: crate::bridge::ObjectId("obj-1".into()),
+            change_type,
+            properties: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn deleted_change_is_not_reinjected_as_live_entity() {
+        // #1499: a Foundry `Deleted` change must not resurrect the object as a
+        // live Broadcast entity. The inbound projection drops it.
+        let mapper = PropertyMapper::new(vec![]);
+        assert!(
+            change_to_message(&change_with_type(ChangeType::Deleted), "track", &mapper).is_none(),
+            "a Deleted change must not produce a live-entity RoutableMessage",
+        );
+    }
+
+    #[test]
+    fn created_and_updated_changes_still_project_to_broadcast() {
+        // Control: non-Deleted changes still project to a Broadcast live
+        // entity, so the Deleted guard does not over-reach.
+        let mapper = PropertyMapper::new(vec![]);
+        for ct in [ChangeType::Created, ChangeType::Updated] {
+            let msg = change_to_message(&change_with_type(ct), "track", &mapper)
+                .expect("Created/Updated must still project to a message");
+            assert!(matches!(msg.destination, Destination::Broadcast));
+        }
     }
 }
