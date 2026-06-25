@@ -227,34 +227,51 @@ async fn route(
         | (&Method::POST, "/Marti/api/tls/signClient/") => {
             handle_sign_client(authorization, body, state)
         }
-        (&Method::GET, "/Marti/api/missions") => {
-            require_bearer(authorization, state, handle_missions(state).await)
-        }
+        // Auth is checked BEFORE the handler runs. The previous form
+        // `require_bearer(auth, state, handle(state).await)` evaluated the
+        // handler argument first (Rust evaluates call arguments eagerly), so
+        // the handler's side effects — DB queries, the contacts provider
+        // callback, the video catalog snapshot — executed for unauthenticated
+        // requests even though the response was later replaced with 401
+        // (#1504). `deny_unless_authorized` short-circuits to 401 without
+        // touching the handler.
+        (&Method::GET, "/Marti/api/missions") => match deny_unless_authorized(authorization, state)
+        {
+            Some(deny) => deny,
+            None => handle_missions(state).await,
+        },
         (&Method::GET, "/Marti/api/contacts/all") => {
-            require_bearer(authorization, state, handle_contacts(state).await)
+            match deny_unless_authorized(authorization, state) {
+                Some(deny) => deny,
+                None => handle_contacts(state).await,
+            }
         }
-        (&Method::GET, "/Marti/api/video") => {
-            require_bearer(authorization, state, handle_video(state))
-        }
+        (&Method::GET, "/Marti/api/video") => match deny_unless_authorized(authorization, state) {
+            Some(deny) => deny,
+            None => handle_video(state),
+        },
         _ => json_error(StatusCode::NOT_FOUND, "not found"),
     }
 }
 
-/// Helper that gates a pre-built response on the bearer-token check.
-/// Keeps each per-route handler free of auth boilerplate while still
-/// flowing the response back through one common codepath.
-fn require_bearer(
+/// Authorization gate for the bearer-token-protected Marti routes.
+///
+/// Returns `None` when the request may proceed — either no token is
+/// configured (open mode) or the bearer token matched — and `Some(401)`
+/// when it must be rejected. Callers MUST short-circuit on `Some` before
+/// invoking the route handler, so handler side effects never run for an
+/// unauthenticated request (#1504).
+fn deny_unless_authorized(
     authorization: Option<&str>,
     state: &MartiCompatState,
-    response: Response<Full<Bytes>>,
-) -> Response<Full<Bytes>> {
+) -> Option<Response<Full<Bytes>>> {
     let Some(ref expected) = state.auth_token else {
-        return response;
+        return None;
     };
     if bearer_ok(authorization, expected) {
-        response
+        None
     } else {
-        json_error(StatusCode::UNAUTHORIZED, "unauthorized")
+        Some(json_error(StatusCode::UNAUTHORIZED, "unauthorized"))
     }
 }
 
@@ -621,6 +638,77 @@ mod tests {
         assert_eq!(arr[0]["lastStatus"], "Connected");
         assert!(arr[0]["takv"].is_string());
         assert!(arr[0]["endpoint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_request_does_not_execute_handler() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // #1504: the bearer check must gate handler EXECUTION, not just swap
+        // the response. A provider that records its invocation proves the
+        // handler body never runs for an unauthenticated request. A "401-only"
+        // assertion would pass even pre-fix, because the old code ran the
+        // handler and merely discarded its result.
+        let ran = Arc::new(AtomicBool::new(false));
+        let probe = ran.clone();
+        let provider: ContactsProvider = Arc::new(move || {
+            probe.store(true, Ordering::SeqCst);
+            Box::pin(async move { Vec::<ContactInfo>::new() })
+        });
+        let mut state = MartiCompatState::empty();
+        state.contacts = Some(provider);
+        state.auth_token = Some(Zeroizing::new(b"s3cr3t".to_vec()));
+
+        // No Authorization header → 401, and the provider must NOT run.
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/contacts/all",
+            None,
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "contacts provider must not execute without a valid bearer token",
+        );
+
+        // Wrong token → 401, still no execution.
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/contacts/all",
+            Some("Bearer wrong"),
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "contacts provider must not execute with a wrong bearer token",
+        );
+
+        // Correct token → handler runs, 200.
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/contacts/all",
+            Some("Bearer s3cr3t"),
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "contacts provider must execute with a valid bearer token",
+        );
     }
 
     #[tokio::test]
