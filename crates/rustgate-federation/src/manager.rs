@@ -9,6 +9,11 @@
 //! (e.g., in `rustgate-server`).
 
 use std::collections::HashMap;
+// `HashSet` is only used by the v2-gated inbound group-allowlist projection
+// (`allowed_peer_groups_from_peers`), so gating its import keeps non-v2 builds
+// free of an unused-import warning (-Dwarnings) (#1508).
+#[cfg(feature = "v2")]
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -217,6 +222,28 @@ fn sort_peers_by_preference(
     local_region: Option<&str>,
 ) {
     peers.sort_by(|a, b| crate::peer::compare_routing_preference(&a.2, &b.2, local_region));
+}
+
+/// Build the per-peer inbound group allowlist the V2 service enforces.
+///
+/// Maps each configured peer's id to the set of groups it is authorized to
+/// claim on inbound events — its `inbound_groups` when set, otherwise its
+/// `groups` (via [`crate::config::PeerConfig::effective_inbound_groups`]).
+/// Wiring this into the service activates the inbound enforcement that ships
+/// in the RPC paths but was previously never populated in production (#1508).
+#[cfg(feature = "v2")]
+fn allowed_peer_groups_from_peers(
+    peers: &[crate::config::PeerConfig],
+) -> HashMap<String, HashSet<String>> {
+    peers
+        .iter()
+        .map(|p| {
+            (
+                p.id.to_string(),
+                p.effective_inbound_groups().iter().cloned().collect(),
+            )
+        })
+        .collect()
 }
 
 /// Structural equality of two peer configurations for hot-reload diffing.
@@ -650,7 +677,12 @@ impl FederationManager {
                 self.config.max_groups_per_peer,
                 self.config.max_group_name_length,
             )
-            .with_max_hops(inbound_max_hops);
+            .with_max_hops(inbound_max_hops)
+            // Wire the per-peer inbound group allowlist from config. Without
+            // this the V2 service's `allowed_peer_groups` stayed `None`, so the
+            // inbound enforcement gates ran in open mode and any
+            // mTLS-authenticated peer could claim arbitrary groups (#1508).
+            .with_allowed_peer_groups(allowed_peer_groups_from_peers(&self.config.peers));
 
             let handle = crate::v2::server::FederationService::start(
                 self.config.v2_listen_addr,
@@ -2223,6 +2255,35 @@ mod tests {
             tenants: Default::default(),
             topology_role: Default::default(),
         }
+    }
+
+    #[cfg(feature = "v2")]
+    #[test]
+    fn allowed_peer_groups_built_from_per_peer_inbound_groups() {
+        // #1508: the manager must populate the V2 service's inbound allowlist
+        // from config — explicit `inbound_groups` when set, otherwise falling
+        // back to the peer's `groups`. Pre-fix this map was never built, so the
+        // service ran in open mode (any peer could claim any group).
+        let peer_a = PeerConfig {
+            inbound_groups: Some(vec!["Alpha".into()]),
+            ..test_peer_config("peer-a", vec!["Gamma".into()])
+        };
+        // peer-b has no explicit inbound_groups → falls back to `groups`.
+        let peer_b = test_peer_config("peer-b", vec!["Beta".into()]);
+        let map = allowed_peer_groups_from_peers(&[peer_a, peer_b]);
+
+        assert_eq!(
+            map.get("peer-a"),
+            Some(&HashSet::from(["Alpha".to_string()])),
+            "explicit inbound_groups must be used as the allowlist",
+        );
+        assert_eq!(
+            map.get("peer-b"),
+            Some(&HashSet::from(["Beta".to_string()])),
+            "missing inbound_groups must fall back to the peer's groups",
+        );
+        // The whole point: peer-b is NOT authorized for peer-a's group.
+        assert!(!map.get("peer-b").unwrap().contains("Alpha"));
     }
 
     // ── SEC-1: pinned-CN resolution table ───────────────────────────
