@@ -4639,7 +4639,6 @@ name = "rustgate-http"
 version = "0.9.0"
 dependencies = [
  "bytes",
- "fastrand",
  "futures",
  "hex",
  "hmac",
@@ -4648,6 +4647,7 @@ dependencies = [
  "prometheus",
  "proptest",
  "prost",
+ "rand 0.8.6",
  "reqwest",
  "rustgate-archive",
  "rustgate-core",
