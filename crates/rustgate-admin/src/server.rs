@@ -841,10 +841,25 @@ pub async fn serve(
     tracing::info!(addr = %bind, "metrics server started");
 
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .map_err(|source| crate::error::AdminServerError::Accept { source })?;
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(source) => {
+                // A transient accept() error (EMFILE/ENFILE under fd pressure,
+                // ECONNABORTED, …) must NOT permanently kill the metrics/health
+                // server: /healthz backs the liveness probe, so bailing here can
+                // cascade into the orchestrator killing an otherwise-healthy pod
+                // (#1503). Log, back off briefly so a persistent condition
+                // does not hot-spin the loop, and keep serving — matching the
+                // continue-on-error behaviour of the data-plane listeners.
+                tracing::warn!(
+                    addr = %bind,
+                    error = %source,
+                    "metrics server accept() error; backing off and continuing"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
 
         // Apply shared TCP tactical-socket tuning so dead NAT middleboxes
         // and half-open scrapers are detected instead of hanging the
