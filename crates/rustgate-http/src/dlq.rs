@@ -718,14 +718,15 @@ fn format_timestamp_now() -> String {
 /// generator used on the live publish path (`publisher::generate_delivery_id`)
 /// so replayed DLQ deliveries appear indistinguishable from fresh ones on
 /// the wire — the same 32-character lowercase hex format, the same 128
-/// bits of entropy. Kept as a free function here rather than a shared
-/// helper to avoid forcing `publisher::generate_delivery_id` to become
-/// `pub(crate)` purely for cross-module reuse; the two call sites are
-/// independent enough that a silent drift between them would be caught
+/// bits of entropy from the OS CSPRNG. Kept as a free function here rather
+/// than a shared helper to avoid forcing `publisher::generate_delivery_id`
+/// to become `pub(crate)` purely for cross-module reuse; the two call sites
+/// are independent enough that a silent drift between them would be caught
 /// by the `dlq_entry_delivery_id_is_lowercase_hex_128_bits` format test.
 fn generate_delivery_id() -> String {
+    use rand::RngCore;
     let mut buf = [0u8; 16];
-    fastrand::fill(&mut buf);
+    rand::rngs::OsRng.fill_bytes(&mut buf);
     hex::encode(buf)
 }
 
@@ -1132,7 +1133,7 @@ mod tests {
     }
 
     /// Two consecutive calls to `generate_delivery_id` must return
-    /// different values. The generator uses `fastrand::fill(16 bytes)`
+    /// different values. The generator draws 16 bytes from the OS CSPRNG
     /// so the collision probability on a single trial is ~2^-128 — a
     /// duplicate here indicates the RNG was replaced by a non-random
     /// source (constant, counter, seeded with zero, etc.).

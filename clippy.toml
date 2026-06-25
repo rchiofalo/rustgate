@@ -17,3 +17,7 @@ disallowed-types = [
     { path = "once_cell::sync::Lazy", reason = "use std::sync::OnceLock — see rules/shared-infrastructure.md metrics pattern" },
     { path = "once_cell::sync::OnceCell", reason = "use std::sync::OnceLock — see rules/shared-infrastructure.md metrics pattern" },
 ]
+
+disallowed-methods = [
+    { path = "fastrand::fill", reason = "non-cryptographic RNG — use rand::rngs::OsRng (CSPRNG) for any identifier an attacker must not predict, e.g. webhook delivery / idempotency IDs (#1520)" },
+]

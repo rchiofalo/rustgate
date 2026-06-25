@@ -37,7 +37,7 @@ hex = { workspace = true }
 subtle = { workspace = true }
 x509-parser = { workspace = true }
 zeroize = { workspace = true }
-fastrand = { workspace = true }
+rand = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }

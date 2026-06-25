@@ -175,6 +175,10 @@ rstar = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 ocsp-stapler = "0.4"
 fastrand = "2"
+# CSPRNG for security-sensitive identifiers (e.g. webhook delivery IDs).
+# `fastrand` is non-cryptographic and must not be used for anything an
+# attacker should not be able to predict — see clippy.toml disallowed-methods.
+rand = "0.8"
 figment = { version = "0.10", features = ["toml"] }
 toml = "1.1"
 # Comment-preserving TOML editor used by the `migrate-config` subcommand
