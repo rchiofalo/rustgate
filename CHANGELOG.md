@@ -75,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Operator clean shutdown no longer hangs on a non-signal exit (closes #1505).** The signal-handler task only completed on `SIGTERM`/`SIGINT`, but `main` also flips the shutdown watch when the controller returns for a non-signal reason (error or natural completion) and then `await`s that task — which blocked forever waiting for a signal that would never arrive, so the process never exited. The signal task now also selects on the shutdown watch and exits when shutdown is triggered elsewhere.
+
 - **Admin/metrics HTTP server survives a transient `accept()` error (closes #1503).** The accept loop propagated the first `accept()` error with `?`, permanently killing `/metrics`, `/healthz`, `/readyz`, and the admin APIs. A single transient `EMFILE`/`ENFILE` (fd exhaustion) would take down the liveness probe and could cascade into the orchestrator killing an otherwise-healthy pod. The loop now logs the error, backs off briefly (so a persistent condition doesn't hot-spin), and keeps serving — matching the continue-on-error behaviour of the data-plane listeners.
 
 - **Reject MQTT topic prefixes in the reserved `$` namespace (F-192, closes #1532).** `validate_topic_prefix` only checked that a non-empty prefix ends with `/`; it accepted prefixes beginning with `$` (e.g. `$SYS/`, `$share/`). MQTT reserves topics whose first level starts with `$` for the broker, so such a prefix would route every topic into broker-reserved names (collision / silent drop). The validator now rejects a leading `$` with `InvalidTopic`. An empty prefix remains "no prefix" per the documented, tested contract.
