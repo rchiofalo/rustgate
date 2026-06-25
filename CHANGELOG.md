@@ -75,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Correlation keys a source by `(source_id, source_protocol)`, not `source_id` alone (closes #1501).** The engine's same-source check compared only `source_id == uid`, so the same wire UID arriving over two different protocols (a DIS entity 1234 and a VMF entity 1234) was wrongly treated as an in-place update of a single source rather than two independent sensors to fuse — silently overwriting one feed's track and corrupting provenance. `find_same_source` and `update_source` now match on the `(source_id, source_protocol)` tuple the module already documents.
+
 - **Operator clean shutdown no longer hangs on a non-signal exit (closes #1505).** The signal-handler task only completed on `SIGTERM`/`SIGINT`, but `main` also flips the shutdown watch when the controller returns for a non-signal reason (error or natural completion) and then `await`s that task — which blocked forever waiting for a signal that would never arrive, so the process never exited. The signal task now also selects on the shutdown watch and exits when shutdown is triggered elsewhere.
 
 - **Admin/metrics HTTP server survives a transient `accept()` error (closes #1503).** The accept loop propagated the first `accept()` error with `?`, permanently killing `/metrics`, `/healthz`, `/readyz`, and the admin APIs. A single transient `EMFILE`/`ENFILE` (fd exhaustion) would take down the liveness probe and could cascade into the orchestrator killing an otherwise-healthy pod. The loop now logs the error, backs off briefly (so a persistent condition doesn't hot-spin), and keeps serving — matching the continue-on-error behaviour of the data-plane listeners.
