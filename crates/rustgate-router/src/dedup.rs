@@ -24,7 +24,8 @@
 //!   collide.
 //! - **non-CoT** —
 //!   `SHA-256(b"non-cot" || 0x00 || tenant || 0x00 || cn || 0x00 ||
-//!   millis_window_le || 0x00 || sha256(payload))`. The sender's CN
+//!   source_protocol || 0x00 || millis_window_le || 0x00 ||
+//!   sha256(payload))`. The sender's CN
 //!   (`Identity.cn`) is folded in so two different senders emitting
 //!   byte-identical payloads at the same instant (e.g. two MAVLink
 //!   HEARTBEATs) are NOT collapsed into one delivery, and a
@@ -336,12 +337,14 @@ impl DedupCache {
     ///   identical to [`check_and_insert`][Self::check_and_insert].
     /// - **non-CoT** (uid not extractable):
     ///   `SHA-256(b"non-cot" || 0x00 || tenant || 0x00 || cn || 0x00 ||
-    ///   millis_window_le || 0x00 || sha256(payload))`. The sender's
-    ///   `Identity.cn` is folded in so two different senders emitting
-    ///   byte-identical payloads at the same instant are NOT
-    ///   collapsed, and `metadata.received_at` truncated to the dedup
-    ///   window is folded in so a legitimate retransmission across the
-    ///   window boundary is not silently dropped.
+    ///   source_protocol || 0x00 || millis_window_le || 0x00 ||
+    ///   sha256(payload))`. The sender's `Identity.cn` is folded in so two
+    ///   different senders emitting byte-identical payloads at the same
+    ///   instant are NOT collapsed; `metadata.source_protocol` is folded in
+    ///   so two different protocols whose bytes coincide do not cross-dedupe
+    ///   (#1531); and `metadata.received_at` truncated to the dedup window is
+    ///   folded in so a legitimate retransmission across the window boundary
+    ///   is not silently dropped.
     ///
     /// Returns `true` on duplicate; otherwise inserts and returns
     /// `false`. Honours the cross-tenant flag identically to
@@ -362,10 +365,18 @@ impl DedupCache {
             return self.lookup_or_insert(key);
         }
 
-        // Non-CoT path: bind to (tenant, cn, time, payload-hash).
+        // Non-CoT path: bind to (tenant, cn, source_protocol, time,
+        // payload-hash). source_protocol prevents two different protocols
+        // whose raw bytes coincide from cross-deduping (#1531).
         let cn: &str = &msg.source.cn;
         let millis_window = window_truncated_millis(msg.metadata.received_at, self.window);
-        let key = build_non_cot_key(effective_tenant, cn, millis_window, &msg.payload);
+        let key = build_non_cot_key(
+            effective_tenant,
+            cn,
+            &msg.metadata.source_protocol,
+            millis_window,
+            &msg.payload,
+        );
         self.lookup_or_insert(key)
     }
 
@@ -480,7 +491,7 @@ fn build_cot_key(tenant: &str, uid: &str, payload: &[u8]) -> Key {
 ///
 /// The format is
 /// `SHA-256(b"non-cot" || 0x00 || tenant || 0x00 || cn || 0x00 ||
-/// millis_window_le || 0x00 || sha256(payload))`.
+/// source_protocol || 0x00 || millis_window_le || 0x00 || sha256(payload))`.
 ///
 /// Closes #882: the previous fallback (`b"" || tenant || 0x00 || ""
 /// || 0x00 || 0_i64_le || 0x00 || payload`) had no CN and no time
@@ -494,6 +505,10 @@ fn build_cot_key(tenant: &str, uid: &str, payload: &[u8]) -> Key {
 /// - Folds in the sender's CN so two different senders emitting
 ///   byte-identical bytes (e.g. two MAVLink HEARTBEATs at the same
 ///   instant) are NOT deduped against each other.
+/// - Folds in the message's `source_protocol` so two *different* protocols
+///   whose raw payloads happen to share bytes (e.g. a DIS PDU and an ASTERIX
+///   datablock from the same sender at the same instant) are NOT deduped
+///   against each other (F-189/#1531).
 /// - Folds in the message's wall-clock timestamp truncated to the
 ///   dedup window, so a legitimate retransmission within a later
 ///   window is not silently suppressed by a stale cache entry from an
@@ -502,7 +517,13 @@ fn build_cot_key(tenant: &str, uid: &str, payload: &[u8]) -> Key {
 ///   the raw bytes) so the preimage stays bounded — the cache is on
 ///   the dispatch hot path and the surrounding mutex protects every
 ///   in-flight message.
-fn build_non_cot_key(tenant: &str, cn: &str, millis_window: u64, payload: &[u8]) -> Key {
+fn build_non_cot_key(
+    tenant: &str,
+    cn: &str,
+    source_protocol: &str,
+    millis_window: u64,
+    payload: &[u8],
+) -> Key {
     let payload_digest: [u8; 32] = Sha256::digest(payload).into();
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_NON_COT);
@@ -510,6 +531,8 @@ fn build_non_cot_key(tenant: &str, cn: &str, millis_window: u64, payload: &[u8])
     hasher.update(tenant.as_bytes());
     hasher.update([0u8]);
     hasher.update(cn.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(source_protocol.as_bytes());
     hasher.update([0u8]);
     hasher.update(millis_window.to_le_bytes());
     hasher.update([0u8]);
@@ -843,6 +866,47 @@ mod tests {
     }
 
     #[test]
+    fn check_message_same_cn_payload_different_source_protocol_not_deduped() {
+        // F-189/#1531: two DIFFERENT protocols whose raw bytes coincide (same
+        // sender, same instant) must NOT cross-dedupe — folding
+        // source_protocol into the non-CoT key keeps them distinct.
+        let c = cache(60, 16);
+        // Non-CoT bytes (not XML, so the non-CoT path is taken).
+        let payload: &[u8] = &[0x10, 0x20, 0x30, 0x40, 0x50];
+        let now = SystemTime::now();
+        let make = |proto: &str| RoutableMessage {
+            source: Identity {
+                cn: std::sync::Arc::<str>::from("sensor-1"),
+                fingerprint: "fp-sensor-1".to_string(),
+                groups: std::collections::BTreeSet::new(),
+                tenant: None,
+                spiffe_id: None,
+                attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            },
+            destination: Destination::Broadcast,
+            payload: Bytes::copy_from_slice(payload),
+            metadata: Metadata::new(now, proto.into(), MessageType::Other("raw".into())),
+        };
+        assert!(!c.check_message(&make("dis")), "first protocol admitted");
+        assert!(
+            !c.check_message(&make("asterix")),
+            "byte-identical payload from a DIFFERENT source_protocol must NOT be deduped (#1531)",
+        );
+        assert_eq!(
+            c.hits(),
+            0,
+            "cross-protocol must not have suppressed anything"
+        );
+        // The fix must NOT weaken intra-protocol dedup: the same protocol
+        // repeating the identical payload in-window is still a duplicate.
+        assert!(
+            c.check_message(&make("dis")),
+            "same protocol + identical payload in-window is still a duplicate",
+        );
+        assert_eq!(c.hits(), 1);
+    }
+
+    #[test]
     fn check_message_same_cn_same_non_cot_payload_within_window_is_deduped() {
         // Intra-sender dedup must still work for the non-CoT path —
         // that is the whole point of having a dedup cache. Two
@@ -935,6 +999,7 @@ mod tests {
         let non_cot_key = build_non_cot_key(
             "",
             "ALPHA",
+            "",
             window_truncated_millis(now, Duration::from_secs(60)),
             xml,
         );
@@ -970,9 +1035,9 @@ mod tests {
     fn build_non_cot_key_domain_prefix_is_pinned() {
         // Same wire-stability contract as `build_cot_key_domain_prefix_is_pinned`
         // but for the non-CoT shape: prefix `b"non-cot"`, then tenant,
-        // CN, millis_window (little-endian), then the SHA-256 of the
-        // payload. Pinning the prefix and field order lets external
-        // tooling (e.g. operator scripts that grep audit logs and
+        // CN, source_protocol, millis_window (little-endian), then the
+        // SHA-256 of the payload. Pinning the prefix and field order lets
+        // external tooling (e.g. operator scripts that grep audit logs and
         // recompute the dedup key from message metadata) stay aligned.
         let payload_digest: [u8; 32] = Sha256::digest(b"hello").into();
         let mut h = Sha256::new();
@@ -982,12 +1047,14 @@ mod tests {
         h.update([0u8]);
         h.update(b"alpha-cn");
         h.update([0u8]);
+        h.update(b"dis");
+        h.update([0u8]);
         h.update(42u64.to_le_bytes());
         h.update([0u8]);
         h.update(payload_digest);
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(
-            build_non_cot_key("tenant", "alpha-cn", 42, b"hello"),
+            build_non_cot_key("tenant", "alpha-cn", "dis", 42, b"hello"),
             expected
         );
     }
