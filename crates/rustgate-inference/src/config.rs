@@ -113,13 +113,28 @@ impl InferenceConfig {
     /// Validate the config. Returns
     /// [`InferenceError::ConfigInvalid`] on any of:
     ///
+    /// - Empty `models_dir` path.
+    /// - More than [`rustgate_core::constants::MAX_PIPELINE_ENTRIES`]
+    ///   pipeline entries (bounds per-message task / memory fan-out so a
+    ///   hostile config cannot trigger a DoS).
     /// - Duplicate `model_name` across pipeline entries.
     /// - `confidence_threshold` outside `[0.0, 1.0]`.
-    /// - Empty `models_dir` path.
     pub fn validate(&self) -> Result<(), InferenceError> {
         if self.models_dir.as_os_str().is_empty() {
             return Err(InferenceError::ConfigInvalid {
                 reason: "models_dir must not be empty".into(),
+            });
+        }
+        // Reject an oversized pipeline before allocating anything sized to
+        // it — each entry fans out into one task per model per message, so
+        // an unbounded list is a task / memory DoS vector (#1528).
+        if self.pipeline.len() > rustgate_core::constants::MAX_PIPELINE_ENTRIES {
+            return Err(InferenceError::ConfigInvalid {
+                reason: format!(
+                    "pipeline has {} entries, exceeds the limit of {}",
+                    self.pipeline.len(),
+                    rustgate_core::constants::MAX_PIPELINE_ENTRIES
+                ),
             });
         }
         let mut seen: Vec<&str> = Vec::with_capacity(self.pipeline.len());
@@ -198,6 +213,39 @@ mod tests {
             models_dir: PathBuf::from("/models"),
             reload_interval_secs: 60,
             pipeline: vec![],
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    fn pipeline_of(len: usize) -> Vec<PipelineEntry> {
+        (0..len)
+            .map(|i| PipelineEntry {
+                model_name: format!("model-{i}"),
+                model_path: PathBuf::from(format!("m{i}.onnx")),
+                target: ModelTarget::Classify,
+                confidence_threshold: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pipeline_exceeding_max_entries_rejected() {
+        // One past the cap → rejected, bounding per-message task fan-out (#1528).
+        let cfg = InferenceConfig {
+            models_dir: PathBuf::from("/models"),
+            reload_interval_secs: 60,
+            pipeline: pipeline_of(rustgate_core::constants::MAX_PIPELINE_ENTRIES + 1),
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn pipeline_at_max_entries_accepted() {
+        // Exactly the cap is allowed (boundary, all names unique).
+        let cfg = InferenceConfig {
+            models_dir: PathBuf::from("/models"),
+            reload_interval_secs: 60,
+            pipeline: pipeline_of(rustgate_core::constants::MAX_PIPELINE_ENTRIES),
         };
         assert!(cfg.validate().is_ok());
     }
