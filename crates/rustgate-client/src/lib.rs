@@ -80,6 +80,12 @@ pub enum ClientError {
     #[error("client config missing required field: {0}")]
     MissingField(&'static str),
 
+    /// `server_name` is not a valid TLS SNI server name (DNS name or IP
+    /// address). Rejected at config build time rather than carried into
+    /// the TLS handshake.
+    #[error("invalid server_name: {0}")]
+    InvalidServerName(String),
+
     /// I/O failure (TCP, TLS read/write, etc.).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -333,6 +339,17 @@ impl ClientConfigBuilder {
                 .map(|(host, _)| host.to_string())
                 .unwrap_or_else(|| "localhost".to_string())
         });
+        // Validate the SNI server name up front using rustls's own DNS-name /
+        // IP-address parser — the same check the dial path applies — so a
+        // malformed or attacker-controlled value (control characters, spaces,
+        // path separators, injection attempts) is rejected at config-build
+        // time with a clear error instead of being carried into the TLS
+        // handshake (#1517). `{server_name:?}` Debug-escapes any control
+        // characters so the error itself cannot forge log lines. The parsed
+        // `ServerName` is only used to validate; the owned `server_name`
+        // string is what we store, so the `Ok` value is intentionally dropped.
+        let _ = rustls_pki_types::ServerName::try_from(server_name.as_str())
+            .map_err(|e| ClientError::InvalidServerName(format!("{server_name:?}: {e}")))?;
         Ok(ClientConfig {
             server_addr,
             server_name,
@@ -491,6 +508,54 @@ mod tests {
                 );
             }
             other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_rejects_invalid_server_name() {
+        // #1517: malformed / attacker-controlled SNI values must be rejected
+        // at build time, not carried into the TLS handshake.
+        for bad in [
+            "bad name",      // space
+            "evil.com/path", // path separator
+            "ctrl\u{0}name", // NUL control char
+            "tab\tname",     // tab
+            "back\\slash",   // backslash
+            "",              // empty
+        ] {
+            let err = ClientConfig::builder()
+                .server_addr("example.test:9443")
+                .plaintext(true)
+                .server_name(bad)
+                .build()
+                .expect_err("invalid server_name must be rejected at build");
+            assert!(
+                matches!(err, ClientError::InvalidServerName(_)),
+                "expected InvalidServerName for {bad:?}, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn builder_accepts_valid_server_names() {
+        // Valid DNS names AND IP literals must build — validating via rustls's
+        // own parser (not a bespoke DNS-only check) keeps IP server names
+        // working.
+        for ok in [
+            "example.com",
+            "localhost",
+            "test-host",
+            "a.b.c.example.org",
+            "192.168.1.1",
+            "::1",
+        ] {
+            let cfg = ClientConfig::builder()
+                .server_addr("example.test:9443")
+                .plaintext(true)
+                .server_name(ok)
+                .build()
+                .unwrap_or_else(|e| panic!("valid server_name {ok:?} must build, got {e:?}"));
+            assert_eq!(cfg.server_name, ok);
         }
     }
 
