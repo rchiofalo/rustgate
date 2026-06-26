@@ -374,14 +374,19 @@ mod tests {
         // Intentionally drop without finish() — simulates crash mid-DLQ.
         drop(writer);
 
-        // The SharedEncryptedWriter's Drop impl calls finish() on our
-        // behalf, so to produce a truly unterminated file we truncate
-        // the tail bytes after drop. The terminator chunk is always
-        // the last AEAD-sealed block; removing the last 32 bytes
-        // reliably strips both the terminator tag and its length
-        // prefix on ChaCha20-Poly1305.
+        // The SharedEncryptedWriter's Drop impl calls finish() on our behalf,
+        // so to produce a truly unterminated file we strip the terminator after
+        // drop. The terminator is the last AEAD-sealed block: a 4-byte length
+        // prefix + a 16-byte Poly1305 tag over an empty plaintext = 20 bytes
+        // (identical for ChaCha20-Poly1305 v2 and XChaCha20-Poly1305 v3 — the
+        // tag is 16 bytes either way). Removing exactly those 20 bytes leaves
+        // the preceding data chunk intact but drops the terminator, so the
+        // reader must report the stream as torn regardless of payload size —
+        // unlike the previous hard-coded 32, which also corrupted the trailing
+        // data chunk and only worked when the payload was large enough.
+        const TERMINATOR_LEN: u64 = 4 + 16;
         let size = std::fs::metadata(&enc_path).unwrap().len();
-        let trunc = size.saturating_sub(32);
+        let trunc = size.saturating_sub(TERMINATOR_LEN);
         let f = std::fs::OpenOptions::new()
             .write(true)
             .open(&enc_path)
