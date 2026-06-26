@@ -222,6 +222,14 @@ pub(crate) struct TlsArgs {
     #[arg(long, default_value_t = true, env = "RUSTGATE_CRL_WARN_STALE")]
     pub(crate) crl_warn_stale: bool,
 
+    /// Seconds between background re-reads of the `--crl` file (0 = disabled,
+    /// the default). When > 0, the server periodically reloads the CRL file and
+    /// swaps it into the live TLS verifier, so a freshly-published revocation
+    /// takes effect on the next handshake without a restart. No-op without
+    /// `--crl`. Default 0 preserves the prior boot-frozen behavior.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_CRL_REFRESH_INTERVAL")]
+    pub(crate) crl_refresh_interval: u64,
+
     /// Require FIPS 140-3 crypto provider. Startup fails if the FIPS provider
     /// is not active. Build with --features fips to enable.
     #[arg(long, default_value_t = false, env = "RUSTGATE_FIPS_REQUIRED")]

@@ -286,7 +286,30 @@ pub(crate) async fn bind_tls_listener(
     let reloader = CertReloader::new(&cli.tls.cert, &cli.tls.key)
         .context("initializing certificate reloader")?;
 
-    let inner_verifier = tls_config.build_default_verifier()?;
+    // When `--crl` is set with a refresh interval, back the client-cert
+    // verifier with a hot-swappable `CrlStore` so a freshly-published CRL takes
+    // effect on the next handshake without a restart (#1496, ADR 0025). With no
+    // refresh interval (the default) keep the static verifier — byte-for-byte
+    // the prior boot-frozen behavior.
+    let crl_store: Option<std::sync::Arc<rustgate_tls::CrlStore>> =
+        match (&cli.tls.crl, cli.tls.crl_refresh_interval) {
+            (Some(path), interval) if interval > 0 => {
+                Some(rustgate_tls::CrlStore::from_path(std::path::Path::new(path))?)
+            }
+            (None, interval) if interval > 0 => {
+                tracing::warn!(
+                    "--crl-refresh-interval has no effect without --crl; \
+                     no revocation list to refresh"
+                );
+                None
+            }
+            _ => None,
+        };
+
+    let inner_verifier = match &crl_store {
+        Some(store) => tls_config.build_dynamic_crl_verifier(store)?,
+        None => tls_config.build_default_verifier()?,
+    };
 
     // Optionally wrap the inner verifier with the client-cert OCSP
     // verifier so revoked client certificates can be detected
@@ -417,6 +440,17 @@ pub(crate) async fn bind_tls_listener(
     } else {
         tracing::info!(
             "certificate hot-reload polling disabled; SIGHUP can still rotate certificates"
+        );
+    }
+
+    // Start the CRL refresh watcher (only present when --crl + a >0 interval
+    // were given, gated above). The dynamic verifier built from this store
+    // observes each new generation on the next handshake.
+    if let Some(store) = &crl_store {
+        store.spawn_watcher(std::time::Duration::from_secs(cli.tls.crl_refresh_interval));
+        tracing::info!(
+            interval_secs = cli.tls.crl_refresh_interval,
+            "live CRL refresh enabled; published revocations apply without restart"
         );
     }
 

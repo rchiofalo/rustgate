@@ -275,3 +275,99 @@ fn summarize_health(crls: &[CertificateRevocationListDer<'static>], path: &Path)
         all_stale: parsed_count > 0 && !any_fresh,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use rustgate_test_utils::certs::TestCa;
+
+    fn now_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    fn write_temp(pem: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-crlstore-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("crl.pem");
+        std::fs::write(&p, pem).unwrap();
+        p
+    }
+
+    #[test]
+    fn from_path_loads_at_generation_1() {
+        let ca = TestCa::new("crl-store-ca");
+        let p = write_temp(&ca.generate_crl(&[]));
+        let store = CrlStore::from_path(&p).unwrap();
+        assert_eq!(store.generation(), 1);
+        let (generation, crls) = store.snapshot();
+        assert_eq!(generation, 1);
+        assert!(!crls.is_empty());
+    }
+
+    #[test]
+    fn reload_is_false_on_identical_bytes() {
+        let ca = TestCa::new("crl-store-ca");
+        let p = write_temp(&ca.generate_crl(&[]));
+        let store = CrlStore::from_path(&p).unwrap();
+        assert!(
+            !store.reload().unwrap(),
+            "byte-identical file must not bump the generation"
+        );
+        assert_eq!(store.generation(), 1);
+    }
+
+    #[test]
+    fn reload_bumps_generation_when_file_changes() {
+        let ca = TestCa::new("crl-store-ca");
+        let p = write_temp(&ca.generate_crl(&[]));
+        let store = CrlStore::from_path(&p).unwrap();
+        let (gen0, list0) = store.snapshot();
+        // Successive CRLs from the same CA get distinct serial numbers, so the
+        // bytes differ and reload installs a new generation.
+        std::fs::write(&p, ca.generate_crl(&[])).unwrap();
+        assert!(
+            store.reload().unwrap(),
+            "changed bytes must install a new generation"
+        );
+        assert_eq!(store.generation(), gen0 + 1);
+        let (gen1, list1) = store.snapshot();
+        assert_eq!(gen1, 2);
+        // The snapshot returns the new list (a distinct Arc).
+        assert!(!Arc::ptr_eq(&list0, &list1));
+    }
+
+    #[test]
+    fn fresh_crl_is_not_all_stale_but_expired_is() {
+        let ca = TestCa::new("crl-store-ca");
+        let fresh = write_temp(&ca.generate_crl(&[]));
+        assert!(
+            !CrlStore::from_path(&fresh).unwrap().health().all_stale,
+            "a CRL with a future nextUpdate must not be all-stale"
+        );
+
+        let expired = write_temp(&ca.generate_expired_crl(&[]));
+        assert!(
+            CrlStore::from_path(&expired).unwrap().health().all_stale,
+            "a CRL with a past nextUpdate must be all-stale"
+        );
+    }
+
+    #[test]
+    fn from_path_rejects_missing_file() {
+        assert!(CrlStore::from_path(Path::new("/nonexistent/dir/crl.pem")).is_err());
+    }
+
+    #[test]
+    fn from_path_rejects_non_crl_bytes() {
+        let p = write_temp("definitely not a PEM CRL");
+        assert!(CrlStore::from_path(&p).is_err());
+    }
+}
