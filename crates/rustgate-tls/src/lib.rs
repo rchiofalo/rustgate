@@ -28,6 +28,7 @@
 
 pub mod cert_reloader;
 pub mod config;
+pub mod crl_store;
 pub mod extract;
 pub mod listener;
 pub mod pem;
@@ -43,6 +44,7 @@ pub mod ocsp;
 pub mod spiffe;
 
 pub use cert_reloader::CertReloader;
+pub use crl_store::{CrlHealth, CrlStore};
 #[cfg(feature = "ocsp")]
 pub use client_ocsp::{ClientOcspVerifier, FetchFuture, OcspFetcher, OcspStaplerFetcher};
 #[cfg(feature = "fips")]
@@ -59,4 +61,4 @@ pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 #[cfg(feature = "spiffe")]
 pub use spiffe::{SpiffeConfig, SpiffeHooks, SpiffeIdentity};
-pub use verifier::{DynamicCertVerifier, RootStoreProvider};
+pub use verifier::{CrlProvider, DynamicCertVerifier, RootStoreProvider};
