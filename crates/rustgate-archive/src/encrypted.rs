@@ -4,10 +4,14 @@
 //! log sinks.
 //!
 //! Files written by [`EncryptedWriter`] are framed as a small fixed header
-//! followed by a sequence of length-prefixed ChaCha20-Poly1305 chunks. Each
-//! chunk uses a unique 96-bit nonce derived from a per-file random base nonce
-//! and a monotonic chunk counter, so the same key may safely be reused across
-//! many files and many chunks within a file.
+//! followed by a sequence of length-prefixed XChaCha20-Poly1305 chunks (format
+//! version 3). Each chunk uses a unique 192-bit nonce derived from a per-file
+//! random base nonce and a monotonic chunk counter. The base nonce carries 160
+//! bits of randomness, so two files drawing the same base under one key has a
+//! birthday bound of ~2^80 files — the same key may safely be reused across a
+//! practically unbounded number of files (#1506). Version 2 archives
+//! (ChaCha20-Poly1305, 64-bit base nonce) remain fully decryptable via
+//! [`decrypt_file`]; only the writer was bumped to v3.
 //!
 //! Per-chunk AAD binds the key id and chunk counter into the AEAD tag so that
 //! reordering chunks within a file is detected at decrypt time, and a sealed
@@ -61,14 +65,14 @@
 //! loading a key file with no expirations declared at all emits a
 //! `tracing::warn!` so operators are nudged toward setting rotation policy.
 //!
-//! ## File format (version 2)
+//! ## File format (version 3)
 //!
 //! ```text
 //! magic     : 8 bytes  = b"RGENC1\0\0"
-//! version   : 1 byte   = 2
+//! version   : 1 byte   = 3
 //! key_id_len: 1 byte
 //! key_id    : key_id_len bytes (UTF-8)
-//! base_nonce: 8 bytes (random)
+//! base_nonce: 24 bytes (20 random || 4 zero — the trailing 4 hold the counter)
 //! repeated chunks:
 //!   len     : 4 bytes (big-endian) length of `ciphertext`
 //!   ciphertext: AEAD output (plaintext_len + 16-byte tag)
@@ -78,10 +82,16 @@
 //!               AAD marker (see below)
 //! ```
 //!
-//! Per-chunk nonce = `base_nonce (8 bytes) || counter_be (4 bytes)`. The
-//! counter starts at 0 and increments by 1 per chunk. With a 32-bit counter
-//! a single file can hold up to ~4.29 billion chunks before rollover, which
-//! is enforced by returning an error.
+//! Per-chunk nonce = `base_nonce[..20] (random) || counter_be (4 bytes)`, a
+//! 192-bit XChaCha20 nonce. The counter starts at 0 and increments by 1 per
+//! chunk; with a 32-bit counter a single file can hold up to ~4.29 billion
+//! chunks before rollover, which is enforced by returning an error.
+//!
+//! **Version 2** (pre-#1506) is identical except `version = 2`, an 8-byte
+//! random base nonce, and a 96-bit ChaCha20-Poly1305 nonce
+//! (`base_nonce (8 bytes) || counter_be (4 bytes)`). [`decrypt_file`] dispatches
+//! on the version byte, so v2 archives stay readable; the writer only ever
+//! produces v3.
 //!
 //! Per-chunk AAD layout (binds key id and chunk index, plus a 1-byte tag
 //! distinguishing data from terminator chunks):
@@ -102,20 +112,41 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 /// Magic bytes identifying a rustgate encrypted archive file.
-pub const MAGIC: &[u8; 8] = b"RGENC1\0\0";
-/// Current on-disk format version.
 ///
-/// Version 2 adds per-chunk AAD binding (key id + chunk counter + chunk kind)
-/// and a sealed terminator chunk to detect tail truncation. Files written by
-/// version 1 are no longer readable; the format is intentionally not
-/// backward-compatible because the v1 design was vulnerable to silent chunk
-/// reordering and truncation.
-pub const FORMAT_VERSION: u8 = 2;
+/// `MAGIC` identifies "a rustgate archive"; the format version byte that
+/// follows selects the cipher and nonce width, so the magic is stable across
+/// format versions.
+pub const MAGIC: &[u8; 8] = b"RGENC1\0\0";
+
+/// Current on-disk format version written by [`EncryptedWriter`].
+///
+/// Version 3 switches the AEAD to **XChaCha20-Poly1305** (192-bit nonce) with a
+/// 24-byte per-file base nonce (20 random bytes + a 4-byte chunk counter). The
+/// previous version 2 used ChaCha20-Poly1305 with a 64-bit random base nonce;
+/// at archive scale (~2^32 files under one key) two files could draw the same
+/// 64-bit base, reusing an identical nonce sequence — catastrophic for the
+/// cipher. The 160 random bits in v3 push the base-collision birthday bound to
+/// ~2^80 files (#1506). Both versions bind per-chunk AAD (key id + counter +
+/// kind) and seal the stream with a terminator chunk; only the cipher and
+/// nonce width differ. Files written by version 1 are not readable; version 2
+/// files remain fully decryptable (see [`decrypt_file`]).
+pub const FORMAT_VERSION: u8 = 3;
+
+/// The previous format version (ChaCha20-Poly1305, 8-byte base nonce). New
+/// files are never written at this version, but [`decrypt_file`] reads it so
+/// archives produced before #1506 stay decryptable.
+const FORMAT_VERSION_V2: u8 = 2;
+
+/// Per-file base-nonce length for [`FORMAT_VERSION_V2`] (ChaCha20-Poly1305).
+const BASE_NONCE_LEN_V2: usize = 8;
+/// Per-file base-nonce length for [`FORMAT_VERSION`] v3 (XChaCha20-Poly1305).
+/// 20 random bytes followed by 4 bytes that hold the per-chunk counter.
+const BASE_NONCE_LEN_V3: usize = 24;
 
 /// AAD discriminator for normal data chunks.
 const AAD_KIND_DATA: u8 = 0x00;
@@ -872,8 +903,8 @@ fn resolve_ikm(
 /// preferred so errors are surfaced.
 pub struct EncryptedWriter {
     path: PathBuf,
-    cipher: ChaCha20Poly1305,
-    base_nonce: [u8; 8],
+    cipher: XChaCha20Poly1305,
+    base_nonce: [u8; BASE_NONCE_LEN_V3],
     counter: u32,
     writer: Option<BufWriter<File>>,
     key_id_bytes: Vec<u8>,
@@ -913,7 +944,7 @@ impl EncryptedWriter {
             });
         }
         let key_bytes = key_ring.active_key()?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
 
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -921,8 +952,14 @@ impl EncryptedWriter {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut base_nonce = [0u8; 8];
-        getrandom(&mut base_nonce)?;
+        // 24-byte XChaCha20 base nonce: 20 random bytes + 4 trailing zero bytes.
+        // The trailing four bytes hold the per-chunk big-endian counter (set by
+        // `chunk_xnonce`); only the first 20 are randomized, giving 160 random
+        // bits per file (#1506). Randomizing all 24 would be harmless (the
+        // counter region is overwritten per chunk) but the explicit split keeps
+        // the invariant `base_nonce[20..24] == 0` checkable in tests.
+        let mut base_nonce = [0u8; BASE_NONCE_LEN_V3];
+        getrandom(&mut base_nonce[..20])?;
 
         // Refuse to follow a symlink at the final path component.
         //
@@ -990,12 +1027,12 @@ impl EncryptedWriter {
             .counter
             .checked_add(1)
             .ok_or(EncryptError::CounterOverflow)?;
-        let nonce = chunk_nonce(&self.base_nonce, self.counter);
+        let nonce = chunk_xnonce(&self.base_nonce, self.counter);
         let aad = self.build_aad(AAD_KIND_DATA);
         let ciphertext = self
             .cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                XNonce::from_slice(&nonce),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
@@ -1037,12 +1074,12 @@ impl EncryptedWriter {
             .counter
             .checked_add(1)
             .ok_or(EncryptError::CounterOverflow)?;
-        let nonce = chunk_nonce(&self.base_nonce, self.counter);
+        let nonce = chunk_xnonce(&self.base_nonce, self.counter);
         let aad = self.build_aad(AAD_KIND_TERMINATOR);
         let ciphertext = self
             .cipher
             .encrypt(
-                Nonce::from_slice(&nonce),
+                XNonce::from_slice(&nonce),
                 Payload {
                     msg: &[][..],
                     aad: &aad,
@@ -1090,12 +1127,6 @@ pub fn decrypt_file(input: &Path, output: &Path, key_ring: &KeyRing) -> Result<(
     }
     let mut version = [0u8; 1];
     reader.read_exact(&mut version)?;
-    if version[0] != FORMAT_VERSION {
-        return Err(EncryptError::Header(format!(
-            "unsupported version {}",
-            version[0]
-        )));
-    }
     let mut id_len = [0u8; 1];
     reader.read_exact(&mut id_len)?;
     let mut id_buf = vec![0u8; id_len[0] as usize];
@@ -1103,13 +1134,10 @@ pub fn decrypt_file(input: &Path, output: &Path, key_ring: &KeyRing) -> Result<(
     let key_id = String::from_utf8(id_buf)
         .map_err(|e| EncryptError::Header(format!("key id not UTF-8: {e}")))?;
     let key_id_bytes = key_id.as_bytes().to_vec();
-    let mut base_nonce = [0u8; 8];
-    reader.read_exact(&mut base_nonce)?;
 
     let key_bytes = key_ring
         .key(&key_id)
         .ok_or_else(|| EncryptError::UnknownKeyId(key_id.clone()))?;
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
 
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
@@ -1123,6 +1151,66 @@ pub fn decrypt_file(input: &Path, output: &Path, key_ring: &KeyRing) -> Result<(
         .open(output)?;
     let mut writer = BufWriter::new(out_file);
 
+    // Dispatch on the format version. v3 uses XChaCha20-Poly1305 with a 24-byte
+    // base nonce; v2 (pre-#1506 archives) uses ChaCha20-Poly1305 with an 8-byte
+    // base. The per-chunk loop (`decrypt_stream`) is shared so the two versions
+    // cannot drift in their terminator / truncation handling — they differ only
+    // in the cipher and the per-chunk nonce builder, passed in as a closure.
+    match version[0] {
+        FORMAT_VERSION => {
+            let mut base = [0u8; BASE_NONCE_LEN_V3];
+            reader.read_exact(&mut base)?;
+            let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
+            decrypt_stream(
+                &mut reader,
+                &mut writer,
+                &key_id_bytes,
+                |counter, aad, ct| {
+                    let nonce = chunk_xnonce(&base, counter);
+                    cipher.decrypt(XNonce::from_slice(&nonce), Payload { msg: ct, aad })
+                },
+            )?;
+        }
+        FORMAT_VERSION_V2 => {
+            let mut base = [0u8; BASE_NONCE_LEN_V2];
+            reader.read_exact(&mut base)?;
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
+            decrypt_stream(
+                &mut reader,
+                &mut writer,
+                &key_id_bytes,
+                |counter, aad, ct| {
+                    let nonce = chunk_nonce(&base, counter);
+                    cipher.decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad })
+                },
+            )?;
+        }
+        other => {
+            return Err(EncryptError::Header(format!("unsupported version {other}")));
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Shared per-chunk decrypt loop for both archive format versions.
+///
+/// `decrypt_chunk(counter, aad, ciphertext)` opens a single AEAD chunk using
+/// the caller's cipher and version-specific nonce. Everything else — the
+/// length framing, the data-then-terminator AAD trial, the "no bytes after the
+/// terminator" check, and unsealed-stream (`Truncated`) detection — lives here
+/// so v2 and v3 share exactly one implementation and cannot diverge (#1506).
+fn decrypt_stream<W, D>(
+    reader: &mut BufReader<File>,
+    writer: &mut W,
+    key_id_bytes: &[u8],
+    decrypt_chunk: D,
+) -> Result<(), EncryptError>
+where
+    W: Write,
+    D: Fn(u32, &[u8], &[u8]) -> Result<Vec<u8>, chacha20poly1305::aead::Error>,
+{
     let mut counter: u32 = 0;
     let mut saw_terminator = false;
     loop {
@@ -1135,38 +1223,24 @@ pub fn decrypt_file(input: &Path, output: &Path, key_ring: &KeyRing) -> Result<(
         let len = u32::from_be_bytes(len_buf) as usize;
         let mut chunk = vec![0u8; len];
         reader.read_exact(&mut chunk)?;
-        let nonce = chunk_nonce(&base_nonce, counter);
 
         // Try data AAD first; if that fails, try terminator AAD.
         let mut aad_data = Vec::with_capacity(key_id_bytes.len() + 5);
-        aad_data.extend_from_slice(&key_id_bytes);
+        aad_data.extend_from_slice(key_id_bytes);
         aad_data.push(AAD_KIND_DATA);
         aad_data.extend_from_slice(&counter.to_be_bytes());
 
-        match cipher.decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: chunk.as_ref(),
-                aad: &aad_data,
-            },
-        ) {
+        match decrypt_chunk(counter, &aad_data, chunk.as_ref()) {
             Ok(plaintext) => {
                 writer.write_all(&plaintext)?;
             }
             Err(_) => {
                 // Maybe terminator
                 let mut aad_term = Vec::with_capacity(key_id_bytes.len() + 5);
-                aad_term.extend_from_slice(&key_id_bytes);
+                aad_term.extend_from_slice(key_id_bytes);
                 aad_term.push(AAD_KIND_TERMINATOR);
                 aad_term.extend_from_slice(&counter.to_be_bytes());
-                let plaintext = cipher
-                    .decrypt(
-                        Nonce::from_slice(&nonce),
-                        Payload {
-                            msg: chunk.as_ref(),
-                            aad: &aad_term,
-                        },
-                    )
+                let plaintext = decrypt_chunk(counter, &aad_term, chunk.as_ref())
                     .map_err(|e| EncryptError::Aead(e.to_string()))?;
                 if !plaintext.is_empty() {
                     return Err(EncryptError::Aead(
@@ -1196,17 +1270,24 @@ pub fn decrypt_file(input: &Path, output: &Path, key_ring: &KeyRing) -> Result<(
     if !saw_terminator {
         return Err(EncryptError::Truncated);
     }
-
-    writer.flush()?;
     Ok(())
 }
 
-/// Build the 12-byte ChaCha20-Poly1305 nonce from the file's base nonce and
-/// the chunk counter.
-fn chunk_nonce(base: &[u8; 8], counter: u32) -> [u8; 12] {
+/// Build the 12-byte ChaCha20-Poly1305 nonce (v2) from the file's 8-byte base
+/// nonce and the chunk counter. Retained for the v2 read path only.
+fn chunk_nonce(base: &[u8; BASE_NONCE_LEN_V2], counter: u32) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[..8].copy_from_slice(base);
     nonce[8..].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+
+/// Build the 24-byte XChaCha20-Poly1305 nonce (v3) from the file's 24-byte base
+/// nonce and the chunk counter: the leading 20 bytes are the per-file random
+/// base; the trailing 4 bytes hold the big-endian chunk counter.
+fn chunk_xnonce(base: &[u8; BASE_NONCE_LEN_V3], counter: u32) -> [u8; BASE_NONCE_LEN_V3] {
+    let mut nonce = *base;
+    nonce[20..].copy_from_slice(&counter.to_be_bytes());
     nonce
 }
 
@@ -1511,9 +1592,9 @@ mod tests {
         // Parse out the file: header, then two data chunks (each len-prefix +
         // ciphertext), then a terminator. Swap the two data chunks.
         let data = std::fs::read(&enc_path).unwrap();
-        // header = 8 magic + 1 version + 1 id_len + id_len + 8 base_nonce
+        // header = 8 magic + 1 version + 1 id_len + id_len + 24 base_nonce (v3)
         let id_len = data[9] as usize;
-        let header_end = 8 + 1 + 1 + id_len + 8;
+        let header_end = 8 + 1 + 1 + id_len + BASE_NONCE_LEN_V3;
 
         let mut cursor = header_end;
         let read_chunk = |data: &[u8], cursor: &mut usize| -> Vec<u8> {
@@ -1557,7 +1638,7 @@ mod tests {
         // Strip the trailing terminator chunk.
         let data = std::fs::read(&enc_path).unwrap();
         let id_len = data[9] as usize;
-        let header_end = 8 + 1 + 1 + id_len + 8;
+        let header_end = 8 + 1 + 1 + id_len + BASE_NONCE_LEN_V3;
 
         let mut cursor = header_end;
         let read_chunk_end = |data: &[u8], cursor: &mut usize| {
@@ -1573,6 +1654,210 @@ mod tests {
 
         let err = decrypt_file(&enc_path, &dec_path, &ring).unwrap_err();
         assert!(matches!(err, EncryptError::Truncated), "got {err:?}");
+    }
+
+    #[test]
+    fn v3_header_and_nonce_invariants() {
+        let dir = tempdir();
+        let enc = dir.join("h.enc");
+        let ring = make_key_ring("k", &[("k", [0x55; 32])]);
+        {
+            let mut w = EncryptedWriter::create(&enc, &ring).unwrap();
+            w.write_chunk(b"x").unwrap();
+            w.finish().unwrap();
+        }
+        let data = std::fs::read(&enc).unwrap();
+        assert_eq!(&data[..8], MAGIC);
+        assert_eq!(data[8], FORMAT_VERSION, "writer must emit version 3");
+        let id_len = data[9] as usize;
+        let base = &data[10 + id_len..10 + id_len + BASE_NONCE_LEN_V3];
+        assert_eq!(base.len(), 24);
+        assert!(
+            base[20..24].iter().all(|&b| b == 0),
+            "v3 base-nonce counter region (bytes 20..24) must be zero on disk",
+        );
+        // The chunk nonce builder writes the big-endian counter into [20..24]
+        // and leaves the random base intact, so consecutive chunks differ.
+        let n0 = chunk_xnonce(&[7u8; BASE_NONCE_LEN_V3], 0);
+        let n1 = chunk_xnonce(&[7u8; BASE_NONCE_LEN_V3], 1);
+        let tail0: [u8; 4] = n0[20..24].try_into().unwrap();
+        let tail1: [u8; 4] = n1[20..24].try_into().unwrap();
+        assert_eq!(tail0, 0u32.to_be_bytes());
+        assert_eq!(tail1, 1u32.to_be_bytes());
+        assert_eq!(&n0[..20], &[7u8; 20]);
+        assert_ne!(n0, n1);
+    }
+
+    #[test]
+    fn v3_zero_data_chunk_round_trips() {
+        // An immediate finish() with no data chunks: header + one terminator
+        // chunk at counter 0. Mirrors the v2 empty-file path on v3.
+        let dir = tempdir();
+        let enc = dir.join("z.enc");
+        let dec = dir.join("z.txt");
+        let ring = make_key_ring("k", &[("k", [0x66; 32])]);
+        {
+            let mut w = EncryptedWriter::create(&enc, &ring).unwrap();
+            w.finish().unwrap();
+        }
+        decrypt_file(&enc, &dec, &ring).unwrap();
+        assert_eq!(std::fs::read(&dec).unwrap(), b"");
+    }
+
+    #[test]
+    fn unsupported_version_rejected() {
+        let dir = tempdir();
+        let enc = dir.join("u.enc");
+        let dec = dir.join("u.txt");
+        let ring = make_key_ring("k", &[("k", [0x77; 32])]);
+        {
+            let mut w = EncryptedWriter::create(&enc, &ring).unwrap();
+            w.write_chunk(b"q").unwrap();
+            w.finish().unwrap();
+        }
+        let mut data = std::fs::read(&enc).unwrap();
+        data[8] = 99; // bogus version byte
+        std::fs::write(&enc, &data).unwrap();
+        let err = decrypt_file(&enc, &dec, &ring).unwrap_err();
+        assert!(matches!(err, EncryptError::Header(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn truncated_v3_header_errors_cleanly() {
+        // A file that claims v3 but is truncated inside the 24-byte base nonce
+        // must surface a clean Io error, never a panic.
+        let dir = tempdir();
+        let enc = dir.join("t.enc");
+        let dec = dir.join("t.txt");
+        let ring = make_key_ring("k", &[("k", [0x88; 32])]);
+        {
+            let mut w = EncryptedWriter::create(&enc, &ring).unwrap();
+            w.write_chunk(b"q").unwrap();
+            w.finish().unwrap();
+        }
+        let data = std::fs::read(&enc).unwrap();
+        let id_len = data[9] as usize;
+        let cut = 10 + id_len + 4; // 4 bytes into the 24-byte base nonce
+        std::fs::write(&enc, &data[..cut]).unwrap();
+        let err = decrypt_file(&enc, &dec, &ring).unwrap_err();
+        assert!(matches!(err, EncryptError::Io(_)), "got {err:?}");
+    }
+
+    /// Test-only **independent** encoder for the legacy v2 wire format
+    /// (ChaCha20-Poly1305, 8-byte base nonce). It emits the v2 bytes directly
+    /// and shares no code with the production read path, so the back-compat
+    /// test below cross-checks two implementations rather than round-tripping
+    /// the shared `decrypt_stream` helper against itself (#1506).
+    // Fixed inputs for the checked-in golden v2 fixture. ChaCha20-Poly1305 is
+    // deterministic given a fixed (key, nonce), so these produce byte-identical
+    // output every run — the fixture is regenerated only when the v2 wire format
+    // legitimately changes (which, being frozen-on-disk, it must not).
+    const GOLDEN_V2_KEY: [u8; 32] = [0x42; 32];
+    const GOLDEN_V2_BASE8: [u8; 8] = [0xAB; 8];
+    const GOLDEN_V2_KEY_ID: &str = "legacy";
+    const GOLDEN_V2_PLAINTEXTS: &[&[u8]] = &[b"alpha", b"bravo", b"charlie"];
+
+    // One-shot generator for `tests/fixtures/golden-v2.enc`. Ignored in normal
+    // runs; re-run with `cargo nextest run -p rustgate-archive
+    // emit_golden_v2_fixture --run-ignored all` only if the v2 format ever
+    // legitimately changes. The committed bytes are what `v2_archive_still_*`
+    // actually decrypt — a frozen fixture cannot co-drift with the reader.
+    #[test]
+    #[ignore = "regenerates the committed golden v2 fixture; not a real test"]
+    fn emit_golden_v2_fixture() {
+        let bytes = encode_v2_archive(
+            &GOLDEN_V2_KEY,
+            GOLDEN_V2_KEY_ID,
+            &GOLDEN_V2_BASE8,
+            GOLDEN_V2_PLAINTEXTS,
+        );
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/golden-v2.enc");
+        std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    fn encode_v2_archive(
+        key: &[u8; 32],
+        key_id: &str,
+        base8: &[u8; 8],
+        chunks: &[&[u8]],
+    ) -> Vec<u8> {
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+        let kid = key_id.as_bytes();
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(FORMAT_VERSION_V2);
+        out.push(kid.len() as u8);
+        out.extend_from_slice(kid);
+        out.extend_from_slice(base8);
+        let seal = |counter: u32, kind: u8, msg: &[u8]| -> Vec<u8> {
+            let nonce = chunk_nonce(base8, counter);
+            let mut aad = Vec::new();
+            aad.extend_from_slice(kid);
+            aad.push(kind);
+            aad.extend_from_slice(&counter.to_be_bytes());
+            cipher
+                .encrypt(Nonce::from_slice(&nonce), Payload { msg, aad: &aad })
+                .unwrap()
+        };
+        let mut counter: u32 = 0;
+        for ch in chunks {
+            let ct = seal(counter, AAD_KIND_DATA, ch);
+            out.extend_from_slice(&(ct.len() as u32).to_be_bytes());
+            out.extend_from_slice(&ct);
+            counter += 1;
+        }
+        let term = seal(counter, AAD_KIND_TERMINATOR, &[]);
+        out.extend_from_slice(&(term.len() as u32).to_be_bytes());
+        out.extend_from_slice(&term);
+        out
+    }
+
+    /// The checked-in golden v2 archive (frozen bytes — see
+    /// `emit_golden_v2_fixture`). Embedded at compile time so the back-compat
+    /// tests decrypt the *exact* on-disk layout an older binary produced.
+    const GOLDEN_V2_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/golden-v2.enc");
+
+    #[test]
+    fn v2_archive_still_decrypts_after_v3_bump() {
+        // Back-compat: the CHECKED-IN golden v2 file must still decrypt through
+        // the production version-dispatching `decrypt_file`. Using frozen
+        // committed bytes (not a regenerated encoder) means a drift in the v2
+        // nonce/AAD handling that happened to also corrupt the reader cannot
+        // mask a regression.
+        assert_eq!(
+            GOLDEN_V2_FIXTURE[8], FORMAT_VERSION_V2,
+            "fixture must be version 2"
+        );
+
+        let dir = tempdir();
+        let enc = dir.join("legacy.enc");
+        let dec = dir.join("legacy.txt");
+        std::fs::write(&enc, GOLDEN_V2_FIXTURE).unwrap();
+        let ring = make_key_ring(GOLDEN_V2_KEY_ID, &[(GOLDEN_V2_KEY_ID, GOLDEN_V2_KEY)]);
+        decrypt_file(&enc, &dec, &ring).unwrap();
+
+        let mut expected = Vec::new();
+        for p in GOLDEN_V2_PLAINTEXTS {
+            expected.extend_from_slice(p);
+        }
+        assert_eq!(std::fs::read(&dec).unwrap(), expected);
+    }
+
+    #[test]
+    fn v2_tampered_chunk_rejected_after_v3_bump() {
+        // The v2 read path still enforces integrity: flipping a ciphertext byte
+        // in the committed v2 fixture fails decryption.
+        let mut bytes = GOLDEN_V2_FIXTURE.to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        let dir = tempdir();
+        let enc = dir.join("legacy_tampered.enc");
+        let dec = dir.join("legacy_tampered.txt");
+        std::fs::write(&enc, &bytes).unwrap();
+        let ring = make_key_ring(GOLDEN_V2_KEY_ID, &[(GOLDEN_V2_KEY_ID, GOLDEN_V2_KEY)]);
+        let err = decrypt_file(&enc, &dec, &ring).unwrap_err();
+        assert!(matches!(err, EncryptError::Aead(_)), "got {err:?}");
     }
 
     fn tempdir() -> PathBuf {
