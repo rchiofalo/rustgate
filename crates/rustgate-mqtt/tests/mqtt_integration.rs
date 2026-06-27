@@ -209,6 +209,47 @@ async fn read_v5_packet(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// A server-auth-only client certificate (CA-signed, `id-kp-serverAuth` only,
+/// no `id-kp-clientAuth`) passes the webpki verifier (`RequiredIfPresent`), so
+/// the TLS handshake completes — but the listener must reject it at identity
+/// extraction, returning `Ok(None)`, matching the primary TLS listener.
+/// Regression for the cross-transport EKU-enforcement gap (this listener
+/// previously skipped `validate_key_usage`).
+#[tokio::test]
+async fn mqtt_rejects_server_auth_only_client_cert() {
+    let ca = TestCa::new("localhost-ca");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("server tls config");
+
+    let listener =
+        Arc::new(MqttListener::bind("127.0.0.1:0".parse().unwrap(), &tls_config).expect("bind"));
+    let addr = listener.local_addr().expect("local addr");
+
+    let accept_listener = Arc::clone(&listener);
+    let accept_handle = tokio::spawn(async move { accept_listener.accept().await });
+
+    // CA-signed with valid dates, so `mqtt_connect`'s TLS handshake succeeds;
+    // the rejection must land later, at identity extraction.
+    let server_auth_cert = ca.issue_server_auth_only_cert("eku-confused");
+    let client_tls = build_client_tls_config(
+        &server_auth_cert.cert_pem,
+        &server_auth_cert.key_pem,
+        &ca.cert_pem,
+    );
+    let _stream = mqtt_connect(addr, &client_tls).await;
+
+    let accepted = tokio::time::timeout(Duration::from_secs(5), accept_handle)
+        .await
+        .expect("accept must not hang")
+        .expect("accept task joined")
+        .expect("accept returned Ok");
+    assert!(
+        accepted.is_none(),
+        "server-auth-only cert must be rejected at identity extraction (accept -> Ok(None))"
+    );
+}
+
 #[tokio::test]
 async fn connect_and_connack() {
     let ca = TestCa::new("MQTT Test CA");
