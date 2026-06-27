@@ -53,6 +53,19 @@ pub enum SensorThingsError {
         message: String,
     },
 
+    /// The response body exceeded the maximum size the client will
+    /// buffer. A SensorThings page is bounded, but the endpoint is
+    /// untrusted (redirects are disabled for the same reason), so a
+    /// hostile or misconfigured server returning a multi-gigabyte —
+    /// possibly chunked, Content-Length-less — body is rejected rather
+    /// than buffered into heap. The wiring task treats this like a
+    /// decode failure: log, skip the document, keep polling.
+    #[error("SensorThings response body exceeded the {limit}-byte maximum")]
+    ResponseTooLarge {
+        /// The maximum permitted body size (`MAX_FRAME_SIZE`).
+        limit: usize,
+    },
+
     /// The configured request timed out before the server returned a
     /// complete response. Distinct from `Transport` so the wiring
     /// task can surface "the server is slow" as a different signal
@@ -109,7 +122,10 @@ impl SensorThingsError {
                 // problems and not retryable.
                 *status == 408 || *status == 429 || (500..600).contains(status)
             }
-            Self::Decode { .. } | Self::Config { .. } => false,
+            // An oversized body is like a decode failure: retrying the same
+            // poll returns the same too-large response, so skip rather than
+            // back off and retry.
+            Self::Decode { .. } | Self::Config { .. } | Self::ResponseTooLarge { .. } => false,
             #[cfg(feature = "mqtt-push")]
             Self::MqttsNotSupported => false,
         }
