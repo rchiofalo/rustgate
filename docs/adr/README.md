@@ -53,6 +53,9 @@ does.
 | [0021](0021-clean-room-tak-interop.md) | Clean-room interoperability policy for TAK and third-party protocols | Accepted |
 | [0022](0022-cross-domain-guard-egress-seam.md) | Cross-domain guard egress seam (central `OnEgressGuard` hook) | Accepted |
 | [0023](0023-tactical-codec-ingress-seam.md) | Tactical codec ingress seam (generic UDP/TCP codec-pluggable listeners) | Accepted |
+| [0024](0024-guard-fail-closed.md) | Fail-closed semantics for the cross-domain guard (unparseable markings, audit-chain load failures) | Proposed |
+| [0025](0025-revocation-lifecycle.md) | Live certificate-revocation lifecycle (CRL refresh, fail-closed staleness, active mid-session disconnect) | Proposed |
+| [0026](0026-archive-xchacha-v3.md) | Wider-nonce v3 archive format (XChaCha20-Poly1305) | Proposed |
 
 ## Authoring a new ADR
 
