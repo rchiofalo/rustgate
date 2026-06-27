@@ -458,13 +458,13 @@ jobs:
         # = "schema")]`) actually compiles and runs here — it re-emits the
         # JSON schema and asserts the checked-in `schemas/rustgate-v0.8.json`
         # matches byte-for-byte, catching a forgotten regen in CI.
-        run: cargo nextest run --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http,schema
+        run: cargo nextest run --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http,schema,marti-compat,missions,video,correlation
 
       - name: Authz P99 budget gate (release)
         run: cargo nextest run --locked --release -p rustgate-authz --run-ignored all perf_budget
 
       - name: Run doc tests
-        run: cargo test --locked --workspace --doc --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http
+        run: cargo test --locked --workspace --doc --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http,marti-compat,missions,video,correlation
 
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
@@ -543,7 +543,7 @@ jobs:
         # up front because cargo-llvm-cov does not auto-mkdir --output-path.
         run: |
           mkdir -p coverage
-          cargo llvm-cov --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http --cobertura --output-path coverage/cobertura.xml nextest
+          cargo llvm-cov --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http,marti-compat,missions,video,correlation --cobertura --output-path coverage/cobertura.xml nextest
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
