@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode};
+use rustgate_core::constants::MAX_FRAME_SIZE;
 
 use crate::config::SensorThingsConfig;
 use crate::error::SensorThingsError;
@@ -230,12 +231,37 @@ impl SensorThingsClient {
             });
         }
 
-        let body = response.bytes().await.map_err(|e| {
-            // Body-read failure after the headers arrived — surface
-            // as a transport error so the wiring's backoff path
-            // applies.
-            SensorThingsError::Transport { source: e }
-        })?;
+        // Cap the response body. A SensorThings page is bounded, but the
+        // endpoint is untrusted (redirects are disabled above for the same
+        // reason), so a hostile or MITM'd server returning a chunked,
+        // Content-Length-less, multi-gigabyte body must not be buffered into
+        // heap. Reject once the body exceeds MAX_FRAME_SIZE rather than
+        // trusting (or requiring) the advertised Content-Length.
+        if let Some(len) = response.content_length()
+            && len > MAX_FRAME_SIZE as u64
+        {
+            return Err(SensorThingsError::ResponseTooLarge {
+                limit: MAX_FRAME_SIZE,
+            });
+        }
+        let mut response = response;
+        let mut body: Vec<u8> = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if would_exceed_limit(body.len(), chunk.len(), MAX_FRAME_SIZE) {
+                        return Err(SensorThingsError::ResponseTooLarge {
+                            limit: MAX_FRAME_SIZE,
+                        });
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                // Body-read failure after the headers arrived — surface as a
+                // transport error so the wiring's backoff path applies.
+                Err(e) => return Err(SensorThingsError::Transport { source: e }),
+            }
+        }
         serde_json::from_slice::<ObservationsPage>(&body).map_err(|e| SensorThingsError::Decode {
             message: format!("failed to decode SensorThings response: {e}"),
         })
@@ -251,10 +277,34 @@ impl SensorThingsClient {
     }
 }
 
+/// Whether appending `incoming` bytes to an already-`accumulated` buffer would
+/// push it past `limit`. Pulled out as a pure function so the streaming
+/// response-body cap — the bound that stops an unbounded (chunked,
+/// Content-Length-less) body from being buffered — is unit-testable without a
+/// streaming HTTP server. `saturating_add` keeps the check correct even if a
+/// hostile chunk length were near `usize::MAX`.
+fn would_exceed_limit(accumulated: usize, incoming: usize, limit: usize) -> bool {
+    accumulated.saturating_add(incoming) > limit
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn would_exceed_limit_bounds_the_streamed_body() {
+        // Under the limit: keep reading.
+        assert!(!would_exceed_limit(0, 1024, MAX_FRAME_SIZE));
+        assert!(!would_exceed_limit(MAX_FRAME_SIZE - 1, 1, MAX_FRAME_SIZE));
+        // Exactly the limit is fine; one byte over trips.
+        assert!(!would_exceed_limit(MAX_FRAME_SIZE, 0, MAX_FRAME_SIZE));
+        assert!(would_exceed_limit(MAX_FRAME_SIZE, 1, MAX_FRAME_SIZE));
+        // Accumulation across chunks crosses the limit.
+        assert!(would_exceed_limit(MAX_FRAME_SIZE - 10, 11, MAX_FRAME_SIZE));
+        // A near-usize::MAX chunk length cannot wrap the check.
+        assert!(would_exceed_limit(1, usize::MAX, MAX_FRAME_SIZE));
+    }
     use crate::config::SensorThingsConfig;
 
     fn cfg_with_endpoint(endpoint: &str) -> SensorThingsConfig {
