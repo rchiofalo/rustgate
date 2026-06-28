@@ -99,6 +99,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use rustgate_core::constants::MAX_FRAME_SIZE;
 use rustgate_core::entity::{AttributeValue, Entity, EntityCodec, EntityKind, Position, Velocity};
 
 use crate::error::{SchemaCodecError, SchemaError};
@@ -960,6 +961,20 @@ impl EntityCodec for SchemaCodec {
             // produce wire-truthful variable payloads.
             if let Some(span) = dyn_size {
                 let needed = field.offset.saturating_add(span);
+                // The `repeat` count is taken from the source Entity —
+                // ultimately an attacker-influenced wire field in
+                // cross-protocol transcoding — so cap the grown buffer at
+                // MAX_FRAME_SIZE. Without this a forged count (e.g. u32::MAX)
+                // multiplied by a non-trivial record size would drive
+                // `out.resize` to a multi-gigabyte allocation, a single-message
+                // remote DoS. The decode side is already bounded by the real
+                // input length; only this on-demand encode growth is unbounded.
+                if needed > MAX_FRAME_SIZE {
+                    return Err(SchemaCodecError::PayloadTooLarge {
+                        needed,
+                        limit: MAX_FRAME_SIZE,
+                    });
+                }
                 if needed > out.len() {
                     out.resize(needed, 0);
                 }
@@ -3030,6 +3045,55 @@ message-types:
         assert_eq!(
             &bytes[1..],
             &[0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44]
+        );
+    }
+
+    #[test]
+    fn repeat_encode_rejects_oversized_count_instead_of_allocating() {
+        // The `repeat` count is taken from the source Entity (an
+        // attacker-influenced wire field in cross-protocol transcoding).
+        // A forged count whose span would grow the output past
+        // MAX_FRAME_SIZE must be rejected with PayloadTooLarge rather than
+        // attempting a multi-hundred-megabyte `Vec::resize` (#1624).
+        const HUGE_REPEAT_SCHEMA: &str = r#"
+schema-version: "1"
+protocol-name: "test.repeat.huge"
+message-types:
+  - name: "M"
+    size-bytes: 4
+    fields:
+      - name: "count"
+        offset: 0
+        field-type: { kind: u32 }
+        endian: big
+        entity-path: "attributes.count"
+      - name: "records"
+        offset: 4
+        field-type: { kind: bytes }
+        repeat:
+          count-from: "count"
+          record-size-bytes: 4
+"#;
+        let codec = SchemaCodec::from_schema_text(HUGE_REPEAT_SCHEMA).unwrap();
+        let mut entity = empty_entity();
+        // 20_000_000 records × 4 bytes ≈ 76 MiB, far over the 16 MiB cap.
+        let _ = entity
+            .attributes
+            .insert("attributes.count".into(), AttributeValue::Int(20_000_000));
+        // A minimal records value so the field lookup succeeds; the ceiling
+        // check fires before the record bytes are ever encoded.
+        let _ = entity.attributes.insert(
+            "schema.test.repeat.huge.records".into(),
+            AttributeValue::Str("00".into()),
+        );
+        let err = codec.from_entity(&entity).unwrap_err();
+        let SchemaCodecError::PayloadTooLarge { needed, limit } = err else {
+            panic!("expected PayloadTooLarge, got {err:?}");
+        };
+        assert_eq!(limit, MAX_FRAME_SIZE);
+        assert!(
+            needed > limit,
+            "needed {needed} must exceed the {limit}-byte cap"
         );
     }
 

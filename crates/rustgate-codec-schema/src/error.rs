@@ -51,6 +51,22 @@ pub enum SchemaCodecError {
         required: usize,
     },
 
+    /// Encoding would produce a payload larger than the maximum frame size.
+    /// A `repeat` field's count is taken from the source
+    /// [`Entity`](rustgate_core::entity::Entity) — ultimately an
+    /// attacker-influenced wire field in cross-protocol transcoding — so an
+    /// unbounded count would grow the output buffer past
+    /// [`rustgate_core::constants::MAX_FRAME_SIZE`]. Rejecting here bounds a
+    /// transcode-side allocation DoS that would otherwise drive
+    /// `Vec::resize` to a multi-gigabyte allocation.
+    #[error("encoded payload would be {needed} bytes, exceeding the {limit}-byte maximum")]
+    PayloadTooLarge {
+        /// Byte length the encode would have required.
+        needed: usize,
+        /// The maximum permitted (`MAX_FRAME_SIZE`).
+        limit: usize,
+    },
+
     /// Decoded bytes are not valid UTF-8 for a string field.
     #[error("field `{field}` UTF-8 decode failed: {source}")]
     Utf8 {
