@@ -208,6 +208,66 @@ async fn ws_rejects_expired_client_cert() {
     );
 }
 
+/// A server-auth-only client certificate (CA-signed, carrying
+/// `id-kp-serverAuth` but **not** `id-kp-clientAuth`) passes the webpki
+/// verifier — which treats EKU as `RequiredIfPresent` and accepts a cert with
+/// the wrong/absent EKU — so the TLS handshake completes. It must then be
+/// rejected at identity extraction, matching the primary TLS listener.
+/// Regression for the cross-transport EKU-enforcement gap (this listener
+/// previously skipped `validate_key_usage`).
+#[tokio::test]
+async fn ws_rejects_server_auth_only_client_cert() {
+    let ca = TestCa::new("Test CA");
+    let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
+    let server_auth_cert = ca.issue_server_auth_only_cert("eku-confused");
+
+    let tls_config = TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)
+        .expect("tls config");
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+    let listener = WsListener::bind(addr, &tls_config).expect("bind");
+    let bound_addr = listener.local_addr().expect("local addr");
+
+    let server_handle = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await
+    });
+
+    // The cert is CA-signed with valid dates, so the TLS handshake itself MUST
+    // succeed — the rejection can only come later, at identity extraction.
+    let client_tls = build_client_tls_config(
+        &server_auth_cert.cert_pem,
+        &server_auth_cert.key_pem,
+        &ca.cert_pem,
+    );
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_tls));
+    let tcp = tokio::net::TcpStream::connect(bound_addr)
+        .await
+        .expect("tcp connect");
+    let server_name = "localhost".try_into().expect("server name");
+    let tls_stream = connector.connect(server_name, tcp).await.expect(
+        "TLS handshake must succeed for a CA-signed cert; rejection belongs at identity extraction",
+    );
+
+    // Drive the WebSocket upgrade. With EKU enforcement in place the listener
+    // drops the connection at identity extraction, so the upgrade must fail —
+    // without it, the upgrade would complete and `accept` would yield a session.
+    let ws_result = tokio_tungstenite::client_async(
+        format!("wss://localhost:{}", bound_addr.port()),
+        tls_stream,
+    )
+    .await;
+    assert!(
+        ws_result.is_err(),
+        "server-auth-only cert must be rejected at identity extraction; WS upgrade must not complete"
+    );
+
+    let server_result = server_handle.await.expect("server task");
+    assert!(
+        server_result.is_err(),
+        "listener must not yield a session for a server-auth-only client cert"
+    );
+}
+
 /// Multiple clients connect sequentially with distinct identities.
 #[tokio::test]
 async fn ws_accept_multiple_clients() {

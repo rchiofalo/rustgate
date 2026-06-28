@@ -49,7 +49,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::net::configure_tactical_socket;
 use rustgate_resilience::SlidingWindowLimiter;
-use rustgate_tls::{TlsConfig, extract_identity};
+use rustgate_tls::{ExpectedKeyUsage, TlsConfig, extract_identity, validate_key_usage};
 pub use server::{
     DEFAULT_MAX_WRITE_BUFFER_BYTES, OnFederationForward, OnHttpForward, OnNatsPublish,
     OnWsAcceptFn, OnWsRejectFn, WebSocketServer, WsServerConfig, WsSessionHooks,
@@ -698,6 +698,13 @@ fn extract_client_identity(tls_stream: &TlsStream) -> Result<Identity> {
         .ok_or(TransportError::NoCertificate)?;
 
     let client_cert = certs.first().ok_or(TransportError::EmptyCertChain)?;
+
+    // The webpki client verifier treats EKU as `RequiredIfPresent`, so it
+    // accepts a CA-signed certificate that carries no `id-kp-clientAuth`
+    // purpose (a server-auth-only cert, or one with no EKU at all). Enforce
+    // ClientAuth here so this transport rejects EKU-confused certificates
+    // identically to the primary TLS listener (rustgate-tls).
+    validate_key_usage(client_cert, ExpectedKeyUsage::ClientAuth)?;
 
     extract_identity(client_cert)
 }
