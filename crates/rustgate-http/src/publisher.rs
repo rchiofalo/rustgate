@@ -1587,6 +1587,16 @@ async fn replay_entry(
     target: &TargetState,
     entry: &crate::dlq_reader::OwnedDlqEntry,
 ) -> ReplayOutcome {
+    // Respect the circuit breaker on replay, exactly as the live dispatch
+    // path does. Drain is triggered on the circuit closing, but if the target
+    // degrades again partway through a large drain the circuit re-opens —
+    // without this gate the loop would keep firing one request per remaining
+    // entry at the unhealthy target. Re-DLQ the entry (Failed) so the next
+    // recovery cycle retries it, rather than hammering a flapping target.
+    if !target.circuit.allow_request() {
+        return ReplayOutcome::Failed;
+    }
+
     // Decode the original payload bytes. A decode failure here is a
     // hard drop — the DLQ file is intact but the entry itself is
     // unusable, and no retry can fix it.
@@ -2869,6 +2879,49 @@ mod tests {
             batch_max_bytes: None,
             batch_format: None,
         }
+    }
+
+    /// A replay must respect the circuit breaker: if the target's circuit is
+    /// open (it re-tripped mid-drain), `replay_entry` returns `Failed`
+    /// without issuing a request, so the entry is re-DLQ'd for the next
+    /// recovery cycle rather than hammering an unhealthy target (#1626).
+    #[tokio::test]
+    async fn replay_entry_skips_when_circuit_open() {
+        let tc = trigger_drain_test_target("siem");
+        let resolver = Arc::new(SsrfSafeResolver::new(true));
+        let target = build_target(&tc, "instance-1", resolver, None).expect("build target");
+
+        // Drive the circuit open the way a flapping target would. The guard
+        // bounds the loop so a config change can never hang the test.
+        let mut guard = 0;
+        while target.circuit.allow_request() && guard < 10_000 {
+            let _ = target.circuit.record_failure();
+            guard += 1;
+        }
+        assert!(
+            !target.circuit.allow_request(),
+            "circuit must be open before the replay"
+        );
+
+        let entry = crate::dlq_reader::OwnedDlqEntry {
+            timestamp: "2026-06-26T00:00:00Z".to_string(),
+            target: "siem".to_string(),
+            reason: "circuit_open".to_string(),
+            delivery_id: "0000000000000000ffffffffffffffff".to_string(),
+            source_cn: "alice".to_string(),
+            source_groups: vec!["alpha".to_string()],
+            destination: "broadcast".to_string(),
+            message_type: "position".to_string(),
+            source_protocol: "tcp".to_string(),
+            payload_b64: rustgate_core::b64::encode(b"hello"),
+            payload_size: 5,
+        };
+
+        let outcome = replay_entry(&target, &entry).await;
+        assert!(
+            matches!(outcome, ReplayOutcome::Failed),
+            "replay against an open circuit must Fail (re-DLQ), not send"
+        );
     }
 
     /// Write a 64-zero-hex KeyRing JSON fixture and return its path,
