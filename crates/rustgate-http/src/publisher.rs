@@ -1955,9 +1955,12 @@ const MAX_ERROR_RESPONSE_BYTES: usize = 1024 * 1024;
 /// caller can surface structured error details or acknowledgement IDs.
 /// When `capture` is `false`, still drains but returns `None`.
 ///
-/// The per-target `max_bytes` is clamped against [`MAX_ERROR_RESPONSE_BYTES`]
-/// and the server-advertised Content-Length to prevent memory exhaustion
-/// from a malicious server returning an unbounded response body.
+/// The per-target `max_bytes` is clamped against [`MAX_ERROR_RESPONSE_BYTES`],
+/// and the body is read by streaming chunks with a hard ceiling on total bytes
+/// consumed — never trusting (or requiring) a Content-Length header. A hostile
+/// server replying with a chunked, Content-Length-less, multi-gigabyte body
+/// therefore cannot exhaust memory: reads stop at the ceiling and the
+/// connection is dropped.
 async fn capture_response_body(
     response: reqwest::Response,
     max_bytes: usize,
@@ -1967,29 +1970,73 @@ async fn capture_response_body(
     // cap cannot exceed this no matter what.
     let effective_cap = max_bytes.min(MAX_ERROR_RESPONSE_BYTES);
 
-    // Content-Length guard: if the server advertises a body larger than
-    // the global ceiling, don't read it. Drop the connection instead.
+    // Content-Length guard: if the server *advertises* a body larger than
+    // the global ceiling, don't read it. Drop the connection instead. This is
+    // only a fast path — a chunked response carries no Content-Length, so the
+    // streaming ceiling below is what actually bounds memory.
     if let Some(len) = response.content_length()
         && len > MAX_ERROR_RESPONSE_BYTES as u64
     {
         return None;
     }
 
-    // Drain the body. Errors (timeout, connection reset) are ignored —
-    // the connection will be dropped and a new one established.
-    let body_bytes = match response.bytes().await {
-        Ok(b) => b,
-        Err(_) => return None,
-    };
-
-    if !capture || body_bytes.is_empty() {
-        return None;
+    // Stream the body chunk-by-chunk rather than buffering it whole. We retain
+    // at most `effective_cap` bytes for capture, but keep draining (and
+    // discarding) up to the hard `MAX_ERROR_RESPONSE_BYTES` ceiling so a
+    // well-behaved body returns the connection to the pool clean. Once that
+    // ceiling is reached we stop reading and drop the connection — this is the
+    // bound that a Content-Length-less (chunked) response would otherwise
+    // evade, letting a hostile upstream buffer an unbounded body into memory.
+    let mut response = response;
+    let mut buf = bytes::BytesMut::new();
+    let mut total_read: usize = 0;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if accumulate_capped(
+                    &mut buf,
+                    &mut total_read,
+                    &chunk,
+                    effective_cap,
+                    MAX_ERROR_RESPONSE_BYTES,
+                ) {
+                    break;
+                }
+            }
+            // Body fully consumed — connection can be reused.
+            Ok(None) => break,
+            // Partial read (timeout, reset): return what we have; the
+            // connection will be dropped and a new one established.
+            Err(_) => break,
+        }
     }
 
-    // Truncate at the per-target cap. `Bytes::slice` is a ref-count
-    // bump + offset update; no memcpy.
-    let take = effective_cap.min(body_bytes.len());
-    Some(body_bytes.slice(0..take))
+    if !capture || buf.is_empty() {
+        return None;
+    }
+    Some(buf.freeze())
+}
+
+/// Accumulate `chunk` into the capture buffer (retaining at most `cap` bytes)
+/// and advance `total_read` by the full chunk length. Returns `true` once
+/// `read_ceiling` total bytes have been consumed and reading must stop.
+///
+/// Pulled out as a pure function so the cap arithmetic — the bound that stops
+/// an unbounded chunked response from being buffered — is unit-testable
+/// without a streaming HTTP server.
+fn accumulate_capped(
+    buf: &mut bytes::BytesMut,
+    total_read: &mut usize,
+    chunk: &[u8],
+    cap: usize,
+    read_ceiling: usize,
+) -> bool {
+    *total_read = total_read.saturating_add(chunk.len());
+    if buf.len() < cap {
+        let take = (cap - buf.len()).min(chunk.len());
+        buf.extend_from_slice(&chunk[..take]);
+    }
+    *total_read >= read_ceiling
 }
 
 /// Format a captured response body for inclusion in a structured log
@@ -2734,6 +2781,65 @@ mod tests {
             captured.is_none(),
             "oversized Content-Length must short-circuit before body read"
         );
+    }
+
+    /// `accumulate_capped` retains at most `cap` bytes but counts the full
+    /// chunk toward `total_read` — so a single oversized chunk is truncated in
+    /// the capture buffer without losing track of how much was actually read.
+    #[test]
+    fn accumulate_capped_retains_only_cap_bytes() {
+        let mut buf = bytes::BytesMut::new();
+        let mut total = 0usize;
+        let stop = accumulate_capped(&mut buf, &mut total, &vec![0xAB; 4096], 512, 1024 * 1024);
+        assert!(!stop, "4 KiB read is far under the 1 MiB ceiling");
+        assert_eq!(buf.len(), 512, "capture buffer retains at most the cap");
+        assert_eq!(
+            total, 4096,
+            "total_read counts the full chunk, not the retained slice"
+        );
+    }
+
+    /// The read ceiling — not the capture cap — is what stops an unbounded
+    /// (chunked, no Content-Length) drain. Consuming past it must signal stop.
+    #[test]
+    fn accumulate_capped_stops_at_read_ceiling() {
+        let mut buf = bytes::BytesMut::new();
+        let mut total = 0usize;
+        let stop = accumulate_capped(&mut buf, &mut total, &vec![0u8; 2048], 256, 1024);
+        assert!(
+            stop,
+            "consuming past the read ceiling must stop the drain loop"
+        );
+        assert_eq!(buf.len(), 256, "capture is still bounded by the cap");
+        assert_eq!(total, 2048);
+    }
+
+    /// Across multiple chunks the cap fills only once and `total_read` spans
+    /// every chunk seen.
+    #[test]
+    fn accumulate_capped_accumulates_across_chunks() {
+        let mut buf = bytes::BytesMut::new();
+        let mut total = 0usize;
+        assert!(!accumulate_capped(
+            &mut buf,
+            &mut total,
+            &[1, 2, 3],
+            4,
+            1024
+        ));
+        assert!(!accumulate_capped(
+            &mut buf,
+            &mut total,
+            &[4, 5, 6],
+            4,
+            1024
+        ));
+        assert_eq!(
+            &buf[..],
+            &[1, 2, 3, 4],
+            "second chunk fills only the remaining cap"
+        );
+        assert_eq!(total, 6, "total_read spans both chunks");
     }
 
     // ── trigger_drain (manual DLQ replay, issue #881 PR C) ─────────
