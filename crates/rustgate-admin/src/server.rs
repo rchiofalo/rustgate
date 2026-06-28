@@ -612,6 +612,28 @@ fn metrics_auth_ok(header: Option<&str>, expected: &[u8]) -> bool {
     token.as_bytes().ct_eq(expected).into()
 }
 
+/// Maximum accepted request-body size for the federation REST API.
+///
+/// Federation peer-config payloads are small JSON objects; this cap bounds the
+/// pre-handler `collect()` so a hostile body cannot exhaust heap (#1621).
+#[cfg(feature = "federation")]
+const MAX_FEDERATION_API_BODY_BYTES: usize = 256 * 1024;
+
+/// Whether a request to the **state-mutating** federation REST API is authorized.
+///
+/// Unlike the read-only `/metrics` scrape — which is open when no token is
+/// configured — the federation API mutates peer trust (peers, `trust_cert_cn`,
+/// inbound-group allowlists), so it is **fail-closed**: it requires both a
+/// configured bearer token *and* a matching `Authorization` header, and denies
+/// outright when no token is configured at all (#1621).
+#[cfg(feature = "federation")]
+fn federation_api_authorized(expected: Option<&[u8]>, header: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    metrics_auth_ok(header, expected)
+}
+
 /// Build a structured JSON readiness response that includes dependency
 /// check results alongside the base `ready` flag from `HealthState`.
 ///
@@ -920,13 +942,51 @@ pub async fn serve(
                             // Delegate /api/federation/ paths to the federation handler
                             #[cfg(feature = "federation")]
                             if req.uri().path().starts_with("/api/federation/") {
+                                // The federation REST API mutates peer trust
+                                // (peers, trust_cert_cn, inbound-group
+                                // allowlists), so — unlike the read-only
+                                // /metrics scrape — it must never be reachable
+                                // without authentication. Require a configured
+                                // token AND a valid bearer header before
+                                // touching the body or the handler; fail closed
+                                // when no token is set (#1621).
+                                let auth_header = req
+                                    .headers()
+                                    .get(hyper::header::AUTHORIZATION)
+                                    .and_then(|v| v.to_str().ok());
+                                if !federation_api_authorized(
+                                    metrics_token.as_ref().map(|t| t.as_slice()),
+                                    auth_header,
+                                ) {
+                                    return Ok(Response::builder()
+                                        .status(StatusCode::UNAUTHORIZED)
+                                        .header(hyper::header::WWW_AUTHENTICATE, "Bearer")
+                                        .body(Full::new(Bytes::from("unauthorized")))
+                                        .unwrap_or_else(|_| internal_error_response()));
+                                }
                                 if let Some(handler) = fed_api.get() {
                                     let method = req.method().clone();
                                     let path = req.uri().path().to_string();
-                                    let body = http_body_util::BodyExt::collect(req.into_body())
-                                        .await
-                                        .map(|b| b.to_bytes())
-                                        .unwrap_or_default();
+                                    // Cap the body before buffering so a hostile
+                                    // request cannot exhaust heap; 413 on excess.
+                                    let body = match http_body_util::BodyExt::collect(
+                                        http_body_util::Limited::new(
+                                            req.into_body(),
+                                            MAX_FEDERATION_API_BODY_BYTES,
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(collected) => collected.to_bytes(),
+                                        Err(_) => {
+                                            return Ok(Response::builder()
+                                                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                                                .body(Full::new(Bytes::from(
+                                                    "request body too large",
+                                                )))
+                                                .unwrap_or_else(|_| internal_error_response()));
+                                        }
+                                    };
                                     if let Some(resp) = handler(&method, &path, &body) {
                                         return Ok(resp);
                                     }
@@ -1201,6 +1261,45 @@ mod tests {
         assert!(metrics_auth_ok(
             Some("Bearer s3cret-token-for-metrics-test1"),
             b"s3cret-token-for-metrics-test1"
+        ));
+    }
+
+    // The federation REST API mutates peer trust, so its gate is fail-closed:
+    // it must deny when no token is configured, and otherwise require a valid
+    // bearer — never the read-only /metrics "open when unset" behavior (#1621).
+    #[cfg(feature = "federation")]
+    #[test]
+    fn federation_api_denies_when_no_token_configured() {
+        // Even a well-formed bearer is rejected if the server set no token.
+        assert!(!federation_api_authorized(
+            None,
+            Some("Bearer anything-at-all")
+        ));
+        assert!(!federation_api_authorized(None, None));
+    }
+
+    #[cfg(feature = "federation")]
+    #[test]
+    fn federation_api_denies_missing_or_wrong_token() {
+        let expected = b"fed-api-secret-token-padding-1".as_slice();
+        assert!(!federation_api_authorized(Some(expected), None));
+        assert!(!federation_api_authorized(
+            Some(expected),
+            Some("Bearer wrong-token-value-padding-9")
+        ));
+        // Wrong scheme is rejected.
+        assert!(!federation_api_authorized(
+            Some(expected),
+            Some("Basic fed-api-secret-token-padding-1")
+        ));
+    }
+
+    #[cfg(feature = "federation")]
+    #[test]
+    fn federation_api_allows_exact_token() {
+        assert!(federation_api_authorized(
+            Some(b"fed-api-secret-token-padding-1"),
+            Some("Bearer fed-api-secret-token-padding-1")
         ));
     }
 
