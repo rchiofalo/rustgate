@@ -1920,35 +1920,45 @@ pub fn spawn_federation_lag_updater(
             let oldest_vec = FEDERATION_PEER_OLDEST_SECONDS.get();
             let latency_vec = FEDERATION_PEER_LATENCY_NANOS.get();
             let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // Peer ids are hashed before they become metric label *values* so
+            // the federation topology (configured peer names) is not disclosed
+            // in plaintext on the unauthenticated-by-default /metrics scrape —
+            // OPSEC redaction, not PII (#1558). The `current`/`known_peers` sets
+            // stay raw because they are only used to diff which labels to set
+            // vs. remove; both the set and remove paths below hash, so the
+            // label space stays consistent across sweeps.
             for (peer, bytes, oldest) in &lag_snapshot {
                 let _ = current.insert(peer.clone());
+                let label = rustgate_core::masking::hash_cn(peer);
                 if let Some(g) = bytes_vec
-                    && let Ok(child) = g.get_metric_with_label_values(&[peer.as_str()])
+                    && let Ok(child) = g.get_metric_with_label_values(&[label.as_str()])
                 {
                     child.set(*bytes as i64);
                 }
                 if let Some(g) = oldest_vec
-                    && let Ok(child) = g.get_metric_with_label_values(&[peer.as_str()])
+                    && let Ok(child) = g.get_metric_with_label_values(&[label.as_str()])
                 {
                     child.set(oldest.round() as i64);
                 }
             }
             for (peer, nanos) in &latency_snapshot {
+                let label = rustgate_core::masking::hash_cn(peer);
                 if let Some(g) = latency_vec
-                    && let Ok(child) = g.get_metric_with_label_values(&[peer.as_str()])
+                    && let Ok(child) = g.get_metric_with_label_values(&[label.as_str()])
                 {
                     child.set(*nanos as i64);
                 }
             }
             for stale in known_peers.difference(&current) {
+                let label = rustgate_core::masking::hash_cn(stale);
                 if let Some(g) = bytes_vec {
-                    let _ = g.remove_label_values(&[stale.as_str()]);
+                    let _ = g.remove_label_values(&[label.as_str()]);
                 }
                 if let Some(g) = oldest_vec {
-                    let _ = g.remove_label_values(&[stale.as_str()]);
+                    let _ = g.remove_label_values(&[label.as_str()]);
                 }
                 if let Some(g) = latency_vec {
-                    let _ = g.remove_label_values(&[stale.as_str()]);
+                    let _ = g.remove_label_values(&[label.as_str()]);
                 }
             }
             known_peers = current;

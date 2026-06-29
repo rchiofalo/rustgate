@@ -456,30 +456,34 @@ fn rpc_metrics_classify_status_pins_three_buckets() {
 #[test]
 fn rpc_metrics_in_flight_guard_lifecycle_for_streaming_rpcs() {
     let peer = "rpc-streams-guard-peer";
+    // The guard hashes the peer id into the label (#1558), so read the gauge
+    // under the same hashed label the guard writes (the raw id still goes into
+    // `enter`, which hashes it internally).
+    let peer_label = sanitize_peer_label(peer);
     let before = rpc_in_flight()
-        .with_label_values(&[RPC_SERVER_ROL_STREAM, peer])
+        .with_label_values(&[RPC_SERVER_ROL_STREAM, peer_label.as_str()])
         .get();
     {
         let _g = InFlightGuard::enter(RPC_SERVER_ROL_STREAM, peer);
         let during = rpc_in_flight()
-            .with_label_values(&[RPC_SERVER_ROL_STREAM, peer])
+            .with_label_values(&[RPC_SERVER_ROL_STREAM, peer_label.as_str()])
             .get();
         assert_eq!(during, before + 1, "expected +1 inside guard scope");
     }
     let after = rpc_in_flight()
-        .with_label_values(&[RPC_SERVER_ROL_STREAM, peer])
+        .with_label_values(&[RPC_SERVER_ROL_STREAM, peer_label.as_str()])
         .get();
     assert_eq!(after, before, "expected gauge to drain on Drop");
 
     // Sanity: same peer, different RPC label gets its own series.
     let other_before = rpc_in_flight()
-        .with_label_values(&[RPC_CLIENT_FEDERATE_GROUPS_STREAM, peer])
+        .with_label_values(&[RPC_CLIENT_FEDERATE_GROUPS_STREAM, peer_label.as_str()])
         .get();
     {
         let _g = InFlightGuard::enter(RPC_CLIENT_FEDERATE_GROUPS_STREAM, peer);
     }
     let other_after = rpc_in_flight()
-        .with_label_values(&[RPC_CLIENT_FEDERATE_GROUPS_STREAM, peer])
+        .with_label_values(&[RPC_CLIENT_FEDERATE_GROUPS_STREAM, peer_label.as_str()])
         .get();
     assert_eq!(other_after, other_before);
 }

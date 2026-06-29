@@ -277,8 +277,14 @@ impl PeerHandle {
         // would represent >8 exabytes — clamp to the gauge's max value
         // instead of silently dropping the sample.
         let value = i64::try_from(current).unwrap_or(i64::MAX);
+        // Hash the peer id before it becomes a metric label value, matching the
+        // federation-lag updater in `rustgate-server` — keeps the configured
+        // peer topology out of the plaintext /metrics scrape (OPSEC, not PII;
+        // #1558). Must use the same `hash_cn` so both writers of this gauge
+        // target the same label for a given peer.
+        let label = rustgate_core::masking::hash_cn(self.id.as_ref());
         crate::metrics::peer_queue_bytes()
-            .with_label_values(&[self.id.as_ref()])
+            .with_label_values(&[label.as_str()])
             .set(value);
     }
 
