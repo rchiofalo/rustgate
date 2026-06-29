@@ -91,7 +91,17 @@ pub fn extract_multipart_filename(body: &[u8], boundary: &str) -> Option<String>
             let start = pos + "filename=\"".len();
             let rest = part.get(start..)?;
             let end = rest.find('"')?;
-            return Some(rest.get(..end)?.to_string());
+            let name = rest.get(..end)?;
+            // Reject control characters in the filename. It becomes the
+            // package display name and is later interpolated into a
+            // `Content-Disposition` response header on download, so a CR / LF /
+            // NUL would allow header / response splitting (#1608). Such a
+            // filename is never legitimate — drop it (the caller falls back to
+            // a generated name) rather than store an injection vector.
+            if name.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+                return None;
+            }
+            return Some(name.to_string());
         }
     }
     None
@@ -130,6 +140,32 @@ mod tests {
         let body = "------X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"my.zip\"\r\n\r\nbody\r\n------X--\r\n";
         let got = extract_multipart_filename(body.as_bytes(), boundary).unwrap();
         assert_eq!(got, "my.zip");
+    }
+
+    #[test]
+    fn extract_multipart_filename_rejects_control_characters() {
+        // A filename containing CR / LF / NUL must not be returned: it becomes
+        // the package display name and is later interpolated into a
+        // `Content-Disposition` response header on download, so the bytes would
+        // allow header / response splitting (#1608).
+        let boundary = "----X";
+        let body = |fname: &str| {
+            format!(
+                "------X\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\n\r\nbody\r\n------X--\r\n"
+            )
+        };
+        // A clean filename still round-trips.
+        assert_eq!(
+            extract_multipart_filename(body("clean.zip").as_bytes(), boundary).as_deref(),
+            Some("clean.zip")
+        );
+        // CR/LF/NUL filenames are dropped (None → caller uses a generated name).
+        assert!(
+            extract_multipart_filename(body("a\r\nSet-Cookie: evil").as_bytes(), boundary)
+                .is_none()
+        );
+        assert!(extract_multipart_filename(body("a\nb").as_bytes(), boundary).is_none());
+        assert!(extract_multipart_filename(body("a\0b").as_bytes(), boundary).is_none());
     }
 
     #[test]
