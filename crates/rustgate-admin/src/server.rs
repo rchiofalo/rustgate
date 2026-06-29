@@ -75,9 +75,9 @@ pub type VideoApiHandler =
 /// `None` for unrecognized paths so the caller can fall through to
 /// 404. Wired by the server binary under `--features correlation`
 /// (closes #848). The shape mirrors the video catalog handler — sync
-/// `Fn`, no `auth` parameter (the snapshot endpoint is read-only and
-/// unauthenticated by default; operators that need auth wrap the
-/// metrics endpoint in their reverse proxy).
+/// `Fn`, no `auth` parameter: the dispatcher gates this path behind the
+/// metrics bearer token when one is configured (#1616), exactly like the
+/// read-only `/metrics` scrape, so the handler itself needs no auth arg.
 #[cfg(feature = "correlation")]
 pub type CorrelationApiHandler =
     Arc<dyn Fn(&hyper::Method, &str, &[u8]) -> Option<Response<Full<Bytes>>> + Send + Sync>;
@@ -1027,6 +1027,26 @@ pub async fn serve(
                             if req.uri().path().starts_with("/api/correlation/")
                                 && let Some(handler) = correlation_api.get()
                             {
+                                // The correlation snapshot exposes operational
+                                // fused-entity data and deep-clones the whole
+                                // graph per request. Gate it behind the metrics
+                                // bearer token when one is configured, exactly
+                                // like the read-only /metrics scrape — this
+                                // dispatch arm previously inherited NO auth even
+                                // when a token was set (#1616).
+                                if let Some(ref expected) = metrics_token {
+                                    let auth = req
+                                        .headers()
+                                        .get(hyper::header::AUTHORIZATION)
+                                        .and_then(|v| v.to_str().ok());
+                                    if !metrics_auth_ok(auth, expected) {
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::UNAUTHORIZED)
+                                            .header(hyper::header::WWW_AUTHENTICATE, "Bearer")
+                                            .body(Full::new(Bytes::from("unauthorized")))
+                                            .unwrap_or_else(|_| internal_error_response()));
+                                    }
+                                }
                                 let method = req.method().clone();
                                 let path = req.uri().path().to_string();
                                 let body = http_body_util::BodyExt::collect(req.into_body())

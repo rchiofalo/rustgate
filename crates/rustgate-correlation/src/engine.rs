@@ -75,6 +75,35 @@ use crate::types::{CorrelationOutcome, FusedEntity, FusedEntityId, RejectionReas
 /// of nearby fused entities).
 const MAX_SPATIAL_CANDIDATES: usize = 16;
 
+/// Maximum number of distinct source tracks retained per fused entity.
+///
+/// Each merge into a fused entity appends a [`SourceTrack`] (which clones the
+/// full original [`Entity`]). Without a cap, an authenticated client flooding
+/// the engine with reports that all fuse into one entity (identical position
+/// and kind, distinct attacker-chosen UIDs) grows `sources` without bound —
+/// memory plus an O(n) fuse/scan cost on the routing hot path (#1613). When the
+/// cap is reached the stalest track (minimum `last_seen`) is evicted before the
+/// new one is appended, so an evicted real sensor simply re-registers on its
+/// next report.
+const MAX_SOURCES_PER_ENTITY: usize = 32;
+
+/// Append `track` to a fused entity's source list, evicting the stalest
+/// existing track first when the per-entity cap [`MAX_SOURCES_PER_ENTITY`] is
+/// reached (#1613). Bounds memory and the O(n) fuse/scan cost regardless of how
+/// many distinct source UIDs an attacker fuses into a single entity.
+fn push_source_capped(sources: &mut Vec<SourceTrack>, track: SourceTrack) {
+    if sources.len() >= MAX_SOURCES_PER_ENTITY
+        && let Some(stalest) = sources
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.last_seen)
+            .map(|(idx, _)| idx)
+    {
+        let _ = sources.remove(stalest);
+    }
+    sources.push(track);
+}
+
 /// `RTreeObject` shim wrapping a fused entity ID with the position
 /// the index is currently keyed on. The `RTree` stores these by
 /// value (Copy); the actual `FusedEntity` lives in the
@@ -396,13 +425,16 @@ impl CorrelationEngine {
                 // Defensive: if the source vanished between
                 // find_same_source and the write, append it (with its real
                 // protocol so a later update matches it correctly).
-                fused.sources.push(SourceTrack {
-                    source_id: entity.uid.clone(),
-                    source_protocol: proto,
-                    original_entity: entity.clone(),
-                    weight,
-                    last_seen: now,
-                });
+                push_source_capped(
+                    &mut fused.sources,
+                    SourceTrack {
+                        source_id: entity.uid.clone(),
+                        source_protocol: proto,
+                        original_entity: entity.clone(),
+                        weight,
+                        last_seen: now,
+                    },
+                );
             }
             if let Some(pos) = fuse_position(&fused.sources) {
                 fused.fused_position = Some(pos);
@@ -420,14 +452,17 @@ impl CorrelationEngine {
     fn merge_into(&self, id: FusedEntityId, entity: Entity, now: SystemTime, score: f64) {
         let weight = position_weight(&entity);
         if let Some(mut fused) = self.entities.get_mut(&id) {
-            fused.sources.push(SourceTrack {
-                source_id: entity.uid.clone(),
-                source_protocol: source_protocol_attr(&entity)
-                    .unwrap_or_else(|| "unknown".to_string()),
-                original_entity: entity.clone(),
-                weight,
-                last_seen: now,
-            });
+            push_source_capped(
+                &mut fused.sources,
+                SourceTrack {
+                    source_id: entity.uid.clone(),
+                    source_protocol: source_protocol_attr(&entity)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    original_entity: entity.clone(),
+                    weight,
+                    last_seen: now,
+                },
+            );
             if let Some(pos) = fuse_position(&fused.sources) {
                 fused.fused_position = Some(pos);
             }
@@ -677,6 +712,28 @@ mod tests {
             "expected merge, got {outcome:?}",
         );
         assert_eq!(engine.len(), 1, "no new fused entity should have spawned");
+    }
+
+    #[test]
+    fn merge_caps_sources_per_entity() {
+        // #1613: a flood of reports with identical position + kind but distinct
+        // attacker-chosen UIDs all fuse into one entity. The per-entity source
+        // list must stay bounded rather than grow with every merge.
+        let engine = CorrelationEngine::new();
+        let now = SystemTime::UNIX_EPOCH;
+        let total = MAX_SOURCES_PER_ENTITY + 50;
+        for i in 0..total {
+            let uid = format!("atk-{i}");
+            let _ = engine.submit_at(entity(&uid, EntityKind::Ground, 38.0, -77.0), now);
+        }
+        assert_eq!(engine.len(), 1, "all reports fuse into a single entity");
+        let snap = engine.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert!(
+            snap[0].sources.len() <= MAX_SOURCES_PER_ENTITY,
+            "per-entity sources must be capped at {MAX_SOURCES_PER_ENTITY}, got {}",
+            snap[0].sources.len()
+        );
     }
 
     #[test]
