@@ -123,7 +123,14 @@ impl OcspFetcher for OcspStaplerFetcher {
 /// Cached OCSP status for a single end-entity certificate.
 #[derive(Clone, Copy, Debug)]
 enum CachedStatus {
-    Good,
+    /// Reported `Good`, recorded at the given wall-clock second (Unix
+    /// epoch). The timestamp lets a frequently-reconnecting cert's `Good`
+    /// answer be re-validated after the TTL instead of trusted for the whole
+    /// process lifetime (#1625). `Revoked` needs no timestamp: revocation is
+    /// monotonic — a revoked certificate never becomes good again.
+    Good {
+        cached_at_secs: u64,
+    },
     Revoked,
 }
 
@@ -141,6 +148,11 @@ pub struct ClientOcspVerifier {
     fetch_tx: mpsc::Sender<(Vec<u8>, Vec<u8>, Vec<u8>)>,
     on_hit: Option<OnCacheHit>,
     on_miss: Option<OnCacheMiss>,
+    /// Seconds after which a cached `Good` answer is treated as stale and
+    /// re-validated on the next handshake (#1625). Bounds how long a
+    /// frequently-reconnecting cert is trusted without re-querying the
+    /// responder, so a later revocation is observed within this window.
+    good_ttl_secs: u64,
 }
 
 impl std::fmt::Debug for ClientOcspVerifier {
@@ -168,6 +180,15 @@ const FETCH_QUEUE_CAPACITY: usize = 256;
 /// Least-recently-used entries are evicted once the cap is reached.
 const OCSP_CACHE_CAPACITY: usize = 4096;
 
+/// Default re-validation window for a cached `Good` OCSP answer (#1625).
+///
+/// One hour balances responder load against revocation-detection latency: a
+/// frequently-reconnecting client's `Good` status is re-queried at most this
+/// long after it was recorded, so a revocation issued mid-session is observed
+/// within the window rather than never. CRL, when configured, independently
+/// catches the same revocation on its own refresh cadence.
+const DEFAULT_OCSP_GOOD_TTL_SECS: u64 = 3600;
+
 impl ClientOcspVerifier {
     /// Wrap an inner verifier with the OCSP cache and background fetcher.
     ///
@@ -179,6 +200,19 @@ impl ClientOcspVerifier {
         fetcher: Arc<dyn OcspFetcher>,
         on_hit: Option<OnCacheHit>,
         on_miss: Option<OnCacheMiss>,
+    ) -> Arc<Self> {
+        Self::new_with_good_ttl(inner, fetcher, on_hit, on_miss, DEFAULT_OCSP_GOOD_TTL_SECS)
+    }
+
+    /// Like [`Self::new`] but with an explicit re-validation window for cached
+    /// `Good` answers (#1625). Exposed primarily for tests; production callers
+    /// use [`Self::new`], which applies [`DEFAULT_OCSP_GOOD_TTL_SECS`].
+    pub fn new_with_good_ttl(
+        inner: Arc<dyn ClientCertVerifier>,
+        fetcher: Arc<dyn OcspFetcher>,
+        on_hit: Option<OnCacheHit>,
+        on_miss: Option<OnCacheMiss>,
+        good_ttl_secs: u64,
     ) -> Arc<Self> {
         let (fetch_tx, mut fetch_rx) =
             mpsc::channel::<(Vec<u8>, Vec<u8>, Vec<u8>)>(FETCH_QUEUE_CAPACITY);
@@ -193,6 +227,7 @@ impl ClientOcspVerifier {
             fetch_tx,
             on_hit,
             on_miss,
+            good_ttl_secs,
         });
 
         let weak = Arc::downgrade(&verifier);
@@ -205,7 +240,12 @@ impl ClientOcspVerifier {
                 match fetcher_clone.fetch(&leaf, &issuer).await {
                     Ok(true) => {
                         debug!(?cert_fp, "client OCSP: cached as Good");
-                        let _ = this.cache.lock().put(cert_fp, CachedStatus::Good);
+                        let _ = this.cache.lock().put(
+                            cert_fp,
+                            CachedStatus::Good {
+                                cached_at_secs: now_unix_secs(),
+                            },
+                        );
                     }
                     Ok(false) => {
                         warn!(?cert_fp, "client OCSP: certificate reported as revoked");
@@ -240,6 +280,27 @@ impl ClientOcspVerifier {
     }
 }
 
+/// Current wall-clock time as whole seconds since the Unix epoch, used to
+/// stamp cached `Good` answers. Used off the verify hot path (in the
+/// background fetcher), so reading the system clock here is fine. Returns 0 if
+/// the clock is before the epoch, which only makes a `Good` entry look stale
+/// sooner (fail-safe).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether a `Good` entry recorded at `cached_at_secs` is stale at handshake
+/// time `now_secs`, given the re-validation window `ttl_secs`. Pulled out as a
+/// pure function so the staleness arithmetic is unit-testable. Clock-backwards
+/// safe: `saturating_sub` treats a backwards clock step as age 0 (fresh), so a
+/// rewound NTP correction can never force a re-fetch storm.
+fn good_entry_is_stale(cached_at_secs: u64, now_secs: u64, ttl_secs: u64) -> bool {
+    now_secs.saturating_sub(cached_at_secs) >= ttl_secs
+}
+
 /// Compute the cache key for a leaf certificate.
 ///
 /// Returns the SHA-256 fingerprint of the full DER encoding. This
@@ -271,11 +332,29 @@ impl ClientCertVerifier for ClientOcspVerifier {
 
         let cert_fp = cache_key(end_entity.as_ref());
         match self.cached_status(&cert_fp) {
-            Some(CachedStatus::Good) => {
-                if let Some(cb) = &self.on_hit {
-                    cb();
+            Some(CachedStatus::Good { cached_at_secs }) => {
+                if good_entry_is_stale(cached_at_secs, now.as_secs(), self.good_ttl_secs) {
+                    // Stale `Good`: re-validate. Fire the miss callback and
+                    // schedule a background re-fetch, then fail open for this
+                    // handshake exactly like a cache miss (Tier 1). Without
+                    // this, a `Good` answer is bumped on every reconnect and
+                    // never re-queried, so a later revocation is never
+                    // observed for the process lifetime (#1625).
+                    if let Some(cb) = &self.on_miss {
+                        cb();
+                    }
+                    let issuer = intermediates
+                        .first()
+                        .map(|c| c.as_ref().to_vec())
+                        .unwrap_or_default();
+                    self.schedule_fetch(cert_fp, end_entity.as_ref().to_vec(), issuer);
+                    Ok(verified)
+                } else {
+                    if let Some(cb) = &self.on_hit {
+                        cb();
+                    }
+                    Ok(verified)
                 }
-                Ok(verified)
             }
             Some(CachedStatus::Revoked) => {
                 if let Some(cb) = &self.on_hit {
@@ -434,7 +513,7 @@ mod tests {
         }
         assert!(matches!(
             verifier.cached_status(&fp),
-            Some(CachedStatus::Good)
+            Some(CachedStatus::Good { .. })
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -511,7 +590,10 @@ mod tests {
         {
             let mut cache = verifier.cache.lock();
             for i in 0..(OCSP_CACHE_CAPACITY + 100) {
-                let _ = cache.put((i as u64).to_le_bytes().to_vec(), CachedStatus::Good);
+                let _ = cache.put(
+                    (i as u64).to_le_bytes().to_vec(),
+                    CachedStatus::Good { cached_at_secs: 0 },
+                );
             }
         }
         assert_eq!(
@@ -605,11 +687,26 @@ mod tests {
         // `Copy` is exercised implicitly via the bounds assertion above; use
         // the explicit `Clone::clone` form so clippy does not flag this as
         // `clone_on_copy` (we genuinely want to exercise the `Clone` derive).
-        let g = CachedStatus::Good;
+        let g = CachedStatus::Good { cached_at_secs: 0 };
         let cloned = Clone::clone(&g);
-        assert!(matches!(cloned, CachedStatus::Good));
+        assert!(matches!(cloned, CachedStatus::Good { .. }));
         assert!(format!("{g:?}").contains("Good"));
         assert!(format!("{:?}", CachedStatus::Revoked).contains("Revoked"));
+    }
+
+    /// A `Good` entry is stale once `ttl_secs` have elapsed since it was
+    /// recorded; a backwards clock step keeps it fresh rather than forcing a
+    /// re-fetch storm (#1625).
+    #[test]
+    fn good_entry_staleness_window() {
+        // Within the window → fresh.
+        assert!(!good_entry_is_stale(100, 150, 3600));
+        assert!(!good_entry_is_stale(100, 100 + 3599, 3600));
+        // At and past the window → stale (re-validate).
+        assert!(good_entry_is_stale(100, 100 + 3600, 3600));
+        assert!(good_entry_is_stale(100, 100 + 10_000, 3600));
+        // Clock stepped backwards (now < cached_at) → fresh, never a storm.
+        assert!(!good_entry_is_stale(5000, 100, 3600));
     }
 
     /// `OcspFetcher` trait objects must be shareable across tokio tasks
@@ -800,7 +897,7 @@ mod tests {
         let fp = cache_key(leaf_der.as_ref());
         verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
         for _ in 0..50 {
-            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good)) {
+            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good { .. })) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -837,7 +934,7 @@ mod tests {
         let fp = cache_key(leaf_der.as_ref());
         verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
         for _ in 0..50 {
-            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good)) {
+            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good { .. })) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -990,7 +1087,7 @@ mod tests {
         let fp = cache_key(leaf_der.as_ref());
         verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
         for _ in 0..50 {
-            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good)) {
+            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good { .. })) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
