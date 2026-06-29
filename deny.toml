@@ -47,6 +47,20 @@ all-features = true
 
 [advisories]
 ignore = [
+    # RUSTSEC-2026-0190 — anyhow <= 1.0.102: `unsound` advisory in
+    # `Error::downcast_mut()` after `Error::context()` (UB via pointer
+    # aliasing). Tracking: #1650. Landed in the daily RUSTSEC DB on
+    # 2026-06-29 and blocks the required `audit` gate on every branch.
+    #
+    # Why it does not apply to this tree: rustgate never calls the affected
+    # method — `rg downcast_mut crates/` returns zero hits. Our error
+    # handling uses `.context()` plus `.downcast()` / `.downcast_ref()`
+    # (immutable), which the advisory explicitly does not cover. The unsound
+    # path is therefore unreachable here.
+    #
+    # Removal trigger: bump `anyhow` past 1.0.102 (`cargo update -p anyhow`),
+    # confirm the advisory clears, and delete this entry. See #1650.
+    "RUSTSEC-2026-0190",
     # RUSTSEC-2024-0436 — paste 1.0.15 is archived/unmaintained.
     # Refs #714 (original observation), #1249 (re-investigation:
     # confirmed paste is purely transitive, no direct use site to swap),
