@@ -983,6 +983,17 @@ pub const DEFAULT_MAX_GROUPS_PER_CN: usize = 128;
 /// Default maximum total number of groups tracked by the router.
 pub const DEFAULT_MAX_TOTAL_GROUPS: usize = 10_000;
 
+/// Default global cap on the number of concurrent sessions the router tracks.
+///
+/// `register` allocates a `SessionHandle` per distinct client CN. Without a
+/// per-tenant quota (the default — `quota_tracker` is `None` unless a tenant
+/// quota file is configured), an attacker holding valid CA-issued certs could
+/// reconnect with many distinct CNs and grow the session map without bound,
+/// driving the process toward OOM (#1606). 100k comfortably covers realistic
+/// tactical client populations while bounding the worst case; raise it with
+/// [`Router::with_max_sessions`] for larger fleets.
+pub const DEFAULT_MAX_SESSIONS: usize = 100_000;
+
 /// Default initial capacity for the sessions map.
 /// Sized to avoid early rehashing under typical deployments.
 const DEFAULT_SESSION_CAPACITY: usize = 256;
@@ -1004,6 +1015,8 @@ struct State {
     cn_group_count: HashMap<Arc<str>, usize>,
     max_groups_per_cn: usize,
     max_total_groups: usize,
+    /// Global cap on concurrent sessions; bounds `sessions` growth (#1606).
+    max_sessions: usize,
 }
 
 impl Default for State {
@@ -1014,6 +1027,7 @@ impl Default for State {
             cn_group_count: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
             max_groups_per_cn: DEFAULT_MAX_GROUPS_PER_CN,
             max_total_groups: DEFAULT_MAX_TOTAL_GROUPS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
         }
     }
 }
@@ -2409,6 +2423,18 @@ impl Router {
         self
     }
 
+    /// Override the global concurrent-session cap (default
+    /// [`DEFAULT_MAX_SESSIONS`]). Builder-style; intended for construction
+    /// time, where the state lock is uncontended — if the lock is somehow
+    /// held, the cap keeps its current value rather than blocking.
+    #[must_use]
+    pub fn with_max_sessions(self, max_sessions: usize) -> Self {
+        if let Ok(mut state) = self.state.try_write() {
+            state.max_sessions = max_sessions;
+        }
+        self
+    }
+
     /// Atomically replace the installed quota tracker.
     pub fn swap_quota_tracker(&self, tracker: Option<Arc<crate::quota::TenantQuotaTracker>>) {
         self.quota_tracker.store(Arc::new(tracker));
@@ -2560,6 +2586,23 @@ impl Router {
                 );
                 return false;
             }
+        }
+
+        // Global session cap: bound total concurrent sessions so an attacker
+        // reconnecting with many distinct CA-issued CNs cannot grow the session
+        // map without limit when no per-tenant quota is configured (the
+        // default), driving the process toward OOM (#1606). A re-registration
+        // of an existing CN is a replacement (handled just below, net-zero on
+        // the map size) and is always allowed; only a genuinely new CN at the
+        // cap is rejected. Checked before the stale-CN removal so the
+        // `contains_key` test sees the pre-replacement state.
+        if !state.sessions.contains_key(&cn) && state.sessions.len() >= state.max_sessions {
+            warn!(
+                cn = %hash_cn(&cn),
+                limit = state.max_sessions,
+                "connection rejected: global session cap reached"
+            );
+            return false;
         }
 
         // Clean stale group entries if this CN was previously registered
@@ -5549,6 +5592,44 @@ mod tests {
             alice_group_count, 3,
             "CN should be limited to max_groups_per_cn"
         );
+    }
+
+    #[tokio::test]
+    async fn register_rejects_new_cn_at_global_session_cap() {
+        // With the global session cap at 1, the first CN registers, a second
+        // *distinct* CN is rejected (it would grow the session map past the
+        // cap), but re-registering an existing CN is always allowed because it
+        // is a replacement, not growth (#1606).
+        let router = Router::new().with_max_sessions(1);
+        let alice = make_identity("alice", &["g1"]);
+        let bob = make_identity("bob", &["g1"]);
+        let (ptx_a, ntx_a, _pa, _na) = make_channels(16, 16);
+        let (ptx_b, ntx_b, _pb, _nb) = make_channels(16, 16);
+
+        assert!(
+            router
+                .register(SessionHandle::new(alice.clone(), ptx_a, ntx_a))
+                .await,
+            "first session fills the cap"
+        );
+        assert!(
+            !router
+                .register(SessionHandle::new(bob.clone(), ptx_b, ntx_b))
+                .await,
+            "a new distinct CN at the cap must be rejected"
+        );
+
+        // Replacement of an existing CN is allowed even at the cap.
+        let (ptx_a2, ntx_a2, _pa2, _na2) = make_channels(16, 16);
+        assert!(
+            router
+                .register(SessionHandle::new(alice.clone(), ptx_a2, ntx_a2))
+                .await,
+            "re-registering an existing CN is a replacement, not growth"
+        );
+
+        let state = router.state.read().await;
+        assert_eq!(state.sessions.len(), 1, "cap holds; only alice is tracked");
     }
 
     #[tokio::test]
