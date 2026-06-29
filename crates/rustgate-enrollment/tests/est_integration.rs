@@ -590,3 +590,69 @@ async fn est_simpleenroll_rate_limited() {
     let resp = env.send_request(make_req()).await;
     assert_eq!(resp.status(), 429);
 }
+
+#[tokio::test]
+async fn est_bad_content_type_does_not_consume_sign_rate_limit() {
+    // #1611: the sign rate-limit slot must NOT be consumed by requests that
+    // never reach signing. With a single-slot limit, several authenticated
+    // requests carrying a bad Content-Type (rejected 415) must not exhaust the
+    // budget — a subsequent well-formed request must still succeed. Pre-fix the
+    // limiter recorded a slot before the Content-Type check, so the first 415
+    // burned the budget and the valid request below returned 429.
+    let env = EstTestEnv::new();
+
+    let signer =
+        CsrSigner::from_pem(&env.ca_cert_pem, &env.ca_key_pem, "TestOrg").expect("build signer");
+    let credentials = Credentials::new(
+        "admin".to_string(),
+        zeroize::Zeroizing::new("secret".to_string()),
+    );
+    let server = EnrollmentServer::new(signer, credentials)
+        .with_rate_limit(1, std::time::Duration::from_secs(60))
+        .with_est();
+
+    let addr = env.addr;
+    let cert_pem = env.server_cert_pem.clone();
+    let key_pem = env.server_key_pem.clone();
+    let _handle = tokio::spawn(async move {
+        let _ = server.run(addr, &cert_pem, &key_pem).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let uri = format!(
+        "https://localhost:{}/.well-known/est/simpleenroll",
+        env.addr.port()
+    );
+
+    // Three authenticated requests with a bad Content-Type — each rejected 415,
+    // and none may consume the single signing slot.
+    for _ in 0..3 {
+        let req = Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("Authorization", encode_basic_auth("admin", "secret"))
+            .header("Content-Type", "text/plain")
+            .header("Host", "localhost")
+            .body(Full::new(Bytes::from("not a csr")))
+            .expect("build request");
+        let resp = env.send_request(req).await;
+        assert_eq!(resp.status(), 415, "bad Content-Type must be rejected 415");
+    }
+
+    // A well-formed request must still succeed: the budget was never spent.
+    let csr_b64 = generate_est_csr("est-client");
+    let req = Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .header("Authorization", encode_basic_auth("admin", "secret"))
+        .header("Content-Type", "application/pkcs10")
+        .header("Host", "localhost")
+        .body(Full::new(Bytes::from(csr_b64)))
+        .expect("build request");
+    let resp = env.send_request(req).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "well-formed request must succeed; bad Content-Type must not consume the sign budget (#1611)"
+    );
+}

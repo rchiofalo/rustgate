@@ -209,21 +209,8 @@ async fn validate_and_read_body<'a>(
     on_rate_limit: Option<&RateLimitCallback>,
     endpoint: &str,
 ) -> Result<(Vec<u8>, &'a str), Response<Full<Bytes>>> {
-    // Rate limit check (before auth to prevent work amplification).
-    // The SlidingWindowLimiter emits the structured audit event
-    // internally on rejection (category = "request").
-    if sign_limiter.is_limited(peer.ip()) {
-        if let Some(cb) = on_rate_limit {
-            cb();
-        }
-        return Err(build_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "text/plain",
-            Bytes::from("rate limit exceeded"),
-        ));
-    }
-
-    // Authentication.
+    // Authentication first — a cheap constant-time credential check. Reject
+    // unauthenticated requests before any signing quota is consumed.
     let auth_header = req
         .headers()
         .get(hyper::header::AUTHORIZATION)
@@ -239,7 +226,10 @@ async fn validate_and_read_body<'a>(
         }
     };
 
-    // Read and validate Content-Type.
+    // Validate Content-Type before the rate-limit check so a malformed request
+    // (wrong media type) is rejected 415 WITHOUT consuming a per-IP signing
+    // slot — otherwise an authenticated client could exhaust a legitimate
+    // peer's signing budget with cheap 415s that never attempt signing (#1611).
     let content_type = req
         .headers()
         .get(hyper::header::CONTENT_TYPE)
@@ -252,6 +242,22 @@ async fn validate_and_read_body<'a>(
             Bytes::from(format!(
                 "expected Content-Type: {CT_PKCS10}, got: {content_type}"
             )),
+        ));
+    }
+
+    // Rate-limit check: the SlidingWindowLimiter records a per-IP slot on the
+    // allowed path, so it must run only after the request is known to be a
+    // well-formed, authenticated signing attempt — otherwise quota is burned by
+    // requests that never reach signing (#1611). The limiter emits the
+    // structured audit event internally on rejection (category = "request").
+    if sign_limiter.is_limited(peer.ip()) {
+        if let Some(cb) = on_rate_limit {
+            cb();
+        }
+        return Err(build_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "text/plain",
+            Bytes::from("rate limit exceeded"),
         ));
     }
 
