@@ -347,6 +347,15 @@
       ],
       "default": null
     },
+    "crl-refresh-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
     "crl-validity-days": {
       "type": [
         "integer",

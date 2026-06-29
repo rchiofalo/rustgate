@@ -199,6 +199,38 @@ impl TlsConfig {
         })
     }
 
+    /// Build a hot-swappable client-cert verifier backed by `crl_store`.
+    ///
+    /// Unlike [`build_default_verifier`](Self::build_default_verifier) — a
+    /// static `WebPkiClientVerifier` whose CRL list is frozen at boot — this
+    /// returns a [`crate::DynamicCertVerifier`] that pulls the CRL list from the
+    /// generation-counted [`crate::CrlStore`] on every handshake's rebuild
+    /// check. A freshly-published CRL (file replaced, or pushed via the
+    /// management API) therefore takes effect on the *next* handshake with no
+    /// restart, fixing the restart-gated-revocation defect (#1496, ADR 0025).
+    ///
+    /// The root store is the (static, single-CA) client CA store, snapshot at a
+    /// constant generation `0`, so only CRL changes drive a verifier rebuild.
+    /// The CRL `snapshot` closure is a read-lock + two `Arc` clones — cheap
+    /// enough to run on the rustls handshake worker thread.
+    pub fn build_dynamic_crl_verifier(
+        &self,
+        crl_store: &Arc<crate::crl_store::CrlStore>,
+    ) -> Result<Arc<dyn ClientCertVerifier>> {
+        let root_store = Arc::clone(&self.client_ca_store);
+        let root_provider: crate::verifier::RootStoreProvider =
+            Box::new(move || (0, (*root_store).clone()));
+        let store = Arc::clone(crl_store);
+        let crl_provider: crate::verifier::CrlProvider = Box::new(move || store.snapshot());
+        crate::verifier::DynamicCertVerifier::with_crl_provider(root_provider, crl_provider)
+            .map(|v| v as Arc<dyn ClientCertVerifier>)
+            .map_err(|e| {
+                RustgateError::from(ConfigError::Other(format!(
+                    "failed to build dynamic client verifier: {e}"
+                )))
+            })
+    }
+
     /// Build a `rustls::ServerConfig` using a custom client certificate verifier
     /// and a dynamic certificate resolver.
     ///

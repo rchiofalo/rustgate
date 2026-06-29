@@ -30,9 +30,21 @@ use tracing::{debug, warn};
 /// compares it against its cached value to decide whether to rebuild.
 pub type RootStoreProvider = Box<dyn Fn() -> (u64, RootCertStore) + Send + Sync>;
 
+/// Provides the current CRL list and its generation number.
+///
+/// Symmetric to [`RootStoreProvider`]: a monotonically increasing counter that
+/// changes whenever the revocation set is reloaded, letting the verifier rebuild
+/// when a freshly-published CRL lands — without a `ServerConfig` rebuild or a
+/// restart (#1496). Like the root-store provider it is invoked on the rustls
+/// handshake thread, so the closure body must stay cheap (an `Arc` clone over a
+/// hot-reloadable store, e.g. [`crate::CrlStore::snapshot`]).
+pub type CrlProvider =
+    Box<dyn Fn() -> (u64, Arc<Vec<CertificateRevocationListDer<'static>>>) + Send + Sync>;
+
 /// Cached inner verifier state.
 struct CachedVerifier {
     generation: u64,
+    crl_generation: u64,
     verifier: Arc<dyn ClientCertVerifier>,
 }
 
@@ -59,7 +71,7 @@ struct CachedVerifier {
 /// startup will now see it advertised in the handshake immediately.
 pub struct DynamicCertVerifier {
     provider: RootStoreProvider,
-    crls: Vec<CertificateRevocationListDer<'static>>,
+    crl_provider: CrlProvider,
     cached: Mutex<CachedVerifier>,
     /// Current root-hint subjects. Replaced atomically on every trust
     /// store generation advance so handshakes always see the live
@@ -116,15 +128,40 @@ impl DynamicCertVerifier {
         provider: RootStoreProvider,
         crls: Vec<CertificateRevocationListDer<'static>>,
     ) -> Result<Arc<Self>, Error> {
+        // Static CRL set — fixed for this verifier's lifetime. A constant
+        // generation means the CRL side never triggers a rebuild, preserving the
+        // original behaviour for callers (e.g. federation inbound) that do not
+        // hot-reload CRLs.
+        let crls = Arc::new(crls);
+        let crl_provider: CrlProvider = Box::new(move || (0, Arc::clone(&crls)));
+        Self::with_crl_provider(provider, crl_provider)
+    }
+
+    /// Like [`new`](Self::new), but the CRL set is pulled from a
+    /// generation-counted [`CrlProvider`] (e.g. a hot-reloadable
+    /// [`crate::CrlStore`]) instead of being frozen at construction. The live
+    /// verifier rebuilds — and so observes a freshly-published CRL at the next
+    /// handshake — whenever **either** the root-store generation **or** the CRL
+    /// generation advances, with no restart (#1496).
+    ///
+    /// Both provider closures run on the rustls handshake worker thread and must
+    /// be cheap and non-blocking (a `RwLock::read` + `Arc` clone).
+    pub fn with_crl_provider(
+        provider: RootStoreProvider,
+        crl_provider: CrlProvider,
+    ) -> Result<Arc<Self>, Error> {
         let (generation, root_store) = provider();
+        let (crl_generation, crls) = crl_provider();
         let initial_subjects: &'static [DistinguishedName] = Vec::leak(root_store.subjects());
-        let verifier = Self::build_verifier(Arc::new(root_store), &crls)?;
+        let crls_ref: &[CertificateRevocationListDer<'static>] = &crls;
+        let verifier = Self::build_verifier(Arc::new(root_store), crls_ref)?;
 
         Ok(Arc::new(Self {
             provider,
-            crls,
+            crl_provider,
             cached: Mutex::new(CachedVerifier {
                 generation,
+                crl_generation,
                 verifier,
             }),
             current_subjects: ArcSwap::from_pointee(initial_subjects),
@@ -146,45 +183,55 @@ impl DynamicCertVerifier {
             .map_err(|e| Error::General(format!("verifier build error: {e}")))
     }
 
-    /// Get the current inner verifier, rebuilding if the generation changed.
+    /// Get the current inner verifier, rebuilding if the root-store **or** the
+    /// CRL generation changed since the last build.
     fn current_verifier(&self) -> Result<Arc<dyn ClientCertVerifier>, Error> {
         let (current_gen, root_store) = (self.provider)();
+        let (current_crl_gen, crls) = (self.crl_provider)();
 
         let mut cached = self.cached.lock();
 
-        if cached.generation == current_gen {
+        if cached.generation == current_gen && cached.crl_generation == current_crl_gen {
             return Ok(Arc::clone(&cached.verifier));
         }
 
-        // Generation changed — rebuild using the store we already fetched.
-        // Share the store via `Arc::clone` so we can still read its
-        // subjects after handing one reference to `build_verifier`; we
-        // leak the fresh subject slice only on success so rebuild
-        // failures don't leave orphan heap buffers behind.
+        // Either generation changed — rebuild from the store + CRLs we just
+        // fetched. Share the store via `Arc::clone` so we can still read its
+        // subjects after handing one reference to `build_verifier`; we leak the
+        // fresh subject slice only on a ROOT change (a CRL-only refresh leaves
+        // the advertised CA list identical, so re-leaking it would waste heap).
+        let root_changed = cached.generation != current_gen;
         debug!(
             old_generation = cached.generation,
             new_generation = current_gen,
-            "trust store changed, rebuilding client cert verifier"
+            old_crl_generation = cached.crl_generation,
+            new_crl_generation = current_crl_gen,
+            "trust store or CRL changed, rebuilding client cert verifier"
         );
         let root_store = Arc::new(root_store);
+        let crls_ref: &[CertificateRevocationListDer<'static>] = &crls;
 
-        match Self::build_verifier(Arc::clone(&root_store), &self.crls) {
+        match Self::build_verifier(Arc::clone(&root_store), crls_ref) {
             Ok(verifier) => {
                 cached.generation = current_gen;
+                cached.crl_generation = current_crl_gen;
                 cached.verifier = Arc::clone(&verifier);
-                // Compute and swap in the fresh subject slice only
-                // after the rebuild succeeds — on error we keep the old
-                // hints aligned with the still-active cached verifier
-                // so handshakes don't advertise CAs we can't validate.
-                let fresh_subjects: &'static [DistinguishedName] = Vec::leak(root_store.subjects());
-                self.current_subjects.store(Arc::new(fresh_subjects));
+                if root_changed {
+                    // Swap in the fresh subject slice only after the rebuild
+                    // succeeds — on error we keep the old hints aligned with the
+                    // still-active cached verifier so handshakes don't advertise
+                    // CAs we can't validate.
+                    let fresh_subjects: &'static [DistinguishedName] =
+                        Vec::leak(root_store.subjects());
+                    self.current_subjects.store(Arc::new(fresh_subjects));
+                }
                 Ok(verifier)
             }
             Err(e) => {
                 rustgate_core::audit::verifier_rebuild_failed(&e.to_string());
                 warn!(
                     error = %e,
-                    "failed to rebuild verifier after trust store change, using cached"
+                    "failed to rebuild verifier after trust store or CRL change, using cached"
                 );
                 Ok(Arc::clone(&cached.verifier))
             }
@@ -194,10 +241,15 @@ impl DynamicCertVerifier {
 
 impl fmt::Debug for DynamicCertVerifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let generation = self.cached.lock().generation;
+        let (generation, crl_generation) = {
+            let cached = self.cached.lock();
+            (cached.generation, cached.crl_generation)
+        };
+        let (_, crls) = (self.crl_provider)();
         f.debug_struct("DynamicCertVerifier")
             .field("generation", &generation)
-            .field("crls", &self.crls.len())
+            .field("crl_generation", &crl_generation)
+            .field("crls", &crls.len())
             .finish()
     }
 }
