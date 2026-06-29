@@ -373,11 +373,22 @@ impl V2Client {
     }
 
     /// Shut down the client and wait for the background task to finish.
+    ///
+    /// Aborts the task before awaiting it (matching the V1 client). The V2
+    /// streaming task can be parked in `send_tx.send().await` against a stalled
+    /// peer that keeps ACKing keepalives but stops draining application data;
+    /// without the abort, `handle.await` would block until the gRPC request
+    /// timeout (up to 300s). Any caller holding the federation manager `RwLock`
+    /// across this shutdown — the graceful-drain path and the peer-discovery
+    /// reconciler — would then wedge every `fed_forward` reader for that whole
+    /// window (#1607). The watch signal is still sent first so an un-wedged
+    /// task can observe it and exit cleanly before the abort lands.
     pub async fn shutdown(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
         if let Some(handle) = self.task_handle.take() {
+            handle.abort();
             let _ = handle.await;
         }
         self.peer.set_state(PeerState::Disconnected);
