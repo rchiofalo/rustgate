@@ -330,10 +330,11 @@ pub(crate) async fn handle_mqtt_session(
     // subscriptions through the same `router.join_group` path a
     // fresh SUBSCRIBE would take so the session_id-keyed routing
     // tables match what they would for an interactively-resubscribing
-    // client. Authz was already enforced when the original SUBSCRIBE
-    // was accepted, so we don't re-validate here — the saved set
-    // reflects what was authorized at SUBSCRIBE time, matching the
-    // MQTT 5.0 §4.1 stored-session contract.
+    // client. Group membership is RE-VALIDATED against the current
+    // certificate below (#1605): the cert may have been re-issued with
+    // fewer groups since the session was saved, so the saved set is not
+    // trusted blindly — only subscriptions the present cert still grants
+    // are restored, exactly as a fresh SUBSCRIBE would be authorized.
     if !restored_subscriptions.is_empty() {
         // Re-join each restored group via the router. Done WITHOUT
         // holding the tracker mutex across the await — the per-call
@@ -351,6 +352,20 @@ pub(crate) async fn handle_mqtt_session(
             // behaviour preserves that — the tracker just carries the
             // wildcard for in-session identifier matching.
             if sub.group.is_empty() {
+                continue;
+            }
+            // Re-validate against the CURRENT certificate (#1605). The cert may
+            // have been re-issued with fewer groups since the session was
+            // saved; silently re-granting a dropped group would let a narrowed
+            // cert regain access on reconnect. The live SUBSCRIBE path performs
+            // the same `is_member_of` check before joining.
+            if !identity.is_member_of(&sub.group) {
+                warn!(
+                    transport = TRANSPORT_LABEL,
+                    cn = %hash_cn(&cn),
+                    group = %sanitize_for_log(&sub.group),
+                    "MQTT session-resume: dropping restored subscription no longer granted by the current certificate"
+                );
                 continue;
             }
             if router

@@ -3064,6 +3064,85 @@ async fn session_retention_resumes_subscriptions_on_reconnect() {
 }
 
 #[tokio::test]
+async fn session_resume_drops_subscriptions_not_granted_by_current_cert() {
+    // #1605: a session is saved while the cert grants "alpha". The client
+    // reconnects with a re-issued cert (same CN) that no longer grants "alpha".
+    // The broker must NOT restore the "alpha" subscription — silently
+    // re-granting a dropped group on resume would be an ACL bypass.
+    let ca = TestCa::new("MQTT Test CA");
+    let cert_full = ca.issue_client_cert("alice", &["alpha"]);
+    let cert_narrowed = ca.issue_client_cert("alice", &[]); // same CN, no alpha
+    let cert_pub = ca.issue_client_cert("bob", &["alpha"]);
+    let router = Arc::new(Router::new());
+
+    let server = new_test_server_with_retention(&ca, router, 3600);
+    let tls_full = build_client_tls_config(&cert_full.cert_pem, &cert_full.key_pem, &ca.cert_pem);
+    let tls_narrowed = build_client_tls_config(
+        &cert_narrowed.cert_pem,
+        &cert_narrowed.key_pem,
+        &ca.cert_pem,
+    );
+    let tls_pub = build_client_tls_config(&cert_pub.cert_pem, &cert_pub.key_pem, &ca.cert_pem);
+
+    // Connection 1: subscribe to alpha (granted) + disconnect, saving the session.
+    {
+        let mut stream = mqtt_connect(server.addr, &tls_full).await;
+        let mut buf = BytesMut::new();
+        let connect = build_v5_connect_with_session("narrowed-resumer", true, 3600);
+        write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Connect(connect)).await;
+        let _ = read_v5_packet(&mut stream, &mut buf).await; // CONNACK
+        let sub = mqttbytes::v5::Subscribe::new("alpha", mqttbytes::QoS::AtLeastOnce);
+        write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Subscribe(sub)).await;
+        let _ = read_v5_packet(&mut stream, &mut buf).await; // SUBACK
+        let disc = mqttbytes::v5::Disconnect::new();
+        write_v5_packet(&mut stream, &mqttbytes::v5::Packet::Disconnect(disc)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connection 2: reconnect with the NARROWED cert, clean_start=0. The
+    // session itself resumes, but the alpha subscription must be dropped.
+    let mut stream2 = mqtt_connect(server.addr, &tls_narrowed).await;
+    let mut buf2 = BytesMut::new();
+    let connect = build_v5_connect_with_session("narrowed-resumer", false, 3600);
+    write_v5_packet(&mut stream2, &mqttbytes::v5::Packet::Connect(connect)).await;
+    match read_v5_packet(&mut stream2, &mut buf2).await {
+        mqttbytes::v5::Packet::ConnAck(ack) => {
+            assert_eq!(ack.code, mqttbytes::v5::ConnectReturnCode::Success);
+            assert!(ack.session_present, "the session itself still resumes");
+        }
+        other => panic!("expected CONNACK Success, got {other:?}"),
+    }
+
+    // Publish to alpha from a third client.
+    let mut stream_pub = mqtt_connect(server.addr, &tls_pub).await;
+    let mut buf_pub = BytesMut::new();
+    write_v5_packet(
+        &mut stream_pub,
+        &mqttbytes::v5::Packet::Connect(mqttbytes::v5::Connect::new("narrowed-publisher")),
+    )
+    .await;
+    let _ = read_v5_packet(&mut stream_pub, &mut buf_pub).await;
+    let publish =
+        mqttbytes::v5::Publish::new("alpha", mqttbytes::QoS::AtMostOnce, b"should-not-arrive");
+    write_v5_packet(&mut stream_pub, &mqttbytes::v5::Packet::Publish(publish)).await;
+
+    // The narrowed cert no longer grants alpha, so the restored subscription
+    // must have been dropped → the resumed session receives nothing.
+    let received = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_v5_packet(&mut stream2, &mut buf2),
+    )
+    .await;
+    assert!(
+        received.is_err(),
+        "restored subscription for a group the narrowed cert no longer grants \
+         must be dropped (#1605); resumed session unexpectedly received: {received:?}"
+    );
+
+    server.shutdown();
+}
+
+#[tokio::test]
 async fn session_retention_disabled_rejects_clean_start_false() {
     // Refs #1162 contract: when retention is disabled (the default),
     // a clean_start=0 CONNECT MUST be rejected with
