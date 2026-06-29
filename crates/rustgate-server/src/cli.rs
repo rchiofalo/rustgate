@@ -2661,6 +2661,7 @@ define_config_file! {
     crl in tls: Option<String>,
     tls_min_version in tls: String,
     crl_warn_stale in tls: bool,
+    crl_refresh_interval in tls: u64,
     fips_required in tls: bool,
     air_gap in tls: bool,
     prefer_post_quantum in tls: bool,
