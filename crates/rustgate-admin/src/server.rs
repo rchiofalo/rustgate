@@ -619,6 +619,16 @@ fn metrics_auth_ok(header: Option<&str>, expected: &[u8]) -> bool {
 #[cfg(feature = "federation")]
 const MAX_FEDERATION_API_BODY_BYTES: usize = 256 * 1024;
 
+/// Maximum accepted request-body size for the mission-package upload API.
+///
+/// Mission packages (ATAK data packages) are ZIP bundles, so the cap is much
+/// larger than the federation JSON cap — but the upload handler still buffers
+/// the whole body into memory before the multipart parser runs, so it must be
+/// bounded (#1618). 50 MiB of payload plus headroom for multipart boundary and
+/// header overhead.
+#[cfg(feature = "missions")]
+const MAX_MISSIONS_API_BODY_BYTES: usize = 52 * 1024 * 1024;
+
 /// Whether a request to the **state-mutating** federation REST API is authorized.
 ///
 /// Unlike the read-only `/metrics` scrape — which is open when no token is
@@ -1091,10 +1101,28 @@ pub async fn serve(
                                     .get(hyper::header::CONTENT_TYPE)
                                     .and_then(|v| v.to_str().ok())
                                     .map(|s| s.to_string());
-                                let body = http_body_util::BodyExt::collect(req.into_body())
-                                    .await
-                                    .map(|b| b.to_bytes())
-                                    .unwrap_or_default();
+                                // Cap the body before buffering it into memory:
+                                // the mission-package upload path collects the
+                                // whole request before the multipart parser
+                                // runs, so an unbounded body could exhaust heap
+                                // (and the parser cost grows with body size).
+                                // 413 on excess (#1618).
+                                let body = match http_body_util::BodyExt::collect(
+                                    http_body_util::Limited::new(
+                                        req.into_body(),
+                                        MAX_MISSIONS_API_BODY_BYTES,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(collected) => collected.to_bytes(),
+                                    Err(_) => {
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::PAYLOAD_TOO_LARGE)
+                                            .body(Full::new(Bytes::from("request body too large")))
+                                            .unwrap_or_else(|_| internal_error_response()));
+                                    }
+                                };
                                 if let Some(resp) = handler(
                                     &method,
                                     &path,
