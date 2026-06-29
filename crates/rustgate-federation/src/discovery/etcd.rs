@@ -164,6 +164,19 @@ impl PeerDiscovery for EtcdDiscovery {
                     Some((key, value))
                 })
                 .collect();
+            // Bound the peer set: a hostile or misconfigured etcd prefix could
+            // hold an absurd number of keys, which would otherwise flow into
+            // `swap_peers` unchecked (#1619). The etcd-client transport already
+            // bounds the per-message body via tonic's decode limit, so the
+            // entry count is the meaningful cap here.
+            if kvs.len() > super::MAX_DISCOVERY_PEERS {
+                return Err(FederationError::discovery(format!(
+                    "etcd returned {} entries under prefix {}, exceeding the {} peer cap",
+                    kvs.len(),
+                    self.prefix,
+                    super::MAX_DISCOVERY_PEERS
+                )));
+            }
             debug!(
                 prefix = %self.prefix,
                 count = kvs.len(),

@@ -140,7 +140,7 @@ impl PeerDiscovery for ConsulDiscovery {
     async fn discover(&self) -> Result<Vec<PeerConfig>> {
         let url = self.catalog_url();
         debug!(url = %url, "querying consul catalog");
-        let entries: Vec<CatalogEntry> = self
+        let mut resp = self
             .http
             .get(&url)
             .send()
@@ -149,12 +149,22 @@ impl PeerDiscovery for ConsulDiscovery {
             .error_for_status()
             .map_err(|e| {
                 FederationError::discovery(format!("consul returned error for {url}: {e}"))
-            })?
-            .json()
-            .await
-            .map_err(|e| {
-                FederationError::discovery(format!("failed to parse consul catalog response: {e}"))
             })?;
+
+        // Read the body under a size cap before deserializing — a hostile or
+        // misbehaving Consul endpoint could otherwise stream an unbounded body
+        // (#1619). `Content-Length` is not trusted; the cap streams the body.
+        let body = super::read_capped_response_body(&mut resp, &url).await?;
+        let entries: Vec<CatalogEntry> = serde_json::from_slice(&body).map_err(|e| {
+            FederationError::discovery(format!("failed to parse consul catalog response: {e}"))
+        })?;
+        if entries.len() > super::MAX_DISCOVERY_PEERS {
+            return Err(FederationError::discovery(format!(
+                "consul returned {} entries for {url}, exceeding the {} peer cap",
+                entries.len(),
+                super::MAX_DISCOVERY_PEERS
+            )));
+        }
 
         Ok(entries.iter().map(Self::entry_to_peer).collect())
     }
