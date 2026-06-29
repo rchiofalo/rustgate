@@ -382,6 +382,18 @@ impl JwksClient {
                 Err(e) => {
                     audit::jwks_refresh_failed(&self.url, &e.to_string());
                     warn!(url = %self.url, error = %e, "jwks refresh failed; cached keyset preserved");
+                    // Still advance the Retiring → Retired grace clock so a
+                    // rotated-out (possibly compromised) kid is dropped from
+                    // the live verifier once its window elapses, even while
+                    // the JWKS endpoint is unreachable (#1627).
+                    advance_grace_on_refresh_failure(
+                        &authority,
+                        &rotation,
+                        &retained,
+                        &mut current,
+                        &self.url,
+                        Instant::now(),
+                    );
                     config.refresh_min
                 }
             };
@@ -599,6 +611,46 @@ pub async fn refresh_once_with_rotation(
         .map(|(kid, v)| (kid, v.algorithm()))
         .collect();
     Ok(clamp_refresh_delay(max_age_hint, config))
+}
+
+/// Advance the Retiring → Retired grace clock when the JWKS refresh is failing
+/// and re-install the verifier set if any kid was retired, so a rotated-out
+/// (possibly compromised) kid is dropped from the live verifier once its
+/// window elapses even during an upstream outage (#1627).
+///
+/// Without a fresh JWKS, the install set is recomputed from the retained
+/// verifier cache: [`RotationStateMachine::filter_for_install`] keeps Active
+/// kids and the Retiring kids still inside their grace window, and the
+/// just-retired kids are first dropped from the cache so they fall out of both
+/// sources. A no-op when nothing crossed its grace boundary this tick.
+fn advance_grace_on_refresh_failure(
+    authority: &Arc<JwtAuthority>,
+    rotation: &Arc<RotationStateMachine>,
+    retained: &Arc<RetainedVerifiers>,
+    current: &mut HashMap<String, Algorithm>,
+    url: &str,
+    now: Instant,
+) {
+    let retired = rotation.advance_grace(now);
+    if retired.is_empty() {
+        return;
+    }
+    for kid in &retired {
+        retained.forget(kid);
+    }
+    let snapshot = retained.snapshot();
+    let install = rotation.filter_for_install(snapshot.clone(), &snapshot);
+    diff_and_audit(current, &install, url);
+    authority.install_external_verifiers(install.clone());
+    *current = install
+        .into_iter()
+        .map(|(kid, v)| (kid, v.algorithm()))
+        .collect();
+    warn!(
+        url = %url,
+        retired = retired.len(),
+        "jwks refresh failing; kids past their retiring grace window were retired and removed from the verifier set"
+    );
 }
 
 /// Convert a parsed JWKS into a map of kid → ExternalVerifier,

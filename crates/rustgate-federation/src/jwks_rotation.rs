@@ -442,6 +442,38 @@ impl RotationStateMachine {
         install
     }
 
+    /// Advance only the time-based Retiring → Retired transitions, without a
+    /// fresh JWKS observation. Used on the refresh-failure path so a kid that
+    /// has outlived its grace window is retired even while the JWKS endpoint
+    /// is unreachable — otherwise a rotated-out (possibly compromised) kid
+    /// would stay installed for the whole outage (#1627). Mirrors the
+    /// Retiring → Retired arm of [`Self::observe_refresh`] but touches no
+    /// other state. Returns the kids demoted to Retired by this call.
+    pub fn advance_grace(&self, now: Instant) -> Vec<String> {
+        let mut state = self.entries.lock();
+        let mut retired = Vec::new();
+        let known: Vec<String> = state.keys().cloned().collect();
+        for kid in known {
+            let Some(entry) = state.get(&kid).copied() else {
+                continue;
+            };
+            if entry.state == RotationState::Retiring {
+                let started = entry.retiring_started_at.unwrap_or(entry.first_seen);
+                if now.saturating_duration_since(started) >= self.retiring_window {
+                    let _ = state.insert(
+                        kid.clone(),
+                        KidEntry {
+                            state: RotationState::Retired,
+                            ..entry
+                        },
+                    );
+                    retired.push(kid);
+                }
+            }
+        }
+        retired
+    }
+
     /// Look up the lifecycle state of a `kid`. Returns `None` for an
     /// unknown kid (never observed, or already evicted from the
     /// Retired tail). Used by tests to assert on transitions.
@@ -664,6 +696,36 @@ mod tests {
         let t = m.observe_refresh(&observed(&[]), now3);
         assert_eq!(m.state_of("k-rotating"), Some(RotationState::Retiring));
         assert_eq!(t.demoted, vec!["k-rotating".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn advance_grace_retires_kid_past_window_without_observation() {
+        // #1627: during a JWKS outage `observe_refresh` is never called, yet a
+        // kid past its retiring grace window must still be demoted to Retired
+        // so a rotated-out key stops verifying. `advance_grace` does this on
+        // the failure path with no fresh observation.
+        let m = RotationStateMachine::new(
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            "https://idp.test/jwks.json",
+        );
+        let _ = m.observe_refresh(&observed(&["k-down"]), Instant::now());
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let _ = m.observe_refresh(&observed(&["k-down"]), Instant::now());
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let _ = m.observe_refresh(&observed(&[]), Instant::now());
+        assert_eq!(m.state_of("k-down"), Some(RotationState::Retiring));
+
+        // Before the grace window elapses, advance_grace is a no-op.
+        tokio::time::advance(Duration::from_secs(299)).await;
+        assert!(m.advance_grace(Instant::now()).is_empty());
+        assert_eq!(m.state_of("k-down"), Some(RotationState::Retiring));
+
+        // Past the window — retired WITHOUT any observe_refresh call.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let retired = m.advance_grace(Instant::now());
+        assert_eq!(retired, vec!["k-down".to_string()]);
+        assert_eq!(m.state_of("k-down"), Some(RotationState::Retired));
     }
 
     #[tokio::test(start_paused = true)]
