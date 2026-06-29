@@ -128,10 +128,12 @@ pub struct TenantQuotaTracker {
     config: QuotaConfig,
     counters: RwLock<HashMap<String, Arc<TenantCounters>>>,
     /// Per-tenant aggregate-throughput buckets (issue #883 sub-item 4).
-    /// Created lazily on first send for each tenant; entries persist
-    /// until [`TenantQuotaTracker`] drops. The map is bounded by
-    /// distinct tenant identifiers (cert Organization), which a
-    /// CN-churning attacker cannot inflate.
+    /// Created lazily on first send for each tenant and pruned in
+    /// [`Self::record_disconnect`] once the tenant has no active
+    /// connections, so the map stays bounded by the set of *actively
+    /// connected* tenants rather than every distinct certificate
+    /// Organization (`O`) ever seen — an attacker with CA control could
+    /// otherwise inflate it with unbounded distinct `O` values (#1617).
     throughput_buckets: DashMap<Arc<str>, Arc<TokenBucket>>,
     on_throughput_rejection: arc_swap::ArcSwap<Option<OnTenantThroughputRejection>>,
     on_throughput_consumed: arc_swap::ArcSwap<Option<OnTenantThroughputConsumed>>,
@@ -255,15 +257,60 @@ impl TenantQuotaTracker {
     }
 
     /// Record a disconnection for `tenant`. Decrements the active
-    /// connection counter with saturating subtract to prevent underflow.
+    /// connection counter with saturating subtract to prevent underflow,
+    /// and prunes the tenant's map entries once it is fully idle.
+    ///
+    /// Pruning keeps the `counters` map (and the throughput-bucket map)
+    /// bounded by the set of *actively used* tenants rather than every
+    /// distinct certificate Organization (`O`) ever seen — an attacker with
+    /// CA control could otherwise issue certs with unbounded distinct `O`
+    /// values and grow the maps without limit (#1617).
     pub fn record_disconnect(&self, tenant: &str) {
-        let counters = self.counters.read();
-        if let Some(c) = counters.get(tenant) {
-            let _ = c
-                .active_connections
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                });
+        let now_zero = {
+            let counters = self.counters.read();
+            match counters.get(tenant) {
+                Some(c) => {
+                    // `fetch_update` returns the *previous* value; the closure
+                    // always returns `Some`, so it always succeeds.
+                    let prev = c
+                        .active_connections
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(1))
+                        })
+                        .unwrap_or(0);
+                    prev <= 1
+                }
+                None => false,
+            }
+        };
+        if now_zero {
+            self.prune_if_idle(tenant);
+        }
+    }
+
+    /// Remove `tenant`'s entries once it has neither active connections nor
+    /// reserved egress bytes, keeping the `counters` and throughput-bucket
+    /// maps bounded by actively-used tenants (#1617).
+    ///
+    /// BOTH counters must be zero: a [`TenantBytePermit`] releases by name
+    /// lookup ([`Self::release_bytes`]), so pruning an entry that still has
+    /// reserved bytes would misaccount the release against a freshly
+    /// recreated entry on a fast reconnect. The check runs under the write
+    /// lock to avoid racing a concurrent reconnect or reservation; callers
+    /// invoke it from whichever path (`record_disconnect` or `release_bytes`)
+    /// drove the last counter to zero.
+    fn prune_if_idle(&self, tenant: &str) {
+        let mut counters = self.counters.write();
+        if let Some(c) = counters.get(tenant)
+            && c.active_connections.load(Ordering::Relaxed) == 0
+            && c.queued_bytes.load(Ordering::Relaxed) == 0
+        {
+            let _ = counters.remove(tenant);
+            drop(counters);
+            // No active connections and no reserved bytes → no in-flight send
+            // to charge against the throughput bucket, so drop it too (it is
+            // recreated lazily on the tenant's next send).
+            let _ = self.throughput_buckets.remove(tenant);
         }
     }
 
@@ -353,13 +400,26 @@ impl TenantQuotaTracker {
     /// Release `bytes` of previously reserved egress queue capacity for
     /// `tenant`. Saturates at zero to prevent underflow on over-release.
     fn release_bytes(&self, tenant: &str, bytes: usize) {
-        let counters = self.counters.read();
-        if let Some(c) = counters.get(tenant) {
-            let _ = c
-                .queued_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(bytes))
-                });
+        let now_zero = {
+            let counters = self.counters.read();
+            match counters.get(tenant) {
+                Some(c) => {
+                    let prev = c
+                        .queued_bytes
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(bytes))
+                        })
+                        .unwrap_or(0);
+                    prev.saturating_sub(bytes) == 0
+                }
+                None => false,
+            }
+        };
+        // If this release drained the tenant's reservation, it may now be
+        // fully idle (a disconnect that raced ahead of in-flight egress would
+        // not have pruned it) — try to reclaim its map entries (#1617).
+        if now_zero {
+            self.prune_if_idle(tenant);
         }
     }
 
@@ -754,6 +814,82 @@ mod tests {
         assert_eq!(tracker.active_connections("acme"), 2);
         tracker.record_disconnect("acme");
         assert_eq!(tracker.active_connections("acme"), 1);
+    }
+
+    #[test]
+    fn record_disconnect_prunes_idle_tenant() {
+        // #1617: the counters map must stay bounded by actively-connected
+        // tenants, not every distinct cert Organization ever seen. A tenant's
+        // entry is pruned once it returns to zero active connections.
+        let config = QuotaConfig {
+            tenants: HashMap::new(),
+            default_quota: Some(TenantQuota {
+                max_connections: 8,
+                max_message_rate: 0,
+                max_queued_bytes: 0,
+                max_throughput_bps: 0,
+                refill_throughput_bps: 0,
+            }),
+        };
+        let tracker = TenantQuotaTracker::new(config);
+
+        assert!(tracker.check_and_record_connection("org-a"));
+        assert!(tracker.check_and_record_connection("org-b"));
+        assert!(tracker.check_and_record_connection("org-a")); // org-a now at 2
+        assert_eq!(tracker.counters.read().len(), 2);
+
+        // org-b drops to zero → pruned; org-a still has a live connection.
+        tracker.record_disconnect("org-b");
+        assert_eq!(tracker.active_connections("org-b"), 0);
+        assert_eq!(
+            tracker.counters.read().len(),
+            1,
+            "org-b pruned at zero; org-a still live"
+        );
+
+        // Drain org-a to zero → pruned; the map is empty again.
+        tracker.record_disconnect("org-a");
+        tracker.record_disconnect("org-a");
+        assert_eq!(tracker.active_connections("org-a"), 0);
+        assert_eq!(tracker.counters.read().len(), 0, "all idle tenants pruned");
+    }
+
+    #[test]
+    fn prune_waits_for_reserved_bytes() {
+        // #1617: a tenant that disconnects while egress bytes are still
+        // reserved must NOT be pruned until those bytes are released — the
+        // permit releases by name lookup, so pruning early would misaccount the
+        // release against a freshly recreated entry on a fast reconnect.
+        let config = QuotaConfig {
+            tenants: HashMap::new(),
+            default_quota: Some(TenantQuota {
+                max_connections: 8,
+                max_message_rate: 0,
+                max_queued_bytes: 10_000,
+                max_throughput_bps: 0,
+                refill_throughput_bps: 0,
+            }),
+        };
+        let tracker = Arc::new(TenantQuotaTracker::new(config));
+        assert!(tracker.check_and_record_connection("org-a"));
+        let permit = tracker.try_reserve_bytes("org-a", 500).expect("reserve");
+
+        // Disconnect to zero connections — but bytes are still reserved.
+        tracker.record_disconnect("org-a");
+        assert_eq!(tracker.active_connections("org-a"), 0);
+        assert_eq!(
+            tracker.counters.read().len(),
+            1,
+            "entry retained while bytes are still reserved"
+        );
+
+        // Releasing the permit drains the reservation → fully idle → pruned.
+        drop(permit);
+        assert_eq!(
+            tracker.counters.read().len(),
+            0,
+            "pruned once reserved bytes are released"
+        );
     }
 
     #[test]
