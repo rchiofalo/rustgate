@@ -293,9 +293,9 @@ pub(crate) async fn bind_tls_listener(
     // the prior boot-frozen behavior.
     let crl_store: Option<std::sync::Arc<rustgate_tls::CrlStore>> =
         match (&cli.tls.crl, cli.tls.crl_refresh_interval) {
-            (Some(path), interval) if interval > 0 => {
-                Some(rustgate_tls::CrlStore::from_path(std::path::Path::new(path))?)
-            }
+            (Some(path), interval) if interval > 0 => Some(rustgate_tls::CrlStore::from_path(
+                std::path::Path::new(path),
+            )?),
             (None, interval) if interval > 0 => {
                 tracing::warn!(
                     "--crl-refresh-interval has no effect without --crl; \

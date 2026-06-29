@@ -21,18 +21,16 @@
 //! (no `Zeroizing`); only the bytes-changed hash and the parsed list are kept.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use rustgate_core::error::{ConfigError, Result, RustgateError};
+use rustgate_core::tasks::spawn_background;
 use rustls::pki_types::CertificateRevocationListDer;
 use rustls::pki_types::pem::PemObject;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 use x509_parser::prelude::parse_x509_crl;
-
-use rustgate_core::error::{ConfigError, Result, RustgateError};
-use rustgate_core::tasks::spawn_background;
 
 /// Freshness summary of the currently-loaded CRL set, recomputed on every
 /// successful [`CrlStore::reload`]. Drives the (opt-in) fail-closed staleness
@@ -279,8 +277,9 @@ fn summarize_health(crls: &[CertificateRevocationListDer<'static>], path: &Path)
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::*;
     use rustgate_test_utils::certs::TestCa;
+
+    use super::*;
 
     fn now_nanos() -> u128 {
         std::time::SystemTime::now()

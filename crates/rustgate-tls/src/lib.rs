@@ -44,7 +44,6 @@ pub mod ocsp;
 pub mod spiffe;
 
 pub use cert_reloader::CertReloader;
-pub use crl_store::{CrlHealth, CrlStore};
 #[cfg(feature = "ocsp")]
 pub use client_ocsp::{ClientOcspVerifier, FetchFuture, OcspFetcher, OcspStaplerFetcher};
 #[cfg(feature = "fips")]
@@ -55,6 +54,7 @@ pub use config::{
 };
 #[cfg(feature = "post-quantum")]
 pub use config::{install_pq_provider, install_provider_with_kx_groups};
+pub use crl_store::{CrlHealth, CrlStore};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
 pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};
