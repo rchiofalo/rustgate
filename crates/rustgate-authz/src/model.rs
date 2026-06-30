@@ -455,6 +455,22 @@ fn hash_identity_into<H: std::hash::Hasher>(id: &Identity, h: &mut H) {
             0u8.hash(h);
         }
     }
+
+    // Tenant (L-8, #1510): the tenant is an authorization-relevant
+    // dimension — per-tenant quotas and ABAC rules key on it — so two
+    // identities that differ only by tenant must hash distinctly, or the
+    // authz decision cache could serve one tenant's verdict to another.
+    // Same discriminant-byte treatment as the SPIFFE ID above so
+    // `Some("")` and `None` cannot collide.
+    match id.tenant.as_deref() {
+        Some(t) => {
+            1u8.hash(h);
+            t.hash(h);
+        }
+        None => {
+            0u8.hash(h);
+        }
+    }
 }
 
 /// Borrowed view of an authenticated identity for policy evaluation.
@@ -770,6 +786,28 @@ mod subject_hash_tests {
         let a = identity("alice", &["ops"], BTreeMap::new(), None);
         let b = identity("bob", &["ops"], BTreeMap::new(), None);
         assert_ne!(SubjectHash::compute(&a), SubjectHash::compute(&b));
+    }
+
+    #[test]
+    fn distinct_tenants_produce_distinct_hashes() {
+        // L-8 (#1510): the tenant is an authorization-relevant dimension,
+        // so two identities differing only by tenant must hash distinctly
+        // or the authz decision cache could serve one tenant's verdict to
+        // another. A tenant-tagged identity must also differ from an
+        // untagged one.
+        let base = identity("alice", &["ops"], BTreeMap::new(), None);
+        let t1 = base.clone().with_tenant("tenant-a");
+        let t2 = base.clone().with_tenant("tenant-b");
+        assert_ne!(
+            SubjectHash::compute(&t1),
+            SubjectHash::compute(&t2),
+            "different tenants must hash differently"
+        );
+        assert_ne!(
+            SubjectHash::compute(&base),
+            SubjectHash::compute(&t1),
+            "tenant-tagged identity must differ from untagged"
+        );
     }
 
     #[test]
