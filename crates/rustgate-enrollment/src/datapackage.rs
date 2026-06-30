@@ -460,54 +460,127 @@ pub fn extract_boundary(content_type: &str) -> Option<&str> {
     })
 }
 
+/// Find the first byte offset of `needle` within `haystack`.
+///
+/// A non-allocating substring search over raw bytes. Returns the
+/// starting index, or `None` when `needle` does not occur. An empty
+/// `needle` matches at offset 0 (mirroring `str::find`).
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Yield the byte ranges between successive `delimiter` occurrences in
+/// `body`, mirroring `str::split` over raw bytes.
+///
+/// Each yielded `(start, end)` pair is the half-open range of a segment
+/// in `body`. Offsets are tracked directly as the scan advances, keeping
+/// the overall walk O(n).
+fn split_parts<'a>(body: &'a [u8], delimiter: &'a [u8]) -> impl Iterator<Item = (usize, usize)> {
+    let mut cursor = 0usize;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        match body
+            .get(cursor..)
+            .and_then(|rest| find_bytes(rest, delimiter))
+        {
+            Some(rel) => {
+                let start = cursor;
+                let end = cursor + rel;
+                cursor = end + delimiter.len();
+                Some((start, end))
+            }
+            None => {
+                done = true;
+                Some((cursor.min(body.len()), body.len()))
+            }
+        }
+    })
+}
+
 /// Extract a named field value from a simple multipart body.
 ///
 /// This is a minimal parser that handles the TAK client's multipart upload
 /// format. It finds the part with the given field name and returns its value.
+///
+/// The body is scanned as raw bytes — only each part's header block (up to
+/// the `\r\n\r\n` separator) is decoded as UTF-8 to match the field name. The
+/// content range is returned verbatim, so a binary part (e.g. a ZIP body) is
+/// no longer rejected by a whole-body UTF-8 decode (#1498).
 pub fn extract_multipart_field<'a>(
     body: &'a [u8],
     boundary: &str,
     field: &str,
 ) -> Option<&'a [u8]> {
     let boundary_marker = format!("--{boundary}");
-    let body_str = std::str::from_utf8(body).ok()?;
-
     let disposition_needle = format!("name=\"{field}\"");
 
-    // Track the byte offset of each part within body_str as we iterate.
-    let mut search_start = 0;
-    for part in body_str.split(&boundary_marker) {
-        // Find where this part actually starts within body_str.
-        let part_offset = body_str[search_start..]
-            .find(part)
-            .map(|i| i + search_start)?;
-        search_start = part_offset + part.len();
-
-        if !part.contains(&disposition_needle) {
+    for (start, end) in split_parts(body, boundary_marker.as_bytes()) {
+        let part = body.get(start..end)?;
+        // Locate the header/content boundary first; decode ONLY the header
+        // block as UTF-8 so binary content never gates the match.
+        let Some(sep) = find_bytes(part, b"\r\n\r\n") else {
+            continue;
+        };
+        let header = std::str::from_utf8(part.get(..sep)?).ok()?;
+        if !header.contains(&disposition_needle) {
             continue;
         }
-        // Content starts after the first blank line (\r\n\r\n)
-        let content_start = part.find("\r\n\r\n").map(|i| i + 4)?;
-        let content = part.get(content_start..)?;
-        // Trim trailing \r\n before the next boundary
-        let content = content.trim_end_matches("\r\n--").trim_end_matches("\r\n");
-        let offset = part_offset + content_start;
-        return body.get(offset..offset + content.len());
+        let content_start = start + sep + 4;
+        let mut content_end = end;
+        // Trim the trailing `\r\n` (and a `\r\n--` if the boundary marker
+        // abutted the content) without UTF-8-decoding the payload.
+        if body.get(content_end.saturating_sub(2)..content_end) == Some(b"--") {
+            content_end = content_end.saturating_sub(2);
+        }
+        if body.get(content_end.saturating_sub(2)..content_end) == Some(b"\r\n") {
+            content_end = content_end.saturating_sub(2);
+        }
+        return body.get(content_start..content_end.max(content_start));
     }
     None
 }
 
 /// Extract the filename from a multipart part's Content-Disposition header.
+///
+/// Only each part's header block is decoded as UTF-8, so a binary content
+/// payload does not block the scan (#1498).
 pub fn extract_multipart_filename(body: &[u8], boundary: &str) -> Option<String> {
-    let body_str = std::str::from_utf8(body).ok()?;
     let boundary_marker = format!("--{boundary}");
-
-    for part in body_str.split(&boundary_marker) {
-        if let Some(pos) = part.find("filename=\"") {
-            let start = pos + "filename=\"".len();
-            let rest = part.get(start..)?;
+    for (start, end) in split_parts(body, boundary_marker.as_bytes()) {
+        let part = body.get(start..end)?;
+        // Decode only the header block (up to `\r\n\r\n`, or the whole part
+        // when no content separator is present) as UTF-8.
+        let header_end = find_bytes(part, b"\r\n\r\n").unwrap_or(part.len());
+        let Ok(header) = std::str::from_utf8(part.get(..header_end)?) else {
+            continue;
+        };
+        if let Some(pos) = header.find("filename=\"") {
+            let value_start = pos + "filename=\"".len();
+            let rest = header.get(value_start..)?;
             let end = rest.find('"')?;
-            return Some(rest.get(..end)?.to_string());
+            let name = rest.get(..end)?;
+            // Reject control characters in the filename. It becomes the
+            // package display name and is later interpolated into a
+            // `Content-Disposition` response header on download, so a CR / LF /
+            // NUL would allow header / response splitting. Drop such a filename
+            // (the caller falls back to a generated name) rather than store an
+            // injection vector. Ported from the missions copy (#1608) during
+            // the binary-body rewrite (#1498).
+            if name.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+                return None;
+            }
+            return Some(name.to_string());
         }
     }
     None
@@ -743,6 +816,65 @@ mod tests {
         // Content-Disposition has name but no filename= attribute
         let body = b"--boundary\r\nContent-Disposition: form-data; name=\"callsign\"\r\n\r\nALPHA-1\r\n--boundary--";
         assert_eq!(extract_multipart_filename(body, "boundary"), None);
+    }
+
+    #[test]
+    fn test_extract_multipart_field_accepts_binary_zip_body() {
+        // A real ZIP body is binary (the local-file-header magic `PK\x03\x04`
+        // plus non-UTF-8 bytes such as 0xFF/0xFE). The previous whole-body
+        // UTF-8 decode rejected every genuine upload (#1498); the byte scan
+        // must return the raw content verbatim and still read the header.
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            b"--boundary\r\nContent-Disposition: form-data; name=\"assetfile\"; filename=\"pkg.zip\"\r\nContent-Type: application/zip\r\n\r\n",
+        );
+        let zip_bytes: &[u8] =
+            b"PK\x03\x04\x14\x00\x00\x00\x08\x00\xff\xfe\xfd\xfc\x00\x01\x02\x03";
+        body.extend_from_slice(zip_bytes);
+        body.extend_from_slice(b"\r\n--boundary--");
+
+        // The body is not valid UTF-8, proving the scan never decodes content.
+        assert!(std::str::from_utf8(&body).is_err());
+
+        let got = extract_multipart_field(&body, "boundary", "assetfile");
+        assert_eq!(got, Some(zip_bytes));
+
+        // The header block still decodes, so the filename is recovered too.
+        assert_eq!(
+            extract_multipart_filename(&body, "boundary"),
+            Some("pkg.zip".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_multipart_filename_rejects_control_characters() {
+        // A filename containing CR / LF / NUL must not be returned: it becomes
+        // the package display name and is later interpolated into a
+        // `Content-Disposition` response header on download, so the bytes would
+        // allow header / response splitting (#1608, ported during #1498).
+        let make = |fname: &str| {
+            format!(
+                "--boundary\r\nContent-Disposition: form-data; name=\"assetfile\"; filename=\"{fname}\"\r\nContent-Type: application/zip\r\n\r\ndata\r\n--boundary--"
+            )
+        };
+        // A clean filename still round-trips.
+        assert_eq!(
+            extract_multipart_filename(make("clean.zip").as_bytes(), "boundary").as_deref(),
+            Some("clean.zip")
+        );
+        // CR/LF/NUL filenames are dropped (None → caller uses a generated name).
+        assert!(
+            extract_multipart_filename(make("a\rb").as_bytes(), "boundary").is_none(),
+            "CR in filename must be rejected"
+        );
+        assert!(
+            extract_multipart_filename(make("a\nb").as_bytes(), "boundary").is_none(),
+            "LF in filename must be rejected"
+        );
+        assert!(
+            extract_multipart_filename(make("a\0b").as_bytes(), "boundary").is_none(),
+            "NUL in filename must be rejected"
+        );
     }
 
     // ── Signature verification tests ──────────────────────────────────
