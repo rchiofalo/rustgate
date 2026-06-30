@@ -59,12 +59,17 @@ pub fn extract_multipart_field<'a>(
     let body_str = std::str::from_utf8(body).ok()?;
     let disposition_needle = format!("name=\"{field}\"");
 
-    let mut search_start = 0;
+    // Track the byte offset of each split part directly instead of
+    // re-searching the body for it. `split` yields the segments between
+    // `boundary_marker` occurrences, so the next part begins exactly
+    // `part.len() + boundary_marker.len()` bytes after the current one. The
+    // previous `body_str[search_start..].find(part)` was O(n·m) per part —
+    // super-linear overall on a periodic body, a CPU-amplification DoS on the
+    // mission-package upload path (#1618).
+    let mut part_offset = 0usize;
     for part in body_str.split(&boundary_marker) {
-        let part_offset = body_str[search_start..]
-            .find(part)
-            .map(|i| i + search_start)?;
-        search_start = part_offset + part.len();
+        let this_offset = part_offset;
+        part_offset += part.len() + boundary_marker.len();
 
         if !part.contains(&disposition_needle) {
             continue;
@@ -72,7 +77,7 @@ pub fn extract_multipart_field<'a>(
         let content_start = part.find("\r\n\r\n").map(|i| i + 4)?;
         let content = part.get(content_start..)?;
         let content = content.trim_end_matches("\r\n--").trim_end_matches("\r\n");
-        let offset = part_offset + content_start;
+        let offset = this_offset + content_start;
         return body.get(offset..offset + content.len());
     }
     None
@@ -132,6 +137,20 @@ mod tests {
         let body = "------TEST\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.zip\"\r\nContent-Type: application/zip\r\n\r\nZIP-BYTES-HERE\r\n------TEST--\r\n";
         let got = extract_multipart_field(body.as_bytes(), boundary, "file").unwrap();
         assert_eq!(got, b"ZIP-BYTES-HERE");
+    }
+
+    #[test]
+    fn extract_multipart_field_finds_target_in_later_part() {
+        // Exercises the offset tracking across multiple parts (#1618): the
+        // target field is the second form field, so the returned byte slice is
+        // correct only if the running offset accumulated past the first part
+        // (the old code re-searched the body for each part instead).
+        let boundary = "B";
+        let body = "--B\r\nContent-Disposition: form-data; name=\"meta\"\r\n\r\nfirst-value\r\n\
+                    --B\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nSECOND-PAYLOAD\r\n\
+                    --B--\r\n";
+        let got = extract_multipart_field(body.as_bytes(), boundary, "file").unwrap();
+        assert_eq!(got, b"SECOND-PAYLOAD");
     }
 
     #[test]
