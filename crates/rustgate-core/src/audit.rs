@@ -1972,6 +1972,29 @@ pub fn archive_key_rotation_due(kid: &str, days_remaining: i64) {
     );
 }
 
+/// Record a completed archive-rotation pass that purged at least one
+/// segment (F-69).
+///
+/// Emitted by `rustgate_archive::archive_rotation` after a rotation pass
+/// deletes expired or over-cap archive segments. A pass that deletes
+/// nothing is normal operational flow and stays on the `tracing` path;
+/// this event marks the security-relevant state transition — archived
+/// data was removed under the retention policy — so the compliance trail
+/// can prove retention enforcement actually ran, and a SIEM can alert on
+/// the *absence* of the heartbeat if rotation silently stalls.
+///
+/// `bytes_after` is the on-disk archive size after the pass;
+/// `files_deleted` is the number of segments purged.
+pub fn archive_rotation_completed(bytes_after: u64, files_deleted: u64) {
+    audit!(
+        "archive.rotation_completed",
+        bytes_after = bytes_after,
+        files_deleted = files_deleted,
+        action = "rotate_archive",
+        result = "completed"
+    );
+}
+
 // ── Admin / lifecycle audit events ──────────────────────────────────
 
 /// Record an operator-initiated graceful drain.

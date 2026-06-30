@@ -428,6 +428,7 @@ must rotate before the key expires or new archives will fail.
 | Event | Fields | Purpose |
 |---|---|---|
 | `archive.key_rotation_due` | `kid`, `days_remaining`, `action`, `result` | Active archive key approaches rotation cliff. |
+| `archive.rotation_completed` | `bytes_after`, `files_deleted`, `action`, `result` | A retention rotation pass purged ≥1 archive segment (F-69); absence is alertable if rotation stalls. |
 
 ## `audit` — hash-chain integrity
 
