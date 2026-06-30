@@ -2945,10 +2945,29 @@ pub(crate) async fn start_inference(
         // critical path non-blocking. The crate's loop guard
         // (`source_protocol = "inference"`) prevents re-inference.
         let sink_router = Arc::clone(router);
+        // Bound the number of concurrent re-injection tasks. The pipeline can
+        // emit up to one result per configured model per inbound message and
+        // the sink is invoked once per result, so an unbounded spawn here turns
+        // one message into hundreds of `router.route` tasks — at high message
+        // rates that exhausts the tokio task pool and starves routing (#1614).
+        // A semaphore caps in-flight reinject tasks; when the ceiling is reached
+        // the re-injection is shed (best-effort enrichment, not the primary
+        // path) rather than spawning unboundedly.
+        const INFERENCE_MAX_CONCURRENT_REINJECTS: usize = 256;
+        let reinject_permits = Arc::new(Semaphore::new(INFERENCE_MAX_CONCURRENT_REINJECTS));
         let sink: rustgate_inference::wiring::InferenceSink =
             Arc::new(move |msg: Arc<rustgate_core::message::RoutableMessage>| {
+                let Ok(permit) = Arc::clone(&reinject_permits).try_acquire_owned() else {
+                    tracing::debug!(
+                        "inference: re-injection ceiling reached; shedding annotated message"
+                    );
+                    return;
+                };
                 let router = Arc::clone(&sink_router);
                 rustgate_core::tasks::spawn_background("inference-reinject", async move {
+                    // Hold the permit for the lifetime of the route so the
+                    // ceiling bounds concurrent reinject work; released on drop.
+                    let _permit = permit;
                     router.route(msg.as_ref().clone()).await;
                 });
             });
