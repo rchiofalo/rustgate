@@ -16,6 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_core::audit;
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
@@ -118,6 +119,13 @@ impl MqttListener {
                 peer = %peer_addr,
                 "MQTT connection rejected: rate limit exceeded for IP"
             );
+            // Closes #1500: record the per-IP rate-limit rejection on the
+            // audit channel, not only via `warn!`.
+            audit::rate_limit_triggered(
+                &peer_addr.to_string(),
+                "mqtt/connect",
+                self.conn_rate.max(),
+            );
             drop(tcp_stream);
             return Ok(None);
         }
@@ -131,10 +139,25 @@ impl MqttListener {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 debug!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                // Closes #1500: surface the TLS-accept failure on the audit
+                // channel; `stage` separates the accept error from a timeout.
+                audit::tls_handshake_failed(
+                    &peer_addr.to_string(),
+                    &e.to_string(),
+                    "mqtt_tls_accept",
+                );
                 return Ok(None);
             }
             Err(_) => {
                 warn!(peer = %peer_addr, "TLS handshake timed out");
+                // Closes #1500: a peer that stalled the TLS handshake past
+                // `HANDSHAKE_TIMEOUT` is rejected — record the distinct
+                // timeout stage for slow-handshake forensics.
+                audit::tls_handshake_failed(
+                    &peer_addr.to_string(),
+                    "handshake timed out",
+                    "mqtt_tls_accept_timeout",
+                );
                 return Ok(None);
             }
         };
@@ -143,6 +166,9 @@ impl MqttListener {
             Ok(id) => Arc::new(id),
             Err(e) => {
                 warn!(peer = %peer_addr, error = %e, "failed to extract identity");
+                // Closes #1500: a certificate that completed the handshake but
+                // yielded no usable identity is a rejected connection.
+                audit::connection_rejected(peer_addr, "identity extraction failed");
                 return Ok(None);
             }
         };

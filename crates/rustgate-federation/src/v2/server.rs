@@ -45,6 +45,15 @@ pub const MAX_FEDERATION_HOPS: u8 = 8;
 /// tests without re-deriving the string.
 pub(crate) const RPC_SEND_ONE_EVENT: &str = "send_one_event";
 
+/// Canonical `rpc` label used for `ServerEventStream` audit records
+/// (closes #1500). The streaming handler observes inbound events via
+/// metrics under `crate::metrics::RPC_SERVER_EVENT_STREAM`, but that
+/// module is `#[cfg(feature = "api")]`-gated; this audit-side mirror of
+/// the same string keeps the reject-path audit emission feature-
+/// independent so the security trail records unauthorized-group drops in
+/// every build configuration.
+pub(crate) const RPC_SERVER_EVENT_STREAM: &str = "server_event_stream";
+
 /// Canonical `rpc` label used for `SendOneBlob` audit and metric records
 /// (refs #864). Mirrors `RPC_SEND_ONE_EVENT` so a SIEM dashboard joining
 /// the two streams sees a uniform `rpc` label vocabulary.
@@ -1239,6 +1248,17 @@ impl FederatedChannel for FederationService {
                             groups = ?sanitized_groups,
                             consecutive_violations = consecutive_violations,
                             "federation peer not authorized for claimed groups, skipping event"
+                        );
+                        // Mirror the unary-RPC reject sites (closes #1500):
+                        // a streaming event dropped for claiming groups the
+                        // peer is not authorized for must leave a structured
+                        // audit record, not only a `warn!` line. `pid` is the
+                        // mTLS-authenticated peer CN; the reason token matches
+                        // the documented `unauthorized_group` vocabulary.
+                        rustgate_core::audit::federation_event_rejected(
+                            RPC_SERVER_EVENT_STREAM,
+                            &pid,
+                            "unauthorized_group",
                         );
                         if consecutive_violations >= MAX_CONSECUTIVE_VIOLATIONS {
                             warn!(

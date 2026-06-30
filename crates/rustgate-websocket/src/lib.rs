@@ -43,6 +43,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustgate_core::audit;
 use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_core::error::{Result, TransportError};
 use rustgate_core::identity::Identity;
@@ -419,6 +420,14 @@ impl WsListener {
                     peer_addr = %peer_addr,
                     "connection rejected: rate limit exceeded for IP"
                 );
+                // Closes #1500: the reject must leave a structured audit
+                // record, not only a `warn!` line, so the security trail
+                // captures per-IP rate-limit rejections.
+                audit::rate_limit_triggered(
+                    &peer_addr.to_string(),
+                    "websocket/connect",
+                    self.conn_rate.max(),
+                );
                 drop(tcp_stream);
                 self.fire_rejected();
                 continue;
@@ -431,6 +440,14 @@ impl WsListener {
                 Ok(stream) => stream,
                 Err(e) => {
                     warn!(peer_addr = %peer_addr, error = %e, "TLS handshake failed");
+                    // Closes #1500: surface the TLS-accept failure on the
+                    // audit channel. `stage` distinguishes this from a
+                    // later WebSocket-upgrade failure on the same peer.
+                    audit::tls_handshake_failed(
+                        &peer_addr.to_string(),
+                        &e.to_string(),
+                        "ws_tls_accept",
+                    );
                     self.fire_rejected();
                     continue;
                 }
@@ -447,6 +464,10 @@ impl WsListener {
                 Ok(id) => id,
                 Err(e) => {
                     warn!(peer_addr = %peer_addr, error = %e, "identity extraction failed");
+                    // Closes #1500: a certificate that completed the TLS
+                    // handshake but yielded no usable identity is a rejected
+                    // connection — record it on the audit channel.
+                    audit::connection_rejected(peer_addr, "identity extraction failed");
                     self.fire_rejected();
                     continue;
                 }
@@ -548,11 +569,19 @@ impl WsListener {
                 Ok(Ok(stream)) => stream,
                 Ok(Err(e)) => {
                     warn!(peer_addr = %peer_addr, error = %e, "WebSocket upgrade failed");
+                    // Closes #1500: the mTLS identity was already authenticated,
+                    // but the HTTP/WebSocket upgrade itself failed — still a
+                    // rejected connection from the audit trail's perspective.
+                    audit::connection_rejected(peer_addr, "websocket upgrade failed");
                     self.fire_rejected();
                     continue;
                 }
                 Err(_) => {
                     warn!(peer_addr = %peer_addr, "WebSocket upgrade timed out");
+                    // Closes #1500: a peer that authenticated but stalled the
+                    // upgrade past `HANDSHAKE_TIMEOUT` is rejected; record the
+                    // distinct timeout reason for slow-loris forensics.
+                    audit::connection_rejected(peer_addr, "websocket upgrade timed out");
                     self.fire_rejected();
                     continue;
                 }
