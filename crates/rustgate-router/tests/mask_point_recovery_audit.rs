@@ -2,23 +2,28 @@
 
 #![allow(unused_results)]
 #![allow(clippy::panic, clippy::unwrap_used)]
-//! Audit-trail regression test for the `MaskPoint` non-XML pass-through
-//! recovery-token vocabulary (issue #742).
+//! Audit-trail + payload regression test for `MaskPoint` recovery on
+//! non-XML payloads (issues #742, #1545 / SEC-18).
 //!
-//! `apply_mask_point` (in `rustgate_transport::obligations`) splits its
-//! audit emission across three forensic buckets when the payload is not
-//! XML-intent: `forwarded_binary` for known binary framings (MAVLink, TAK
-//! protobuf, ASTERIX), `forwarded_unmasked` for `source_protocol`
-//! claiming XML/CoT but the payload not parseable, and
-//! `forwarded_unknown` for unrecognised `source_protocol` values. Pre
-//! issue #742 the dispatcher emitted the same `forwarded_unmasked` token
-//! for every non-XML payload, which collapsed the three cases into a
-//! single audit string and forced operators to re-derive the
-//! distinction by hand.
+//! `apply_mask_point` (in `rustgate_router::obligations`) can mask two
+//! payload shapes — CoT XML and MAVLink. Every other position-bearing
+//! protocol (DIS, Link 16, ASTERIX, VMF, SAPIENT, NFFI, STANAG 4586,
+//! Meshtastic, TAK protobuf) has no registered coordinate masker.
 //!
-//! This test pins the on-the-wire shape of the new audit emission so a
-//! SIEM correlation tool can rely on the field names AND the recovery
-//! token strings being stable.
+//! Before #1545 those payloads were **forwarded unmasked** with a
+//! `forwarded_binary` / `forwarded_unmasked` / `forwarded_unknown` audit
+//! token — so a `MaskPoint` obligation meant to strip location did
+//! nothing and the original coordinates egressed intact. #1545 makes the
+//! non-XML branch **fail closed**: the body is erased (the same terminal
+//! state the XML-parse-failure path produces) and the audit token is
+//! `recovery = "dropped"`. See ADR 0027.
+//!
+//! This test pins both halves of that contract: the on-the-wire audit
+//! shape (field names + the `dropped` token a SIEM correlates on) AND
+//! the post-condition that the payload is actually erased, not just
+//! audited. MAVLink is exercised separately — it has a masker, and a
+//! frame it cannot place (a short non-position frame) is genuinely
+//! point-less and still forwards as `forwarded_binary`.
 //!
 //! Lives in its own integration-test binary so the thread-local audit
 //! subscriber installed here cannot race subscribers installed by other
@@ -87,11 +92,12 @@ fn build_message(payload: &'static [u8], source_protocol: &str) -> RoutableMessa
 }
 
 /// Drive `apply_mask_point` end-to-end with the supplied
-/// `source_protocol` and return the captured audit JSON output. The
-/// payload is hard-coded to a non-XML byte sequence so the dispatcher
-/// always lands in the pass-through branch and emits exactly one audit
-/// record.
-fn run_and_capture(payload: &'static [u8], source_protocol: &str) -> String {
+/// `source_protocol` and return the captured audit JSON output together
+/// with the (possibly mutated) message so callers can assert both the
+/// audit token and the payload post-condition. The payload is a non-XML
+/// byte sequence so the dispatcher lands in the non-XML branch and emits
+/// exactly one audit record.
+fn run_and_capture(payload: &'static [u8], source_protocol: &str) -> (String, RoutableMessage) {
     let buf = SharedBuf::default();
     let layer = tracing_subscriber::fmt::layer()
         .json()
@@ -111,21 +117,49 @@ fn run_and_capture(payload: &'static [u8], source_protocol: &str) -> String {
     // Drop the guard so any async writers flush; explicit drop here is
     // defensive — the `_guard` already covers the synchronous emission.
     drop(_guard);
-    buf.snapshot()
+    (buf.snapshot(), msg)
+}
+
+/// Assert the shared fail-closed post-condition: the audit record carries
+/// `recovery = "dropped"`, names the source protocol, and the payload was
+/// actually erased to the `other:masked` terminal state.
+fn assert_dropped_and_erased(log: &str, msg: &RoutableMessage, source_protocol: &str) {
+    assert!(
+        log.contains(r#""recovery":"dropped""#),
+        "expected recovery=dropped in audit, got: {log}"
+    );
+    assert!(
+        log.contains(&format!(r#""source_protocol":"{source_protocol}""#)),
+        "expected source_protocol={source_protocol} in audit, got: {log}"
+    );
+    assert!(
+        log.contains(r#""event_type":"authz.obligation_failed""#),
+        "expected event_type=authz.obligation_failed in audit, got: {log}"
+    );
+    assert!(
+        msg.payload.is_empty(),
+        "fail-closed must erase the payload, but {} bytes survived",
+        msg.payload.len()
+    );
+    assert_eq!(
+        msg.metadata.message_type,
+        MessageType::Other("masked".into()),
+        "erased payload must be typed other:masked"
+    );
 }
 
 #[test]
-fn apply_mask_point_emits_forwarded_binary_for_mavlink() {
-    // A MAVLink frame is a binary payload that cannot host a CoT
-    // `<point>` element. The dispatcher passes it through unmasked
-    // (correct by design) and the audit token must be
-    // `forwarded_binary` so an analyst can distinguish this from the
-    // higher-severity unparseable-XML case.
+fn mask_point_forwards_pointless_mavlink_frame() {
+    // MAVLink has a registered masker; a short frame `mask_position`
+    // cannot place is genuinely point-less and still forwards unmasked,
+    // audited `forwarded_binary` so an analyst can distinguish it from
+    // the fail-closed drop below. This path is deliberately unchanged by
+    // #1545 (which scopes to non-MAVLink protocols).
     let mavlink_frame: &[u8] = &[0xFD, 0x09, 0x00, 0x00, 0x00, 0x01, 0x01];
     // Leak to 'static so the helper signature stays simple — every
     // call-site here uses small fixed byte sequences.
     let leaked: &'static [u8] = Box::leak(mavlink_frame.to_vec().into_boxed_slice());
-    let log = run_and_capture(leaked, "mavlink");
+    let (log, msg) = run_and_capture(leaked, "mavlink");
 
     assert!(
         log.contains(r#""recovery":"forwarded_binary""#),
@@ -135,102 +169,69 @@ fn apply_mask_point_emits_forwarded_binary_for_mavlink() {
         log.contains(r#""source_protocol":"mavlink""#),
         "expected source_protocol=mavlink in audit, got: {log}"
     );
-    assert!(
-        log.contains(r#""event_type":"authz.obligation_failed""#),
-        "expected event_type=authz.obligation_failed in audit, got: {log}"
+    // Point-less MAVLink frame is forwarded, not erased.
+    assert_eq!(
+        msg.payload.as_ref(),
+        leaked,
+        "point-less MAVLink frame must forward unmodified"
     );
 }
 
 #[test]
-fn apply_mask_point_emits_forwarded_binary_for_tak_protobuf() {
-    // TAK protobuf frames start with the 0xBF magic byte. Same forensic
-    // bucket as MAVLink — known binary framing, position masking N/A.
+fn mask_point_fails_closed_for_tak_protobuf() {
+    // TAK protobuf frames carry position in binary fields, not a CoT
+    // `<point>`. Pre-#1545 they forwarded unmasked (a leak); now the
+    // body is erased.
     let tak_frame: &[u8] = &[0xBF, 0x01, 0x02, 0x03];
     let leaked: &'static [u8] = Box::leak(tak_frame.to_vec().into_boxed_slice());
-    let log = run_and_capture(leaked, "tak_protobuf");
-
-    assert!(
-        log.contains(r#""recovery":"forwarded_binary""#),
-        "expected recovery=forwarded_binary in audit, got: {log}"
-    );
-    assert!(
-        log.contains(r#""source_protocol":"tak_protobuf""#),
-        "expected source_protocol=tak_protobuf in audit, got: {log}"
-    );
+    let (log, msg) = run_and_capture(leaked, "tak_protobuf");
+    assert_dropped_and_erased(&log, &msg, "tak_protobuf");
 }
 
 #[test]
-fn apply_mask_point_emits_forwarded_binary_for_tak_protobuf_hyphenated() {
-    // `Codec::protocol_id()` returns `"tak-protobuf"` (with hyphen),
-    // while older config keys spelled the same wire format
-    // `"tak_protobuf"`. Both forms must bucket identically so a
-    // federation hop that round-trips the protocol identifier through
-    // a hyphen-preferring layer does not flip the recovery token.
+fn mask_point_fails_closed_for_tak_protobuf_hyphenated() {
+    // `Codec::protocol_id()` returns `"tak-protobuf"` (hyphen) while
+    // older config keys spelled it `"tak_protobuf"`. Both forms must
+    // reach the same fail-closed drop so a federation hop that
+    // round-trips the identifier cannot flip the outcome back to a leak.
     let tak_frame: &[u8] = &[0xBF, 0x01, 0x02, 0x03];
     let leaked: &'static [u8] = Box::leak(tak_frame.to_vec().into_boxed_slice());
-    let log = run_and_capture(leaked, "tak-protobuf");
-
-    assert!(
-        log.contains(r#""recovery":"forwarded_binary""#),
-        "expected recovery=forwarded_binary in audit, got: {log}"
-    );
+    let (log, msg) = run_and_capture(leaked, "tak-protobuf");
+    assert_dropped_and_erased(&log, &msg, "tak-protobuf");
 }
 
 #[test]
-fn apply_mask_point_emits_forwarded_binary_for_asterix() {
+fn mask_point_fails_closed_for_asterix() {
     // ASTERIX (CAT-021/048/062) is a Eurocontrol surveillance binary
-    // wire format. Same forensic bucket as MAVLink and TAK protobuf.
+    // format whose tracks carry lat/lon. The single most serious leak
+    // from the #1545 audit — now erased rather than forwarded.
     let asterix_frame: &[u8] = &[0x3E, 0x00, 0x10, 0x00];
     let leaked: &'static [u8] = Box::leak(asterix_frame.to_vec().into_boxed_slice());
-    let log = run_and_capture(leaked, "asterix");
-
-    assert!(
-        log.contains(r#""recovery":"forwarded_binary""#),
-        "expected recovery=forwarded_binary in audit, got: {log}"
-    );
+    let (log, msg) = run_and_capture(leaked, "asterix");
+    assert_dropped_and_erased(&log, &msg, "asterix");
 }
 
 #[test]
-fn apply_mask_point_emits_forwarded_unmasked_for_unparseable_xml() {
-    // A `source_protocol` claiming `cot` (or `xml`) means the upstream
-    // SAID this would be CoT — but the payload's first non-whitespace
-    // byte is not `<`, so the dispatcher could not parse it. Position
-    // MAY be in the bytes and the masker bypassed inspection. This is
-    // the higher-severity audit token, preserved from the pre-issue-
-    // #742 vocabulary so SIEM rules keyed on `forwarded_unmasked`
-    // continue to fire on exactly this case.
+fn mask_point_fails_closed_for_protocol_claiming_cot() {
+    // A `source_protocol` claiming `cot` whose payload does not start
+    // with `<` cannot be parsed for a `<point>` element — position MAY
+    // be in the bytes and the masker was bypassed. Pre-#1545 this was
+    // `forwarded_unmasked`; now it fails closed like every other
+    // unmaskable non-XML payload.
     //
-    // Note: a payload that DOES start with `<` but fails to parse
-    // takes the fail-closed path with `recovery=dropped` instead;
-    // that's a different forensic case covered by the unit tests in
-    // `obligations.rs`.
-    let log = run_and_capture(b"truncated-cot-payload", "cot");
-
-    assert!(
-        log.contains(r#""recovery":"forwarded_unmasked""#),
-        "expected recovery=forwarded_unmasked in audit, got: {log}"
-    );
-    assert!(
-        log.contains(r#""source_protocol":"cot""#),
-        "expected source_protocol=cot in audit, got: {log}"
-    );
+    // Note: a payload that DOES start with `<` but fails to parse takes
+    // the XML-intent fail-closed path, also `recovery=dropped`; that
+    // case is covered by the unit tests in `obligations.rs`.
+    let (log, msg) = run_and_capture(b"truncated-cot-payload", "cot");
+    assert_dropped_and_erased(&log, &msg, "cot");
 }
 
 #[test]
-fn apply_mask_point_emits_forwarded_unknown_for_unrecognized_protocol() {
-    // Anything not in the known-binary or known-XML lists — a
-    // misconfigured upstream, a transport whose identifier this build
-    // does not yet recognise, or a deliberate operator-defined label —
-    // surfaces in the operator-visibility unknown bucket. Keeps the
-    // higher-severity unparseable-XML and N/A-binary cases distinct.
-    let log = run_and_capture(b"some random bytes", "unknown_proto_xyz");
-
-    assert!(
-        log.contains(r#""recovery":"forwarded_unknown""#),
-        "expected recovery=forwarded_unknown in audit, got: {log}"
-    );
-    assert!(
-        log.contains(r#""source_protocol":"unknown_proto_xyz""#),
-        "expected source_protocol=unknown_proto_xyz in audit, got: {log}"
-    );
+fn mask_point_fails_closed_for_unrecognized_protocol() {
+    // An unrecognised `source_protocol` — a misconfigured upstream or a
+    // transport this build does not yet know — is treated as
+    // potentially position-bearing and erased. Default-deny: we cannot
+    // prove the payload is position-free, so we do not forward it.
+    let (log, msg) = run_and_capture(b"some random bytes", "unknown_proto_xyz");
+    assert_dropped_and_erased(&log, &msg, "unknown_proto_xyz");
 }
