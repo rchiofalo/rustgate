@@ -1087,17 +1087,24 @@ pub(crate) async fn start_ogc_sensorthings(
     }
 
     let bearer = match cfg.auth_token_path.as_deref() {
-        Some(path) => match tokio::fs::read_to_string(path).await {
-            Ok(token) => Some(std::sync::Arc::<str>::from(token.trim())),
-            Err(e) => {
-                tracing::warn!(
-                    path = %path,
-                    error = %e,
-                    "failed to read [sensorthings] auth-token-path; falling back to unauthenticated polling"
-                );
-                None
+        // Read through `read_secret_file` (L-3, #1510): it enforces a size
+        // cap, rejects a world/group-readable token file (mode 0o077), and
+        // gates empty files — and the intermediate `Zeroizing<String>` is
+        // wiped on drop, so the cleartext token does not linger in process
+        // memory beyond the `Arc<str>` the client actually needs.
+        Some(path) => {
+            match rustgate_core::read_secret_file(path, &rustgate_core::SecretFileOpts::default()) {
+                Ok(token) => Some(std::sync::Arc::<str>::from(token.trim())),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "failed to read [sensorthings] auth-token-path; falling back to unauthenticated polling"
+                    );
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
 
