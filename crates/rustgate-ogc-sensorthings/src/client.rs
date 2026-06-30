@@ -164,12 +164,12 @@ impl SensorThingsClient {
             url.push_str("&$expand=Datastream/Thing/Locations");
         }
         if let Some(cursor) = since {
-            // SensorThings filter strings are URL-encoded once we
-            // pass them through reqwest::Url::parse, but composing
-            // the raw query string is fine — the cursor is an ISO
-            // 8601 timestamp under our control, so no encoding
-            // surprises. Wrap the timestamp in single quotes per
-            // SensorThings filter syntax.
+            // The cursor is a `phenomenonTime` value validated as RFC 3339 by
+            // the polling task (see `wiring::max_parseable_cursor`) before it
+            // reaches here — it is NOT free-form server text. Because only an
+            // RFC-3339-valid timestamp literal can arrive, raw interpolation
+            // into the OData `$filter` clause cannot inject operators.
+            // SensorThings datetime literals are written bare (no quotes).
             url.push_str(&format!("&$filter=phenomenonTime gt {cursor}"));
         }
         url
