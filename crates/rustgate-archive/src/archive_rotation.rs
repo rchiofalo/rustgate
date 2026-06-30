@@ -295,6 +295,13 @@ pub fn spawn(cfg: RotationConfig) -> tokio::task::JoinHandle<()> {
                             bytes_after = stats.bytes_after,
                             "archive rotation pass completed",
                         );
+                        // Retention enforcement removed archived data — a
+                        // security-relevant state transition (F-69). A
+                        // zero-delete pass stays on the tracing path below.
+                        rustgate_core::audit::archive_rotation_completed(
+                            stats.bytes_after,
+                            stats.files_deleted,
+                        );
                     } else {
                         tracing::debug!(
                             bytes_after = stats.bytes_after,
