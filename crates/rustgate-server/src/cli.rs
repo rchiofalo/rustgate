@@ -263,10 +263,12 @@ pub(crate) struct TlsArgs {
     #[arg(long, env = "RUSTGATE_KX_GROUPS")]
     pub(crate) kx_groups: Option<String>,
 
-    /// Run in CNSA 2.0 compliance mode. **Scaffolding flag — not yet
-    /// fully functional**; the convergence work tracked in #504
-    /// blocks on aws-lc-rs resolving the FIPS / ML-DSA mutual
-    /// exclusion ([aws-lc-rs #964]).
+    /// Run in CNSA 2.0 compliance mode. **Compile-time scaffolding only —
+    /// no runtime effect yet** beyond requiring `--features post-quantum`
+    /// at build time and logging the phased-readiness gap. It does NOT
+    /// switch key exchange to ML-KEM-1024 or enforce ML-DSA certs today;
+    /// the convergence work tracked in #504 blocks on aws-lc-rs resolving
+    /// the FIPS / ML-DSA mutual exclusion ([aws-lc-rs #964]).
     ///
     /// What this flag eventually configures (per NSA CNSA 2.0):
     ///

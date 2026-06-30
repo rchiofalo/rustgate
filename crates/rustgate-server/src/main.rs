@@ -586,9 +586,24 @@ fn main() -> anyhow::Result<()> {
     // includes FIPS validation (same aws-lc-rs backend) plus PQ KX groups.
     #[cfg(feature = "post-quantum")]
     if let Some(ref groups) = cli.tls.kx_groups {
+        // An explicit group order takes precedence over --prefer-post-quantum;
+        // the operator has spelled out the exact preference they want.
+        if cli.tls.prefer_post_quantum {
+            tracing::info!(
+                groups = %groups,
+                "--prefer-post-quantum superseded by an explicit --kx-groups order"
+            );
+        }
         rustgate_tls::install_provider_with_kx_groups(groups)?;
     } else {
         rustgate_tls::install_pq_provider()?;
+        // The default PQ provider already lists X25519MLKEM768 first, so PQ is
+        // preferred whether or not the flag is set. Confirm the negotiated
+        // preference when the operator explicitly opted in, so the flag is no
+        // longer a silent no-op on a --features post-quantum build.
+        if cli.tls.prefer_post_quantum {
+            tracing::info!("--prefer-post-quantum honored: X25519MLKEM768 key exchange preferred");
+        }
     }
 
     #[cfg(all(feature = "fips", not(feature = "post-quantum")))]
