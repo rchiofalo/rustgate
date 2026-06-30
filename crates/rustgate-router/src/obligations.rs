@@ -16,9 +16,13 @@
 //!
 //! - [`Obligation::MaskPoint`] — CoT `<point>` coordinates (`lat`, `lon`,
 //!   `hae`) are zeroed via [`rustgate_cot::mask::strip_coordinates`].
-//!   Non-XML payloads pass through unmodified; XML-intent payloads that
-//!   fail to parse fall back to [`Obligation::MaskPayload`]-equivalent
-//!   erasure so malformed input cannot leak coordinates.
+//!   Non-XML, non-MAVLink payloads **fail closed** to
+//!   [`Obligation::MaskPayload`]-equivalent erasure (#1545): they may be
+//!   position-bearing protocols (DIS, Link 16, ASTERIX, …) the dispatcher
+//!   has no masker for, so forwarding would leak coordinates. MAVLink has
+//!   a registered masker (a point-less frame still forwards). XML-intent
+//!   payloads that fail to parse also erase, so malformed input cannot
+//!   leak coordinates either.
 //! - [`Obligation::MaskPayload`] — the payload body is replaced with an
 //!   empty [`Bytes`] and the classified message type is coerced to
 //!   [`MessageType::Other`] with a `"masked"` tag so downstream caches
@@ -70,13 +74,14 @@
 //! [`Obligation::MaskPoint`] distinguishes two recovery modes:
 //!
 //! - Payload does not announce itself as XML (first non-whitespace byte
-//!   is not `<`) → forward unmodified. The masker is named for CoT; a
-//!   policy that attaches it to a MAVLink or protobuf stream is a
-//!   mis-configuration, not a leak. The audit `recovery` token is
-//!   refined by `source_protocol` so an analyst can distinguish a
-//!   legitimate binary framing (MAVLink, TAK protobuf, ASTERIX) from a
-//!   genuinely unparseable XML payload — see
-//!   [`rustgate_core::audit::classify_mask_recovery_for`].
+//!   is not `<`) and is not MAVLink → **fail-closed**: erase the body
+//!   (#1545). A non-XML, non-MAVLink payload is a position-bearing
+//!   protocol the dispatcher has no coordinate masker for, so forwarding
+//!   it would leak the coordinates `MaskPoint` was meant to strip. The
+//!   audit `recovery` token is `"dropped"`; `source_protocol` still names
+//!   the upstream so an operator can prioritise a per-codec masker. The
+//!   MAVLink path is the exception — it has a masker, so a frame it cannot
+//!   place (a non-position frame) forwards as `forwarded_binary`.
 //! - Payload starts with `<` but fails to parse or trips the attribute
 //!   budget → **fail-closed**: empty the body and coerce the message
 //!   type to `Other("masked")`, the same state [`Obligation::MaskPayload`]
@@ -597,24 +602,26 @@ pub fn apply_obligations_with_limiter(
 ///
 /// Recovery rules:
 ///
-/// 1. **Non-XML payload** (first non-whitespace byte is not `<`) — pass
-///    through unmodified. `MaskPoint` is a CoT-specific control; a
-///    policy attached to a MAVLink/protobuf stream is a
-///    mis-configuration and the dispatcher must not silently drop the
-///    traffic. The audit `recovery` token is refined by
-///    `source_protocol` so an analyst can distinguish three forensic
-///    buckets (see [`audit::classify_mask_recovery_for`]):
-///
-///    - `recovery = "forwarded_binary"` — known binary framing
-///      (MAVLink, TAK protobuf, ASTERIX); position masking is N/A by
-///      design.
-///    - `recovery = "forwarded_unmasked"` — `source_protocol` claims
-///      XML/CoT but the payload could not be parsed (matches the
-///      pre-issue-#742 label, so SIEM dashboards keyed on this token
-///      keep working).
-///    - `recovery = "forwarded_unknown"` — `source_protocol` is not in
-///      the recognised set; surfaces misconfigured upstreams without
-///      conflating them with the higher-severity unparseable-XML case.
+/// 1. **Non-XML payload** (first non-whitespace byte is not `<`), other
+///    than MAVLink — **fail-closed**: erase the body via
+///    [`apply_mask_payload`] and emit `recovery = "dropped"`. Such a
+///    payload is a position-bearing protocol the dispatcher has no
+///    coordinate masker for (DIS, Link 16, ASTERIX, VMF, SAPIENT, NFFI,
+///    STANAG 4586, Meshtastic, TAK protobuf). Forwarding it unmasked —
+///    the pre-#1545 behaviour — leaked the coordinates a `MaskPoint`
+///    obligation was meant to strip (SEC-18). "No `<point>` element" is
+///    not "no position": binary framings carry lat/lon in their own
+///    fields. This is default-deny — a payload we cannot prove is
+///    position-free is treated as if it carries one — so genuinely
+///    point-less binary traffic routed through a `MaskPoint` group is
+///    erased too. The DEBUG record keeps the
+///    [`audit::classify_mask_recovery_for`] protocol-class string in a
+///    separate `protocol_class` field for drill-down, and
+///    `source_protocol` names the upstream so an operator can prioritise
+///    a per-codec masker (the proper, non-interim fix). See ADR 0027.
+///    MAVLink is handled earlier (it has a registered masker; a frame it
+///    cannot place, e.g. `HEARTBEAT`, is genuinely point-less and still
+///    forwards as `forwarded_binary`).
 ///
 /// 2. **XML-intent parse failure** (payload starts with `<` but
 ///    quick_xml errors, or the `<point>` attribute budget is exceeded)
@@ -663,9 +670,10 @@ fn apply_mask_point(
     }
 
     // XML-intent is decided from the payload itself: first
-    // non-whitespace byte is `<`. Non-XML payloads cannot host a
-    // `<point>` element — forward unmodified but still audit so
-    // operators see the policy hint landed on traffic it cannot mask.
+    // non-whitespace byte is `<`. A non-XML payload cannot host a
+    // `<point>` element, but it may still carry coordinates in a binary
+    // field, so the branch below fails it closed rather than forwarding
+    // (#1545).
     let is_xml_intent = msg
         .payload
         .iter()
@@ -673,32 +681,38 @@ fn apply_mask_point(
         .is_some_and(|b| *b == b'<');
 
     if !is_xml_intent {
-        // Refine the recovery token by the inbound `source_protocol`
-        // so the audit trail distinguishes "binary framing where
-        // masking is N/A by design" from "XML-text framing where the
-        // masker should have caught this" from "unrecognised
-        // upstream, operator should investigate". Pre-issue-#742 the
-        // dispatcher emitted the same `forwarded_unmasked` token for
-        // every non-XML payload, which collapsed three forensic cases
-        // into one audit string and forced operators to re-derive the
-        // distinction from the `source_protocol` field manually.
-        let recovery = audit::classify_mask_recovery_for(&msg.metadata.source_protocol);
+        // Fail closed (#1545 / SEC-18). A non-XML, non-MAVLink payload
+        // reaching MaskPoint is a position-bearing protocol the dispatcher
+        // has no registered coordinate masker for — DIS, Link 16, ASTERIX,
+        // VMF, SAPIENT, NFFI, STANAG 4586, Meshtastic, TAK protobuf. Before
+        // #1545 the dispatcher forwarded it UNMASKED and merely audited a
+        // `forwarded_*` token, so a MaskPoint obligation meant to strip
+        // location did nothing and the original coordinates egressed intact
+        // (the most serious finding of the June 2026 semantic audit). The
+        // #742 premise that "no `<point>` element ⇒ nothing to mask" is
+        // wrong for binary framings that carry lat/lon in their own fields.
+        //
+        // Erase the body instead — the same terminal state the XML-parse-
+        // failure path below produces — rather than leak coordinates we
+        // cannot strip. This is default-deny: a payload we cannot prove is
+        // position-free is treated as if it carries one. `source_protocol`
+        // still names which upstream tripped this so an operator can
+        // prioritise a per-codec masker (the proper, non-interim fix); the
+        // protocol-class string is preserved on the DEBUG record for
+        // drill-down. See ADR 0027.
+        let protocol_class = audit::classify_mask_recovery_for(&msg.metadata.source_protocol);
         tracing::debug!(
             source_protocol = %msg.metadata.source_protocol,
             message_type = %msg.metadata.message_type,
-            recovery = recovery,
-            "mask_point obligation: non-XML payload, forwarding unmasked"
+            recovery = audit::MASK_RECOVERY_DROPPED,
+            protocol_class = protocol_class,
+            "mask_point obligation: non-XML payload with no registered position masker, erasing payload"
         );
-        // Issue #775: SIEM dashboards group on the static `reason`
-        // token. Non-XML pass-through is its own bucket independent
-        // of which `recovery` sub-bucket the source_protocol resolves
-        // to — the recovery field still carries the binary / unmasked
-        // / unknown trio for the analyst-side drill-down.
         audit::authz_obligation_failed(
             &msg.source.cn,
             "MaskPoint",
             audit::OBLIGATION_REASON_MASK_POINT_NON_XML,
-            recovery,
+            audit::MASK_RECOVERY_DROPPED,
             &msg.metadata.source_protocol,
             msg.destination.kind_str(),
             policy_id,
@@ -706,6 +720,7 @@ fn apply_mask_point(
         if let Some(limiter) = rate_limiter {
             limiter.observe_failure(audit::OBLIGATION_REASON_MASK_POINT_NON_XML);
         }
+        apply_mask_payload(msg);
         return;
     }
 
@@ -1032,35 +1047,41 @@ mod tests {
     }
 
     #[test]
-    fn mask_point_on_non_cot_passes_through_unchanged() {
-        // Not XML at all. MaskPoint is best-effort — the payload should
-        // be forwarded intact rather than dropped.
+    fn mask_point_on_non_cot_fails_closed() {
+        // Not XML at all, and not MAVLink. Pre-#1545 MaskPoint forwarded
+        // such a payload unchanged; now it fails closed (#1545 / SEC-18):
+        // a non-XML, non-MAVLink protocol is potentially position-bearing
+        // with no registered masker, so the body is erased rather than
+        // egressed with coordinates intact.
         let mut msg = sample_msg(b"not xml at all", MessageType::Chat);
         apply(&mut msg, &[Obligation::MaskPoint]);
-        assert_eq!(msg.payload.as_ref(), b"not xml at all");
-        // Message type unchanged: masking is a payload-level op.
-        assert_eq!(msg.metadata.message_type, MessageType::Chat);
+        assert!(msg.payload.is_empty(), "non-XML payload must be erased");
+        assert_eq!(
+            msg.metadata.message_type,
+            MessageType::Other("masked".into())
+        );
     }
 
-    // Issue #742: the audit `recovery` token for the non-XML pass-
-    // through path is bucketed by `source_protocol`. The audit-emission
-    // shape is pinned by the integration test
-    // `tests/mask_point_recovery_audit.rs` (separate binary so the
-    // tracing callsite Interest cache does not race other tests in
-    // this crate). The tests below pin the side-effect contract: a
-    // binary-labelled payload must survive `apply_mask_point` byte-for-
-    // byte regardless of which binary framing the payload claims to
-    // be, so a future refactor cannot accidentally start mutating
-    // MAVLink / TAK protobuf / ASTERIX bytes while still emitting the
-    // expected audit token.
+    // Issue #1545 (SEC-18): the non-XML, non-MAVLink path fails closed —
+    // the body is erased rather than forwarded, because such a payload is a
+    // position-bearing protocol the dispatcher has no coordinate masker for
+    // (DIS, Link 16, ASTERIX, VMF, TAK protobuf, …) and forwarding it would
+    // leak the coordinates a MaskPoint obligation was meant to strip. The
+    // audit-emission shape (`recovery = "dropped"`) is pinned by the
+    // integration test `tests/mask_point_recovery_audit.rs` (separate binary
+    // so the tracing callsite Interest cache does not race other tests in
+    // this crate). The tests below pin the side-effect contract: the erase
+    // happens regardless of which binary framing the payload claims to be.
+    // MAVLink is the exception — it has a registered masker, so a frame it
+    // cannot place (a non-position frame) still forwards unchanged.
 
     #[test]
     fn mask_point_on_mavlink_payload_passes_through_unchanged() {
         // A MAVLink frame is a binary payload that cannot host a CoT
-        // `<point>` element. Pre-issue-#742 the dispatcher already
-        // passed it through unmodified; this test pins that
-        // invariant against a future regression where the dispatcher
-        // might start "trying anyway" on a binary-labelled payload.
+        // `<point>` element. MAVLink has a registered masker; a frame
+        // `mask_position` cannot place (a non-position frame) is genuinely
+        // point-less and still forwards unchanged. This path is deliberately
+        // unchanged by #1545 (which scopes to non-MAVLink protocols).
         let frame: &'static [u8] = &[0xFD, 0x09, 0x00, 0x00, 0x00, 0x01, 0x01];
         let mut msg = sample_msg_with_protocol(frame, MessageType::Mavlink, "mavlink");
         let before = msg.payload.clone();
@@ -1070,72 +1091,77 @@ mod tests {
     }
 
     #[test]
-    fn mask_point_on_tak_protobuf_payload_passes_through_unchanged() {
-        // TAK protobuf frames start with the 0xBF magic byte. Same
-        // pass-through invariant as MAVLink. The hyphenated and
-        // underscored protocol-id spellings are exercised by the
-        // classifier unit tests in `rustgate-core::audit::tests`; here
-        // we pin the side-effect contract for the dispatcher itself.
+    fn mask_point_on_tak_protobuf_payload_fails_closed() {
+        // TAK protobuf frames start with the 0xBF magic byte and carry
+        // position in binary fields — forwarding them unmasked was the
+        // #1545 leak. The body is now erased rather than passed through.
         let frame: &'static [u8] = &[0xBF, 0x01, 0x02, 0x03];
         let mut msg =
             sample_msg_with_protocol(frame, MessageType::Other("binary".into()), "tak-protobuf");
-        let before = msg.payload.clone();
         apply(&mut msg, &[Obligation::MaskPoint]);
+        assert!(
+            msg.payload.is_empty(),
+            "tak-protobuf payload must be erased"
+        );
         assert_eq!(
-            msg.payload, before,
-            "tak-protobuf payload must not be mutated"
+            msg.metadata.message_type,
+            MessageType::Other("masked".into())
         );
     }
 
     #[test]
-    fn mask_point_on_asterix_payload_passes_through_unchanged() {
-        // ASTERIX surveillance frames are a binary wire format. Same
-        // pass-through invariant.
+    fn mask_point_on_asterix_payload_fails_closed() {
+        // ASTERIX surveillance frames carry lat/lon in a binary format —
+        // the single most serious leak from the #1545 audit. Erased now.
         let frame: &'static [u8] = &[0x3E, 0x00, 0x10, 0x00];
         let mut msg =
             sample_msg_with_protocol(frame, MessageType::Other("surveillance".into()), "asterix");
-        let before = msg.payload.clone();
         apply(&mut msg, &[Obligation::MaskPoint]);
-        assert_eq!(msg.payload, before, "asterix payload must not be mutated");
+        assert!(msg.payload.is_empty(), "asterix payload must be erased");
+        assert_eq!(
+            msg.metadata.message_type,
+            MessageType::Other("masked".into())
+        );
     }
 
     #[test]
-    fn mask_point_on_unparseable_cot_passes_through_unchanged() {
-        // `source_protocol = cot` plus a non-XML-intent first byte
-        // means the upstream said this would be CoT but the bytes are
-        // not in a parseable shape. Position MAY be in the bytes —
-        // the audit token (`forwarded_unmasked`, pinned by the
-        // integration test) reflects that severity. The side-effect
-        // contract is identical to the binary case: pass through
-        // unmodified, do NOT fail-closed (that path is reserved for
-        // XML-intent payloads where the parser actually started).
+    fn mask_point_on_unparseable_cot_fails_closed() {
+        // `source_protocol = cot` plus a non-XML-intent first byte means
+        // the upstream said this would be CoT but the bytes are not in a
+        // parseable shape. Position MAY be in the bytes, so the dispatcher
+        // erases rather than forwards (#1545) — this now matches the
+        // XML-intent fail-closed path rather than passing through.
         let mut msg =
             sample_msg_with_protocol(b"truncated-cot-payload", MessageType::Position, "cot");
-        let before = msg.payload.clone();
         apply(&mut msg, &[Obligation::MaskPoint]);
-        assert_eq!(
-            msg.payload, before,
-            "non-XML-intent cot payload must not be erased"
+        assert!(
+            msg.payload.is_empty(),
+            "non-XML-intent cot payload must be erased"
         );
-        assert_eq!(msg.metadata.message_type, MessageType::Position);
+        assert_eq!(
+            msg.metadata.message_type,
+            MessageType::Other("masked".into())
+        );
     }
 
     #[test]
-    fn mask_point_on_unrecognized_protocol_passes_through_unchanged() {
-        // An unrecognised `source_protocol` is bucketed into the
-        // `forwarded_unknown` audit token. The side-effect contract
-        // is the same as for the recognised binary and XML cases:
-        // pass through unmodified, never silently drop.
+    fn mask_point_on_unrecognized_protocol_fails_closed() {
+        // An unrecognised `source_protocol` is treated as potentially
+        // position-bearing — default-deny: a payload we cannot prove is
+        // position-free is erased rather than forwarded (#1545).
         let mut msg = sample_msg_with_protocol(
             b"some random bytes",
             MessageType::Other("blob".into()),
             "unknown_proto_xyz",
         );
-        let before = msg.payload.clone();
         apply(&mut msg, &[Obligation::MaskPoint]);
+        assert!(
+            msg.payload.is_empty(),
+            "unrecognised-protocol payload must be erased"
+        );
         assert_eq!(
-            msg.payload, before,
-            "unrecognised-protocol payload must not be mutated"
+            msg.metadata.message_type,
+            MessageType::Other("masked".into())
         );
     }
 
