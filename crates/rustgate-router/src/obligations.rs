@@ -597,24 +597,26 @@ pub fn apply_obligations_with_limiter(
 ///
 /// Recovery rules:
 ///
-/// 1. **Non-XML payload** (first non-whitespace byte is not `<`) — pass
-///    through unmodified. `MaskPoint` is a CoT-specific control; a
-///    policy attached to a MAVLink/protobuf stream is a
-///    mis-configuration and the dispatcher must not silently drop the
-///    traffic. The audit `recovery` token is refined by
-///    `source_protocol` so an analyst can distinguish three forensic
-///    buckets (see [`audit::classify_mask_recovery_for`]):
-///
-///    - `recovery = "forwarded_binary"` — known binary framing
-///      (MAVLink, TAK protobuf, ASTERIX); position masking is N/A by
-///      design.
-///    - `recovery = "forwarded_unmasked"` — `source_protocol` claims
-///      XML/CoT but the payload could not be parsed (matches the
-///      pre-issue-#742 label, so SIEM dashboards keyed on this token
-///      keep working).
-///    - `recovery = "forwarded_unknown"` — `source_protocol` is not in
-///      the recognised set; surfaces misconfigured upstreams without
-///      conflating them with the higher-severity unparseable-XML case.
+/// 1. **Non-XML payload** (first non-whitespace byte is not `<`), other
+///    than MAVLink — **fail-closed**: erase the body via
+///    [`apply_mask_payload`] and emit `recovery = "dropped"`. Such a
+///    payload is a position-bearing protocol the dispatcher has no
+///    coordinate masker for (DIS, Link 16, ASTERIX, VMF, SAPIENT, NFFI,
+///    STANAG 4586, Meshtastic, TAK protobuf). Forwarding it unmasked —
+///    the pre-#1545 behaviour — leaked the coordinates a `MaskPoint`
+///    obligation was meant to strip (SEC-18). "No `<point>` element" is
+///    not "no position": binary framings carry lat/lon in their own
+///    fields. This is default-deny — a payload we cannot prove is
+///    position-free is treated as if it carries one — so genuinely
+///    point-less binary traffic routed through a `MaskPoint` group is
+///    erased too. The DEBUG record keeps the
+///    [`audit::classify_mask_recovery_for`] protocol-class string in a
+///    separate `protocol_class` field for drill-down, and
+///    `source_protocol` names the upstream so an operator can prioritise
+///    a per-codec masker (the proper, non-interim fix). See ADR 0027.
+///    MAVLink is handled earlier (it has a registered masker; a frame it
+///    cannot place, e.g. `HEARTBEAT`, is genuinely point-less and still
+///    forwards as `forwarded_binary`).
 ///
 /// 2. **XML-intent parse failure** (payload starts with `<` but
 ///    quick_xml errors, or the `<point>` attribute budget is exceeded)
@@ -673,32 +675,38 @@ fn apply_mask_point(
         .is_some_and(|b| *b == b'<');
 
     if !is_xml_intent {
-        // Refine the recovery token by the inbound `source_protocol`
-        // so the audit trail distinguishes "binary framing where
-        // masking is N/A by design" from "XML-text framing where the
-        // masker should have caught this" from "unrecognised
-        // upstream, operator should investigate". Pre-issue-#742 the
-        // dispatcher emitted the same `forwarded_unmasked` token for
-        // every non-XML payload, which collapsed three forensic cases
-        // into one audit string and forced operators to re-derive the
-        // distinction from the `source_protocol` field manually.
-        let recovery = audit::classify_mask_recovery_for(&msg.metadata.source_protocol);
+        // Fail closed (#1545 / SEC-18). A non-XML, non-MAVLink payload
+        // reaching MaskPoint is a position-bearing protocol the dispatcher
+        // has no registered coordinate masker for — DIS, Link 16, ASTERIX,
+        // VMF, SAPIENT, NFFI, STANAG 4586, Meshtastic, TAK protobuf. Before
+        // #1545 the dispatcher forwarded it UNMASKED and merely audited a
+        // `forwarded_*` token, so a MaskPoint obligation meant to strip
+        // location did nothing and the original coordinates egressed intact
+        // (the most serious finding of the June 2026 semantic audit). The
+        // #742 premise that "no `<point>` element ⇒ nothing to mask" is
+        // wrong for binary framings that carry lat/lon in their own fields.
+        //
+        // Erase the body instead — the same terminal state the XML-parse-
+        // failure path below produces — rather than leak coordinates we
+        // cannot strip. This is default-deny: a payload we cannot prove is
+        // position-free is treated as if it carries one. `source_protocol`
+        // still names which upstream tripped this so an operator can
+        // prioritise a per-codec masker (the proper, non-interim fix); the
+        // protocol-class string is preserved on the DEBUG record for
+        // drill-down. See ADR 0027.
+        let protocol_class = audit::classify_mask_recovery_for(&msg.metadata.source_protocol);
         tracing::debug!(
             source_protocol = %msg.metadata.source_protocol,
             message_type = %msg.metadata.message_type,
-            recovery = recovery,
-            "mask_point obligation: non-XML payload, forwarding unmasked"
+            recovery = audit::MASK_RECOVERY_DROPPED,
+            protocol_class = protocol_class,
+            "mask_point obligation: non-XML payload with no registered position masker, erasing payload"
         );
-        // Issue #775: SIEM dashboards group on the static `reason`
-        // token. Non-XML pass-through is its own bucket independent
-        // of which `recovery` sub-bucket the source_protocol resolves
-        // to — the recovery field still carries the binary / unmasked
-        // / unknown trio for the analyst-side drill-down.
         audit::authz_obligation_failed(
             &msg.source.cn,
             "MaskPoint",
             audit::OBLIGATION_REASON_MASK_POINT_NON_XML,
-            recovery,
+            audit::MASK_RECOVERY_DROPPED,
             &msg.metadata.source_protocol,
             msg.destination.kind_str(),
             policy_id,
@@ -706,6 +714,7 @@ fn apply_mask_point(
         if let Some(limiter) = rate_limiter {
             limiter.observe_failure(audit::OBLIGATION_REASON_MASK_POINT_NON_XML);
         }
+        apply_mask_payload(msg);
         return;
     }
 
