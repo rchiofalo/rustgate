@@ -56,6 +56,7 @@ does.
 | [0024](0024-guard-fail-closed.md) | Fail-closed semantics for the cross-domain guard (unparseable markings, audit-chain load failures) | Proposed |
 | [0025](0025-revocation-lifecycle.md) | Live certificate-revocation lifecycle (CRL refresh, fail-closed staleness, active mid-session disconnect) | Proposed |
 | [0026](0026-archive-xchacha-v3.md) | Wider-nonce v3 archive format (XChaCha20-Poly1305) | Proposed |
+| [0027](0027-maskpoint-fail-closed.md) | MaskPoint fails closed for unmaskable position protocols (DIS/Link 16/ASTERIX/…) | Proposed |
 
 ## Authoring a new ADR
 
