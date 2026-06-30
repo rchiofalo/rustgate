@@ -19,6 +19,9 @@ rumqttc = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# `parsing` (on top of the workspace's `formatting`) for RFC 3339 cursor
+# validation in the polling task — see `wiring::max_parseable_cursor`.
+time = { workspace = true, features = ["parsing"] }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing = { workspace = true }
 

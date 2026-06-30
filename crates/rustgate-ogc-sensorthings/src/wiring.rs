@@ -65,6 +65,8 @@ use rustgate_core::identity::Identity;
 use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
 use rustgate_core::tasks::{SubsystemHandle, spawn_background};
 use rustgate_router::Router;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -245,18 +247,51 @@ pub(crate) async fn poll_once(
     if page.value.is_empty() {
         return Ok(None);
     }
-    let mut latest_phenomenon_time: Option<String> = None;
     for observation in &page.value {
         if let Some(msg) = observation_to_message(observation, entity_kind.clone(), sub) {
             router.route(msg).await;
         }
-        // Advance the cursor to the maximum `phenomenonTime` seen
-        // — observations within a page are returned ordered by
-        // `phenomenonTime asc` (the polling URL pins this), so
-        // the last entry has the maximum.
-        latest_phenomenon_time = Some(observation.phenomenon_time.clone());
     }
-    Ok(latest_phenomenon_time)
+    // Advance the cursor to the maximum *parseable* `phenomenonTime` in the
+    // page rather than the last entry. The previous code trusted the server's
+    // `phenomenonTime asc` ordering pin, so a server that returned events out
+    // of order could drive the cursor backwards (re-delivery) or skip ahead
+    // (M-5). Each candidate is also validated as RFC 3339 before it can
+    // become the cursor (M-4): the cursor is interpolated into the next
+    // request's `$filter` clause, so an unvalidated server-supplied string
+    // would be an OData-injection sink. When no value parses, returning `None`
+    // holds the prior cursor — fail-safe, since the `gt` filter re-delivers
+    // rather than skips.
+    let cursor = max_parseable_cursor(&page.value);
+    if cursor.is_none() {
+        debug!(
+            target: "rustgate.ogc-sensorthings",
+            datastream_id = datastream_id,
+            count = page.value.len(),
+            "no parseable phenomenonTime in non-empty page; holding prior cursor"
+        );
+    }
+    Ok(cursor)
+}
+
+/// Return the maximum *parseable* RFC 3339 `phenomenonTime` across a page,
+/// in its original string form, for use as the next poll cursor.
+///
+/// Order-independent (does not trust the server's claimed ordering) and
+/// injection-safe (only an RFC-3339-valid value can ever be returned, so it
+/// is a timestamp literal rather than free-form server text when it lands in
+/// the `$filter` clause). Returns `None` when no observation carries a
+/// parseable timestamp, which keeps the caller's prior cursor.
+fn max_parseable_cursor(observations: &[Observation]) -> Option<String> {
+    let mut max: Option<(OffsetDateTime, &str)> = None;
+    for obs in observations {
+        if let Ok(parsed) = OffsetDateTime::parse(&obs.phenomenon_time, &Rfc3339)
+            && max.as_ref().is_none_or(|(m, _)| parsed > *m)
+        {
+            max = Some((parsed, &obs.phenomenon_time));
+        }
+    }
+    max.map(|(_, s)| s.to_string())
 }
 
 /// Project an [`Observation`] onto a [`RoutableMessage`].
@@ -427,5 +462,46 @@ mod tests {
             observation_to_message(&obs, rustgate_core::entity::EntityKind::Sensor, &sub).unwrap();
         let entity: Entity = serde_json::from_slice(msg.payload.as_ref()).unwrap();
         assert_eq!(entity.uid, "sensorthings-observation-7");
+    }
+
+    #[test]
+    fn cursor_is_max_not_last_and_rejects_unparseable() {
+        fn obs_at(t: &str) -> Observation {
+            serde_json::from_str(&format!(
+                r#"{{"@iot.id": 1, "phenomenonTime": "{t}", "result": 1}}"#
+            ))
+            .unwrap()
+        }
+
+        // Out-of-order page: the LAST entry is not the maximum. Trusting the
+        // server's claimed ordering (the old behaviour) would drive the cursor
+        // backwards to 11:00 and re-deliver 12:00 every poll; max-tracking
+        // pins it to 12:00 regardless of order (M-5).
+        let page = vec![
+            obs_at("2026-05-08T10:00:00Z"),
+            obs_at("2026-05-08T12:00:00Z"),
+            obs_at("2026-05-08T11:00:00Z"),
+        ];
+        assert_eq!(
+            max_parseable_cursor(&page).as_deref(),
+            Some("2026-05-08T12:00:00Z")
+        );
+
+        // An injection-shaped / non-RFC-3339 value can never become the
+        // cursor — it is skipped, and the max of the valid values is used
+        // (M-4): the cursor reaches the next request's `$filter` clause.
+        let page = vec![
+            obs_at("2026-05-08T09:00:00Z"),
+            obs_at("2026-01-01T00:00:00Z or 1 eq 1"),
+        ];
+        assert_eq!(
+            max_parseable_cursor(&page).as_deref(),
+            Some("2026-05-08T09:00:00Z")
+        );
+
+        // All-unparseable page → None, which holds the prior cursor
+        // (fail-safe: the `gt` filter re-delivers rather than skips).
+        let page = vec![obs_at("not-a-timestamp")];
+        assert_eq!(max_parseable_cursor(&page), None);
     }
 }
