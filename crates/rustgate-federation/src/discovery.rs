@@ -46,6 +46,46 @@ pub mod dns_sd;
 #[cfg(feature = "peer-discovery-etcd")]
 pub mod etcd;
 
+/// Maximum size, in bytes, of a peer-discovery HTTP response body buffered
+/// before deserialization. Bounds memory against a hostile or misbehaving
+/// discovery backend that streams an unbounded body — the `Content-Length`
+/// header is advisory and can be omitted, so the body is read chunk-by-chunk
+/// and aborted once it crosses this cap rather than trusted (#1619).
+#[cfg(feature = "peer-discovery-consul")]
+pub(crate) const MAX_DISCOVERY_RESPONSE_SIZE: usize = 50 * 1024 * 1024;
+
+/// Maximum number of peer entries accepted from a single discovery response.
+/// A backend returning more than this is treated as an error rather than
+/// reconciling an absurd peer set into `FederationManager::swap_peers` (#1619).
+#[cfg(any(feature = "peer-discovery-consul", feature = "peer-discovery-etcd"))]
+pub(crate) const MAX_DISCOVERY_PEERS: usize = 10_000;
+
+/// Read a peer-discovery HTTP response body, rejecting it once it exceeds
+/// [`MAX_DISCOVERY_RESPONSE_SIZE`]. Streams chunk-by-chunk via
+/// [`reqwest::Response::chunk`] because the `Content-Length` header is
+/// advisory — an attacker can omit it and `reqwest`'s buffering helpers
+/// (`.json()` / `.bytes()`) would otherwise accumulate the whole body without
+/// limit (#1619).
+#[cfg(feature = "peer-discovery-consul")]
+pub(crate) async fn read_capped_response_body(
+    resp: &mut reqwest::Response,
+    url: &str,
+) -> Result<Vec<u8>> {
+    use crate::error::FederationError;
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        FederationError::discovery(format!("reading discovery response from {url} failed: {e}"))
+    })? {
+        if body.len().saturating_add(chunk.len()) > MAX_DISCOVERY_RESPONSE_SIZE {
+            return Err(FederationError::discovery(format!(
+                "discovery response from {url} exceeds the {MAX_DISCOVERY_RESPONSE_SIZE}-byte cap"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Pluggable source of federation peers.
 ///
 /// Implementations resolve the current peer set on demand. The reconciler
