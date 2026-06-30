@@ -38,6 +38,19 @@ const KEEP_ALIVE_FACTOR: f64 = 1.5;
 /// Topic prefix for broadcast messages routed to MQTT subscribers.
 const BROADCAST_TOPIC_SUFFIX: &str = "$broadcast";
 
+/// Maximum number of distinct subscription entries tracked per MQTT session.
+///
+/// The per-session tracker dedups on `(filter, subscription_identifier)`. An
+/// MQTT 5.0 client can re-SUBSCRIBE the same authorized filter with a fresh
+/// Subscription Identifier (`1..=268_435_455`) on every packet, defeating the
+/// dedup and growing the tracker without bound — the router's `join_group` is
+/// idempotent, so the per-CN group cap does not bound it, and the tracker is
+/// scanned O(n) on every delivered PUBLISH (#1615). This caps the tracker so
+/// memory and the write-path scan stay bounded. 1000 is far above any
+/// legitimate client's subscription count (typically < 50); it is a safety
+/// bound rather than a tuning knob.
+const MAX_SUBSCRIPTIONS_PER_SESSION: usize = 1000;
+
 /// Shared registry tracking which MQTT client IDs are in use and by which CN.
 ///
 /// Prevents client ID collision attacks where two different mTLS identities
@@ -2285,7 +2298,6 @@ async fn handle_subscribe_v5(
         .await
         {
             Ok(()) => {
-                fire_subscribe_accept(session_hooks);
                 // MQTT 5.0 §3.8.2.1.2 Subscription Identifier — the
                 // OPTIONAL `id` from `SubscribeProperties` (a VBI on
                 // the wire, surfaced as `Option<usize>` by mqttbytes)
@@ -2300,13 +2312,22 @@ async fn handle_subscribe_v5(
                     .as_ref()
                     .and_then(|p| p.id)
                     .and_then(|id| u32::try_from(id).ok());
-                track_subscription(
+                if !track_subscription(
                     subscriptions,
                     &filter.path,
                     filter.qos,
                     topic_prefix,
                     sub_id,
-                );
+                ) {
+                    // Per-session subscription cap reached (#1615): a v5 client
+                    // can cycle Subscription Identifiers on the same filter to
+                    // defeat the tracker dedup and grow it without bound. Refuse
+                    // this subscription instead of tracking it unboundedly.
+                    fire_subscribe_reject(session_hooks);
+                    return_codes.push(mqttbytes::v5::SubscribeReasonCode::ImplementationSpecific);
+                    continue;
+                }
+                fire_subscribe_accept(session_hooks);
                 // Collect retained messages now while the filter is
                 // confirmed-authorised; defer the actual send until
                 // after SUBACK so a slow client back-pressuring the
@@ -2469,7 +2490,6 @@ async fn handle_subscribe_v4(
         .await
         {
             Ok(()) => {
-                fire_subscribe_accept(session_hooks);
                 // See handle_subscribe_v5 for the retention-tracker
                 // rationale (refs #880). v3.1.1 doesn't support
                 // session retention via the new infrastructure (we
@@ -2484,17 +2504,24 @@ async fn handle_subscribe_v4(
                 // `subscription_identifier` field is `None` and the
                 // v4 dispatch path stays observationally identical
                 // to its pre-#880 behaviour.
-                track_subscription(subscriptions, &filter.path, filter.qos, topic_prefix, None);
-                collect_retained_for_filter(
-                    retain_store,
-                    identity,
-                    &filter.path,
-                    filter.qos,
-                    topic_prefix,
-                    None,
-                    &mut retained_to_send,
-                );
-                mqttbytes::v4::SubscribeReasonCode::Success(filter.qos)
+                if !track_subscription(subscriptions, &filter.path, filter.qos, topic_prefix, None)
+                {
+                    // Per-session subscription cap reached (#1615).
+                    fire_subscribe_reject(session_hooks);
+                    mqttbytes::v4::SubscribeReasonCode::Failure
+                } else {
+                    fire_subscribe_accept(session_hooks);
+                    collect_retained_for_filter(
+                        retain_store,
+                        identity,
+                        &filter.path,
+                        filter.qos,
+                        topic_prefix,
+                        None,
+                        &mut retained_to_send,
+                    );
+                    mqttbytes::v4::SubscribeReasonCode::Success(filter.qos)
+                }
             }
             Err(_) => {
                 fire_subscribe_reject(session_hooks);
@@ -2666,13 +2693,18 @@ fn min_qos(a: mqttbytes::QoS, b: mqttbytes::QoS) -> mqttbytes::QoS {
 /// retained), but re-SUBSCRIBE with the same filter and a NEW
 /// identifier creates a new entry so the write loop attaches every
 /// distinct identifier on a matching PUBLISH per §3.3.4.8.
+///
+/// Enforces [`MAX_SUBSCRIPTIONS_PER_SESSION`]: returns `true` when the
+/// subscription is tracked (or already present) and `false` when the cap is
+/// reached and a new entry is refused (#1615).
+#[must_use]
 fn track_subscription(
     subscriptions: &Arc<parking_lot::Mutex<Vec<crate::session_store::RetainedSubscription>>>,
     filter_path: &str,
     qos: mqttbytes::QoS,
     topic_prefix: Option<&str>,
     subscription_identifier: Option<u32>,
-) {
+) -> bool {
     // Compute the post-strip filter regardless of wildcard status —
     // the matcher in the write loop runs against destination groups
     // which are themselves post-strip.
@@ -2708,16 +2740,25 @@ fn track_subscription(
     };
 
     let mut tracker = subscriptions.lock();
-    if !tracker.iter().any(|s| {
+    // Already tracked (same filter + subscription identifier): a no-op that
+    // does not grow the tracker — always allowed.
+    if tracker.iter().any(|s| {
         s.filter == stripped_filter && s.subscription_identifier == subscription_identifier
     }) {
-        tracker.push(crate::session_store::RetainedSubscription {
-            group: group_owned,
-            qos: qos_byte,
-            subscription_identifier,
-            filter: stripped_filter,
-        });
+        return true;
     }
+    // New entry: enforce the per-session cap before pushing so a client cannot
+    // grow the tracker without bound by cycling Subscription Identifiers (#1615).
+    if tracker.len() >= MAX_SUBSCRIPTIONS_PER_SESSION {
+        return false;
+    }
+    tracker.push(crate::session_store::RetainedSubscription {
+        group: group_owned,
+        qos: qos_byte,
+        subscription_identifier,
+        filter: stripped_filter,
+    });
+    true
 }
 
 fn collect_retained_for_filter(
@@ -3221,6 +3262,48 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn track_subscription_caps_per_session_tracker() {
+        // #1615: cycling MQTT 5.0 Subscription Identifiers on the same filter
+        // defeats the (filter, id) dedup; the per-session tracker must still be
+        // bounded so memory and the O(n) write-path scan cannot grow without
+        // limit.
+        let subs = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+        // Fill to the cap with distinct identifiers on the SAME filter.
+        for id in 0..MAX_SUBSCRIPTIONS_PER_SESSION as u32 {
+            assert!(track_subscription(
+                &subs,
+                "fleet/alpha",
+                mqttbytes::QoS::AtMostOnce,
+                None,
+                Some(id),
+            ));
+        }
+        assert_eq!(subs.lock().len(), MAX_SUBSCRIPTIONS_PER_SESSION);
+
+        // One more distinct identifier is refused at the cap.
+        assert!(!track_subscription(
+            &subs,
+            "fleet/alpha",
+            mqttbytes::QoS::AtMostOnce,
+            None,
+            Some(u32::MAX),
+        ));
+        assert_eq!(subs.lock().len(), MAX_SUBSCRIPTIONS_PER_SESSION);
+
+        // A duplicate (already-tracked) entry is still accepted — it does not
+        // grow the tracker, so the cap must not reject it.
+        assert!(track_subscription(
+            &subs,
+            "fleet/alpha",
+            mqttbytes::QoS::AtMostOnce,
+            None,
+            Some(0),
+        ));
+        assert_eq!(subs.lock().len(), MAX_SUBSCRIPTIONS_PER_SESSION);
+    }
 
     #[test]
     fn client_id_claim_same_cn_allowed() {
