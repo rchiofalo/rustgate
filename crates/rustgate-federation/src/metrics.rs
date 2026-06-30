@@ -279,7 +279,7 @@ pub fn init() -> prometheus::Result<()> {
 // live in `rustgate_metrics` so every crate following the
 // `OnceLock` + `init()` + accessor pattern shares one implementation.
 
-use rustgate_core::sanitize::sanitize_for_log;
+use rustgate_core::masking::hash_cn;
 use rustgate_metrics::{
     fallback_counter, fallback_counter_vec, fallback_gauge, fallback_gauge_vec,
     fallback_histogram_vec,
@@ -543,15 +543,19 @@ pub fn rpc_total() -> &'static IntCounterVec {
     })
 }
 
-/// Sanitize a peer-id label value for the per-RPC metric vectors.
+/// Hash a peer-id into a stable, non-disclosing label value for the
+/// per-RPC metric vectors.
 ///
-/// Peer-id is the federate-id string from a peer-controlled `Identity`
-/// or the mTLS CN. Both are user-influenced surfaces — we route them
-/// through [`sanitize_for_log`] so a peer that smuggled `\r\n` into its
-/// federate-id can't forge log lines downstream of a Prometheus scrape
-/// that prints labels verbatim.
+/// Peer-id is the federate-id string from a peer-controlled `Identity` or
+/// the mTLS CN. It is hashed with [`hash_cn`] before it becomes a label so
+/// the federation topology (configured peer names) is not disclosed in
+/// plaintext on the unauthenticated-by-default `/metrics` scrape (#1558).
+/// Hashing also subsumes the previous log-forging guard: the hex digest
+/// cannot carry a `\r\n` that a peer might otherwise smuggle into its
+/// federate-id to forge log lines downstream of a scrape that prints labels
+/// verbatim. The name is retained for call-site stability.
 pub fn sanitize_peer_label(peer: &str) -> String {
-    sanitize_for_log(peer)
+    hash_cn(peer)
 }
 
 /// Classify a `tonic::Status` into the canonical `result` label value
@@ -885,17 +889,26 @@ mod tests {
         let _ = tot.with_label_values(&[RPC_SEND_ONE_BLOB, "peer-fallback", RESULT_SUCCESS]);
     }
 
-    /// The peer-id label must be sanitized before reaching the metric
-    /// vector — a peer that injected `\r\n` into its federate-id
-    /// would otherwise forge log lines downstream of any scrape that
-    /// prints labels verbatim. The output of [`sanitize_peer_label`]
-    /// must contain neither CR nor LF.
     #[test]
-    fn rpc_metrics_label_peer_is_sanitized() {
-        let evil = "peer-\r\nfake-line";
-        let safe = sanitize_peer_label(evil);
-        assert!(!safe.contains('\r'), "CR must be stripped: {safe:?}");
-        assert!(!safe.contains('\n'), "LF must be stripped: {safe:?}");
+    fn rpc_metrics_label_peer_is_hashed() {
+        // #1558: peer ids must be hashed, not disclosed verbatim, in metric
+        // labels so the /metrics scrape does not reveal federation topology.
+        let peer = "us-west-edge-7";
+        let label = sanitize_peer_label(peer);
+        assert_ne!(label, peer, "peer id must not appear verbatim in the label");
+        assert_eq!(
+            label,
+            rustgate_core::masking::hash_cn(peer),
+            "label must be the hash_cn digest"
+        );
+        // Hashing also guarantees the label carries no CR/LF, so a peer that
+        // smuggles `\r\n` into its federate-id cannot forge log lines
+        // downstream of a scrape that prints labels verbatim.
+        let evil = sanitize_peer_label("peer-\r\nfake-line");
+        assert!(
+            !evil.contains('\r') && !evil.contains('\n'),
+            "label must contain no CR/LF: {evil:?}"
+        );
     }
 
     /// `classify_status` is the canonical gRPC `Code` → `result`
@@ -922,18 +935,21 @@ mod tests {
     #[test]
     fn rpc_in_flight_gauge_enters_and_exits_via_guard() {
         ensure_init();
+        // The guard hashes the peer id into the label (#1558), so read the
+        // gauge under the same hashed label the guard writes, not the raw id.
+        let peer_label = sanitize_peer_label("peer-guard-test");
         let before = rpc_in_flight()
-            .with_label_values(&[RPC_SEND_ONE_BLOB, "peer-guard-test"])
+            .with_label_values(&[RPC_SEND_ONE_BLOB, peer_label.as_str()])
             .get();
         {
             let _g = InFlightGuard::enter(RPC_SEND_ONE_BLOB, "peer-guard-test");
             let during = rpc_in_flight()
-                .with_label_values(&[RPC_SEND_ONE_BLOB, "peer-guard-test"])
+                .with_label_values(&[RPC_SEND_ONE_BLOB, peer_label.as_str()])
                 .get();
             assert_eq!(during, before + 1, "guard must increment on enter");
         }
         let after = rpc_in_flight()
-            .with_label_values(&[RPC_SEND_ONE_BLOB, "peer-guard-test"])
+            .with_label_values(&[RPC_SEND_ONE_BLOB, peer_label.as_str()])
             .get();
         assert_eq!(after, before, "guard must decrement on drop");
     }
