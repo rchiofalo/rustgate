@@ -495,6 +495,16 @@ async fn ws_read_loop(
                 );
             }
             if limiter.should_disconnect() {
+                // Closes #1500: mirror the per-message throttle path below,
+                // which already audits. A sustained frame/byte rate-limit
+                // breach that forces a disconnect must leave the same
+                // structured `security.rate_limited` record so the audit
+                // trail is symmetric across both rate-limit outcomes.
+                rustgate_core::audit::rate_limit_triggered(
+                    &identity.cn,
+                    "websocket/inbound-disconnect",
+                    limiter.max_frames_per_sec() as usize,
+                );
                 return Err("disconnected: sustained rate limit violations".into());
             }
             continue;
