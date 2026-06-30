@@ -447,6 +447,11 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
     let mut in_detail = false;
     let mut detail_depth = 0usize;
     let mut detail_buf = String::new();
+    // Tag-name stack for child elements opened inside `<detail>`. Used to
+    // reject unbalanced or mismatched closing tags, which would otherwise
+    // reconstruct as malformed XML (#1610). Moves in lockstep with
+    // `detail_depth`: push on a non-empty child open, pop on its close.
+    let mut detail_tags: Vec<Vec<u8>> = Vec::new();
     let mut seen_event = false;
     let mut buf = Vec::new();
 
@@ -466,6 +471,7 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
                     &mut in_detail,
                     &mut detail_depth,
                     &mut detail_buf,
+                    &mut detail_tags,
                 ) {
                     break;
                 }
@@ -479,6 +485,7 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
                     &mut in_detail,
                     &mut detail_depth,
                     &mut detail_buf,
+                    &mut detail_tags,
                 ) {
                     break;
                 }
@@ -491,20 +498,35 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
                     }
                     b"delta" => {}
                     b"detail" if detail_depth == 1 => {
+                        // Every child tag opened inside <detail> must have been
+                        // matched and popped; a non-empty stack means an opening
+                        // tag was never closed, which would reconstruct as
+                        // malformed XML (#1610).
+                        if !detail_tags.is_empty() {
+                            return None;
+                        }
                         in_detail = false;
                         snap.detail_inner = Some(std::mem::take(&mut detail_buf));
                         detail_depth = 0;
                     }
                     _ => {
-                        if in_detail && detail_depth > 1 {
-                            detail_buf.push_str("</");
-                            detail_buf.push_str(&String::from_utf8_lossy(&name));
-                            detail_buf.push('>');
-                            detail_depth = detail_depth.saturating_sub(1);
-                        } else if in_detail {
-                            // closing an unopened tag inside detail is
-                            // malformed — ignore and let detail close on
-                            // its own </detail> or EOF.
+                        if in_detail {
+                            // Match the closing tag against the stack of child
+                            // tags opened inside <detail>. A mismatch or
+                            // underflow (closing a tag that was never opened)
+                            // means the reconstructed detail would be malformed
+                            // XML; reject the whole snapshot so the encoder
+                            // falls back to a full, verbatim event emit rather
+                            // than shipping invalid XML downstream (#1610).
+                            match detail_tags.pop() {
+                                Some(opened) if opened == name => {
+                                    detail_buf.push_str("</");
+                                    detail_buf.push_str(&String::from_utf8_lossy(&name));
+                                    detail_buf.push('>');
+                                    detail_depth = detail_depth.saturating_sub(1);
+                                }
+                                _ => return None,
+                            }
                         }
                     }
                 }
@@ -546,6 +568,7 @@ fn handle_open(
     in_detail: &mut bool,
     detail_depth: &mut usize,
     detail_buf: &mut String,
+    detail_tags: &mut Vec<Vec<u8>>,
 ) -> bool {
     let name = e.name().as_ref().to_vec();
     match name.as_slice() {
@@ -555,6 +578,7 @@ fn handle_open(
                     append_tag_start(detail_buf, e, is_empty);
                     if !is_empty {
                         *detail_depth = detail_depth.saturating_add(1);
+                        detail_tags.push(name.clone());
                     }
                 }
                 return false;
@@ -646,6 +670,7 @@ fn handle_open(
                 append_tag_start(detail_buf, e, is_empty);
                 if !is_empty {
                     *detail_depth = detail_depth.saturating_add(1);
+                    detail_tags.push(name.clone());
                 }
             }
             false
@@ -1057,6 +1082,62 @@ mod tests {
             DeltaOutput::Full(b) => assert_eq!(b.as_ref(), b"not xml at all"),
             other => panic!("expected full, got {other:?}"),
         }
+    }
+
+    /// Wrap `detail` body in a minimal valid `<event>`/`<detail>` envelope.
+    fn event_with_detail(detail: &str) -> Bytes {
+        Bytes::from(format!(
+            "<event version=\"2.0\" uid=\"U1\" type=\"a-f-G\" time=\"t\" start=\"t\" stale=\"t\">\
+             <detail>{detail}</detail></event>"
+        ))
+    }
+
+    #[test]
+    fn parse_snapshot_rejects_unbalanced_detail_tags() {
+        // #1610: closing tags inside <detail> with no matching open (or
+        // mismatched nesting) would reconstruct as malformed XML. parse_snapshot
+        // must reject these (None) so the encoder falls back to a full verbatim
+        // emit rather than shipping invalid XML downstream.
+        // Unmatched close at the detail level (empty stack underflow).
+        assert!(parse_snapshot(&event_with_detail("</unmatched>")).is_none());
+        // Unmatched close nested one level deep.
+        assert!(parse_snapshot(&event_with_detail("<content></unmatched></content>")).is_none());
+        // Mismatched nesting: <a><b></a></b> — b must close before a.
+        assert!(parse_snapshot(&event_with_detail("<a><b></a></b>")).is_none());
+        // An opened tag never closed (detail closes with a non-empty stack).
+        assert!(parse_snapshot(&event_with_detail("<a>text")).is_none());
+
+        // Properly nested detail still parses and reconstructs verbatim.
+        let ok = parse_snapshot(&event_with_detail("<a><b>x</b></a>"))
+            .expect("well-formed detail parses");
+        assert_eq!(ok.detail_inner.as_deref(), Some("<a><b>x</b></a>"));
+    }
+
+    #[test]
+    fn parse_snapshot_keeps_detail_well_formed_with_text_entities() {
+        // #1609 (verified NOT an injection). quick_xml emits an entity reference
+        // in element text (`&lt;`, `&amp;`) as a distinct event that the detail
+        // capture does not fold in, so the entity content is DROPPED rather than
+        // decoded in place. The reconstruction is therefore lossy but always
+        // well-formed — it never emits the stray unescaped `<` / `&` that #1609
+        // feared would corrupt the downstream XML. (The fix #1609 suggested —
+        // re-escaping the detail inner — would instead double-escape the
+        // reconstructed structural tags and corrupt valid output, which is why
+        // it was not applied.)
+        let snap = parse_snapshot(&event_with_detail("<remark>a &lt; b &amp; c</remark>"))
+            .expect("parses");
+        let inner = snap.detail_inner.as_deref().expect("detail inner present");
+        assert!(
+            inner.starts_with("<remark>") && inner.ends_with("</remark>"),
+            "structural tags must survive reconstruction: {inner:?}"
+        );
+        let text = inner
+            .trim_start_matches("<remark>")
+            .trim_end_matches("</remark>");
+        assert!(
+            !text.contains('<') && !text.contains('&'),
+            "no stray '<' or '&' may leak into the reconstructed detail text: {text:?}"
+        );
     }
 
     #[test]
