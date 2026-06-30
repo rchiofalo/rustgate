@@ -300,6 +300,19 @@ pub enum GuardError {
         /// Direction the message was attempting to cross.
         direction: GuardDirection,
     },
+    /// More than one CAPCO marking element is present in the payload.
+    /// The guard inspects only the first marking, so a second (possibly
+    /// higher) marking would otherwise cross a release boundary
+    /// unexamined while the audit record names only the first. The
+    /// governing classification is ambiguous — reject on `HighToLow`
+    /// (#1604).
+    #[error(
+        "inbound message carries multiple CAPCO markings — ambiguous classification for direction {direction}"
+    )]
+    MultipleMarkings {
+        /// Direction the message was attempting to cross.
+        direction: GuardDirection,
+    },
     /// Audit log write or chain accounting failed.
     #[error("guard audit log error: {source}")]
     Audit {
@@ -329,6 +342,7 @@ impl GuardError {
         match self {
             Self::RateLimitExceeded { .. } => "rate_limit",
             Self::MissingMarking => "missing_marking",
+            Self::MultipleMarkings { .. } => "multiple_markings",
             Self::UnauthorizedClassification { .. } => "unauthorized_classification",
             Self::Audit { .. } => "audit_error",
             Self::Io { .. } => "io_error",
@@ -458,6 +472,27 @@ impl CrossDomainGuard {
                 "missing_marking",
             )?;
             return Err(GuardError::MissingMarking);
+        }
+
+        // Step 1.5: multi-marking ambiguity (#1604). `extract_marking`
+        // returns only the FIRST marking, so on a release boundary a second
+        // (possibly higher) marking would cross unexamined while the audit
+        // record names only the first. A payload carrying more than one
+        // marking is policy-ambiguous about which classification governs —
+        // reject it on the HighToLow boundary rather than release on the
+        // first marking alone. LowToHigh / Bidirectional are permissive,
+        // matching the classification-dominance check below.
+        if direction == GuardDirection::HighToLow && count_markings(&payload) > 1 {
+            self.write_audit_record(
+                direction,
+                msg,
+                marking.as_deref(),
+                &input_sha,
+                &output_sha,
+                "deny",
+                "multiple_markings",
+            )?;
+            return Err(GuardError::MultipleMarkings { direction });
         }
 
         // Step 2: classification dominance check. A `TopSecret`
@@ -743,6 +778,39 @@ fn extract_marking(payload: &[u8]) -> Option<String> {
     }
 }
 
+/// Count `<marking>` elements anywhere in an XML payload.
+///
+/// Used by the HighToLow gate to reject policy-ambiguous multi-marking
+/// messages (#1604): [`extract_marking`] inspects only the first marking,
+/// so a second, possibly-higher marking would otherwise cross the boundary
+/// unexamined. Counts every `<marking>` element (start or empty) regardless
+/// of attributes — any payload with more than one is ambiguous. Non-XML
+/// payloads carry no markings and short-circuit to `0`.
+fn count_markings(payload: &[u8]) -> usize {
+    if !is_xml_intent(payload) {
+        return 0;
+    }
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+    let mut reader = Reader::from_reader(payload);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut count = 0usize;
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if local_name(e.name().as_ref()).eq_ignore_ascii_case(b"marking") {
+                    count += 1;
+                }
+            }
+            Ok(Event::Eof) => return count,
+            Err(_) => return count,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
 /// Extract the CoT envelope `uid` attribute from a payload, if any.
 /// Returns `None` for non-XML or missing-uid payloads — the audit
 /// record then carries an empty string in `msg_uid` so SIEM rules can
@@ -901,6 +969,49 @@ mod tests {
             audit_log_path: tmp.path().join("boundary-audit.jsonl"),
             direction: GuardDirection::Bidirectional,
         }
+    }
+
+    fn cot_with_two_markings(uid: &str, m1: &str, m2: &str) -> Bytes {
+        let xml = format!(
+            r#"<event uid="{uid}" type="a-f-G-U-C" start="2026-05-04T12:00:00Z" stale="2026-05-04T12:05:00Z"><point lat="38.9" lon="-77.0" hae="125.0"/><detail><marking value="{m1}"/><marking value="{m2}"/><contact callsign="ALPHA-1"/></detail></event>"#,
+        );
+        Bytes::from(xml)
+    }
+
+    #[test]
+    fn guard_rejects_multiple_markings_high_to_low() {
+        // #1604: a release-boundary message with two markings is ambiguous —
+        // the guard inspects only the first, so a second (higher) marking
+        // would cross unexamined. Reject + audit reason=multiple_markings.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp, 64 * 1024, 64 * 1024, true);
+        let mut g = CrossDomainGuard::new(cfg).unwrap();
+        let msg = make_message(cot_with_two_markings("u1", "//SECRET//", "//TOP SECRET//"));
+        let err = g
+            .evaluate(&msg, GuardDirection::HighToLow)
+            .expect_err("multi-marking must be rejected on the release boundary");
+        assert!(
+            matches!(err, GuardError::MultipleMarkings { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(err.reason_token(), "multiple_markings");
+        assert_eq!(g.audit_records_written(), 1, "exactly one deny record");
+    }
+
+    #[test]
+    fn guard_permits_multiple_markings_low_to_high() {
+        // Elevation side is permissive (matches the classification check):
+        // multi-marking is allowed when crossing into a higher domain.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp, 64 * 1024, 64 * 1024, true);
+        let mut g = CrossDomainGuard::new(cfg).unwrap();
+        let msg = make_message(cot_with_two_markings(
+            "u1",
+            "//SECRET//",
+            "//CONFIDENTIAL//",
+        ));
+        let res = g.evaluate(&msg, GuardDirection::LowToHigh);
+        assert!(res.is_ok(), "LowToHigh must permit multi-marking: {res:?}");
     }
 
     #[test]
