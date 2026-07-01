@@ -371,6 +371,18 @@ async fn handle_ws_session(
         }
         audit.emit_on_delivered();
     }
+    // Re-drain to close the drain→register race (#1509): a Direct message
+    // persisted in the drain→register gap would otherwise wait for the next
+    // reconnect. Empty (cheap) under normal operation.
+    let regap = router.drain_offline_messages(&identity.cn).await;
+    let regap = router.filter_offline_messages(&identity, regap);
+    for pending in regap {
+        let (msg, audit) = pending.into_parts();
+        if handle.send(Arc::new(msg)).await.is_err() {
+            break;
+        }
+        audit.emit_on_delivered();
+    }
     router.replay_positions(&handle).await;
 
     let ws_stream = session.into_stream();
