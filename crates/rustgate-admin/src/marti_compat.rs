@@ -222,7 +222,12 @@ async fn route(
     state: &MartiCompatState,
 ) -> Response<Full<Bytes>> {
     match (method, path) {
-        (&Method::GET, "/Marti/api/tls/config") => handle_tls_config(state),
+        (&Method::GET, "/Marti/api/tls/config") => {
+            match deny_unless_authorized(authorization, state) {
+                Some(deny) => deny,
+                None => handle_tls_config(state),
+            }
+        }
         (&Method::POST, "/Marti/api/tls/signClient")
         | (&Method::POST, "/Marti/api/tls/signClient/") => {
             handle_sign_client(authorization, body, state)
@@ -278,7 +283,10 @@ fn deny_unless_authorized(
 /// `GET /Marti/api/tls/config`
 ///
 /// Returns the CA cert + accepted ciphers + protocol versions so a TAK
-/// client can build its truststore from an unauthenticated preflight.
+/// client can build its truststore during preflight. When an admin
+/// bearer token is configured the caller gates this route through
+/// [`deny_unless_authorized`] first (#1551) — same disposition as the
+/// other read-only GET endpoints; in open mode it answers without auth.
 /// ATAK is tolerant about missing/extra fields, so we ship a stable
 /// JSON shape rather than reproducing TAK Server's exact XML envelope.
 fn handle_tls_config(state: &MartiCompatState) -> Response<Full<Bytes>> {
@@ -709,6 +717,44 @@ mod tests {
             ran.load(Ordering::SeqCst),
             "contacts provider must execute with a valid bearer token",
         );
+
+        // #1551: tls/config shares the same gate — reject with no header,
+        // reject on a wrong token, and admit only the correct bearer.
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/tls/config",
+            None,
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/tls/config",
+            Some("Bearer wrong"),
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/tls/config",
+            Some("Bearer s3cr3t"),
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -767,6 +813,69 @@ mod tests {
         assert!(!ciphers.is_empty());
         let versions = parsed["data"]["protocolVersions"].as_array().unwrap();
         assert!(versions.iter().any(|v| v == "TLSv1.3"));
+    }
+
+    #[tokio::test]
+    async fn tls_config_requires_bearer_when_token_configured() {
+        // #1551: GET /Marti/api/tls/config must sit behind the same
+        // bearer gate as its sibling GET endpoints when a token is
+        // configured. In open mode (no token) it still answers 200.
+        let mut state = MartiCompatState::empty();
+        state.auth_token = Some(Zeroizing::new(token_bytes()));
+
+        // No header: 401.
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/tls/config",
+            None,
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong token: 401.
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/tls/config",
+            Some("Bearer wrong-token"),
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct token: 200.
+        let auth = format!("Bearer {}", String::from_utf8(token_bytes()).unwrap());
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/tls/config",
+            Some(&auth),
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Open mode (no token configured): 200 without any header.
+        let open_state = MartiCompatState::empty();
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/api/tls/config",
+            None,
+            None,
+            b"",
+            &open_state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
