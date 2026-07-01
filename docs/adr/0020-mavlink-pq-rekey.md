@@ -31,12 +31,16 @@ Three forcing functions:
    without it the Router cannot apply ACL or authz to MAVLink traffic
    and the integration is "wide-open ingress with policy bypass," which
    is worse than no integration at all.
-2. **Post-quantum forward secrecy.** MAVLink v2 signing keys are
-   symmetric 32-byte values. Operators today distribute them
-   out-of-band (USB, scp, K8s secret) and rotate manually. An attacker
-   who records the bootstrap-time distribution channel can recover
-   today's traffic in 2035 once classical ECDH is broken. The CNSA 2.0
-   target (ADR 0019) demands a PQ-secured distribution story.
+2. **Post-quantum confidentiality (harvest-now-decrypt-later
+   resistance).** MAVLink v2 signing keys are symmetric 32-byte values.
+   Operators today distribute them out-of-band (USB, scp, K8s secret)
+   and rotate manually. An attacker who records the bootstrap-time
+   distribution channel can recover today's traffic in 2035 once
+   classical ECDH is broken. The CNSA 2.0 target (ADR 0019) demands a
+   PQ-secured distribution story. This is confidentiality against a
+   future quantum adversary, not forward secrecy — the decap key is a
+   long-term static identity, so decap-key rotation is the
+   forward-secrecy lever (see §4).
 3. **Algorithm agility.** CNSA 2.0 §4 expects an algorithm identifier
    on every PQ wire envelope so ML-KEM-768 → ML-KEM-1024 (Level 3 →
    Level 5) can land without breaking interop. The MAVLink rekey
@@ -145,9 +149,14 @@ wrap_key       = HKDF-SHA256(
 The bootstrap secret is **only** used as the HKDF salt — it
 authenticates the wrap (an attacker without it cannot derive
 `wrap_key` even with a valid ML-KEM ciphertext) but is not the session
-key. Forward secrecy is guaranteed by ML-KEM: compromising the
-bootstrap secret tomorrow does not reveal past session keys, because
-those derive from ephemeral ML-KEM decapsulations.
+key. This is **post-quantum confidential** (harvest-now-decrypt-later
+resistant), not forward-secret: the ML-KEM decapsulation key is the
+receiver's long-term static PQ identity, not an ephemeral key, so an
+attacker who records envelopes and later compromises that decap key
+recovers every wrapped key. Compromising only the bootstrap secret does
+not reveal past wrap keys — but the decap key does. Decap-key rotation
+is the forward-secrecy lever: rotating it bounds the set of past
+envelopes a single decap-key compromise can open.
 
 ### 5. Wire format with algorithm-id prefix
 

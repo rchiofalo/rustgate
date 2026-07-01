@@ -6,10 +6,11 @@
 //! distribute them out-of-band today and rotate them by hand; an
 //! adversary who records the distribution channel can recover today's
 //! traffic once classical ECDH falls. This module gives operators a
-//! forward-secret rekey channel: the new signing key travels inside an
-//! ML-KEM-768 (FIPS 203) encapsulation, so a recorded envelope cannot be
-//! opened even by a future quantum adversary holding the long-term
-//! bootstrap secret.
+//! post-quantum confidential rekey channel (harvest-now-decrypt-later
+//! resistant while the decap key stays secret): the new signing key
+//! travels inside an ML-KEM-768 (FIPS 203) encapsulation, so a recorded
+//! envelope cannot be opened by a future quantum adversary holding only
+//! the long-term bootstrap secret.
 //!
 //! # Wire format (ADR 0020 §5)
 //!
@@ -38,12 +39,15 @@
 //! The 32-byte bootstrap secret is used **only** as the HKDF salt — it
 //! authenticates the wrap (an attacker without it cannot derive the wrap
 //! key even with a valid ML-KEM ciphertext) but is never itself the
-//! session key. Forward secrecy comes from ML-KEM: compromising the
-//! bootstrap secret tomorrow does not reveal past wrap keys, because each
-//! derives from an ephemeral ML-KEM decapsulation. The ML-KEM
-//! decapsulation key is the receiver's long-term PQ identity; its on-disk
-//! provisioning is wired in the server crate (PR 6). This module operates
-//! on in-memory keys.
+//! session key. This design is **not** forward-secret: the ML-KEM
+//! decapsulation key is the receiver's long-term static PQ identity, not
+//! an ephemeral key, so an attacker who records envelopes and later
+//! compromises that decap key recovers every wrapped key. Compromising
+//! only the bootstrap secret does not, by itself, reveal past wrap keys —
+//! but the decap key does. Decap-key rotation is the forward-secrecy
+//! lever: rotating it bounds the set of past envelopes a single decap-key
+//! compromise can open. The decap key's on-disk provisioning is wired in
+//! the server crate (PR 6). This module operates on in-memory keys.
 //!
 //! # AEAD binding
 //!
