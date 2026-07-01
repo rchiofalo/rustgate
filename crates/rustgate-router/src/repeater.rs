@@ -104,7 +104,7 @@ impl EmergencyRepeater {
 
         events
             .values()
-            .filter(|e| now.duration_since(e.received_at).unwrap_or_default() < self.stale_delay)
+            .filter(|e| is_fresh(now, e.received_at, self.stale_delay))
             .map(|e| e.message.clone())
             .collect()
     }
@@ -115,9 +115,7 @@ impl EmergencyRepeater {
         let before = events.len();
         let now = SystemTime::now();
 
-        events.retain(|_, e| {
-            now.duration_since(e.received_at).unwrap_or_default() < self.stale_delay
-        });
+        events.retain(|_, e| is_fresh(now, e.received_at, self.stale_delay));
 
         before - events.len()
     }
@@ -171,6 +169,20 @@ impl EmergencyRepeater {
             }
         })
     }
+}
+
+/// Decide whether a cached emergency received at `received_at` is still
+/// fresh relative to `now`.
+///
+/// Fail-closed on clock skew: if `now < received_at` (NTP step-back or a
+/// future-dated `received_at`), `duration_since` errors and we treat the
+/// entry as stale (drop it) rather than the old `unwrap_or_default()`
+/// behaviour, which mapped the error to a zero elapsed time and let a
+/// future-dated event pass the staleness filter forever (SEC-23).
+fn is_fresh(now: SystemTime, received_at: SystemTime, stale_delay: Duration) -> bool {
+    now.duration_since(received_at)
+        .map(|elapsed| elapsed < stale_delay)
+        .unwrap_or(false)
 }
 
 /// Extract the `uid` attribute from a CoT `<event>` element.
@@ -301,6 +313,63 @@ mod tests {
 
         let removed = repeater.sweep().await;
         assert_eq!(removed, 1);
+        assert!(repeater.is_empty().await);
+    }
+
+    #[test]
+    fn is_fresh_drops_future_received_at() {
+        // SEC-23: a future `received_at` (clock step-back / corrupted
+        // timestamp) must be treated as STALE, not fresh. The old
+        // `unwrap_or_default()` mapped the `now < received_at` error to a
+        // zero elapsed time, which compared as fresh and let the event
+        // pass the staleness filter indefinitely — fail-open.
+        let now = SystemTime::now();
+        let future = now + Duration::from_secs(3600);
+        assert!(
+            !is_fresh(now, future, Duration::from_secs(300)),
+            "future received_at must be treated as stale"
+        );
+    }
+
+    #[test]
+    fn is_fresh_accepts_recent_and_drops_old() {
+        let now = SystemTime::now();
+        let recent = now - Duration::from_secs(10);
+        let old = now - Duration::from_secs(600);
+        assert!(is_fresh(now, recent, Duration::from_secs(300)));
+        assert!(!is_fresh(now, old, Duration::from_secs(300)));
+    }
+
+    /// SEC-23 end-to-end: an entry whose `received_at` is in the future
+    /// must be excluded from `active_events()` and removed by `sweep()`.
+    /// We insert directly into the events map to plant the future
+    /// timestamp, since `process()` always stamps `SystemTime::now()`.
+    #[tokio::test]
+    async fn future_dated_emergency_is_excluded_and_swept() {
+        let repeater = EmergencyRepeater::new();
+        {
+            let mut events = repeater.events.write().await;
+            let msg = make_alert(
+                "future-1",
+                r#"<event type="b-a-o-tbl" uid="future-1"><detail><emergency type="911 Alert" /></detail></event>"#,
+            );
+            let _ = events.insert(
+                "future-1".to_string(),
+                CachedEmergency {
+                    message: msg,
+                    received_at: SystemTime::now() + Duration::from_secs(3600),
+                },
+            );
+        }
+
+        let active = repeater.active_events().await;
+        assert!(
+            active.is_empty(),
+            "future-dated emergency must be excluded from active replay"
+        );
+
+        let removed = repeater.sweep().await;
+        assert_eq!(removed, 1, "future-dated emergency must be swept out");
         assert!(repeater.is_empty().await);
     }
 
