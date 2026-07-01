@@ -6396,6 +6396,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_forward_redrain_after_register_captures_gap_message() {
+        use tempfile::TempDir;
+
+        use crate::store_forward::ClientQueue;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let queue = Arc::new(ClientQueue::open(tmp.path(), 1_000_000).expect("open queue"));
+        let router = Arc::new(Router::new().with_client_queue(Arc::clone(&queue)));
+
+        let alice = make_identity("alice", &["alpha"]);
+        let bob = make_identity("bob", &["alpha"]);
+
+        // A message is queued while bob is offline.
+        router
+            .route(RoutableMessage {
+                source: (*alice).clone(),
+                destination: Destination::Direct((*bob).clone()),
+                payload: Bytes::from_static(b"m0"),
+                metadata: Metadata::new(SystemTime::now(), "test".to_string(), MessageType::Chat),
+            })
+            .await;
+        for _ in 0..200 {
+            if queue.stats("bob").depth == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.stats("bob").depth, 1);
+
+        // The session drains BEFORE register.
+        let first = router.drain_offline_messages("bob").await;
+        assert_eq!(first.len(), 1);
+
+        // THE RACE (#1509): a Direct message arrives *after* that first drain
+        // but *before* register completes — still no live session, so it
+        // persists to the offline queue instead of being delivered live.
+        router
+            .route(RoutableMessage {
+                source: (*alice).clone(),
+                destination: Destination::Direct((*bob).clone()),
+                payload: Bytes::from_static(b"m1"),
+                metadata: Metadata::new(SystemTime::now(), "test".to_string(), MessageType::Chat),
+            })
+            .await;
+        for _ in 0..200 {
+            if queue.stats("bob").depth == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(queue.stats("bob").depth, 1);
+
+        // Register, then RE-DRAIN (the fix). Before this change the gap-race
+        // message would sit in the queue until the next reconnect; the second
+        // drain must now capture it.
+        let (ptx_b, ntx_b, _prx_b, _nrx_b) = make_channels(32, 32);
+        let handle = SessionHandle::new(bob.clone(), ptx_b, ntx_b);
+        let _ = router.register(handle.clone()).await;
+
+        let regap = router.drain_offline_messages("bob").await;
+        assert_eq!(
+            regap.len(),
+            1,
+            "re-drain must capture the message persisted in the drain→register gap"
+        );
+        assert_eq!(regap[0].payload.as_ref(), b"m1");
+    }
+
+    #[tokio::test]
     async fn store_forward_disabled_does_not_persist() {
         // Regression: when no client queue is attached, routing to an
         // offline CN must remain a silent drop (no panic, no state).

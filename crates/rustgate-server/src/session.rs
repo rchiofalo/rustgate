@@ -239,6 +239,24 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
         }
         audit.emit_on_delivered();
     }
+    // Re-drain to close the drain→register race (#1509). A `Direct` message
+    // routed to this CN *after* the first drain but *before* `register`
+    // completed was persisted to the offline queue with no live session to
+    // receive it, so it would otherwise sit until the next reconnect. Now
+    // that the session is registered, a second drain delivers it in order
+    // before the session loop starts. Empty (cheap) under normal operation.
+    let regap = deps
+        .router
+        .drain_offline_messages_for_identity(&identity)
+        .await;
+    let regap = deps.router.filter_offline_messages(&identity, regap);
+    for pending in regap {
+        let (msg, audit) = pending.into_parts();
+        if handle.send(Arc::new(msg)).await.is_err() {
+            break;
+        }
+        audit.emit_on_delivered();
+    }
     deps.router.replay_positions(&handle).await;
 
     // justification: both halves need `mut` only when the `proto` feature is
@@ -877,6 +895,21 @@ pub(crate) async fn run_plaintext_tcp<P: NatsPublish + Send + Sync + 'static>(
                                 // Drop `audit` without emitting: the
                                 // drain-path classified_delivery record
                                 // fires only on actual delivery.
+                                break;
+                            }
+                            audit.emit_on_delivered();
+                        }
+                        // Re-drain to close the drain→register race (#1509):
+                        // a Direct message persisted in the drain→register gap
+                        // would otherwise wait for the next reconnect. Empty
+                        // (cheap) under normal operation.
+                        let regap = router
+                            .drain_offline_messages_for_identity(&identity)
+                            .await;
+                        let regap = router.filter_offline_messages(&identity, regap);
+                        for pending in regap {
+                            let (msg, audit) = pending.into_parts();
+                            if handle.send(Arc::new(msg)).await.is_err() {
                                 break;
                             }
                             audit.emit_on_delivered();
