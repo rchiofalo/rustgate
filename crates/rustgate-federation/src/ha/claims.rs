@@ -62,7 +62,11 @@ rustgate_core::on_callback!(
 pub struct ClaimManager {
     kv: async_nats::jetstream::kv::Store,
     pod_id: String,
-    claims: Mutex<HashMap<String, u64>>, // peer_id → revision
+    // Single source of truth for claim state, shared with the background
+    // refresh/watch tasks via `Arc` clone. Claims added after `start()` via
+    // `try_claim` are visible to those tasks because both sides lock the
+    // same `Arc<Mutex<..>>` — see issue #1494.
+    claims: Arc<Mutex<HashMap<String, u64>>>, // peer_id → revision
     on_peer_available: Option<OnPeerAvailable>,
     on_claim_lost: Option<OnClaimLost>,
     shutdown_tx: watch::Sender<bool>,
@@ -101,7 +105,7 @@ impl ClaimManager {
         Ok(Self {
             kv,
             pod_id,
-            claims: Mutex::new(HashMap::new()),
+            claims: Arc::new(Mutex::new(HashMap::new())),
             on_peer_available: None,
             on_claim_lost: None,
             shutdown_tx,
@@ -124,15 +128,14 @@ impl ClaimManager {
     pub async fn start(&self) {
         let mut handles = self.task_handles.lock().await;
 
-        // Refresh loop: re-put all claims every REFRESH_INTERVAL_SECS
+        // Refresh loop: re-put all claims every REFRESH_INTERVAL_SECS.
+        // Share the SAME `Arc<Mutex<..>>` as `self.claims` so claims added
+        // after `start()` via `try_claim` are refreshed (issue #1494). A
+        // cloned snapshot would freeze the refresh set at start time and let
+        // later claims' TTL expire → split-brain.
         let kv = self.kv.clone();
         let pod_id = self.pod_id.clone();
-        let claims = self.claims.lock().await;
-        let claims_snapshot: HashMap<String, u64> = claims.clone();
-        drop(claims);
-
-        let claims_ref = Arc::new(Mutex::new(claims_snapshot));
-        let claims_for_refresh = claims_ref.clone();
+        let claims_for_refresh = self.claims.clone();
         let on_claim_lost = self.on_claim_lost.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
 
@@ -161,7 +164,7 @@ impl ClaimManager {
         // Watch loop: detect expired claims and fire on_peer_available
         let kv = self.kv.clone();
         let pod_id = self.pod_id.clone();
-        let claims_for_watch = claims_ref;
+        let claims_for_watch = self.claims.clone();
         let on_peer_available = self.on_peer_available.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
 
