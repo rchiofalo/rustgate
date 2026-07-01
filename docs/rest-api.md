@@ -1089,7 +1089,6 @@ websocat wss://server:8444/ \
 
 ---
 
-<<<<<<< HEAD
 ## Marti API Compatibility (`/Marti/api/*`)
 
 Drop-in TAK Server replacement surface, mounted on the admin HTTP server (default port 9090) when the `marti-compat` feature is enabled. Every endpoint maps a TAK-compatible URL onto an existing rustgate subsystem; this is a compatibility shim, not new functionality. ATAK / WinTAK / iTAK clients connect with no reconfiguration. Closes #863.
@@ -1101,7 +1100,7 @@ The URL prefix `/Marti/` is **case-sensitive** with a capital `M` — ATAK build
 | Marti endpoint                       | Maps to                                              | Auth                                |
 | ------------------------------------ | ---------------------------------------------------- | ----------------------------------- |
 | `POST /Marti/api/tls/signClient[/]`  | `rustgate-enrollment` CSR signer → PKCS#12 (`.p12`)  | HTTP Basic (TAK enrollment flow)    |
-| `GET  /Marti/api/tls/config`         | CA cert + accepted ciphers + protocol versions       | None (unauthenticated preflight)    |
+| `GET  /Marti/api/tls/config`         | CA cert + accepted ciphers + protocol versions       | Bearer token (when configured)      |
 | `GET  /Marti/api/missions`           | `rustgate-missions` lightweight package store        | Bearer token (when configured)      |
 | `GET  /Marti/api/contacts/all`       | Connected client list from the router                | Bearer token (when configured)      |
 | `GET  /Marti/api/video`              | Video stream catalog from `rustgate-admin::video`    | Bearer token (when configured)      |
@@ -1127,10 +1126,10 @@ curl -u operator:secret \
 
 ### GET /Marti/api/tls/config
 
-Unauthenticated preflight returning the CA cert (base64 DER) plus the static cipher / protocol-version list rustgate's TLS provider accepts.
+Returns the CA cert (base64 DER) plus the static cipher / protocol-version list rustgate's TLS provider accepts. **Bearer-token gated when an admin token is configured** (open otherwise), matching the other read-only GET endpoints on this surface (#1551). This is distinct from the enrollment server's `/Marti/api/tls/config` (port 8446), which is an intentionally-unauthenticated TAK preflight.
 
 ```bash
-curl https://rustgate.example.com:9090/Marti/api/tls/config
+curl -H "Authorization: Bearer <admin-token>" https://rustgate.example.com:9090/Marti/api/tls/config
 ```
 
 ```json
@@ -1220,7 +1219,7 @@ Returns the in-memory CoT `b-i-v` video stream catalog (`rustgate-admin::video`)
 - `Marti/api/sync/*` (mission sync — lands with the rest of #860)
 - `Marti/api/cot/xml` (live CoT push — would need a WebSocket tap into the router)
 - Deprecated XML response variants (we ship JSON only — ATAK is tolerant about format)
-=======
+
 ## Expanded Management API (closes #875)
 
 Built behind the `management-api` feature flag, this surface adds operator-facing read endpoints for running configuration, connected clients, build identity, metrics summary, store-and-forward queue depth, and a verifier driver for the hash-chained audit log. It coexists alongside the legacy `/api/cert/*`, `/api/dlq/*`, `/api/reload`, and `/api/drain` endpoints (all of which remain unchanged).
@@ -1325,7 +1324,6 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9090/api/version
 ```
 
 **Response shape:** `{"data": {"version": "0.8.0", "git_hash": "abc1234", "features": ["metrics", "nats", ...], "fips_active": false}}`.
->>>>>>> 92c8464 (feat(admin): management REST API expansion + MOSA OSMP document (closes #875))
 
 ---
 
