@@ -234,11 +234,122 @@ async fn adoption_callback_fires_on_release() {
     cm_b.stop().await;
 }
 
-// NOTE: claim_lost_callback_fires is omitted because the current ClaimManager
-// implementation snapshots the claims HashMap at start() time. Claims added
-// after start() via try_claim() are written to self.claims but not to the
-// refresh loop's local copy, so the refresh loop cannot detect claim-loss
-// for dynamically acquired claims. This is a known limitation tracked separately.
+// ── Post-start refresh renewal (issue #1494) ────────────────────
+//
+// Regression guard for #1494: `start()` used to hand the refresh loop a
+// cloned SNAPSHOT of the claims/registrations map, so anything added after
+// `start()` (the normal case — `try_claim`/`register` run in the per-peer
+// connection loop, always after `start()`) never had its TTL renewed and
+// silently expired → split-brain. The fix shares a single
+// `Arc<Mutex<HashMap>>` between `self` and the background task. Both tests
+// claim/register a peer AFTER `start()`, then assert the background loop
+// acted on that dynamically-added entry: the claim test waits one refresh
+// cycle and asserts the fencing token advanced; the registry test waits
+// past the KV TTL and asserts the entry survived (an un-refreshed entry
+// would have expired). Either signal is only possible if the loop sees the
+// dynamic entry.
+
+/// One refresh interval (10s) plus a margin, in wall-clock time.
+const ONE_REFRESH_CYCLE: Duration = Duration::from_secs(13);
+
+/// Longer than the 30s KV TTL, so an *un*-refreshed entry has certainly
+/// expired by the time we re-check. Used by the registry test, whose
+/// public surface (`list_connections`) cannot observe a revision bump —
+/// only presence/absence — so we rely on TTL expiry as the discriminator.
+const PAST_TTL_WINDOW: Duration = Duration::from_secs(33);
+
+#[tokio::test]
+async fn claim_added_after_start_is_refreshed() {
+    let nats = require_nats!();
+    let js = nats.jetstream().await;
+
+    let cm = ClaimManager::new(js, "pod-a".into())
+        .await
+        .expect("create cm");
+    // Refresh loop starts with an EMPTY claim set — the pre-fix snapshot
+    // would stay empty forever.
+    cm.start().await;
+
+    // Claim happens AFTER start(), like the real per-peer connection loop.
+    let initial = cm
+        .try_claim(&pid("peer-1"))
+        .await
+        .expect("pod-a should claim peer-1");
+    assert!(initial > 0, "fencing token should be positive");
+
+    // Let one refresh cycle run. The refresh loop re-puts the claim via
+    // `kv.update`, which returns a strictly higher revision and stores it.
+    tokio::time::sleep(ONE_REFRESH_CYCLE).await;
+
+    // Still owned and still visible — TTL was renewed, not expired.
+    assert!(
+        cm.is_owner(&pid("peer-1")).await,
+        "peer-1 must still be owned after one refresh cycle (TTL renewed)"
+    );
+    assert!(
+        cm.claimed_peers().await.contains(&"peer-1".to_string()),
+        "peer-1 must be visible to claimed_peers() after refresh"
+    );
+
+    // The fencing token must have advanced: proof the background loop
+    // actually touched the dynamically-added claim (pre-fix: unchanged,
+    // because the loop never saw it).
+    let refreshed = cm
+        .fencing_token(&pid("peer-1"))
+        .await
+        .expect("peer-1 must still have a fencing token");
+    assert!(
+        refreshed > initial,
+        "fencing token must advance across a refresh cycle \
+         (initial={initial}, after={refreshed}) — the refresh loop must \
+         see claims added after start()"
+    );
+
+    cm.stop().await;
+}
+
+#[tokio::test]
+async fn registration_added_after_start_is_refreshed() {
+    let nats = require_nats!();
+    let js = nats.jetstream().await;
+
+    let cr = ConnectionRegistry::new(js, "pod-a".into())
+        .await
+        .expect("create registry");
+    // Refresh loop starts with an EMPTY registration set — the pre-fix
+    // snapshot would stay empty forever.
+    cr.start().await;
+
+    // Register AFTER start(), like the real connection path.
+    cr.register(&pid("peer-1"), Direction::Outbound, Some(1))
+        .await
+        .expect("register peer-1");
+
+    // Present immediately.
+    let conns = cr.list_connections().await.expect("list connections");
+    assert!(
+        conns.iter().any(|c| c.peer_id.as_str() == "peer-1"),
+        "peer-1 must be present right after register"
+    );
+
+    // Wait past the 30s KV TTL. Without refresh (pre-fix), the entry has
+    // long since expired and `list_connections` returns empty for peer-1.
+    // With the shared-Arc fix, the background loop keeps re-putting it every
+    // 10s, so it survives.
+    tokio::time::sleep(PAST_TTL_WINDOW).await;
+
+    let conns = cr
+        .list_connections()
+        .await
+        .expect("list connections after TTL window");
+    assert!(
+        conns.iter().any(|c| c.peer_id.as_str() == "peer-1"),
+        "peer-1 registration must survive past the KV TTL — the refresh \
+         loop must see registrations added after start() (issue #1494)"
+    );
+
+    cr.stop().await;
+}
 
 // ── Connection Registry tests ───────────────────────────────────
 

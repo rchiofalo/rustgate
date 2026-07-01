@@ -7,6 +7,7 @@
 //! distributed state with TTL-based cleanup.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustgate_core::masking::hash_cn;
@@ -80,7 +81,11 @@ pub struct PodInfo {
 pub struct ConnectionRegistry {
     kv: async_nats::jetstream::kv::Store,
     pod_id: String,
-    registered: Mutex<HashMap<String, ConnectionInfo>>,
+    // Single source of truth for registration state, shared with the
+    // background refresh task via `Arc` clone. Registrations added after
+    // `start()` via `register` are refreshed because both sides lock the same
+    // `Arc<Mutex<..>>` — see issue #1494.
+    registered: Arc<Mutex<HashMap<String, ConnectionInfo>>>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -117,7 +122,7 @@ impl ConnectionRegistry {
         Ok(Self {
             kv,
             pod_id,
-            registered: Mutex::new(HashMap::new()),
+            registered: Arc::new(Mutex::new(HashMap::new())),
             shutdown_tx,
             shutdown_rx,
             task_handle: Mutex::new(None),
@@ -126,11 +131,12 @@ impl ConnectionRegistry {
 
     /// Start the background refresh loop.
     pub async fn start(&self) {
+        // Share the SAME `Arc<Mutex<..>>` as `self.registered` so
+        // registrations added after `start()` via `register` are refreshed
+        // (issue #1494). A cloned snapshot would freeze the refresh set at
+        // start time and let later registrations' TTL expire.
         let kv = self.kv.clone();
-        let registered = {
-            let reg = self.registered.lock().await;
-            Arc::new(Mutex::new(reg.clone()))
-        };
+        let registered = self.registered.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
 
         let handle = tokio::spawn(async move {
@@ -306,8 +312,6 @@ impl ConnectionRegistry {
         info!(pod_id = %self.pod_id, "connection registry stopped");
     }
 }
-
-use std::sync::Arc;
 
 /// Refresh all registered connections by re-putting them to reset TTL.
 async fn refresh_registrations(
