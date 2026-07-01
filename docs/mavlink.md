@@ -116,9 +116,10 @@ the binary wire form:
 ## Post-quantum signing-key rekey (`mavlink-pq`)
 
 Signing keys are symmetric and, by default, distributed out of band. The
-optional `mavlink-pq` feature adds a forward-secret rekey channel that
-wraps a new signing key inside an ML-KEM-768 (FIPS 203) encapsulation, so
-an adversary recording the distribution channel cannot recover the key
+optional `mavlink-pq` feature adds a post-quantum confidential
+(harvest-now-decrypt-later resistant) rekey channel that wraps a new
+signing key inside an ML-KEM-768 (FIPS 203) encapsulation, so an adversary
+recording the distribution channel cannot recover the key
 even with a future quantum computer. See ADR 0020 §4–§6 for the wire
 format and key schedule.
 
