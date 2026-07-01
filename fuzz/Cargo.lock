@@ -1832,10 +1832,16 @@ name = "rustgate-mavlink"
 version = "0.9.0"
 dependencies = [
  "bytes",
+ "lru",
+ "parking_lot",
  "rustgate-core",
+ "sha2",
+ "subtle",
  "thiserror 2.0.18",
+ "tokio",
  "tokio-util",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1888,6 +1894,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tracing",
 ]
@@ -1932,6 +1939,7 @@ dependencies = [
  "rustgate-authz",
  "rustgate-core",
  "rustgate-cot",
+ "rustgate-mavlink",
  "rustgate-resilience",
  "serde",
  "serde_json",
@@ -2006,6 +2014,7 @@ name = "rustgate-vmf"
 version = "0.9.0"
 dependencies = [
  "bytes",
+ "rustgate-codec-schema",
  "rustgate-core",
  "thiserror 2.0.18",
 ]
@@ -2548,9 +2557,9 @@ dependencies = [
 
 [[package]]
 name = "tonic"
-version = "0.14.5"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fec7c61a0695dc1887c1b53952990f3ad2e3a31453e1f49f10e75424943a93ec"
+checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
  "async-trait",
  "base64",
