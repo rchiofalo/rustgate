@@ -383,7 +383,7 @@ struct ClientInner {
     inbound: broadcast::Sender<Message>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     shutdown: Arc<tokio::sync::Notify>,
-    disconnected: AtomicBool,
+    disconnected: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -404,8 +404,18 @@ impl Client {
         let inbound = in_tx.clone();
         let shutdown_signal = Arc::clone(&shutdown);
         let cfg_for_task = config.clone();
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let disconnected_for_task = Arc::clone(&disconnected);
         let task = tokio::spawn(async move {
-            reconnect::run(cfg_for_task, stream, out_rx, inbound, shutdown_signal).await;
+            reconnect::run(
+                cfg_for_task,
+                stream,
+                out_rx,
+                inbound,
+                shutdown_signal,
+                disconnected_for_task,
+            )
+            .await;
         });
 
         Ok(Self {
@@ -414,7 +424,7 @@ impl Client {
                 inbound: in_tx,
                 tasks: Mutex::new(vec![task]),
                 shutdown,
-                disconnected: AtomicBool::new(false),
+                disconnected,
             }),
         })
     }
@@ -448,7 +458,15 @@ impl Client {
     /// flush pending writes, send a TLS close_notify, and await tasks.
     pub async fn disconnect(&self) {
         self.inner.disconnected.store(true, Ordering::Release);
-        self.inner.shutdown.notify_waiters();
+        // `notify_one` (not `notify_waiters`) STORES a permit when the run
+        // loop is not currently parked on `shutdown.notified()` — e.g. it is
+        // mid-`dial()`, or between its per-iteration `disconnected` check and
+        // the `select!`. That permit wakes the very next `notified()` poll,
+        // closing the lost-wakeup window that could otherwise hang
+        // `disconnect().await` on `task.await` for an idle connection
+        // (#1497 H-9). Belt-and-suspenders with the `disconnected` flag the
+        // run loop re-checks each iteration and after each dial.
+        self.inner.shutdown.notify_one();
         let mut tasks = self.inner.tasks.lock().await;
         for task in tasks.drain(..) {
             let _ = task.await;
@@ -458,7 +476,10 @@ impl Client {
 
 impl Drop for ClientInner {
     fn drop(&mut self) {
-        self.shutdown.notify_waiters();
+        // `notify_one` stores a permit if the run loop is not parked, so the
+        // shutdown signal is never lost even if drop races the loop between
+        // its select points (#1497 H-9).
+        self.shutdown.notify_one();
     }
 }
 
