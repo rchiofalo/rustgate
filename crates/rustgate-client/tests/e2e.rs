@@ -311,6 +311,61 @@ async fn client_recovers_after_server_restart() {
 }
 
 #[tokio::test]
+async fn disconnect_during_reconnect_does_not_hang() {
+    // #1497 / H-9 regression: `disconnect()` sets the `disconnected` flag then
+    // fires `notify_waiters()`, which only wakes tasks *currently* parked on
+    // `shutdown.notified()`. If that notify races with the run loop being
+    // inside `dial()` (the reconnect backoff path), the wakeup is lost and
+    // `disconnect().await` would hang forever on `task.await`. The fix threads
+    // the flag into `run()` and checks it (Acquire) at the top of every
+    // iteration and again right after redialing.
+    //
+    // Drive the loop into the redial state by binding a plaintext listener,
+    // accepting once, then dropping the connection so the client's read loop
+    // hits EOF and starts hammering the (now dead) port with reconnect
+    // attempts. Then `disconnect()` must still return promptly.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let accept_task = tokio::spawn(async move {
+        // Accept exactly one connection, hold it briefly, then drop it so the
+        // client sees EOF and enters the reconnect loop against a dead port.
+        if let Ok((sock, _)) = listener.accept().await {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(sock);
+        }
+        // Drop the listener so subsequent redials get connection-refused.
+        drop(listener);
+    });
+
+    let config = ClientConfig::builder()
+        .server_addr(addr.to_string())
+        .plaintext(true)
+        .codec(Codec::LengthPrefixed4)
+        .connect_timeout(Duration::from_secs(5))
+        .reconnect(ReconnectPolicy {
+            initial_backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_millis(50),
+            max_attempts: 0, // infinite — the loop only stops on disconnect
+        })
+        .build()
+        .unwrap();
+
+    let client = Client::connect(config).await.unwrap();
+    accept_task.await.unwrap();
+
+    // Let the client cycle through a few failed redials so `disconnect()` is
+    // very likely to land while the loop is mid-`dial()` or mid-backoff.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // The whole point: this must not hang. Bound it generously; a lost wakeup
+    // would blow straight through this timeout.
+    tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+        .await
+        .expect("disconnect() hung — H-9 lost-wakeup regression");
+}
+
+#[tokio::test]
 async fn binary_payload_via_client_api() {
     let (server, accept_handle) = start_server(2).await;
     let alice = connect_via_client(&server, "alice", &["sigint"]).await;
