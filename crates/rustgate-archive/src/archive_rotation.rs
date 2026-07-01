@@ -135,8 +135,15 @@ pub fn run_pass(
     // Age-based sweep.
     if max_age > Duration::ZERO {
         entries.retain(|e| {
-            let age = now.duration_since(e.mtime).unwrap_or_default();
-            if age > max_age {
+            // Fail-closed on clock skew: if `now < mtime` (NTP step-back or a
+            // future-dated mtime), `duration_since` errors. Treat that as
+            // fully-aged and evict, rather than the old `unwrap_or_default()`
+            // which mapped it to age 0 and kept the file forever (SEC-23).
+            let aged = now
+                .duration_since(e.mtime)
+                .map(|age| age > max_age)
+                .unwrap_or(true);
+            if aged {
                 if let Err(err) = std::fs::remove_file(&e.path) {
                     tracing::warn!(
                         path = %e.path.display(),
@@ -343,6 +350,12 @@ mod tests {
         f.set_modified(when).unwrap();
     }
 
+    fn set_mtime_future(path: &Path, ahead: Duration) {
+        let when = SystemTime::now() + ahead;
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(when).unwrap();
+    }
+
     #[test]
     fn rotation_drops_oldest_when_over_size_cap() {
         let dir =
@@ -394,6 +407,38 @@ mod tests {
         assert_eq!(stats.files_deleted, 1);
         assert!(!old.exists());
         assert!(fresh.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_age_sweep_evicts_future_dated_file() {
+        // SEC-23: a file whose mtime is in the FUTURE (clock step-back or a
+        // corrupted/future-dated mtime) must be treated as fully aged and
+        // evicted by the age sweep. The previous `unwrap_or_default()`
+        // mapped the `now < mtime` error to age 0, so a future-dated file
+        // was NEVER aged out — retention/disk fail-open.
+        let dir = std::env::temp_dir().join(format!(
+            "rustgate-archive-rot-future-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let future = write_file(&dir, "cot-future.jsonl", 256);
+        let fresh = write_file(&dir, "cot-fresh.jsonl", 256);
+        // One hour into the future vs a normal recent mtime.
+        set_mtime_future(&future, Duration::from_secs(3600));
+        set_mtime(&fresh, Duration::from_secs(60));
+
+        let stats = run_pass(&dir, 0, Duration::from_secs(3600), &[]).unwrap();
+
+        assert_eq!(
+            stats.files_deleted, 1,
+            "future-dated file must be evicted, not retained forever"
+        );
+        assert!(!future.exists(), "future-dated file should be age-evicted");
+        assert!(fresh.exists(), "normally-fresh file retained");
 
         let _ = fs::remove_dir_all(&dir);
     }
