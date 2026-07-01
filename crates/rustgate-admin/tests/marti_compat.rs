@@ -329,10 +329,14 @@ async fn bearer_token_gates_read_only_endpoints() {
         b"marti-integration-bearer-padding-32-bytes".to_vec(),
     ));
 
+    // #1551 (SEC-7): tls/config shares the bearer gate with the other
+    // read-only GET endpoints when a token is configured — it no longer
+    // rides open past the auth check.
     for path in [
         "/Marti/api/missions",
         "/Marti/api/contacts/all",
         "/Marti/api/video",
+        "/Marti/api/tls/config",
     ] {
         let resp = handle_request(&Method::GET, path, None, None, b"", &state)
             .await
@@ -353,19 +357,4 @@ async fn bearer_token_gates_read_only_endpoints() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-
-    // /Marti/api/tls/config is documented as the unauthenticated
-    // preflight endpoint — TAK clients hit it before they have a
-    // truststore, let alone an admin token. Stay open.
-    let resp = handle_request(
-        &Method::GET,
-        "/Marti/api/tls/config",
-        None,
-        None,
-        b"",
-        &state,
-    )
-    .await
-    .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
 }
