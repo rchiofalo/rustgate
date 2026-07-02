@@ -371,6 +371,37 @@ This restricts:
 - **Ingress**: Only TAK (4433), metrics (9090), and federation (9000) ports
 - **Egress**: Only DNS (53) and NATS (4222), plus federation peer ports (9000/9001) when enabled
 
+By default the policy is **allow-all-on-ports**: any source may reach the
+enabled ingress ports and egress to NATS/federation may go to any
+destination. This preserves connectivity for existing deployments — enabling
+`networkPolicy.enabled` alone does not flip the chart to deny-by-default.
+
+To narrow *which peers* may connect, set `networkPolicy.ingressSelectors`
+and/or `networkPolicy.egressSelectors`. Each is a list of Kubernetes
+`NetworkPolicyPeer` objects. When non-empty they render a `from:` (ingress)
+or `to:` (egress) stanza that restricts the rule to the matching peers; when
+empty the allow-all-on-ports behavior is retained. The enabled ports stay
+reachable in either case — only the allowed source/destination set changes.
+DNS egress (UDP/TCP 53) is always left unrestricted so name resolution keeps
+working.
+
+```yaml
+networkPolicy:
+  enabled: true
+  ingressSelectors:
+    # Same-namespace pods only.
+    - podSelector: {}
+    # Plus pods in namespaces labeled team=tak.
+    - namespaceSelector:
+        matchLabels:
+          team: tak
+  egressSelectors:
+    # Only reach the NATS pods (applies to NATS + federation egress).
+    - podSelector:
+        matchLabels:
+          app: nats
+```
+
 ### Managing
 
 ```bash

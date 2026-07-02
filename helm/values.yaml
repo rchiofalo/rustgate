@@ -142,6 +142,46 @@ metrics:
 
 networkPolicy:
   enabled: false
+  # Optional source selectors for ingress rules. When EMPTY (the default),
+  # the policy allows traffic from ANY source on the enabled ports
+  # (allow-all-on-ports) — this preserves the historical behavior and does
+  # NOT sever existing deployments. Populate this list to render a `from:`
+  # stanza that restricts ingress to the matching peers only. The listed
+  # ports (TLS bind, WebSocket, metrics, enrollment, federation, plaintext)
+  # stay reachable — only the set of allowed sources is narrowed.
+  #
+  # Each entry is a Kubernetes NetworkPolicyPeer. Examples:
+  #   ingressSelectors:
+  #     # Same namespace only (empty podSelector matches all pods in ns):
+  #     - podSelector: {}
+  #     # Pods in namespaces labeled team=tak, on any pod:
+  #     - namespaceSelector:
+  #         matchLabels:
+  #           team: tak
+  #     # A specific CIDR (e.g. an on-prem gateway range):
+  #     - ipBlock:
+  #         cidr: 10.20.0.0/16
+  ingressSelectors: []
+  # Optional destination selectors for egress rules. When EMPTY (the
+  # default), egress to NATS and federation ports is allowed to ANY
+  # destination (allow-all-on-ports), matching historical behavior. DNS
+  # egress (UDP/TCP 53) is ALWAYS left unrestricted so cluster name
+  # resolution keeps working regardless of this setting. Populate this list
+  # to render a `to:` stanza that restricts the NATS and federation egress
+  # rules to the matching peers only — the required ports stay open, just
+  # to a narrower destination set.
+  #
+  # Each entry is a Kubernetes NetworkPolicyPeer. Examples:
+  #   egressSelectors:
+  #     # Only reach the NATS pods in this namespace:
+  #     - podSelector:
+  #         matchLabels:
+  #           app: nats
+  #     # Federation peers in namespaces labeled tier=federation:
+  #     - namespaceSelector:
+  #         matchLabels:
+  #           tier: federation
+  egressSelectors: []
 
 ingress:
   enabled: false
