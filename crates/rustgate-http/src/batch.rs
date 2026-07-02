@@ -20,22 +20,33 @@
 //! up in `TargetState`. Callers must hold the mutex across `push` /
 //! `drain`.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
+use rustgate_resilience::backpressure::BackpressurePermit;
 
 /// A single-message entry buffered in a [`Batcher`].
 ///
-/// For now, holds only the serialized body that will be concatenated at
-/// flush time by [`crate::payload::render_batch`]. A future DLQ-on-
-/// terminal-batch-failure follow-up will grow this struct to also carry
-/// an `Arc<RoutableMessage>` so each original message can be dead-
-/// lettered individually; that wiring is deliberately out of scope for
-/// the initial batch PR so the state machine can land without pulling
-/// the DLQ path into the change.
+/// Holds the serialized body that will be concatenated at flush time by
+/// [`crate::payload::render_batch`], plus the originating message's
+/// backpressure permit so the gate keeps accounting for the buffered
+/// bytes until they are actually flushed and sent (a future DLQ-on-
+/// terminal-batch-failure follow-up will grow this to also carry an
+/// `Arc<RoutableMessage>` for per-message dead-lettering).
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
     /// Serialized single-message body produced by
     /// [`crate::payload::serialize`] before the batch decision.
     pub(crate) body: Bytes,
+    /// Backpressure reservation for this buffered body. Held for the
+    /// lifetime of the entry so the gate's in-flight byte accounting
+    /// stays accurate while the body sits in the batcher; released when
+    /// the flush payload that owns this entry is dropped after the send.
+    /// `None` when the gate is disabled.
+    // justification: pure RAII — kept only so its `Drop` releases the
+    // gate reservation once the entry is flushed; never read directly.
+    #[allow(dead_code)]
+    pub(crate) permit: Option<Arc<BackpressurePermit>>,
 }
 
 /// Why the batcher emitted a flush payload.
@@ -153,9 +164,13 @@ impl Batcher {
     /// count-trigger and bytes-trigger are evaluated in that order so
     /// a batch that simultaneously hits both limits is labelled
     /// `Count` — the more specific trigger.
-    pub(crate) fn push(&mut self, body: Bytes) -> Option<FlushPayload> {
+    pub(crate) fn push(
+        &mut self,
+        body: Bytes,
+        permit: Option<Arc<BackpressurePermit>>,
+    ) -> Option<FlushPayload> {
         let body_len = body.len();
-        self.pending.push(BatchEntry { body });
+        self.pending.push(BatchEntry { body, permit });
         self.pending_bytes += body_len;
 
         if self.pending.len() >= self.max_messages {
@@ -198,7 +213,7 @@ mod tests {
     fn push_below_thresholds_returns_none_and_buffers() {
         let mut b = Batcher::new(5, 1024);
         assert!(b.is_empty());
-        let out = b.push(Bytes::from_static(b"a"));
+        let out = b.push(Bytes::from_static(b"a"), None);
         assert!(out.is_none());
         assert_eq!(b.len(), 1);
         assert_eq!(b.pending_bytes(), 1);
@@ -207,10 +222,10 @@ mod tests {
     #[test]
     fn push_count_threshold_triggers_count_flush() {
         let mut b = Batcher::new(3, 10 * 1024);
-        assert!(b.push(Bytes::from_static(b"x")).is_none());
-        assert!(b.push(Bytes::from_static(b"y")).is_none());
+        assert!(b.push(Bytes::from_static(b"x"), None).is_none());
+        assert!(b.push(Bytes::from_static(b"y"), None).is_none());
         let flush = b
-            .push(Bytes::from_static(b"z"))
+            .push(Bytes::from_static(b"z"), None)
             .expect("third push must flush");
         assert_eq!(flush.reason, FlushReason::Count);
         assert_eq!(flush.len(), 3);
@@ -221,10 +236,10 @@ mod tests {
     #[test]
     fn push_bytes_threshold_triggers_bytes_flush() {
         let mut b = Batcher::new(100, 16);
-        assert!(b.push(Bytes::from_static(b"0123456")).is_none());
+        assert!(b.push(Bytes::from_static(b"0123456"), None).is_none());
         // Total after this push: 7 + 10 = 17 > 16 -> bytes flush.
         let flush = b
-            .push(Bytes::from_static(b"abcdefghij"))
+            .push(Bytes::from_static(b"abcdefghij"), None)
             .expect("bytes cap must flush");
         assert_eq!(flush.reason, FlushReason::Bytes);
         assert_eq!(flush.len(), 2);
@@ -235,9 +250,9 @@ mod tests {
         // max_messages=2, max_bytes=6; second push brings both to their
         // caps at once. Count is the more specific trigger, so it wins.
         let mut b = Batcher::new(2, 6);
-        assert!(b.push(Bytes::from_static(b"aaa")).is_none());
+        assert!(b.push(Bytes::from_static(b"aaa"), None).is_none());
         let flush = b
-            .push(Bytes::from_static(b"bbb"))
+            .push(Bytes::from_static(b"bbb"), None)
             .expect("simultaneous cap hit must flush");
         assert_eq!(flush.reason, FlushReason::Count);
         assert_eq!(flush.len(), 2);
@@ -249,7 +264,7 @@ mod tests {
         // than park indefinitely waiting for more messages.
         let mut b = Batcher::new(100, 8);
         let flush = b
-            .push(Bytes::from_static(b"xxxxxxxxxxxxxxxx"))
+            .push(Bytes::from_static(b"xxxxxxxxxxxxxxxx"), None)
             .expect("lone-oversized push must flush");
         assert_eq!(flush.reason, FlushReason::Bytes);
         assert_eq!(flush.len(), 1);
@@ -264,8 +279,8 @@ mod tests {
     #[test]
     fn drain_flushes_remaining_entries_with_drain_reason() {
         let mut b = Batcher::new(10, 1024);
-        assert!(b.push(Bytes::from_static(b"a")).is_none());
-        assert!(b.push(Bytes::from_static(b"b")).is_none());
+        assert!(b.push(Bytes::from_static(b"a"), None).is_none());
+        assert!(b.push(Bytes::from_static(b"b"), None).is_none());
         let flush = b.drain().expect("non-empty drain must yield payload");
         assert_eq!(flush.reason, FlushReason::Drain);
         assert_eq!(flush.len(), 2);
@@ -275,9 +290,9 @@ mod tests {
     #[test]
     fn flush_payload_bodies_preserve_insertion_order() {
         let mut b = Batcher::new(3, 1024);
-        let _ = b.push(Bytes::from_static(b"first"));
-        let _ = b.push(Bytes::from_static(b"second"));
-        let flush = b.push(Bytes::from_static(b"third")).unwrap();
+        let _ = b.push(Bytes::from_static(b"first"), None);
+        let _ = b.push(Bytes::from_static(b"second"), None);
+        let flush = b.push(Bytes::from_static(b"third"), None).unwrap();
         let bodies = flush.bodies();
         assert_eq!(bodies.len(), 3);
         assert_eq!(&bodies[0][..], b"first");
@@ -300,8 +315,48 @@ mod tests {
         // regression that added (n-1) to pending_bytes would flip the
         // bytes threshold early on ~1 KiB boundaries.
         let mut b = Batcher::new(10, 1024);
-        let _ = b.push(Bytes::from_static(b"abcde"));
-        let _ = b.push(Bytes::from_static(b"fghij"));
+        let _ = b.push(Bytes::from_static(b"abcde"), None);
+        let _ = b.push(Bytes::from_static(b"fghij"), None);
         assert_eq!(b.pending_bytes(), 10);
+    }
+
+    #[test]
+    fn buffered_permit_keeps_gate_reserved_until_flush_payload_drops() {
+        use rustgate_resilience::backpressure::BackpressureGate;
+
+        let gate = BackpressureGate::new(1_000_000);
+        let mut b = Batcher::new(2, 1_000_000);
+
+        // First push buffers below thresholds; the permit rides along in
+        // the entry, so the gate must keep counting its reserved bytes.
+        let permit = Arc::new(gate.acquire(100));
+        assert!(b.push(Bytes::from_static(b"a"), Some(permit)).is_none());
+        assert_eq!(
+            gate.current(),
+            100,
+            "buffered entry must keep its reservation alive"
+        );
+
+        // Second push crosses the count threshold and yields the flush
+        // payload. The reservation is still held — the flush owns the
+        // permit until it is dropped after the (would-be) send.
+        let permit2 = Arc::new(gate.acquire(50));
+        let flush = b
+            .push(Bytes::from_static(b"b"), Some(permit2))
+            .expect("count threshold must flush");
+        assert_eq!(
+            gate.current(),
+            150,
+            "flush payload still holds both reservations before drop"
+        );
+
+        // Dropping the flush payload (post-send) releases every retained
+        // reservation — the gate returns to zero.
+        drop(flush);
+        assert_eq!(
+            gate.current(),
+            0,
+            "dropping the flush payload must release all buffered reservations"
+        );
     }
 }

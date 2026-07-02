@@ -409,7 +409,10 @@ pub struct PeerConfig {
     /// peer back from the fan-out unless every Active peer in the same
     /// tenant is currently unavailable, at which point Standbys are
     /// promoted automatically.
-    #[serde(default, rename = "topologyRole", alias = "topology_role")]
+    // Serialize as snake_case to match its siblings and the documented
+    // `topology_role` config key. The camelCase `topologyRole` remains a
+    // read alias so any config dumped by an older build still loads.
+    #[serde(default, alias = "topologyRole")]
     pub topology_role: TopologyRole,
 }
 
@@ -546,6 +549,47 @@ mod tests {
         assert_eq!(parsed.groups.len(), 2);
         assert_eq!(parsed.routing_mode, RoutingMode::Broadcast);
         assert_eq!(parsed.protocol_version, 1);
+    }
+
+    #[test]
+    fn topology_role_serializes_snake_case_and_accepts_camel_case_alias() {
+        // Dumps must emit the documented snake_case `topology_role`
+        // key (matching every sibling field), not the legacy
+        // camelCase `topologyRole`.
+        let peer = PeerConfig {
+            id: "peer-1".into(),
+            address: "10.0.0.1:9001".into(),
+            groups: vec![],
+            inbound_groups: None,
+            outbound_groups: None,
+            enabled: true,
+            is_outbound: true,
+            trust_cert_cn: None,
+            routing_mode: RoutingMode::Broadcast,
+            protocol_version: 1,
+            jwt_token: None,
+            region: None,
+            zone: None,
+            priority: 100,
+            compression: None,
+            tenants: Default::default(),
+            topology_role: TopologyRole::Standby,
+        };
+        let json = serde_json::to_string(&peer).expect("serialize");
+        assert!(
+            json.contains("\"topology_role\""),
+            "expected snake_case key in {json}"
+        );
+        assert!(
+            !json.contains("topologyRole"),
+            "camelCase key must not appear in {json}"
+        );
+
+        // The camelCase alias must still deserialize for backward
+        // compatibility with configs dumped by older builds.
+        let legacy = r#"{"id":"p","address":"1.2.3.4:9001","groups":[],"enabled":true,"is_outbound":false,"trust_cert_cn":null,"topologyRole":"standby"}"#;
+        let parsed: PeerConfig = serde_json::from_str(legacy).expect("deserialize alias");
+        assert_eq!(parsed.topology_role, TopologyRole::Standby);
     }
 
     #[test]
