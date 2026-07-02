@@ -96,7 +96,7 @@ pub enum ParseError {
     /// rather than propagated to downstream geofilter / multicast logic.
     #[error("field `{field}` out of range: {value}")]
     OutOfRange { field: &'static str, value: f64 },
-    /// The `<detail>` subtree nested deeper than [`MAX_DETAIL_DEPTH`].
+    /// The `<detail>` subtree nested deeper than `MAX_DETAIL_DEPTH`.
     ///
     /// Mirrors the `MAX_XML_DEPTH` cap the transport and TLS XML surfaces
     /// enforce, so a pathologically nested payload cannot inflate the
@@ -104,7 +104,7 @@ pub enum ParseError {
     #[error("detail nesting exceeds {max} levels")]
     DetailTooDeep { max: usize },
     /// The flattened `<detail>` attribute bag exceeded
-    /// [`MAX_ATTR_BAG_BYTES`].
+    /// `MAX_ATTR_BAG_BYTES`.
     ///
     /// Mirrors the `MAX_ATTR_BAG_BYTES` cap enforced on the SAN /
     /// certificate attribute surfaces, so a payload with thousands of
