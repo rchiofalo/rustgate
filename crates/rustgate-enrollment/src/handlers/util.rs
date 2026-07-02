@@ -6,6 +6,83 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Response, StatusCode};
 
+/// Redact absolute filesystem paths from a client-facing error string.
+///
+/// Enrollment errors can embed filesystem paths verbatim (an `io::Error`
+/// from a failed DB read/rename carries the path, and `serde_json::Error`
+/// can carry file context), which would leak deployment topology to any
+/// client that can trigger the error (F-149, #1526). This replaces every
+/// run that looks like an absolute path — a leading `/` or a Windows
+/// `C:\`-style drive prefix followed by non-whitespace path characters —
+/// with the literal token `<path>`.
+///
+/// **Split-surface policy:** apply this only at the client-facing HTTP
+/// response boundary. Server-side `tracing` log lines keep the full,
+/// unredacted error so operators retain the path for triage.
+pub(crate) fn redact_paths(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // A path segment starts at a `/` (Unix) or a `<drive>:\` prefix
+        // (Windows). We only treat `/` as a path start when it is at the
+        // beginning of a token (preceded by whitespace, a quote, or the
+        // string start) so ordinary prose slashes (e.g. "and/or") are not
+        // clobbered.
+        let prev_is_boundary = i == 0
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'(' | b'[' | b'`'
+            );
+        let unix_path = bytes[i] == b'/' && prev_is_boundary;
+        let win_path = prev_is_boundary
+            && bytes[i].is_ascii_alphabetic()
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == b':'
+            && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/');
+
+        if unix_path || win_path {
+            out.push_str("<path>");
+            // Consume the whole path run: any non-whitespace, non-quote
+            // character is treated as part of the path.
+            while i < bytes.len()
+                && !matches!(
+                    bytes[i],
+                    b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b')' | b']' | b'`'
+                )
+            {
+                i += 1;
+            }
+        } else {
+            // Push the current UTF-8 character intact. `input` is valid
+            // UTF-8, so advance by the full code point width.
+            let ch_len = utf8_char_len(bytes[i]);
+            let end = (i + ch_len).min(bytes.len());
+            out.push_str(&input[i..end]);
+            i = end;
+        }
+    }
+    out
+}
+
+/// Byte-length of the UTF-8 code point whose leading byte is `b`.
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        // Continuation or invalid leading byte — advance one to make
+        // progress; `input` being valid UTF-8 means this arm is only hit
+        // defensively.
+        1
+    }
+}
+
 /// Build an HTTP response with the given status, content type, and body.
 pub(crate) fn build_response(
     status: StatusCode,
@@ -71,6 +148,69 @@ fn hex_nibble(b: u8) -> u8 {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A Unix absolute path embedded in an error string is replaced by
+    /// `<path>` and no `/`-rooted fragment survives (F-149, #1526). This
+    /// is the core split-surface contract: the client-facing copy must
+    /// never carry deployment topology.
+    #[test]
+    fn redact_paths_replaces_unix_absolute_path() {
+        let msg = "failed to rename /var/lib/rustgate/revocations.tmp";
+        let out = redact_paths(msg);
+        assert_eq!(out, "failed to rename <path>");
+        assert!(
+            !out.contains('/'),
+            "no path separator may survive redaction: {out}"
+        );
+    }
+
+    /// The path token that opens a quoted or parenthesised context is
+    /// redacted but the surrounding punctuation is preserved, so
+    /// `(os error 2)`-style trailers stay intact.
+    #[test]
+    fn redact_paths_preserves_trailing_punctuation() {
+        let msg = "No such file or directory (/etc/rustgate/db.json) (os error 2)";
+        let out = redact_paths(msg);
+        assert_eq!(out, "No such file or directory (<path>) (os error 2)");
+        assert!(!out.contains('/'), "no `/` may remain: {out}");
+    }
+
+    /// A Windows drive-letter path is redacted too — the helper must not
+    /// be Unix-only, since operators may run on either platform.
+    #[test]
+    fn redact_paths_replaces_windows_drive_path() {
+        let msg = r"cannot open C:\ProgramData\rustgate\db.json for writing";
+        let out = redact_paths(msg);
+        assert_eq!(out, "cannot open <path> for writing");
+        assert!(!out.contains('\\'), "no backslash may remain: {out}");
+    }
+
+    /// A prose slash mid-word (e.g. "and/or", "key/value") is NOT a path
+    /// and must be left untouched — only token-initial `/` runs are
+    /// redacted. Over-redacting benign text would garble error messages.
+    #[test]
+    fn redact_paths_leaves_prose_slashes_intact() {
+        let msg = "expected key/value pair and/or a trailing comma";
+        assert_eq!(redact_paths(msg), msg);
+    }
+
+    /// Multi-byte UTF-8 in the surrounding text round-trips intact — the
+    /// helper walks code points, not bytes, so it must not corrupt
+    /// non-ASCII characters while redacting an embedded path.
+    #[test]
+    fn redact_paths_preserves_multibyte_utf8() {
+        let msg = "erreur en écrivant /srv/données/db.json — réessayez";
+        let out = redact_paths(msg);
+        assert_eq!(out, "erreur en écrivant <path> — réessayez");
+        assert!(!out.contains('/'));
+    }
+
+    /// A string with no path is returned unchanged.
+    #[test]
+    fn redact_paths_noop_on_pathless_input() {
+        let msg = "serial must be hex characters only";
+        assert_eq!(redact_paths(msg), msg);
+    }
 
     #[test]
     fn percent_decode_space() {
