@@ -1,6 +1,5 @@
 ---
 source: crates/rustgate-operator/tests/reconcile.rs
-assertion_line: 55
 expression: yaml
 ---
 ---
@@ -70,26 +69,26 @@ data:
   federation-peers.json: |-
     [
       {
-        "id": "my-cluster-0",
         "address": "my-cluster-0.my-cluster-headless.rustgate.svc.cluster.local:9001",
-        "groups": [],
         "enabled": true,
+        "groups": [],
+        "id": "my-cluster-0",
         "is_outbound": true,
         "trust_cert_cn": null
       },
       {
-        "id": "my-cluster-1",
         "address": "my-cluster-1.my-cluster-headless.rustgate.svc.cluster.local:9001",
-        "groups": [],
         "enabled": true,
+        "groups": [],
+        "id": "my-cluster-1",
         "is_outbound": true,
         "trust_cert_cn": null
       },
       {
-        "id": "my-cluster-2",
         "address": "my-cluster-2.my-cluster-headless.rustgate.svc.cluster.local:9001",
-        "groups": [],
         "enabled": true,
+        "groups": [],
+        "id": "my-cluster-2",
         "is_outbound": true,
         "trust_cert_cn": null
       }
