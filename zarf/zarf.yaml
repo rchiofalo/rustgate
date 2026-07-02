@@ -20,14 +20,14 @@ metadata:
   # artifact in your release-asset pipeline.
   authors: rchiofalo
 
-# Build-time hints for `zarf package create`.
-#
-# `flavor` lets a downstream consumer build either the default
-# (ghcr.io) variant or the `ironbank` variant once H4 lands the
-# hardened Dockerfile. Both flavors produce the same Helm release
-# — only the image-pull origin changes.
-build:
-  flavor: default
+# Flavor selection is a build-time choice made on the command line, e.g.
+# `zarf package create --flavor default` (the ghcr.io variant) or
+# `--flavor ironbank` (the hardened Dockerfile variant once H4 lands).
+# Both flavors produce the same Helm release — only the image-pull origin
+# changes. The `build:` block is NOT set here: it is output metadata that
+# `zarf package create` generates and stamps into the built package
+# (architecture, timestamp, version, flavor); committing a partial one
+# fails `zarf package create`'s own linter.
 
 components:
   # ----------------------------------------------------------------
