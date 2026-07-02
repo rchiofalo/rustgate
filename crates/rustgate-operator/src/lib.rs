@@ -12,7 +12,8 @@
 //! * a `StatefulSet` for the replicas,
 //! * a headless `Service` for stable pod DNS,
 //! * a client-facing `ClusterIP` `Service` for tactical traffic,
-//! * a `ConfigMap` carrying the rendered `rustgate.toml`,
+//! * a `ConfigMap` carrying the rendered `rustgate.toml` (and, with
+//!   federation auto-discovery on, a `federation-peers.json` peer file),
 //! * (optional) a `cert-manager.io/v1/Certificate` per cluster.
 //!
 //! ## Architecture

@@ -8,8 +8,9 @@
 //! * `apps/v1/StatefulSet` — the rustgate replica set,
 //! * `v1/Service` — the headless service for stable DNS,
 //! * `v1/Service` — the client-facing ClusterIP service,
-//! * `v1/ConfigMap` — the rendered `rustgate.toml` (including the
-//!   federation peer list when `spec.federation.autoDiscover` is `true`),
+//! * `v1/ConfigMap` — the rendered `rustgate.toml` plus, when
+//!   `spec.federation.autoDiscover` is `true`, a `federation-peers.json`
+//!   peer list that the TOML references via `federation-peers-file`,
 //! * `cert-manager.io/v1/Certificate` — emitted only when
 //!   `spec.certManager` is present, one per cluster (the chart's existing
 //!   per-pod cert reloader rotates pods through the same SVID).
@@ -198,13 +199,35 @@ fn render_client_service(cluster: &RustgateCluster) -> Result<RenderedManifest> 
     })
 }
 
-/// Render the rustgate.toml content the operator embeds in the ConfigMap.
+/// In-pod path the ConfigMap's `rustgate.toml` key is mounted at.
+const CONFIG_MOUNT_PATH: &str = "/etc/rustgate/rustgate.toml";
+
+/// In-pod path the ConfigMap's `federation-peers.json` key is mounted at.
+/// The rendered `rustgate.toml` references this via `federation-peers-file`.
+const FEDERATION_PEERS_MOUNT_PATH: &str = "/etc/rustgate/federation-peers.json";
+
+/// ConfigMap data key holding the peer list. Kept separate from the TOML
+/// because the server reads peers from a JSON file (`--federation-peers-file`),
+/// not from an inline TOML table — see [`render_federation_peers_json`].
+const FEDERATION_PEERS_KEY: &str = "federation-peers.json";
+
+/// Render the `rustgate.toml` the operator embeds in the ConfigMap.
 ///
-/// When `spec.federation.autoDiscover` is `true`, the operator emits a peer
-/// list keyed off the StatefulSet's stable pod DNS names. Each replica
-/// `<name>-N.<headless-svc>.<ns>.svc.cluster.local` becomes a peer entry.
-/// Pods skip themselves at runtime via the federation manager's existing
-/// self-id filter, so listing every replica unconditionally is safe.
+/// The output uses the **flat, kebab-cased** keys the server's config loader
+/// (`rustgate-server`'s `ConfigFile`, a `deny_unknown_fields` mirror of the
+/// CLI flags) actually accepts — `bind`, `federation-v2-bind`,
+/// `federation-peers-file`. There is deliberately no `[server]` or
+/// `[federation]` table and no `enabled` key: the server rejects unknown
+/// keys, and federation is enabled implicitly by the presence of
+/// `federation-v2-bind` / `federation-peers-file`.
+///
+/// When `spec.federation.autoDiscover` is `true`, the peer list is emitted to
+/// a **separate JSON file** (see [`render_federation_peers_json`]) referenced
+/// by `federation-peers-file`; peers are never inlined into the TOML. The
+/// per-pod `federation-id` is supplied at runtime via the
+/// `RUSTGATE_FEDERATION_ID` environment variable (wired from `POD_NAME` in the
+/// StatefulSet) so each replica gets a distinct server identity — a shared
+/// config file cannot express a per-pod value.
 pub fn render_rustgate_toml(cluster: &RustgateCluster) -> String {
     let mut out = String::new();
     out.push_str("# rustgate.toml — managed by rustgate-operator\n");
@@ -212,37 +235,57 @@ pub fn render_rustgate_toml(cluster: &RustgateCluster) -> String {
     out.push_str(&cluster.metadata.name);
     out.push('\n');
     out.push('\n');
-    out.push_str("[server]\n");
     out.push_str(&format!(
-        "tactical-bind = \"0.0.0.0:{}\"\n",
+        "bind = \"0.0.0.0:{}\"\n",
         cluster.spec.service_port
     ));
-    out.push('\n');
     if cluster.spec.federation.auto_discover {
-        out.push_str("[federation]\n");
-        out.push_str("enabled = true\n");
+        out.push('\n');
+        out.push_str("# Federation is enabled by the presence of these keys; the\n");
+        out.push_str("# per-pod federation-id is injected via the RUSTGATE_FEDERATION_ID\n");
+        out.push_str("# environment variable (POD_NAME) in the StatefulSet.\n");
         out.push_str(&format!(
-            "v2-bind = \"0.0.0.0:{}\"\n",
+            "federation-v2-bind = \"0.0.0.0:{}\"\n",
             cluster.spec.federation.port
         ));
         out.push_str(&format!(
-            "id = \"{}-${{HOSTNAME}}\"\n",
-            cluster.metadata.name
+            "federation-peers-file = \"{FEDERATION_PEERS_MOUNT_PATH}\"\n"
         ));
-        out.push_str("# Peers below are generated from StatefulSet pod DNS records.\n");
-        out.push_str("# The federation manager filters self by id at runtime.\n");
-        for i in 0..cluster.spec.replicas {
-            let dns = pod_dns(cluster, i);
-            out.push('\n');
-            out.push_str("[[federation.peers]]\n");
-            out.push_str(&format!("id = \"{}-{}\"\n", cluster.metadata.name, i));
-            out.push_str(&format!(
-                "address = \"{}:{}\"\n",
-                dns, cluster.spec.federation.port
-            ));
-        }
     }
     out
+}
+
+/// Render the `federation-peers.json` the server ingests via
+/// `--federation-peers-file`. The server deserializes this file as a JSON
+/// array of `rustgate_federation::config::PeerConfig`, so the shape here must
+/// match that struct's required fields exactly (`id`, `address`, `groups`,
+/// `enabled`, `is_outbound`, `trust_cert_cn`); all other peer fields fall back
+/// to their `serde` defaults.
+///
+/// One entry is emitted per replica, keyed off the StatefulSet's stable pod
+/// DNS names (`<name>-N.<headless-svc>.<ns>.svc.cluster.local`). Each replica
+/// runs with a distinct per-pod `federation-id` (injected via
+/// `RUSTGATE_FEDERATION_ID`), since a shared ConfigMap cannot carry a per-pod
+/// value. Returns `None` when auto-discovery is off (no peers file is
+/// referenced in that case).
+pub fn render_federation_peers_json(cluster: &RustgateCluster) -> Option<String> {
+    if !cluster.spec.federation.auto_discover {
+        return None;
+    }
+    let peers: Vec<Value> = (0..cluster.spec.replicas)
+        .map(|i| {
+            json!({
+                "id": format!("{}-{}", cluster.metadata.name, i),
+                "address": format!("{}:{}", pod_dns(cluster, i), cluster.spec.federation.port),
+                "groups": [],
+                "enabled": true,
+                "is_outbound": true,
+                "trust_cert_cn": Value::Null,
+            })
+        })
+        .collect();
+    // Pretty-print for a readable ConfigMap; the server parses either form.
+    serde_json::to_string_pretty(&Value::Array(peers)).ok()
 }
 
 /// Stable pod DNS name for replica `i`. Mirrors the layout the StatefulSet
@@ -265,6 +308,9 @@ pub fn pod_dns(cluster: &RustgateCluster, i: i32) -> String {
 fn render_configmap(cluster: &RustgateCluster) -> Result<RenderedManifest> {
     let mut data = BTreeMap::new();
     let _ = data.insert("rustgate.toml".to_string(), render_rustgate_toml(cluster));
+    if let Some(peers) = render_federation_peers_json(cluster) {
+        let _ = data.insert(FEDERATION_PEERS_KEY.to_string(), peers);
+    }
     let manifest = json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -364,7 +410,7 @@ fn render_statefulset(cluster: &RustgateCluster) -> Result<RenderedManifest> {
         ));
     }
 
-    let env = vec![
+    let mut env = vec![
         json!({
             "name": "POD_NAME",
             "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } }
@@ -375,9 +421,18 @@ fn render_statefulset(cluster: &RustgateCluster) -> Result<RenderedManifest> {
         }),
         json!({
             "name": "RUSTGATE_CONFIG",
-            "value": "/etc/rustgate/rustgate.toml"
+            "value": CONFIG_MOUNT_PATH
         }),
     ];
+    // A shared ConfigMap cannot carry a per-pod federation-id, so inject it
+    // from the pod name — this gives each replica the distinct federation
+    // identity the server needs.
+    if spec.federation.auto_discover {
+        env.push(json!({
+            "name": "RUSTGATE_FEDERATION_ID",
+            "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } }
+        }));
+    }
 
     let manifest = json!({
         "apiVersion": "apps/v1",
@@ -415,7 +470,7 @@ fn render_statefulset(cluster: &RustgateCluster) -> Result<RenderedManifest> {
                         "name": "rustgate",
                         "image": spec.image,
                         "imagePullPolicy": spec.image_pull_policy,
-                        "args": ["--config", "/etc/rustgate/rustgate.toml"],
+                        "args": ["--config", CONFIG_MOUNT_PATH],
                         "env": env,
                         "ports": [
                             { "name": "tactical", "containerPort": spec.service_port, "protocol": "TCP" },
@@ -562,28 +617,58 @@ mod tests {
     }
 
     #[test]
-    fn rustgate_toml_includes_peers_when_auto_discover_on() {
+    fn rustgate_toml_uses_flat_keys_the_server_accepts() {
         let cluster = full_cluster();
         let toml = render_rustgate_toml(&cluster);
-        assert!(toml.contains("[federation]"));
-        // Sanity: we should not be echoing the CRD field name into
-        // rustgate.toml (which uses `enabled` rather than `autoDiscover`).
+        // Flat top-level bind (not a [server] table, not `tactical-bind`).
+        assert!(toml.contains("bind = \"0.0.0.0:4433\""));
+        assert!(toml.contains("federation-v2-bind = \"0.0.0.0:9001\""));
+        assert!(toml.contains("federation-peers-file = \"/etc/rustgate/federation-peers.json\""));
+        // The server rejects these — they must never appear in the TOML.
+        assert!(!toml.contains("[server]"));
+        assert!(!toml.contains("[federation]"));
+        assert!(!toml.contains("[[federation.peers]]"));
+        assert!(!toml.contains("enabled = true"));
+        assert!(!toml.contains("tactical-bind"));
+        // Peers are not inlined into the TOML.
+        assert!(!toml.contains("svc.cluster.local"));
+        // Never echo the CRD field name into config.
         assert!(!toml.contains("auto_discover"));
-        for i in 0..3 {
-            assert!(toml.contains(&format!("my-cluster-{i}")));
-            assert!(toml.contains(&format!(
-                "my-cluster-{i}.my-cluster-headless.rustgate.svc.cluster.local:9001"
-            )));
+    }
+
+    #[test]
+    fn federation_peers_json_lists_every_replica() {
+        let cluster = full_cluster();
+        let peers = render_federation_peers_json(&cluster).expect("peers json");
+        let parsed: Value = serde_json::from_str(&peers).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        for (i, peer) in arr.iter().enumerate() {
+            assert_eq!(
+                peer["id"].as_str().unwrap(),
+                format!("my-cluster-{i}").as_str()
+            );
+            assert_eq!(
+                peer["address"].as_str().unwrap(),
+                format!("my-cluster-{i}.my-cluster-headless.rustgate.svc.cluster.local:9001")
+                    .as_str()
+            );
+            assert!(peer["enabled"].as_bool().unwrap());
+            assert!(peer["is_outbound"].as_bool().unwrap());
+            assert!(peer["groups"].is_array());
+            assert!(peer["trust_cert_cn"].is_null());
         }
     }
 
     #[test]
-    fn rustgate_toml_skips_peers_when_auto_discover_off() {
+    fn rustgate_toml_skips_federation_when_auto_discover_off() {
         let mut cluster = full_cluster();
         cluster.spec.federation.auto_discover = false;
         let toml = render_rustgate_toml(&cluster);
-        assert!(!toml.contains("[federation]"));
-        assert!(!toml.contains("[[federation.peers]]"));
+        assert!(!toml.contains("federation-v2-bind"));
+        assert!(!toml.contains("federation-peers-file"));
+        assert!(toml.contains("bind = \"0.0.0.0:4433\""));
+        assert!(render_federation_peers_json(&cluster).is_none());
     }
 
     #[test]
