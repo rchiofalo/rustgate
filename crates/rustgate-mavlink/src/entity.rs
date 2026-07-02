@@ -19,7 +19,7 @@
 //! |--------------------------------------|------------------------------------------------------------------------|
 //! | `system_id` + `component_id`         | `Entity.uid` (`"mavlink-{system_id}-{component_id}"`)                  |
 //! | HEARTBEAT (`MSG_ID = 0`) `MAV_TYPE`  | `Entity.kind` (Aircraft / Ground / Marine / Sensor / Unknown)          |
-//! | GLOBAL_POSITION_INT (`MSG_ID = 33`)  | `Entity.position` (lat/lon/alt) + `Entity.velocity` (speed/course)     |
+//! | GLOBAL_POSITION_INT (`MSG_ID = 33`)  | `Entity.position` (lat/lon) + `Entity.velocity` (speed/course)         |
 //! | non-strict-subset payload bytes      | `Entity.attributes` under the `"mavlink."` key prefix                  |
 //!
 //! Outbound (`Entity` → MAVLink) is intentionally narrower: only
@@ -55,12 +55,35 @@
 //! can group on it without per-frame string allocation in the
 //! steady-state Aircraft / Ground / Marine path.
 //!
+//! # Altitude datum (MSL vs HAE)
+//!
+//! MAVLink `GLOBAL_POSITION_INT.alt` is millimetres above **mean sea
+//! level (MSL)**, whereas `Entity.position.hae_meters` is height above
+//! the **WGS-84 ellipsoid (HAE)** by contract — the datum CoT
+//! (`<point hae>`), DIS (ECEF → ellipsoid), and Link 16 already use.
+//! The two differ by the geoid undulation (roughly −100 m to +85 m
+//! worldwide), so labeling MSL as HAE would inject a tens-of-metres
+//! error into cross-protocol fusion and correlation.
+//!
+//! This codec **does not normalize** the datum and does **not** carry
+//! an EGM96 geoid table. The decoder leaves `hae_meters` **unset** for
+//! MAVLink-sourced entities and preserves the raw MSL value verbatim in
+//! the `mavlink.global_position_int.alt_mm` attribute, with
+//! `mavlink.global_position_int.alt_datum = "msl"` labeling the
+//! reference so fusion consumers can choose their own conversion. The
+//! encoder re-emits `alt_mm` when present, so the same-codec round-trip
+//! stays lossless despite `hae_meters` being `None`. See issue #1560
+//! (SEC-22). A future geoid-conversion tier can populate `hae_meters`
+//! without changing this shape.
+//!
 //! # Round-trip discipline
 //!
 //! Same-codec round-trip is preserved for the GLOBAL_POSITION_INT
 //! subset: `to_entity(global_position_frame)` followed by
 //! `from_entity(entity)` produces a frame whose system / component
-//! identifiers and lat / lon / alt fields match the input. The frame
+//! identifiers and lat / lon / alt fields match the input — the
+//! altitude round-trips through the `mavlink.global_position_int.alt_mm`
+//! attribute (see the Altitude datum section), not `hae_meters`. The frame
 //! is **not** byte-identical: HEARTBEAT-only entities cannot encode
 //! back through `from_entity`, the `time_boot_ms` field is recovered
 //! from the `mavlink.global_position_int.time_boot_ms` attribute when
@@ -504,11 +527,19 @@ fn decode_global_position_int(
     let alt_raw = read_i32_le(payload, 12)
         .ok_or(MavlinkEntityError::MissingField("global_position_int.alt"))?;
 
-    // 1e-7 deg per LSB, 1e-3 m per LSB.
+    // 1e-7 deg per LSB. MAVLink `alt` is millimetres above **MSL**,
+    // not height-above-ellipsoid. `hae_meters` is HAE by contract (CoT
+    // `<point hae>`, DIS ECEF→ellipsoid), so we deliberately leave it
+    // unset rather than mislabel MSL as HAE — mislabeling injects an
+    // ~tens-of-metres error into cross-protocol fusion. The raw MSL
+    // value is preserved verbatim in the
+    // `mavlink.global_position_int.alt_mm` attribute below and is what
+    // the encoder re-emits, so the datum is honest and the round-trip
+    // stays lossless. See issue #1560 (SEC-22).
     let position = Position {
         lat: f64::from(lat_raw) / 1.0e7,
         lon: f64::from(lon_raw) / 1.0e7,
-        hae_meters: Some(f64::from(alt_raw) / 1.0e3),
+        hae_meters: None,
     };
 
     // Optional velocity: only emitted when (vx, vy, vz) are all in
@@ -530,9 +561,16 @@ fn decode_global_position_int(
         format!("{MAVLINK_PREFIX}global_position_int.lon_e7"),
         AttributeValue::Int(i64::from(lon_raw)),
     );
+    // Raw MSL altitude, preserved verbatim (see the `hae_meters: None`
+    // rationale above). The companion `alt_datum` attribute labels the
+    // reference so fusion consumers pick their own MSL→HAE conversion.
     let _ = attributes.insert(
         format!("{MAVLINK_PREFIX}global_position_int.alt_mm"),
         AttributeValue::Int(i64::from(alt_raw)),
+    );
+    let _ = attributes.insert(
+        format!("{MAVLINK_PREFIX}global_position_int.alt_datum"),
+        AttributeValue::Str("msl".into()),
     );
     if header.wire_payload_len >= 20
         && let Some(rel) = read_i32_le(payload, 16)
@@ -694,11 +732,21 @@ fn encode_global_position_int(entity: &Entity) -> Result<Bytes, MavlinkEntityErr
 
     let lat_e7 = scale_to_i32(position.lat, 1.0e7, "lat")?;
     let lon_e7 = scale_to_i32(position.lon, 1.0e7, "lon")?;
-    let alt_mm = position
-        .hae_meters
-        .map(|m| scale_to_i32(m, 1.0e3, "hae_meters"))
-        .transpose()?
-        .unwrap_or(0);
+    // MAVLink `alt` is MSL, so `hae_meters` (HAE by contract) is left
+    // unset by the decoder (#1560). Prefer the preserved raw MSL value
+    // from `alt_mm`; fall back to `hae_meters` only for entities that
+    // originated in an HAE-native protocol and carry no MAVLink datum.
+    let alt_mm = match entity
+        .attributes
+        .get(&format!("{MAVLINK_PREFIX}global_position_int.alt_mm"))
+    {
+        Some(AttributeValue::Int(v)) => i32::try_from(*v).unwrap_or(0),
+        _ => position
+            .hae_meters
+            .map(|m| scale_to_i32(m, 1.0e3, "hae_meters"))
+            .transpose()?
+            .unwrap_or(0),
+    };
 
     let time_boot_ms = match entity
         .attributes
@@ -983,7 +1031,7 @@ mod tests {
 
     #[test]
     fn mavlink_global_position_int_to_entity_extracts_position() {
-        // 42.0°N / -71.0°W / 100 m HAE — the canonical Massachusetts
+        // 42.0°N / -71.0°W / 100 m MSL — the canonical Massachusetts
         // coordinates the issue prescribes.
         let codec = MavlinkEntityCodec;
         let frame = v2_global_position_int(
@@ -1003,7 +1051,20 @@ mod tests {
         let position = entity.position.expect("position present");
         assert!((position.lat - 42.0).abs() < 1e-9);
         assert!((position.lon - -71.0).abs() < 1e-9);
-        assert_eq!(position.hae_meters, Some(100.0));
+        // MAVLink `alt` is MSL, not HAE (#1560): `hae_meters` is left
+        // unset and the raw MSL value is preserved in an attribute,
+        // labeled with its datum.
+        assert_eq!(position.hae_meters, None);
+        assert_eq!(
+            entity.attributes.get("mavlink.global_position_int.alt_mm"),
+            Some(&AttributeValue::Int(100_000)),
+        );
+        assert_eq!(
+            entity
+                .attributes
+                .get("mavlink.global_position_int.alt_datum"),
+            Some(&AttributeValue::Str("msl".into())),
+        );
     }
 
     #[test]
@@ -1144,6 +1205,14 @@ mod tests {
         assert_eq!(e1.kind, e2.kind);
         assert_eq!(e1.position, e2.position);
         assert_eq!(e1.velocity, e2.velocity);
+        // Altitude round-trips through the raw MSL attribute, not
+        // `hae_meters` (#1560): the encoder falls back to `alt_mm` so
+        // the 100 000 mm survives even though `hae_meters` is `None`.
+        assert_eq!(e1.position.and_then(|p| p.hae_meters), None);
+        assert_eq!(
+            e2.attributes.get("mavlink.global_position_int.alt_mm"),
+            Some(&AttributeValue::Int(100_000)),
+        );
         // Verify the encoded frame parses as GLOBAL_POSITION_INT.
         let header = parse_header(&bytes).expect("header");
         assert_eq!(header.msg_id, GLOBAL_POSITION_INT_MSG_ID);
