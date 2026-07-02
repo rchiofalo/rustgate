@@ -13,7 +13,11 @@ spec:
     - Ingress
     - Egress
   ingress:
-    - ports:
+    - {{- if .Values.networkPolicy.ingressSelectors }}
+      from:
+        {{- toYaml .Values.networkPolicy.ingressSelectors | nindent 8 }}
+      {{- end }}
+      ports:
         - port: {{ .Values.service.port }}
           protocol: TCP
         {{- if .Values.websocket.enabled }}
@@ -51,12 +55,20 @@ spec:
         - port: 53
           protocol: TCP
     {{- if .Values.nats.enabled }}
-    - ports:
+    - {{- if .Values.networkPolicy.egressSelectors }}
+      to:
+        {{- toYaml .Values.networkPolicy.egressSelectors | nindent 8 }}
+      {{- end }}
+      ports:
         - port: 4222
           protocol: TCP
     {{- end }}
     {{- if .Values.federation.enabled }}
-    - ports:
+    - {{- if .Values.networkPolicy.egressSelectors }}
+      to:
+        {{- toYaml .Values.networkPolicy.egressSelectors | nindent 8 }}
+      {{- end }}
+      ports:
         - port: {{ .Values.federation.v1Port }}
           protocol: TCP
         - port: {{ .Values.federation.v2Port }}
