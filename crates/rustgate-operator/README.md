@@ -10,8 +10,9 @@ operator owns:
 - a `StatefulSet` (rustgate replicas)
 - a headless `Service` (stable pod DNS)
 - a client-facing `ClusterIP` `Service` (tactical traffic)
-- a `ConfigMap` (rendered `rustgate.toml`, including the federation peer list
-  when `spec.federation.autoDiscover: true`)
+- a `ConfigMap` (rendered `rustgate.toml`, plus a `federation-peers.json`
+  peer file — referenced from the TOML via `federation-peers-file` — when
+  `spec.federation.autoDiscover: true`)
 - a `cert-manager.io/v1/Certificate` (when `spec.certManager` is set)
 
 Owner-references are applied so deletion of the parent cascade-deletes

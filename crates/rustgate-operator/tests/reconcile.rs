@@ -106,24 +106,117 @@ fn full_cluster_renders_five_manifests() {
 }
 
 #[test]
-fn statefulset_uses_per_pod_dns_in_federation_peers() {
+fn federation_peers_json_uses_per_pod_dns() {
     let cluster = full_cluster();
     let manifests = render_all(&cluster).expect("render");
     let cm = manifests
         .iter()
         .find(|m| m.kind == "ConfigMap")
         .expect("configmap");
-    let toml = cm.manifest["data"]["rustgate.toml"]
+    let peers = cm.manifest["data"]["federation-peers.json"]
         .as_str()
-        .expect("rustgate.toml string");
+        .expect("federation-peers.json string");
     for i in 0..3 {
         let expected =
             format!("my-cluster-{i}.my-cluster-headless.rustgate.svc.cluster.local:9001");
         assert!(
-            toml.contains(&expected),
-            "expected federation peer {expected} in rendered config:\n{toml}"
+            peers.contains(&expected),
+            "expected federation peer {expected} in rendered peers file:\n{peers}"
         );
     }
+    // The peer list must NOT be inlined into the TOML — the server rejects it.
+    let toml = cm.manifest["data"]["rustgate.toml"]
+        .as_str()
+        .expect("rustgate.toml string");
+    assert!(!toml.contains("svc.cluster.local"));
+    assert!(toml.contains("federation-peers-file = \"/etc/rustgate/federation-peers.json\""));
+}
+
+/// Anti-drift safety net: the rendered `rustgate.toml` must deserialize
+/// through a struct that mirrors the server's real config loader — a flat,
+/// kebab-cased, `deny_unknown_fields` mirror of `rustgate-server`'s
+/// `ConfigFile`. The server's `ConfigFile` is `pub(crate)` in a binary-only
+/// crate, so it cannot be imported here; instead this mirror reproduces the
+/// exact serde discipline (`#[serde(deny_unknown_fields, rename_all =
+/// "kebab-case")]`, every field `Option`) that makes the server reject the
+/// old nested `[server]`/`[federation]` layout. If the renderer ever emits a
+/// key the server would not accept, `deny_unknown_fields` fails this test.
+///
+/// The mirrored key subset is exactly what the operator emits; the field
+/// names/types match `ConfigFile`'s `bind`, `federation-v2-bind`,
+/// `federation-peers-file` entries in `crates/rustgate-server/src/cli.rs`.
+#[test]
+fn rendered_toml_parses_as_server_config_file() {
+    use rustgate_operator::render::render_rustgate_toml;
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    #[allow(dead_code)]
+    struct ServerConfigFileMirror {
+        bind: Option<String>,
+        #[serde(rename = "federation-v1-bind")]
+        federation_v1_bind: Option<String>,
+        #[serde(rename = "federation-v2-bind")]
+        federation_v2_bind: Option<String>,
+        #[serde(rename = "federation-id")]
+        federation_id: Option<String>,
+        #[serde(rename = "federation-peers-file")]
+        federation_peers_file: Option<String>,
+    }
+
+    let cluster = full_cluster();
+    let toml = render_rustgate_toml(&cluster);
+    let parsed: ServerConfigFileMirror = toml::from_str(&toml)
+        .unwrap_or_else(|e| panic!("server would reject rendered rustgate.toml: {e}\n{toml}"));
+
+    assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0:4433"));
+    assert_eq!(parsed.federation_v2_bind.as_deref(), Some("0.0.0.0:9001"));
+    assert_eq!(
+        parsed.federation_peers_file.as_deref(),
+        Some("/etc/rustgate/federation-peers.json")
+    );
+
+    // And the rendered peers file must parse as the server's peer array
+    // shape (id / address / groups / enabled / is_outbound / trust_cert_cn).
+    let peers = rustgate_operator::render::render_federation_peers_json(&cluster).expect("peers");
+    let arr: serde_json::Value =
+        serde_json::from_str(&peers).expect("peers file must be valid JSON");
+    let entries = arr.as_array().expect("peers array");
+    assert_eq!(entries.len(), 3);
+    for peer in entries {
+        assert!(peer["id"].is_string());
+        assert!(peer["address"].is_string());
+        assert!(peer["groups"].is_array());
+        assert!(peer["enabled"].is_boolean());
+        assert!(peer["is_outbound"].is_boolean());
+    }
+}
+
+/// With auto-discovery off, the TOML still parses cleanly and carries no
+/// federation keys or peers-file reference.
+#[test]
+fn rendered_toml_without_federation_parses() {
+    use rustgate_operator::render::render_rustgate_toml;
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    #[allow(dead_code)]
+    struct ServerConfigFileMirror {
+        bind: Option<String>,
+        #[serde(rename = "federation-v2-bind")]
+        federation_v2_bind: Option<String>,
+        #[serde(rename = "federation-peers-file")]
+        federation_peers_file: Option<String>,
+    }
+
+    let mut cluster = full_cluster();
+    cluster.spec.federation.auto_discover = false;
+    let toml = render_rustgate_toml(&cluster);
+    let parsed: ServerConfigFileMirror = toml::from_str(&toml)
+        .unwrap_or_else(|e| panic!("server would reject rendered rustgate.toml: {e}\n{toml}"));
+    assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0:4433"));
+    assert!(parsed.federation_v2_bind.is_none());
+    assert!(parsed.federation_peers_file.is_none());
 }
 
 #[test]

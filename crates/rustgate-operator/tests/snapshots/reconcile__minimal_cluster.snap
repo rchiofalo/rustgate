@@ -55,13 +55,11 @@ spec:
 ---
 apiVersion: v1
 data:
-  rustgate.toml: |+
+  rustgate.toml: |
     # rustgate.toml — managed by rustgate-operator
     # Source: RustgateCluster rustgate-min
 
-    [server]
-    tactical-bind = "0.0.0.0:4433"
-
+    bind = "0.0.0.0:4433"
 kind: ConfigMap
 metadata:
   labels:
