@@ -433,7 +433,7 @@ pub fn decode_document(payload: &[u8]) -> Result<NffiDocument, NffiError> {
             }
             Event::Text(t) => {
                 let s = t
-                    .xml_content()
+                    .xml10_content()
                     .map_err(quick_xml::Error::from)?
                     .into_owned();
                 if !s.is_empty() {
