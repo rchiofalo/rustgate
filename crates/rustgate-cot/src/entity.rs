@@ -298,7 +298,7 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
             Event::Text(t) => {
                 if in_detail && pending_text_key.is_some() {
                     let s = t
-                        .xml_content()
+                        .xml10_content()
                         .map_err(quick_xml::Error::from)?
                         .into_owned();
                     if !s.is_empty() {
