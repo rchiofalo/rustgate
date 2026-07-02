@@ -2923,7 +2923,13 @@ impl Router {
                 match verdict {
                     InterceptorVerdict::Allow => {}
                     InterceptorVerdict::Drop(reason) => {
-                        let dropped_tenant = msg.metadata.tenant_id().map(str::to_string);
+                        // Only pay the per-message tenant-string allocation when a
+                        // per-tenant dropped callback is actually installed (F-116).
+                        let dropped_tenant = if (**self.on_dropped_by_tenant.load()).is_some() {
+                            msg.metadata.tenant_id().map(str::to_string)
+                        } else {
+                            None
+                        };
                         self.emit_dropped_by_tenant("interceptor", dropped_tenant.as_deref());
                         tracing::debug!(
                             target: "router",
@@ -2943,7 +2949,15 @@ impl Router {
         // `msg` into `route_inner` — the per-tenant metric callbacks
         // need both, and after the move we only have an
         // `Arc<RoutableMessage>` (whose mutated copy may differ).
-        let routed_tenant: Option<String> = msg.metadata.tenant_id().map(str::to_string);
+        // Only pay the per-message tenant-string allocation when a per-tenant
+        // fanout or dropped callback is actually installed (F-116).
+        let routed_tenant: Option<String> = if (**self.on_fanout_by_tenant.load()).is_some()
+            || (**self.on_dropped_by_tenant.load()).is_some()
+        {
+            msg.metadata.tenant_id().map(str::to_string)
+        } else {
+            None
+        };
         let routed_destination_kind = destination_kind(&msg.destination);
 
         let routed = self.route_inner(msg, permit).await;
