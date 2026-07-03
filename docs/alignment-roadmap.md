@@ -11,8 +11,8 @@ blocked on an upstream dependency. Nothing in this document authorizes new
 work: an item appearing in "Tracked / Not Yet Built" is a *pointer* to a
 future issue/ADR, not a commitment to build it in a given release. When a
 theme moves between tables, update the row and the linked issue in lockstep
-(the same discipline the [crate table](architecture.md) and
-[`README.md`](../README.md) follow).
+(the same discipline the [crate table](https://github.com/rchiofalo/rustgate/blob/main/docs/architecture.md) and
+[`README.md`](https://github.com/rchiofalo/rustgate/blob/main/README.md) follow).
 
 Verified against `main` at the time of writing. If a claim below drifts
 (a crate is renamed, a flag changes semantics, a sub-issue closes), correct
@@ -27,18 +27,18 @@ theme is exhaustively complete.
 
 | Part 17/18 theme | Where it lives on `main` | Notes |
 |---|---|---|
-| 17.5 — Post-quantum crypto timeline (CNSA 2.0) | `--cnsa2` flag (`rustgate-server`) + [ADR 0019](adr/0019-cnsa2-hybrid-mldsa.md) | `--cnsa2` is compile-time scaffolding today (requires `--features post-quantum`); it does **not** yet switch to ML-KEM-1024 or enforce ML-DSA certs. See "Blocked Upstream" for the ML-DSA cert cluster. |
-| 17.5 — ML-DSA package signing | [ADR 0020](adr/0020-mavlink-pq-rekey.md), `mavlink-pq` feature (`rustgate-mavlink`) | Package-signature verification (#500) and the MAVLink ML-KEM-768 signing-key rekey path are landed; TLS-cert ML-DSA is not (below). |
-| 17.9 — ABMS / CJADC2 codec breadth | 9 tactical codec crates + `rustgate-codec-schema` | `rustgate-{mavlink,meshtastic,vmf,sapient,nffi,dis,link16,stanag4586,asterix}`. Schema-first codec design is [ADR 0018](adr/0018-schema-first-codec-design.md); the ingress seam is [ADR 0023](adr/0023-tactical-codec-ingress-seam.md). OMS/UCI and JFN wire formats specifically are not yet mapped. |
-| 17.10 — Replicator short-lived certs / auto-revocation | [ADR 0025](adr/0025-revocation-lifecycle.md) revocation lifecycle, `--crl-refresh-interval` | Live CRL refresh without restart landed (ADR 0025, Piece 1). Fail-closed staleness handling and active-session disconnect are follow-up pieces of the same ADR. |
+| 17.5 — Post-quantum crypto timeline (CNSA 2.0) | `--cnsa2` flag (`rustgate-server`) + [ADR 0019](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0019-cnsa2-hybrid-mldsa.md) | `--cnsa2` is compile-time scaffolding today (requires `--features post-quantum`); it does **not** yet switch to ML-KEM-1024 or enforce ML-DSA certs. See "Blocked Upstream" for the ML-DSA cert cluster. |
+| 17.5 — ML-DSA package signing | [ADR 0020](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0020-mavlink-pq-rekey.md), `mavlink-pq` feature (`rustgate-mavlink`) | Package-signature verification (#500) and the MAVLink ML-KEM-768 signing-key rekey path are landed; TLS-cert ML-DSA is not (below). |
+| 17.9 — ABMS / CJADC2 codec breadth | 9 tactical codec crates + `rustgate-codec-schema` | `rustgate-{mavlink,meshtastic,vmf,sapient,nffi,dis,link16,stanag4586,asterix}`. Schema-first codec design is [ADR 0018](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0018-schema-first-codec-design.md); the ingress seam is [ADR 0023](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0023-tactical-codec-ingress-seam.md). OMS/UCI and JFN wire formats specifically are not yet mapped. |
+| 17.10 — Replicator short-lived certs / auto-revocation | [ADR 0025](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0025-revocation-lifecycle.md) revocation lifecycle, `--crl-refresh-interval` | Live CRL refresh without restart landed (ADR 0025, Piece 1). Fail-closed staleness handling and active-session disconnect are follow-up pieces of the same ADR. |
 | 17.11 — Space domain awareness (entity model) | `rustgate-core::entity` protocol-agnostic entity model | The canonical entity representation that a future orbital/TLE type would extend already exists; an orbital element type is not built. |
 | 18.1 — Palantir Foundry integration | `rustgate-foundry` | Partner/platform integration crate present. |
 | 18.2 — Anduril Lattice integration | `rustgate-lattice` | gRPC/protobuf-over-mTLS partner integration crate present. |
 | 18.3 — RTI Connext DDS | `rustgate-dds` | DDS/RTPS integration crate present. |
 | 18.4 — European NATO C2 (NFFI) | `rustgate-nffi` + live NFFI/STANAG-5527 TCP ingress | Friendly-force-information ingest landed; the broader SitaWare/TORCH-X/TACNET surface is not a single crate. |
-| 18.5 — TAK ecosystem (protobuf-first) | `TakProtobuf` framing ([ADR 0021](adr/0021-clean-room-tak-interop.md)), `rustgate-meshtastic` | Clean-room TAK protobuf interop and the Meshtastic codec are present. |
+| 18.5 — TAK ecosystem (protobuf-first) | `TakProtobuf` framing ([ADR 0021](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0021-clean-room-tak-interop.md)), `rustgate-meshtastic` | Clean-room TAK protobuf interop and the Meshtastic codec are present. |
 | 18.6 — Small UAS (STANAG 4586) | `rustgate-stanag4586` + live STANAG 4586 UDP ingress | LOI 2-3 telemetry ingest landed on the datagram path; TCP-stream STANAG 4586 is deferred on a per-deployment framing decision. |
-| Cross-domain guard (17.3 / 17.4 classified data) | `rustgate-guard` + [ADR 0022](adr/0022-cross-domain-guard-egress-seam.md), [ADR 0024](adr/0024-guard-fail-closed.md) | Fail-closed egress guard seam present. Not a Part-17 item by name, but the mechanism the classified-EW / kill-chain-provenance themes lean on. |
+| Cross-domain guard (17.3 / 17.4 classified data) | `rustgate-guard` + [ADR 0022](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0022-cross-domain-guard-egress-seam.md), [ADR 0024](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0024-guard-fail-closed.md) | Fail-closed egress guard seam present. Not a Part-17 item by name, but the mechanism the classified-EW / kill-chain-provenance themes lean on. |
 
 ## Tracked / Not Yet Built
 
