@@ -172,7 +172,7 @@ async fn paused_runtime_drives_sweep_task_deterministically() {
     // pending, so this is bounded but deterministic.
     let drained = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if cache.len() == 0 {
+            if cache.is_empty() {
                 return;
             }
             tokio::time::advance(Duration::from_millis(110)).await;
