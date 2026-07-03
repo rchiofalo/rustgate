@@ -96,3 +96,61 @@ The forcing function for THIS ADR is twofold:
 - A future ADR superseding this one (pure ML-DSA migration) has a clear pointer to "this is what we decided in 2026 and why."
 
 **Migration path.** When CNSA 2.0 + rustls + aws-lc-rs converge (expected 2027–2028), the four sub-PRs (#501/#502/#503 plus the wiring) flip the `--cnsa2` flag from "scaffold" to "full enforcement." This ADR's status becomes **Accepted**; if NSA revises the algorithm suite before then, this ADR's body remains the historical record and a new ADR supersedes.
+
+## #503 Hybrid Certificate Issuance
+
+This section records the direction and the first concrete slice for the hybrid
+dual-signature certificate work (#503).
+
+### Decision
+
+1. **Primary path: composite ML-DSA** per `draft-ietf-lamps-pq-composite-sigs` —
+   a single certificate carrying a composite signature. PQ-capable peers verify
+   the ML-DSA half; legacy peers verify the classical ECDSA half. This is the
+   direction the rest of the CNSA 2.0 arc (#500/#501/#502/#504) already commits
+   to above.
+
+2. **Fallback path: dual certificate chains** — the server presents two separate
+   chains (one classical, one PQ) over TLS 1.3. This is less
+   standards-dependent but **operationally more complex** (two CA key pairs, two
+   certs per CSR, a PKCS#12 bundle carrying both chains). It is the fallback,
+   chosen only if the composite draft stalls past the deployment window.
+
+3. **Composite profiles** (mirroring the CNSA 2.0 tiers in the Decision above):
+   - `ML-DSA-87 + ECDSA-P384` — CNSA 2.0 Level 5 (the NSS target).
+   - `ML-DSA-65 + ECDSA-P256` — Level 3, for wire-budget-constrained tactical
+     radios where ML-DSA-87 is oversized.
+
+### Blocked upstream — what must land first
+
+A working composite-signing path **cannot be built today**, so #503 ships a
+scaffold, not fake crypto. The gates:
+
+- **rcgen** (workspace pin) has no composite / ML-DSA signature construction
+  API.
+- **rustls** has no ML-DSA certificate-verification path yet — issue **#501**
+  (open).
+- **ML-DSA "pure" issuance** — issue **#502** (open) — is a prerequisite for the
+  ML-DSA half of the composite.
+- The **`draft-ietf-lamps-pq-composite-sigs`** IETF draft is still in "Revised
+  I-D Needed" state.
+- The **aws-lc-rs FIPS/ML-DSA mutual exclusion**
+  ([aws-lc-rs #964](https://github.com/aws/aws-lc-rs/issues/964)) blocks the
+  provider-side pieces.
+
+### First slice (this batch)
+
+Behind an off-by-default `hybrid-certs` cargo feature on `rustgate-enrollment`
+(no new runtime deps):
+
+- `HybridSignatureProfile` enum (`Ml87EcdsaP384` for L5, `Ml65EcdsaP256` for L3)
+  with algorithm/level/descriptor accessors — the stable surface #501/#502 fill
+  in.
+- `sign_csr_hybrid(...)` stub that enforces the same CSR contract as
+  `sign_csr` but returns the new `EnrollmentError::HybridUnsupported` variant,
+  whose message points at this ADR section and the blocking issues.
+
+This makes the epic's first slice real (types + feature flag + error surface +
+design record) without shipping an unsigned or unstandardized certificate. When
+the upstream gates clear, the real composite issuance slots into
+`sign_csr_hybrid`'s body behind the same signature.

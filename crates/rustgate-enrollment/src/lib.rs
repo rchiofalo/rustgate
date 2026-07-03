@@ -25,6 +25,8 @@ pub mod error;
 #[cfg(feature = "est")]
 pub mod est;
 mod handlers;
+#[cfg(feature = "hybrid-certs")]
+pub mod hybrid;
 mod keypair;
 pub mod pkcs12;
 pub mod response;
@@ -36,6 +38,8 @@ pub use auth::Credentials;
 pub use contacts::{ContactInfo, ContactsProvider, cached_contacts_provider};
 pub use datapackage::DataPackageStore;
 pub use error::EnrollmentError;
+#[cfg(feature = "hybrid-certs")]
+pub use hybrid::{HybridSignatureProfile, sign_csr_hybrid};
 pub use revocation::RevocationStore;
 pub use server::{
     DEFAULT_SIGN_RATE_LIMIT, DEFAULT_SIGN_RATE_WINDOW, EnrollmentServer, RateLimitCallback,

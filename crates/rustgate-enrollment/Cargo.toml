@@ -13,6 +13,12 @@ workspace = true
 [features]
 est = ["dep:cms", "dep:der", "dep:x509-cert"]
 fips = ["rcgen/fips"]
+# Scaffold-only surface for hybrid (composite ML-DSA + ECDSA) certificate
+# issuance (#503). Off by default and adds no runtime deps: it exposes the
+# `HybridSignatureProfile` types and a `sign_csr_hybrid` stub that returns
+# `EnrollmentError::HybridUnsupported` (blocked upstream — see ADR 0019). No
+# real composite signing until #501/#502 and rcgen/aws-lc-rs upstream land.
+hybrid-certs = []
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }
