@@ -749,6 +749,13 @@
       ],
       "default": null
     },
+    "guard-audit-chain-fail-open": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "guard-config-file": {
       "type": [
         "string",
