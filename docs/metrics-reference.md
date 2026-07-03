@@ -219,11 +219,26 @@ cost for a large bandwidth reduction on position-update-heavy traffic;
 
 ## Per-tenant quotas
 
-Per-tenant connection caps and aggregate-throughput token buckets. The
-`tenant` label is derived from the certificate Organization (`O`) field;
-when no tenant is identifiable the synthetic `DEFAULT_TENANT_KEY` is
-used. To prevent registry explosion the label collapses to `_overflow`
-past `MAX_TENANT_LABELS`.
+Per-tenant connection caps, aggregate-throughput token buckets, and an
+instantaneous queued-byte cap. The `tenant` label is derived from the
+certificate Organization (`O`) field; when no tenant is identifiable the
+synthetic `DEFAULT_TENANT_KEY` is used. To prevent registry explosion
+the label collapses to `_overflow` past `MAX_TENANT_LABELS`.
+
+The tenant-quota JSON (loaded via `--tenant-quota-file`) exposes three
+independent limits per tenant: `max_connections` (session admission),
+`max_throughput_bps` (a bytes/sec *rate* cap), and `max_queued_bytes`
+(an *instantaneous* in-flight cap). As of issue #1514 the
+`max_queued_bytes` field is **enforced at the router egress path**: a
+message whose byte count would push the sending tenant's in-flight
+reservation over the cap is dropped (emitting the
+`quota.tenant_queued_bytes_exceeded` audit event and the
+`tenant_queued_bytes_exceeded` dropped-reason), and the reservation only
+releases as recipient channels drain — so a tenant with slow readers
+cannot monopolize the global backpressure budget. A `max_queued_bytes`
+of `0` means unlimited (tracked but never rejected). Enforcement
+currently covers the router local-delivery egress path only; the HTTP,
+NATS, and federation outbound paths use the global backpressure gate.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|

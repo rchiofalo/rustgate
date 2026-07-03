@@ -103,12 +103,15 @@ rustgate_core::on_callback!(
     /// argument is one of the documented `reason` labels:
     /// `"no_subscribers"`, `"backpressure"`, `"acl_denied"`,
     /// `"authz_denied"`, `"obligation_failed"`,
-    /// `"tenant_throughput_exceeded"`. Wired by the server binary to
+    /// `"tenant_throughput_exceeded"`,
+    /// `"tenant_queued_bytes_exceeded"`. Wired by the server binary to
     /// feed the `rustgate_router_dropped_total{reason}` counter — the
     /// same `reason` vocabulary the audit-log emits, so SIEM correlation
     /// and Prometheus dashboards stay in lock-step. The
     /// `tenant_throughput_exceeded` label is emitted by the per-tenant
-    /// token bucket layer added in issue #883 sub-item 4.
+    /// token bucket layer added in issue #883 sub-item 4; the
+    /// `tenant_queued_bytes_exceeded` label is emitted by the per-tenant
+    /// instantaneous queued-byte admission layer added in issue #1514.
     /// Closes #768.
     pub OnDropped,
     &'static str
@@ -535,12 +538,23 @@ pub struct RoutedMessage {
     // the reservation to the gate. Option so that callers without a gate
     // (tests, disabled path) pay no cost.
     _permit: Option<Arc<BackpressurePermit>>,
+    // Parallel to `_permit`, but for the per-tenant queued-byte
+    // reservation (issue #1514). Cloned once per recipient so the
+    // tenant's in-flight byte counter stays pegged until the *last*
+    // session channel drains this message — giving slow readers real
+    // per-tenant backpressure. Option so callers without a quota tracker
+    // (tests, disabled path) pay no cost.
+    _tenant_permit: Option<Arc<crate::quota::TenantBytePermit>>,
 }
 
 impl RoutedMessage {
-    /// Wrap an `Arc<RoutableMessage>` without a backpressure permit.
+    /// Wrap an `Arc<RoutableMessage>` without any admission permit.
     pub fn new(msg: Arc<RoutableMessage>) -> Self {
-        Self { msg, _permit: None }
+        Self {
+            msg,
+            _permit: None,
+            _tenant_permit: None,
+        }
     }
 
     /// Wrap an `Arc<RoutableMessage>` with a shared backpressure permit.
@@ -548,6 +562,22 @@ impl RoutedMessage {
         Self {
             msg,
             _permit: Some(permit),
+            _tenant_permit: None,
+        }
+    }
+
+    /// Wrap an `Arc<RoutableMessage>` with optional shared global and
+    /// per-tenant admission permits. Either may be `None` when the
+    /// corresponding gate/tracker is not installed.
+    pub fn with_permits(
+        msg: Arc<RoutableMessage>,
+        permit: Option<Arc<BackpressurePermit>>,
+        tenant_permit: Option<Arc<crate::quota::TenantBytePermit>>,
+    ) -> Self {
+        Self {
+            msg,
+            _permit: permit,
+            _tenant_permit: tenant_permit,
         }
     }
 
@@ -614,6 +644,7 @@ impl RoutedMessage {
         Ok(Self {
             msg: Arc::new(msg),
             _permit: self._permit.clone(),
+            _tenant_permit: self._tenant_permit.clone(),
         })
     }
 }
@@ -2876,6 +2907,66 @@ impl Router {
             .as_ref()
             .map(|gate| Arc::new(gate.acquire(msg.payload.len())));
 
+        // #1514: per-tenant queued-byte admission. Sits *inside* the
+        // global gate so a single noisy tenant cannot consume the whole
+        // 512 MiB global budget and starve quiet tenants. The permit is
+        // threaded through every per-recipient `RoutedMessage` clone
+        // (parallel to `_permit` above) so the tenant's in-flight byte
+        // counter only releases when the *last* session channel drains —
+        // real per-tenant backpressure against slow readers.
+        //
+        // `try_reserve_bytes` returns `None` both for over-cap AND for a
+        // tenant with no queued-byte cap configured. We only treat `None`
+        // as a rejection when a positive `max_queued_bytes` is actually
+        // configured for the tenant; otherwise we fall through to the
+        // global gate alone, preserving pre-#1514 compatibility.
+        let tenant_permit: Option<Arc<crate::quota::TenantBytePermit>> = {
+            let tracker_guard = self.quota_tracker.load();
+            match &**tracker_guard {
+                Some(tracker) => {
+                    let tenant_key = msg
+                        .source
+                        .tenant
+                        .as_deref()
+                        .unwrap_or(crate::quota::DEFAULT_TENANT_KEY);
+                    match tracker.try_reserve_bytes(tenant_key, msg.payload.len()) {
+                        Some(p) => Some(Arc::new(p)),
+                        None => {
+                            let cap = tracker
+                                .quota_for(tenant_key)
+                                .map(|q| q.max_queued_bytes)
+                                .unwrap_or(0);
+                            if cap > 0 {
+                                // Genuine over-cap rejection: shed the message.
+                                let uid = extract_cot_uid(&msg.payload);
+                                rustgate_core::audit::tenant_queued_bytes_exceeded(
+                                    tenant_key,
+                                    uid,
+                                    msg.payload.len(),
+                                    cap,
+                                );
+                                warn!(
+                                    tenant = %tenant_key,
+                                    source = %hash_cn(&msg.source.cn),
+                                    requested = msg.payload.len(),
+                                    reserved_cap = cap,
+                                    "tenant queued-byte reservation exceeded — dropping message"
+                                );
+                                emit_access(&msg, "tenant_queued_bytes_exceeded");
+                                self.emit_dropped("tenant_queued_bytes_exceeded");
+                                return None;
+                            }
+                            // No cap configured (or unlimited cap the
+                            // reservation could not track): fall through to
+                            // the global gate alone.
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
+
         // #859: stamp the originating session's tenant onto the
         // metadata so downstream surfaces (archive directory layout,
         // store-and-forward keying, NATS subject prefix, per-tenant
@@ -2960,7 +3051,7 @@ impl Router {
         };
         let routed_destination_kind = destination_kind(&msg.destination);
 
-        let routed = self.route_inner(msg, permit).await;
+        let routed = self.route_inner(msg, permit, tenant_permit).await;
 
         // #859: fire the per-tenant fanout / dropped callback once
         // per `route_for_egress` invocation. We do not slice further
@@ -3156,6 +3247,7 @@ impl Router {
         &self,
         msg: RoutableMessage,
         permit: Option<Arc<BackpressurePermit>>,
+        tenant_permit: Option<Arc<crate::quota::TenantBytePermit>>,
     ) -> Option<Arc<RoutableMessage>> {
         // Cross-path deduplication: drop the message before any
         // dispatch work if it has already been delivered via another
@@ -3517,10 +3609,7 @@ impl Router {
         // return path so NATS/federation/HTTP forwarders dispatch the
         // *same* post-Send-PEP form that local sessions received.
         let arc_msg = Arc::new(msg);
-        let envelope = match permit {
-            Some(p) => RoutedMessage::with_permit(Arc::clone(&arc_msg), p),
-            None => RoutedMessage::new(Arc::clone(&arc_msg)),
-        };
+        let envelope = RoutedMessage::with_permits(Arc::clone(&arc_msg), permit, tenant_permit);
 
         match envelope.destination.clone() {
             Destination::Direct(target) => {
