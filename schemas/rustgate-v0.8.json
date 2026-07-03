@@ -165,6 +165,13 @@
       ],
       "default": null
     },
+    "authz-no-policy-allow": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "authz-policy-file": {
       "type": [
         "string",
@@ -793,6 +800,13 @@
       ],
       "default": null
     },
+    "insecure-unbounded-rate-limits": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "jwks-pending-window-secs": {
       "type": [
         "integer",
@@ -994,6 +1008,13 @@
       "format": "uint",
       "default": null,
       "minimum": 0
+    },
+    "metrics-no-auth": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
     },
     "metrics-per-identity": {
       "type": [

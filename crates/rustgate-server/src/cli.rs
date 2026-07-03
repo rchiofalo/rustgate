@@ -633,6 +633,20 @@ pub(crate) struct MetricsArgs {
     #[arg(long, env = "RUSTGATE_METRICS_TOKEN_FILE")]
     pub(crate) metrics_token_file: Option<String>,
 
+    /// Secure-by-default warm-up opt-out (ADR 0036, #1559). Acknowledge
+    /// that this deployment intentionally exposes an UNAUTHENTICATED
+    /// `/metrics` endpoint — `--metrics-bind` is set but no
+    /// `--metrics-token-file` is provided.
+    ///
+    /// This flag changes NO behaviour today. Its only effect this release
+    /// is to silence the startup warning that warns the metrics endpoint
+    /// will require a bearer token in a future enforcement release. Set it
+    /// to pre-pin the current unauthenticated posture deliberately (e.g. a
+    /// metrics port already firewalled to a trusted scraper); leave it
+    /// unset to keep the warning as a migration reminder.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_METRICS_NO_AUTH")]
+    pub(crate) metrics_no_auth: bool,
+
     /// Enable Tier 2 per-identity Prometheus metrics (handshake failures,
     /// session duration, bytes sent/received) labelled by `identity_cn`.
     /// When disabled the metrics are not registered at all and impose
@@ -734,6 +748,26 @@ pub(crate) struct LimitArgs {
         env = "RUSTGATE_BACKPRESSURE_RESUME_DWELL_MS"
     )]
     pub(crate) backpressure_resume_dwell_ms: u64,
+
+    /// Secure-by-default warm-up opt-out (ADR 0036, #1559). Acknowledge
+    /// that this deployment intentionally runs unbounded per-listener
+    /// rate limits — any of `--ws-max-frames-per-sec`,
+    /// `--ws-max-bytes-per-sec`, or `--udp-rate-limit` left at `0`
+    /// (unlimited), or a `--udp-bind` listener with no
+    /// `--udp-allowed-cidrs` source filter.
+    ///
+    /// This flag changes NO behaviour today. Its only effect this release
+    /// is to silence the startup warning that warns these currently
+    /// unbounded limits will receive finite defaults in a future
+    /// enforcement release. Set it to pre-pin the current unbounded
+    /// posture deliberately; leave it unset to keep the warning as a
+    /// migration reminder.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_INSECURE_UNBOUNDED_RATE_LIMITS"
+    )]
+    pub(crate) insecure_unbounded_rate_limits: bool,
 }
 
 #[derive(Args, Serialize)]
@@ -1756,6 +1790,20 @@ pub(crate) struct AuthzArgs {
     #[arg(long, default_value_t = false, env = "RUSTGATE_AUTHZ_FAIL_OPEN")]
     pub(crate) authz_fail_open: bool,
 
+    /// Secure-by-default warm-up opt-out (ADR 0036, #1559). Acknowledge
+    /// that this deployment intentionally runs with no routing policy —
+    /// neither `--group-acl-file` nor `--authz-policy-file` set — so the
+    /// router stays app-layer-open (any authenticated client may send and
+    /// receive on any group).
+    ///
+    /// This flag changes NO behaviour today. Its only effect this release
+    /// is to silence the startup warning that warns routing will become
+    /// default-deny in a future enforcement release. Set it to pre-pin the
+    /// current open posture deliberately; leave it unset to keep the
+    /// warning as a migration reminder.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_AUTHZ_NO_POLICY_ALLOW")]
+    pub(crate) authz_no_policy_allow: bool,
+
     /// Allow the router to continue delivery when the authz engine
     /// returns an `Obligation` variant the transport build cannot
     /// actuate (e.g. a deliberately skewed rolling upgrade where new
@@ -2747,6 +2795,7 @@ define_config_file! {
     est_enabled in enrollment: bool,
     metrics_bind in metrics: Option<String>,
     metrics_token_file in metrics: Option<String>,
+    metrics_no_auth in metrics: bool,
     metrics_per_identity in metrics: bool,
     metrics_identity_allowlist in metrics: Option<std::path::PathBuf>,
     metrics_max_connections in metrics: usize,
@@ -2757,6 +2806,7 @@ define_config_file! {
     max_queued_bytes in limits: usize,
     max_queued_bytes_low_water in limits: Option<usize>,
     backpressure_resume_dwell_ms in limits: u64,
+    insecure_unbounded_rate_limits in limits: bool,
     websocket_bind in websocket: Option<String>,
     ws_max_frames_per_sec in websocket: u32,
     ws_max_bytes_per_sec in websocket: u64,
@@ -2887,6 +2937,7 @@ define_config_file! {
     authz_policy_format in authz: AuthzPolicyFormat,
     authz_reload_interval in authz: u64,
     authz_fail_open in authz: bool,
+    authz_no_policy_allow in authz: bool,
     authz_allow_unknown_obligations in authz: bool,
     require_classification_marking in authz: bool,
     default_classification in authz: Option<String>,
@@ -3092,7 +3143,83 @@ impl Cli {
         // but TOML config values bypass it and need an explicit check here.
         let _ = validate_write_buffer_range(self.websocket.ws_max_write_buffer_bytes)
             .map_err(|e| anyhow::anyhow!("ws-max-write-buffer-bytes: {e}"))?;
+
+        self.warn_secure_by_default_warmup();
         Ok(())
+    }
+
+    /// Emit the secure-by-default warm-up warnings (ADR 0036, #1559).
+    ///
+    /// This is the log-only warm-up slice of the owner's staged flip: it
+    /// changes NO routing/metrics/rate-limit behaviour this release. It
+    /// names, at startup, exactly what will be denied or required in the
+    /// enforcement release, so operators can migrate before the defaults
+    /// change. Each warning is suppressed by an explicit opt-out flag that
+    /// pre-pins the current (insecure) posture on purpose. Following the
+    /// ADR 0024 warm-up precedent — surface the would-be change first,
+    /// enforce one release later.
+    fn warn_secure_by_default_warmup(&self) {
+        // (a) No routing policy: the router is app-layer-open today (any
+        // authenticated client may send/receive on any group). Enforcement
+        // release will make this default-deny.
+        let has_routing_policy =
+            self.authz.group_acl_file.is_some() || self.authz.authz_policy_file.is_some();
+        if !has_routing_policy && !self.authz.authz_no_policy_allow {
+            tracing::warn!(
+                target: "audit",
+                flip = "no-policy-deny",
+                opt_out = "--authz-no-policy-allow",
+                "secure-by-default warm-up (ADR 0036): no routing policy is configured \
+                 (neither --group-acl-file nor --authz-policy-file); routing is \
+                 currently app-layer-open and WILL become default-deny in a future \
+                 release. Configure a policy, or pass --authz-no-policy-allow to keep \
+                 the open posture deliberately and silence this warning."
+            );
+        }
+
+        // (b) Unauthenticated metrics endpoint: enforcement release will
+        // require a bearer token whenever --metrics-bind is set.
+        if self.metrics.metrics_bind.is_some()
+            && self.metrics.metrics_token_file.is_none()
+            && !self.metrics.metrics_no_auth
+        {
+            tracing::warn!(
+                target: "audit",
+                flip = "metrics-require-auth",
+                opt_out = "--metrics-no-auth",
+                "secure-by-default warm-up (ADR 0036): the metrics endpoint is bound \
+                 without --metrics-token-file; it is currently unauthenticated and WILL \
+                 require a bearer token in a future release. Set --metrics-token-file, \
+                 or pass --metrics-no-auth to keep it unauthenticated deliberately and \
+                 silence this warning."
+            );
+        }
+
+        // (c) Unbounded per-listener rate limits: enforcement release will
+        // give these finite defaults.
+        let ws_unbounded =
+            self.websocket.ws_max_frames_per_sec == 0 || self.websocket.ws_max_bytes_per_sec == 0;
+        let udp_bound = self.plaintext.udp_bind.is_some();
+        let udp_unbounded = udp_bound
+            && (self.plaintext.udp_rate_limit == 0 || self.plaintext.udp_allowed_cidrs.is_none());
+        if (ws_unbounded || udp_unbounded) && !self.limits.insecure_unbounded_rate_limits {
+            tracing::warn!(
+                target: "audit",
+                flip = "finite-rate-limit-defaults",
+                opt_out = "--insecure-unbounded-rate-limits",
+                ws_max_frames_per_sec = self.websocket.ws_max_frames_per_sec,
+                ws_max_bytes_per_sec = self.websocket.ws_max_bytes_per_sec,
+                udp_rate_limit = self.plaintext.udp_rate_limit,
+                udp_bound,
+                udp_allowed_cidrs_set = self.plaintext.udp_allowed_cidrs.is_some(),
+                "secure-by-default warm-up (ADR 0036): one or more per-listener rate \
+                 limits are unbounded (ws-max-frames-per-sec / ws-max-bytes-per-sec / \
+                 udp-rate-limit at 0, or a UDP listener with no --udp-allowed-cidrs); \
+                 these WILL receive finite defaults in a future release. Set explicit \
+                 limits, or pass --insecure-unbounded-rate-limits to keep them unbounded \
+                 deliberately and silence this warning."
+            );
+        }
     }
 
     /// Serialize the merged configuration as TOML for `print-config`.
@@ -4258,6 +4385,131 @@ mod tests {
         // Should succeed (warn, not bail).
         cli.validate()
             .expect("authz-fail-open without policy should warn, not error");
+    }
+
+    // ── secure-by-default warm-up flags (ADR 0036, #1559) ────────────
+
+    #[test]
+    fn validate_no_policy_warmup_does_not_bail() {
+        // The warm-up is log-only: no routing policy configured must
+        // still start (warn, not error). This pins that #1559 did not
+        // slip in the enforcement flip early.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cli = cli_with_temp_tls(&dir);
+        assert!(cli.authz.group_acl_file.is_none());
+        assert!(cli.authz.authz_policy_file.is_none());
+        assert!(!cli.authz.authz_no_policy_allow);
+        cli.validate()
+            .expect("no routing policy must warn, not bail (log-only warm-up)");
+    }
+
+    #[test]
+    fn validate_accepts_authz_no_policy_allow_opt_out() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.authz.authz_no_policy_allow = true;
+        cli.validate()
+            .expect("--authz-no-policy-allow must be accepted as an opt-out");
+    }
+
+    #[test]
+    fn validate_accepts_metrics_no_auth_with_bind_and_no_token() {
+        // Mirrors cli_metrics_bind_optional: metrics bound without a
+        // token, plus the opt-out, must not bail (log-only warm-up).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        cli.metrics.metrics_bind = Some("127.0.0.1:9090".to_owned());
+        cli.metrics.metrics_token_file = None;
+        cli.metrics.metrics_no_auth = true;
+        cli.validate()
+            .expect("--metrics-no-auth with a bound metrics endpoint must not bail");
+    }
+
+    #[test]
+    fn validate_accepts_insecure_unbounded_rate_limits_opt_out() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut cli = cli_with_temp_tls(&dir);
+        // Default ws limits are 0 (unbounded); set a UDP listener with no
+        // CIDR filter to exercise the udp arm too.
+        cli.plaintext.udp_bind = Some("0.0.0.0:8087".to_owned());
+        cli.plaintext.udp_rate_limit = 0;
+        cli.plaintext.udp_allowed_cidrs = None;
+        cli.limits.insecure_unbounded_rate_limits = true;
+        cli.validate()
+            .expect("--insecure-unbounded-rate-limits must be accepted as an opt-out");
+    }
+
+    #[test]
+    fn cli_secure_by_default_warmup_flags_parse() {
+        // Pin the three exact flag strings — operator runbooks and helm
+        // charts key off them; a rename would not fail at compile time.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, "").expect("write cert");
+        std::fs::write(&key, "").expect("write key");
+        std::fs::write(&ca, "").expect("write ca");
+
+        let cli = Cli::try_parse_from([
+            "rustgate",
+            "--cert",
+            cert.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--ca",
+            ca.to_str().unwrap(),
+            "--authz-no-policy-allow",
+            "--metrics-no-auth",
+            "--insecure-unbounded-rate-limits",
+        ])
+        .expect("warm-up opt-out flags should parse");
+        assert!(cli.authz.authz_no_policy_allow);
+        assert!(cli.metrics.metrics_no_auth);
+        assert!(cli.limits.insecure_unbounded_rate_limits);
+
+        // Defaults must all be false (current behaviour unchanged).
+        let cli_default = cli_with_temp_tls(&dir);
+        assert!(!cli_default.authz.authz_no_policy_allow);
+        assert!(!cli_default.metrics.metrics_no_auth);
+        assert!(!cli_default.limits.insecure_unbounded_rate_limits);
+    }
+
+    #[test]
+    fn secure_by_default_warmup_flags_round_trip_via_config_file() {
+        // Prove the serde `in <group>` wiring is present so a config-file
+        // deployment can set the opt-outs under deny_unknown_fields.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cert = dir.path().join("c.pem");
+        let key = dir.path().join("k.pem");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&cert, "").expect("write cert");
+        std::fs::write(&key, "").expect("write key");
+        std::fs::write(&ca, "").expect("write ca");
+
+        let cert_s = cert.to_str().unwrap();
+        let key_s = key.to_str().unwrap();
+        let ca_s = ca.to_str().unwrap();
+
+        let cfg = dir.path().join("warmup.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "cert = \"{cert_s}\"\nkey = \"{key_s}\"\nca = \"{ca_s}\"\n\
+                 authz-no-policy-allow = true\nmetrics-no-auth = true\n\
+                 insecure-unbounded-rate-limits = true\n"
+            ),
+        )
+        .expect("write");
+
+        let file = load_config_file(cfg.to_str().unwrap()).expect("load");
+        let matches = Cli::command()
+            .get_matches_from(["rustgate", "--cert", cert_s, "--key", key_s, "--ca", ca_s]);
+        let mut cli = Cli::from_arg_matches(&matches).expect("parse");
+        file.apply_to(&mut cli, &matches);
+        assert!(cli.authz.authz_no_policy_allow);
+        assert!(cli.metrics.metrics_no_auth);
+        assert!(cli.limits.insecure_unbounded_rate_limits);
     }
 
     // ── classification CLI flag pins (refs #849) ─────────────────────
