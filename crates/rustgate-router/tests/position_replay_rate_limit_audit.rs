@@ -102,7 +102,7 @@ fn replay_positions_emits_audit_on_rate_limit() {
         let router = Router::new().with_position_replay_limit(PositionReplayLimitConfig::new(0, 1));
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["alpha"]);
-        router.cache().store(make_position(&alice)).await;
+        router.cache().store(make_position(&alice));
 
         let (ptx, prx) = mpsc::channel(16);
         let (ntx, nrx) = mpsc::channel(16);

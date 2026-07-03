@@ -185,7 +185,7 @@ impl JetStreamReplay {
                     };
 
                     // Store directly into cache (no sessions connected yet during replay)
-                    router.cache().store(routable).await;
+                    router.cache().store(routable);
                     count += 1;
 
                     // Checkpoint only after the message was successfully processed

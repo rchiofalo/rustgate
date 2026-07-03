@@ -749,7 +749,7 @@ async fn position_cache_replay() {
     router.route(position_msg).await;
 
     // Verify it's cached
-    assert_eq!(router.cache().len().await, 1);
+    assert_eq!(router.cache().len(), 1);
 
     // Bob connects later — position goes to priority channel
     let (bptx, bntx, mut bprx, _bnrx) = make_channels(16);
@@ -784,7 +784,7 @@ async fn chat_messages_not_cached() {
     router.route(chat_msg).await;
 
     // Chat should not be cached
-    assert!(router.cache().is_empty().await);
+    assert!(router.cache().is_empty());
 }
 
 /// Multiple positions from same CN — only latest is cached.
@@ -817,7 +817,7 @@ async fn position_cache_replaces_old() {
     router.route(pos2).await;
 
     // Only one entry (latest)
-    assert_eq!(router.cache().len().await, 1);
+    assert_eq!(router.cache().len(), 1);
 
     // Bob connects and gets the latest position (priority channel)
     let bob = Arc::new(make_identity("bob", &["team"]));

@@ -78,26 +78,22 @@ async fn clock_jump_forward_past_ttl_excludes_entry_from_replay() {
     // clock jump of 10s past the TTL. `get_all` must filter it.
     let cache = PositionCache::new();
     let backdated = SystemTime::now() - Duration::from_secs(10);
-    cache
-        .store(position_with_received_at(
-            "alice",
-            backdated,
-            Some(Duration::from_secs(5)),
-        ))
-        .await;
+    cache.store(position_with_received_at(
+        "alice",
+        backdated,
+        Some(Duration::from_secs(5)),
+    ));
 
     // Insert a fresh entry that should NOT expire — pin the per-entry
     // semantics so a regression that uses a global "all-or-nothing"
     // expiry is caught.
-    cache
-        .store(position_with_received_at(
-            "bob",
-            SystemTime::now(),
-            Some(Duration::from_secs(3600)),
-        ))
-        .await;
+    cache.store(position_with_received_at(
+        "bob",
+        SystemTime::now(),
+        Some(Duration::from_secs(3600)),
+    ));
 
-    let visible = cache.get_all().await;
+    let visible = cache.get_all();
     let names: Vec<&str> = visible.iter().map(|m| &*m.source.cn).collect();
     assert!(
         !names.contains(&"alice"),
@@ -117,17 +113,15 @@ async fn clock_jump_backwards_does_not_evict_entries() {
     // the future; the entry must survive every TTL filter.
     let cache = PositionCache::new();
     let future_received = SystemTime::now() + Duration::from_secs(30);
-    cache
-        .store(position_with_received_at(
-            "from-the-future",
-            future_received,
-            Some(Duration::from_secs(1)),
-        ))
-        .await;
+    cache.store(position_with_received_at(
+        "from-the-future",
+        future_received,
+        Some(Duration::from_secs(1)),
+    ));
 
     // The 1s TTL would otherwise be long-expired given normal time
     // arithmetic; the backwards-clock branch must rescue this entry.
-    let visible = cache.get_all().await;
+    let visible = cache.get_all();
     assert_eq!(
         visible.len(),
         1,
@@ -136,7 +130,7 @@ async fn clock_jump_backwards_does_not_evict_entries() {
     assert_eq!(&*visible[0].source.cn, "from-the-future");
 
     // Sweep must also leave the entry alone.
-    let removed = cache.sweep().await;
+    let removed = cache.sweep();
     assert_eq!(
         removed, 0,
         "sweep must not remove future-stamped entries (clock-backwards safety)"
@@ -156,14 +150,12 @@ async fn paused_runtime_drives_sweep_task_deterministically() {
     // Both must work together for the chaos signal to be meaningful.
     let cache = Arc::new(PositionCache::new());
     let backdated = SystemTime::now() - Duration::from_secs(10);
-    cache
-        .store(position_with_received_at(
-            "stale",
-            backdated,
-            Some(Duration::from_secs(1)),
-        ))
-        .await;
-    assert_eq!(cache.len().await, 1);
+    cache.store(position_with_received_at(
+        "stale",
+        backdated,
+        Some(Duration::from_secs(1)),
+    ));
+    assert_eq!(cache.len(), 1);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = cache.start_sweep_task_with_interval(shutdown_rx, Duration::from_millis(100));
@@ -180,7 +172,7 @@ async fn paused_runtime_drives_sweep_task_deterministically() {
     // pending, so this is bounded but deterministic.
     let drained = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if cache.len().await == 0 {
+            if cache.len() == 0 {
                 return;
             }
             tokio::time::advance(Duration::from_millis(110)).await;
@@ -192,11 +184,7 @@ async fn paused_runtime_drives_sweep_task_deterministically() {
         drained.is_ok(),
         "paused-time advance past interval must drive a sweep cycle"
     );
-    assert_eq!(
-        cache.len().await,
-        0,
-        "expired entry must be removed by the sweep"
-    );
+    assert_eq!(cache.len(), 0, "expired entry must be removed by the sweep");
 
     // Clean shutdown.
     shutdown_tx.send(true).unwrap();
@@ -212,14 +200,12 @@ async fn sweep_does_not_fire_before_first_interval_elapses() {
     // immediately would silently retire entries that the operator
     // expects to survive their first interval.
     let cache = Arc::new(PositionCache::new());
-    cache
-        .store(position_with_received_at(
-            "stale",
-            SystemTime::now() - Duration::from_secs(10),
-            Some(Duration::from_secs(1)),
-        ))
-        .await;
-    assert_eq!(cache.len().await, 1);
+    cache.store(position_with_received_at(
+        "stale",
+        SystemTime::now() - Duration::from_secs(10),
+        Some(Duration::from_secs(1)),
+    ));
+    assert_eq!(cache.len(), 1);
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let _handle = cache.start_sweep_task_with_interval(shutdown_rx, Duration::from_secs(60));
@@ -230,7 +216,7 @@ async fn sweep_does_not_fire_before_first_interval_elapses() {
     tokio::task::yield_now().await;
 
     assert_eq!(
-        cache.len().await,
+        cache.len(),
         1,
         "sweep must not fire before first interval elapses (entry should still be present)"
     );
@@ -248,18 +234,16 @@ async fn clock_jump_zero_ttl_excludes_entry_on_next_read() {
     // Duration::ZERO`. Any non-zero elapsed time exceeds the zero
     // TTL, so the entry must be filtered.
     let cache = PositionCache::new();
-    cache
-        .store(position_with_received_at(
-            "zero-ttl",
-            SystemTime::now() - Duration::from_millis(1),
-            Some(Duration::ZERO),
-        ))
-        .await;
+    cache.store(position_with_received_at(
+        "zero-ttl",
+        SystemTime::now() - Duration::from_millis(1),
+        Some(Duration::ZERO),
+    ));
 
     // The store call itself does not filter — it only inserts. The
     // filtering happens on `get_all`.
-    assert_eq!(cache.len().await, 1, "store must persist the entry");
-    let visible = cache.get_all().await;
+    assert_eq!(cache.len(), 1, "store must persist the entry");
+    let visible = cache.get_all();
     assert!(
         visible.is_empty(),
         "TTL=0 with elapsed > 0 must be filtered from get_all (got {visible:?})"
