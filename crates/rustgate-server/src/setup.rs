@@ -306,10 +306,32 @@ pub(crate) async fn bind_tls_listener(
             _ => None,
         };
 
-    let inner_verifier = match &crl_store {
-        Some(store) => tls_config.build_dynamic_crl_verifier(store)?,
-        None => tls_config.build_default_verifier()?,
-    };
+    // Opt-in fail-closed staleness gate (#1496, ADR-0025 Piece 2). Only wired
+    // when both a hot-reloadable CRL store exists AND `--crl-fail-closed` is
+    // set; otherwise the verifier stays fail-open (the default). The gate is
+    // driven by the CRL watcher below on every refresh tick.
+    let fail_closed_gate: Option<std::sync::Arc<rustgate_tls::FailClosedGate>> =
+        match (&crl_store, cli.tls.crl_fail_closed) {
+            (Some(_), true) => Some(rustgate_tls::FailClosedGate::new(
+                std::time::Duration::from_secs(cli.tls.crl_grace_secs),
+            )),
+            (None, true) => {
+                tracing::warn!(
+                    "--crl-fail-closed has no effect without --crl and \
+                     --crl-refresh-interval > 0; nothing drives the staleness gate"
+                );
+                None
+            }
+            _ => None,
+        };
+
+    let inner_verifier: std::sync::Arc<dyn rustgate_transport::ClientCertVerifier> =
+        match &crl_store {
+            Some(store) => {
+                tls_config.build_dynamic_crl_verifier_with_gate(store, fail_closed_gate.clone())?
+            }
+            None => tls_config.build_default_verifier()?,
+        };
 
     // Optionally wrap the inner verifier with the client-cert OCSP
     // verifier so revoked client certificates can be detected
@@ -447,9 +469,24 @@ pub(crate) async fn bind_tls_listener(
     // were given, gated above). The dynamic verifier built from this store
     // observes each new generation on the next handshake.
     if let Some(store) = &crl_store {
-        store.spawn_watcher(std::time::Duration::from_secs(cli.tls.crl_refresh_interval));
+        // When the fail-closed gate is active, drive it from the watcher: each
+        // tick re-evaluates freshness (even on an unchanged file) and engages
+        // or releases the gate. Without the gate this is the plain watcher.
+        let observer: Option<rustgate_tls::CrlHealthObserver> =
+            fail_closed_gate.as_ref().map(|gate| {
+                let gate = std::sync::Arc::clone(gate);
+                std::sync::Arc::new(move |health: &rustgate_tls::CrlHealth| {
+                    gate.observe(health.all_stale);
+                }) as rustgate_tls::CrlHealthObserver
+            });
+        store.spawn_watcher_with_observer(
+            std::time::Duration::from_secs(cli.tls.crl_refresh_interval),
+            observer,
+        );
         tracing::info!(
             interval_secs = cli.tls.crl_refresh_interval,
+            fail_closed = cli.tls.crl_fail_closed,
+            grace_secs = cli.tls.crl_grace_secs,
             "live CRL refresh enabled; published revocations apply without restart"
         );
     }

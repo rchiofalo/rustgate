@@ -14,6 +14,8 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -21,7 +23,128 @@ use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error, RootCertStore, SignatureScheme};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+/// Monotonic clock source for the fail-closed grace timer.
+///
+/// Abstracted behind a trait so tests can drive the grace deadline
+/// deterministically without sleeping. Production uses [`SystemClock`]
+/// ([`Instant::now`]); tests inject a controllable fake.
+pub trait GraceClock: Send + Sync {
+    /// Current monotonic instant.
+    fn now(&self) -> Instant;
+}
+
+/// Real monotonic clock backed by [`Instant::now`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl GraceClock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// Opt-in fail-closed staleness gate for the live CRL verifier (ADR-0025
+/// Piece 2, M-10).
+///
+/// When enabled, the gate observes CRL freshness on every watcher tick and,
+/// once **every** parsed CRL has been stale continuously for longer than the
+/// configured grace window, engages `deny_all`: the [`DynamicCertVerifier`]
+/// then rejects *all* client-certificate handshakes at the top of
+/// [`DynamicCertVerifier::verify_client_cert`], before delegating to the inner
+/// `WebPkiClientVerifier`. A fresh, non-stale CRL clears the gate synchronously
+/// on the reload path so recovery does not wait for inbound traffic.
+///
+/// The gate is `deny_all` + a grace deadline behind a small mutex touched only
+/// on watcher ticks and reloads — never on the handshake hot path, which reads
+/// `deny_all` with a single relaxed atomic load.
+pub struct FailClosedGate {
+    /// Hot-path flag: `true` rejects every client-cert handshake. Read with a
+    /// relaxed atomic load in `verify_client_cert`; written only from
+    /// [`FailClosedGate::observe`] / [`FailClosedGate::clear`].
+    deny_all: AtomicBool,
+    /// Grace window: how long the CRL set must remain continuously stale
+    /// before the gate engages. Zero engages immediately on the first
+    /// observed all-stale tick.
+    grace: Duration,
+    /// Deadline bookkeeping, guarded because the watcher-tick observation is
+    /// off the hot path. `None` means "not currently in a staleness window".
+    stale_since: Mutex<Option<Instant>>,
+    clock: Arc<dyn GraceClock>,
+}
+
+impl fmt::Debug for FailClosedGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FailClosedGate")
+            .field("deny_all", &self.deny_all.load(Ordering::Relaxed))
+            .field("grace_secs", &self.grace.as_secs())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FailClosedGate {
+    /// Build a gate with the given grace window using the real system clock.
+    pub fn new(grace: Duration) -> Arc<Self> {
+        Self::with_clock(grace, Arc::new(SystemClock))
+    }
+
+    /// Build a gate with an injected clock (test seam).
+    pub fn with_clock(grace: Duration, clock: Arc<dyn GraceClock>) -> Arc<Self> {
+        Arc::new(Self {
+            deny_all: AtomicBool::new(false),
+            grace,
+            stale_since: Mutex::new(None),
+            clock,
+        })
+    }
+
+    /// Hot-path read: is the gate currently rejecting all handshakes?
+    pub fn is_engaged(&self) -> bool {
+        self.deny_all.load(Ordering::Relaxed)
+    }
+
+    /// Observe the latest CRL freshness. Call on every watcher tick and on
+    /// every reload — including ticks where the file bytes were unchanged, so
+    /// a set that ages into staleness still engages the gate.
+    ///
+    /// * `all_stale == false` → healthy: clear any staleness window and
+    ///   release `deny_all` synchronously (ADR revision 2 — recovery must not
+    ///   wait for inbound traffic).
+    /// * `all_stale == true` → start (or continue) the grace timer; engage
+    ///   `deny_all` only once `grace` has elapsed since the window opened.
+    pub fn observe(&self, all_stale: bool) {
+        if !all_stale {
+            self.clear();
+            return;
+        }
+        let now = self.clock.now();
+        let mut stale_since = self.stale_since.lock();
+        let opened = *stale_since.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(opened);
+        if elapsed >= self.grace && !self.deny_all.swap(true, Ordering::Relaxed) {
+            drop(stale_since);
+            warn!(
+                grace_secs = self.grace.as_secs(),
+                "CRL fail-closed engaged: all CRLs stale past grace window, \
+                 rejecting all client-cert handshakes until a fresh CRL is published"
+            );
+            rustgate_core::audit::crl_fail_closed_engaged(self.grace.as_secs());
+        }
+    }
+
+    /// Release the gate and reset the staleness window. Idempotent — only logs
+    /// and emits an audit event on an actual engaged→clear transition.
+    pub fn clear(&self) {
+        let mut stale_since = self.stale_since.lock();
+        *stale_since = None;
+        if self.deny_all.swap(false, Ordering::Relaxed) {
+            drop(stale_since);
+            info!("CRL fail-closed cleared: fresh CRL observed, resuming client-cert handshakes");
+            rustgate_core::audit::crl_fail_closed_cleared();
+        }
+    }
+}
 
 /// Provides a fresh root certificate store and its generation number.
 ///
@@ -72,6 +195,10 @@ struct CachedVerifier {
 pub struct DynamicCertVerifier {
     provider: RootStoreProvider,
     crl_provider: CrlProvider,
+    /// Opt-in fail-closed staleness gate. When present and engaged, every
+    /// `verify_client_cert` call is rejected before the inner verifier runs.
+    /// `None` (the default) preserves the original fail-open behavior.
+    fail_closed: Option<Arc<FailClosedGate>>,
     cached: Mutex<CachedVerifier>,
     /// Current root-hint subjects. Replaced atomically on every trust
     /// store generation advance so handshakes always see the live
@@ -150,6 +277,19 @@ impl DynamicCertVerifier {
         provider: RootStoreProvider,
         crl_provider: CrlProvider,
     ) -> Result<Arc<Self>, Error> {
+        Self::with_crl_provider_and_gate(provider, crl_provider, None)
+    }
+
+    /// Like [`with_crl_provider`](Self::with_crl_provider), but also attaches an
+    /// opt-in [`FailClosedGate`]. When `fail_closed` is `Some` and the gate is
+    /// engaged, [`verify_client_cert`](Self::verify_client_cert) rejects every
+    /// handshake before delegating to the inner verifier. Passing `None`
+    /// preserves the original fail-open behavior (#1496, ADR-0025 Piece 2).
+    pub fn with_crl_provider_and_gate(
+        provider: RootStoreProvider,
+        crl_provider: CrlProvider,
+        fail_closed: Option<Arc<FailClosedGate>>,
+    ) -> Result<Arc<Self>, Error> {
         let (generation, root_store) = provider();
         let (crl_generation, crls) = crl_provider();
         let initial_subjects: &'static [DistinguishedName] = Vec::leak(root_store.subjects());
@@ -159,6 +299,7 @@ impl DynamicCertVerifier {
         Ok(Arc::new(Self {
             provider,
             crl_provider,
+            fail_closed,
             cached: Mutex::new(CachedVerifier {
                 generation,
                 crl_generation,
@@ -166,6 +307,13 @@ impl DynamicCertVerifier {
             }),
             current_subjects: ArcSwap::from_pointee(initial_subjects),
         }))
+    }
+
+    /// The attached fail-closed gate, if any. Callers (e.g. the CRL watcher in
+    /// `rustgate-server::setup`) drive [`FailClosedGate::observe`] through this
+    /// handle on every refresh tick.
+    pub fn fail_closed_gate(&self) -> Option<&Arc<FailClosedGate>> {
+        self.fail_closed.as_ref()
     }
 
     /// Build a `WebPkiClientVerifier` from the given root store and CRLs.
@@ -269,6 +417,17 @@ impl ClientCertVerifier for DynamicCertVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
+        // Fail-closed staleness gate (opt-in). Consulted BEFORE building or
+        // delegating to the inner verifier so a "good" OCSP verdict from an
+        // outer wrapper (which delegates to this method first) cannot override
+        // it. A single relaxed atomic load on the hot path.
+        if let Some(gate) = &self.fail_closed
+            && gate.is_engaged()
+        {
+            return Err(Error::General(
+                "client cert rejected: CRL stale, fail-closed engaged".to_string(),
+            ));
+        }
         let verifier = self.current_verifier()?;
         verifier.verify_client_cert(end_entity, intermediates, now)
     }
@@ -833,5 +992,178 @@ mod tests {
         let as_trait: Arc<dyn ClientCertVerifier> = verifier;
         assert!(!as_trait.root_hint_subjects().is_empty());
         assert!(!as_trait.supported_verify_schemes().is_empty());
+    }
+
+    // ---- Fail-closed staleness gate (ADR-0025 Piece 2, M-10) ----
+
+    use std::sync::Mutex as StdMutex;
+
+    /// Controllable clock for deterministic grace-window tests.
+    struct FakeClock {
+        now: StdMutex<Instant>,
+    }
+
+    impl FakeClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                now: StdMutex::new(Instant::now()),
+            })
+        }
+
+        fn advance(&self, by: Duration) {
+            let mut g = self.now.lock().unwrap();
+            *g += by;
+        }
+    }
+
+    impl GraceClock for FakeClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    /// Build a dynamic verifier whose inner `WebPkiClientVerifier` is valid,
+    /// wired to a fail-closed gate, so we can prove the gate short-circuits
+    /// `verify_client_cert` before the inner verifier ever runs.
+    fn verifier_with_gate(gate: Arc<FailClosedGate>) -> Arc<DynamicCertVerifier> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = test_root_store();
+        DynamicCertVerifier::with_crl_provider_and_gate(
+            Box::new(move || (0, store.clone())),
+            {
+                let empty: Arc<Vec<CertificateRevocationListDer<'static>>> = Arc::new(Vec::new());
+                Box::new(move || (0, Arc::clone(&empty)))
+            },
+            Some(gate),
+        )
+        .expect("build verifier with gate")
+    }
+
+    #[test]
+    fn gate_engaged_rejects_before_delegating_to_inner() {
+        let clock = FakeClock::new();
+        let gate = FailClosedGate::with_clock(Duration::from_secs(0), clock);
+        let verifier = verifier_with_gate(Arc::clone(&gate));
+
+        // Engage the gate via an all-stale observation (grace 0 => immediate).
+        gate.observe(true);
+        assert!(gate.is_engaged());
+
+        // A bogus end-entity would be rejected by the inner verifier anyway,
+        // but the gate must short-circuit with its OWN error string, proving
+        // the inner verifier was never consulted.
+        let bogus = CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
+        let err = verifier
+            .verify_client_cert(&bogus, &[], UnixTime::now())
+            .expect_err("engaged gate must reject");
+        match err {
+            Error::General(msg) => assert!(
+                msg.contains("fail-closed engaged"),
+                "expected fail-closed error, got: {msg}"
+            ),
+            other => panic!("expected General fail-closed error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grace_zero_engages_immediately_on_all_stale() {
+        let clock = FakeClock::new();
+        let gate = FailClosedGate::with_clock(Duration::from_secs(0), Arc::clone(&clock) as _);
+        assert!(!gate.is_engaged());
+        gate.observe(true);
+        assert!(gate.is_engaged(), "grace 0 must engage on first all-stale");
+    }
+
+    #[test]
+    fn grace_window_defers_engagement_until_deadline() {
+        let clock = FakeClock::new();
+        let gate = FailClosedGate::with_clock(Duration::from_secs(30), Arc::clone(&clock) as _);
+
+        // Window opens but grace not yet elapsed.
+        gate.observe(true);
+        assert!(!gate.is_engaged(), "must not engage before grace elapses");
+
+        // Still short of the deadline.
+        clock.advance(Duration::from_secs(29));
+        gate.observe(true);
+        assert!(!gate.is_engaged(), "still within grace window");
+
+        // Cross the deadline.
+        clock.advance(Duration::from_secs(2));
+        gate.observe(true);
+        assert!(gate.is_engaged(), "must engage once grace elapses");
+    }
+
+    #[test]
+    fn fresh_generation_clears_gate_synchronously() {
+        let clock = FakeClock::new();
+        let gate = FailClosedGate::with_clock(Duration::from_secs(0), Arc::clone(&clock) as _);
+
+        gate.observe(true);
+        assert!(gate.is_engaged());
+
+        // A healthy (not all-stale) observation must clear the gate right away,
+        // without any handshake — recovery does not wait for inbound traffic.
+        gate.observe(false);
+        assert!(
+            !gate.is_engaged(),
+            "fresh CRL must clear the gate synchronously"
+        );
+    }
+
+    #[test]
+    fn stale_window_resets_after_recovery() {
+        let clock = FakeClock::new();
+        let gate = FailClosedGate::with_clock(Duration::from_secs(30), Arc::clone(&clock) as _);
+
+        // Open a window, then recover before the deadline — the window resets.
+        gate.observe(true);
+        clock.advance(Duration::from_secs(20));
+        gate.observe(false);
+        assert!(!gate.is_engaged());
+
+        // A new stale window must count from zero again, not from the old open.
+        gate.observe(true);
+        clock.advance(Duration::from_secs(20));
+        gate.observe(true);
+        assert!(
+            !gate.is_engaged(),
+            "recovery must reset the staleness clock, not accumulate"
+        );
+        clock.advance(Duration::from_secs(11));
+        gate.observe(true);
+        assert!(gate.is_engaged());
+    }
+
+    #[test]
+    fn healthy_observation_never_engages_gate() {
+        // ADR revision 3 posture: a healthy (`all_stale == false`) observation
+        // — e.g. an empty-but-fresh CRL with a future nextUpdate and zero
+        // revoked serials — must never engage the gate, even with grace 0.
+        let clock = FakeClock::new();
+        let gate = FailClosedGate::with_clock(Duration::from_secs(0), clock);
+        for _ in 0..5 {
+            gate.observe(false);
+            assert!(!gate.is_engaged(), "healthy CRL must not engage the gate");
+        }
+    }
+
+    #[test]
+    fn no_gate_stays_fail_open() {
+        // Without a gate the verifier preserves the original behavior: a valid
+        // inner verifier is always consulted; there is no deny-all path.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let store = test_root_store();
+        let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
+            .expect("build verifier");
+        assert!(verifier.fail_closed_gate().is_none());
+    }
+
+    #[test]
+    fn gate_debug_redacts_via_non_exhaustive() {
+        let gate = FailClosedGate::new(Duration::from_secs(5));
+        let dbg = format!("{gate:?}");
+        assert!(dbg.contains("FailClosedGate"));
+        assert!(dbg.contains("grace_secs"));
     }
 }

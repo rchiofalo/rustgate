@@ -1107,6 +1107,61 @@ mod tests {
     /// `Arc::downgrade`-based lifecycle against a regression that
     /// upgraded to a strong reference (which would create a cycle and
     /// leak the task).
+    /// ADR-0025 Piece 2 composition invariant: when the inner
+    /// `DynamicCertVerifier` has its fail-closed gate engaged, the outer
+    /// `ClientOcspVerifier` MUST reject regardless of a "good" OCSP verdict.
+    /// The wrapper runs the inner `verify_client_cert` first with `?`, so an
+    /// engaged gate short-circuits before OCSP is ever consulted (#1496).
+    #[tokio::test]
+    async fn ocsp_wrapper_cannot_override_engaged_fail_closed_gate() {
+        let (_, leaf_der) = build_inner_and_certs();
+
+        // Real dynamic inner verifier with an engaged fail-closed gate.
+        let ca = rustgate_test_utils::certs::TestCa::new("FC Gate OCSP CA");
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pki_types::pem::PemObject::pem_slice_iter(ca.cert_pem.as_bytes())
+            .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+            .unwrap()
+        {
+            roots.add(c).unwrap();
+        }
+        let gate = crate::verifier::FailClosedGate::new(std::time::Duration::from_secs(0));
+        gate.observe(true);
+        assert!(gate.is_engaged());
+        let empty_crls: Arc<Vec<rustls::pki_types::CertificateRevocationListDer<'static>>> =
+            Arc::new(Vec::new());
+        let inner = crate::verifier::DynamicCertVerifier::with_crl_provider_and_gate(
+            Box::new(move || (0, roots.clone())),
+            Box::new(move || (0, Arc::clone(&empty_crls))),
+            Some(gate),
+        )
+        .unwrap();
+
+        let fetcher = Arc::new(FakeFetcher {
+            good: true,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier = ClientOcspVerifier::new(inner, fetcher, None, None);
+        // Seed a Good OCSP verdict so the ONLY thing that can reject is the
+        // inner gate.
+        let fp = cache_key(leaf_der.as_ref());
+        verifier.schedule_fetch(fp.clone(), leaf_der.as_ref().to_vec(), Vec::new());
+        for _ in 0..50 {
+            if matches!(verifier.cached_status(&fp), Some(CachedStatus::Good { .. })) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let err = verifier
+            .verify_client_cert(&leaf_der, &[], UnixTime::now())
+            .expect_err("engaged inner gate must reject despite a Good OCSP verdict");
+        assert!(
+            format!("{err}").contains("fail-closed engaged"),
+            "wrapper must surface the inner fail-closed error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn spawned_task_exits_when_verifier_arc_is_dropped() {
         let (inner, _) = build_inner_and_certs();

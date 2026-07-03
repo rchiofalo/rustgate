@@ -230,6 +230,24 @@ pub(crate) struct TlsArgs {
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CRL_REFRESH_INTERVAL")]
     pub(crate) crl_refresh_interval: u64,
 
+    /// Reject **all** client-certificate handshakes once every loaded CRL has
+    /// gone stale (its `nextUpdate` is in the past) past `--crl-grace-secs`.
+    /// Opt-in and default `false` — a default deployment stays fail-open,
+    /// byte-for-byte unchanged. No-op without `--crl` and
+    /// `--crl-refresh-interval > 0`. A fresh, non-stale CRL clears the gate
+    /// immediately on the next refresh tick. Trade-off: with a single CRL a
+    /// stalled publisher rejects the whole fleet after the grace window — that
+    /// is the intended availability-for-security posture (#1496, ADR-0025).
+    #[arg(long, default_value_t = false, env = "RUSTGATE_CRL_FAIL_CLOSED")]
+    pub(crate) crl_fail_closed: bool,
+
+    /// Grace window, in seconds, that the CRL set may remain continuously stale
+    /// before `--crl-fail-closed` engages. `0` (the default) engages
+    /// immediately on the first observed all-stale refresh tick. Ignored
+    /// unless `--crl-fail-closed` is set.
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_CRL_GRACE_SECS")]
+    pub(crate) crl_grace_secs: u64,
+
     /// Require FIPS 140-3 crypto provider. Startup fails if the FIPS provider
     /// is not active. Build with --features fips to enable.
     #[arg(long, default_value_t = false, env = "RUSTGATE_FIPS_REQUIRED")]
@@ -2682,6 +2700,8 @@ define_config_file! {
     tls_min_version in tls: String,
     crl_warn_stale in tls: bool,
     crl_refresh_interval in tls: u64,
+    crl_fail_closed in tls: bool,
+    crl_grace_secs in tls: u64,
     fips_required in tls: bool,
     air_gap in tls: bool,
     prefer_post_quantum in tls: bool,

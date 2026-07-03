@@ -2973,7 +2973,9 @@ async fn reload_all_configs(
                     crl_count = summary.count as u64,
                     crl_max_age_seconds = summary.max_age_seconds.unwrap_or_default(),
                     path = %path,
-                    "CRL re-parsed (restart server to apply changes to active listener)"
+                    "CRL re-parsed for SIGHUP validation; the live listener picks up \
+                     changes automatically when --crl-refresh-interval is set, otherwise \
+                     restart the server to apply them"
                 );
                 ComponentReloadOutcome {
                     result: "success",
