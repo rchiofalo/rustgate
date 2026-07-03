@@ -64,6 +64,7 @@ does.
 | [0032](0032-meshtastic-serial-ingress-seam.md) | Meshtastic LoRa / serial ingress seam (non-IP admission; transport-owned de-encapsulation/decryption; serial-vs-bridge transport deferred) | Proposed |
 | [0033](0033-http-client-stack.md) | `reqwest` (rustls-only) as the sanctioned outbound-HTTP client; `hyper-util` migration deferred | Documented |
 | [0034](0034-multi-tenant-at-rest-isolation.md) | Per-tenant at-rest crypto isolation for archives (tenant→key-id resolver) | Proposed |
+| [0035](0035-routablemessage-entity-attach.md) | Attach an optional parsed `Entity` to `RoutableMessage` (additive; inference fast path + Foundry outbound consumer) | Proposed |
 
 ## Authoring a new ADR
 

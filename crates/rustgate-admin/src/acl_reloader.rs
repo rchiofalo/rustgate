@@ -339,6 +339,7 @@ mod tests {
                 "test".to_string(),
                 rustgate_core::message::MessageType::Chat,
             ),
+            entity: None,
         };
         router.route(msg).await;
         assert!(nrx_a.try_recv().is_ok(), "alice must receive in open mode");
@@ -357,6 +358,7 @@ mod tests {
                 "test".to_string(),
                 rustgate_core::message::MessageType::Chat,
             ),
+            entity: None,
         };
         router.route(msg).await;
         assert!(

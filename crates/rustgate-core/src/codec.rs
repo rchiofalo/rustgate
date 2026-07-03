@@ -154,6 +154,7 @@ mod tests {
                 "test".to_string(),
                 MessageType::Other("test".to_string()),
             ),
+            entity: None,
         }
     }
 

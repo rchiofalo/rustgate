@@ -43,6 +43,7 @@ fn make_msg(payload: &[u8], cn: &str, msg_type: MessageType) -> RoutableMessage 
         destination: Destination::Broadcast,
         payload: Bytes::from(payload.to_vec()),
         metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), msg_type),
+        entity: None,
     }
 }
 

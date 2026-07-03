@@ -265,3 +265,65 @@ async fn inbound_change_stream_reaches_subscribers() {
     assert_eq!(evt.object_id, ObjectId("X".into()));
     assert_eq!(evt.change_type, ChangeType::Created);
 }
+
+// ── #1540 attached-entity outbound path (ADR 0035) ──────────────────
+
+fn message_with_entity(entity: Option<Entity>) -> rustgate_core::message::RoutableMessage {
+    use rustgate_core::identity::Identity;
+    use rustgate_core::message::{Destination, MessageType, Metadata, RoutableMessage};
+
+    let msg = RoutableMessage {
+        source: Identity::plaintext("foundry-test".into(), Default::default())
+            .expect("plaintext identity"),
+        destination: Destination::Broadcast,
+        payload: bytes::Bytes::from_static(b"<event/>"),
+        metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Position),
+        entity: None,
+    };
+    match entity {
+        Some(e) => msg.with_entity(e),
+        None => msg,
+    }
+}
+
+#[tokio::test]
+async fn handle_outbound_dispatches_attached_entity_to_bridge() {
+    // #1540: when the envelope carries an attached Entity, the outbound
+    // handler must project + upsert it through the bridge — the same
+    // observable effect as `dispatch_entity`.
+    let mock = MockFoundryBridge::new();
+    let bridge: Arc<dyn FoundryBridge> = Arc::new(mock.clone());
+    let cfg = config();
+    let mappers = testing::build_mapper_table_for_test(&cfg.object_types);
+    let mut queue = testing::fresh_queue();
+
+    let msg = message_with_entity(Some(ground_entity("DELTA-1", "delta", 10.0, 20.0, 3.0)));
+    testing::handle_outbound_for_test(&bridge, &mappers, &mut queue, msg).await;
+
+    let stored = mock.stored_objects();
+    assert_eq!(stored.len(), 1, "attached entity must produce one upsert");
+    let ((type_id, uid), props) = &stored[0];
+    assert_eq!(type_id, "mil-track-dismount");
+    assert_eq!(uid, "DELTA-1");
+    assert_eq!(props.as_object().unwrap()["callSign"], "delta");
+}
+
+#[tokio::test]
+async fn handle_outbound_without_entity_is_a_noop_scaffold() {
+    // Control: with no attached entity — the shape at every router
+    // ingress today — the handler drops the message without upserting.
+    let mock = MockFoundryBridge::new();
+    let bridge: Arc<dyn FoundryBridge> = Arc::new(mock.clone());
+    let cfg = config();
+    let mappers = testing::build_mapper_table_for_test(&cfg.object_types);
+    let mut queue = testing::fresh_queue();
+
+    testing::handle_outbound_for_test(&bridge, &mappers, &mut queue, message_with_entity(None))
+        .await;
+
+    assert!(
+        mock.stored_objects().is_empty(),
+        "a message with no attached entity must not upsert (deliberate scaffold)"
+    );
+    assert_eq!(testing::queue_depth(&queue), 0);
+}

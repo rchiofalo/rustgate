@@ -275,6 +275,7 @@ async fn udp_multicast_rebroadcast_emits_to_configured_group() {
             "tcp".into(),
             MessageType::Position,
         ),
+        entity: None,
     };
     let _ = router.route_for_egress(msg).await;
     // Drain the listener channels so they don't block the router.
@@ -356,6 +357,7 @@ async fn udp_multicast_rate_limit_caps_outbound_bps() {
                 "tcp".into(),
                 MessageType::Position,
             ),
+            entity: None,
         };
         let _ = router.route_for_egress(msg).await;
         // Drain to avoid back-pressure on the router.

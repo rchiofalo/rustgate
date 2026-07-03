@@ -65,6 +65,7 @@ fn position_message(uid: &str, group: &str, lat: f64, lon: f64) -> RoutableMessa
         destination: Destination::Broadcast,
         payload: cot_position_xml(uid, lat, lon),
         metadata: Metadata::new(SystemTime::now(), "tak".to_string(), MessageType::Position),
+        entity: None,
     }
 }
 
@@ -554,6 +555,7 @@ async fn non_position_messages_filtered() {
         destination: Destination::Broadcast,
         payload: chat_xml,
         metadata: Metadata::new(SystemTime::now(), "tak".to_string(), MessageType::Chat),
+        entity: None,
     };
 
     adapter.publisher().publish(&chat_msg).await;
@@ -600,6 +602,7 @@ async fn non_position_messages_published() {
         destination: Destination::Broadcast,
         payload: chat_xml,
         metadata: Metadata::new(SystemTime::now(), "tak".to_string(), MessageType::Chat),
+        entity: None,
     };
 
     adapter.publisher().publish(&chat_msg).await;
@@ -661,6 +664,7 @@ async fn unknown_position_filtered() {
             9_999_999.0,
         ),
         metadata: Metadata::new(SystemTime::now(), "tak".to_string(), MessageType::Position),
+        entity: None,
     };
     adapter.publisher().publish(&msg).await;
 

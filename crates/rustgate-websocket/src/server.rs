@@ -1225,6 +1225,7 @@ mod tests {
                 "test".into(),
                 rustgate_core::message::MessageType::Other("test".into()),
             ),
+            entity: None,
         };
 
         let cloned = Arc::clone(&cb);
@@ -1317,6 +1318,7 @@ mod tests {
                 "test".into(),
                 rustgate_core::message::MessageType::Other("test".into()),
             ),
+            entity: None,
         };
         cb(msg);
 

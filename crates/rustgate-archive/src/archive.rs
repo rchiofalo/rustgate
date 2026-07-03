@@ -634,6 +634,7 @@ mod tests {
                 "cot".to_string(),
                 rustgate_core::message::MessageType::Position,
             ),
+            entity: None,
         };
 
         archiver.record(&msg).await;
@@ -701,6 +702,7 @@ mod tests {
                 "cot".to_string(),
                 rustgate_core::message::MessageType::Position,
             ),
+            entity: None,
         };
 
         archiver.record(&msg).await;
@@ -1009,6 +1011,7 @@ mod tests {
                 "cot".to_string(),
                 rustgate_core::message::MessageType::Position,
             ),
+            entity: None,
         }
     }
 
@@ -1209,6 +1212,7 @@ mod tests {
                 "cot".to_string(),
                 rustgate_core::message::MessageType::Position,
             ),
+            entity: None,
         };
 
         archiver.record(&msg).await;

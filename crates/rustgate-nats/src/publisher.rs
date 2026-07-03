@@ -361,6 +361,7 @@ mod tests {
             destination: rustgate_core::message::Destination::Broadcast,
             payload: bytes::Bytes::new(),
             metadata: meta,
+            entity: None,
         }
     }
 

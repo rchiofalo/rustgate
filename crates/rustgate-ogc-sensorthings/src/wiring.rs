@@ -344,6 +344,7 @@ fn observation_to_message(
             // not the routing-time message type.
             MessageType::Status,
         ),
+        entity: None,
     })
 }
 

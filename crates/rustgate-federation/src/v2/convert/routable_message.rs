@@ -162,6 +162,7 @@ pub fn federated_event_to_routable(
         destination,
         payload: Bytes::from(xml),
         metadata,
+        entity: None,
     })
 }
 
@@ -269,6 +270,7 @@ mod tests {
                 SOURCE_FEDERATION.to_string(),
                 MessageType::Position,
             ),
+            entity: None,
         };
 
         let event = routable_to_federated_event(&msg, &empty_metadata()).expect("conversion");
@@ -297,6 +299,7 @@ mod tests {
                 SOURCE_FEDERATION.to_string(),
                 MessageType::Position,
             ),
+            entity: None,
         };
 
         let event = routable_to_federated_event(&msg, &empty_metadata()).expect("conversion");
@@ -516,6 +519,7 @@ mod tests {
                 SOURCE_FEDERATION.to_string(),
                 MessageType::Position,
             ),
+            entity: None,
         };
 
         let event = routable_to_federated_event(&msg, &sample_metadata()).expect("to event");

@@ -45,6 +45,7 @@ fn build_message(source: &Identity, payload: &[u8], dest: Destination) -> Routab
             "tcp".into(),
             MessageType::Other("raw".into()),
         ),
+        entity: None,
     }
 }
 
@@ -745,6 +746,7 @@ async fn position_cache_replay() {
         destination: Destination::Broadcast,
         payload: Bytes::from("<event type='a-f-G'/>"),
         metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Position),
+        entity: None,
     };
     router.route(position_msg).await;
 
@@ -780,6 +782,7 @@ async fn chat_messages_not_cached() {
         destination: Destination::Broadcast,
         payload: Bytes::from("hello"),
         metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Chat),
+        entity: None,
     };
     router.route(chat_msg).await;
 
@@ -804,6 +807,7 @@ async fn position_cache_replaces_old() {
         destination: Destination::Broadcast,
         payload: Bytes::from("pos1"),
         metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Position),
+        entity: None,
     };
     router.route(pos1).await;
 
@@ -813,6 +817,7 @@ async fn position_cache_replaces_old() {
         destination: Destination::Broadcast,
         payload: Bytes::from("pos2"),
         metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Position),
+        entity: None,
     };
     router.route(pos2).await;
 
@@ -862,6 +867,7 @@ async fn expired_message_is_dropped() {
             MessageType::Other("raw".into()),
         )
         .with_ttl(std::time::Duration::from_secs(1)),
+        entity: None,
     };
     router.route(expired_msg).await;
 
@@ -904,6 +910,7 @@ async fn message_without_ttl_routes_normally() {
             "tcp".into(),
             MessageType::Other("raw".into()),
         ),
+        entity: None,
     };
     router.route(msg).await;
 
@@ -942,6 +949,7 @@ async fn non_expired_ttl_message_routes_normally() {
             MessageType::Other("raw".into()),
         )
         .with_ttl(std::time::Duration::from_secs(300)),
+        entity: None,
     };
     router.route(msg).await;
 

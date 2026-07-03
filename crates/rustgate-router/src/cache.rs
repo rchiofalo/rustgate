@@ -365,6 +365,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event/>"),
             metadata,
+            entity: None,
         }
     }
 
@@ -374,6 +375,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event/>"),
             metadata: Metadata::new(received_at, "cot".to_string(), MessageType::Position),
+            entity: None,
         }
     }
 
@@ -390,6 +392,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event/>"),
             metadata,
+            entity: None,
         }
     }
 

@@ -251,6 +251,7 @@ impl ListenerCtx {
                 SOURCE_MAVLINK.to_string(),
                 MessageType::Mavlink,
             ),
+            entity: None,
         };
         (self.sink)(msg);
     }

@@ -1011,6 +1011,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from(payload),
             metadata: meta,
+            entity: None,
         });
 
         let mut state = MartiCompatState::empty();

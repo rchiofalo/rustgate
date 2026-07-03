@@ -107,6 +107,7 @@ mod tests {
                 SOURCE_MAVLINK.into(),
                 MessageType::Mavlink,
             ),
+            entity: None,
         }
     }
 

@@ -153,6 +153,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event/>"),
             metadata: Metadata::new(SystemTime::now(), protocol.to_string(), msg_type),
+            entity: None,
         }
     }
 

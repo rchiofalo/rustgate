@@ -136,6 +136,7 @@ mod tests {
                 "test".into(),
                 MessageType::Other("test".into()),
             ),
+            entity: None,
         }
     }
 

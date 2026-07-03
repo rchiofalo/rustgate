@@ -94,6 +94,7 @@ fn make_msg(seq: usize) -> RoutableMessage {
             "tcp".to_string(),
             MessageType::Other("drain".to_string()),
         ),
+        entity: None,
     }
 }
 

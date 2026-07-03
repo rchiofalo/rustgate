@@ -1880,6 +1880,7 @@ pub(crate) fn build_federation_inbound_handler(
                 destination: Destination::Broadcast,
                 payload,
                 metadata,
+                entity: None,
             };
             // Drive through `route_for_egress` so Send-PEP obligations
             // (e.g. `MaskPoint` / `MaskPayload`) apply to the envelope

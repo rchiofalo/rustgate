@@ -307,6 +307,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from(payload.to_string()),
             metadata: meta,
+            entity: None,
         }
     }
 

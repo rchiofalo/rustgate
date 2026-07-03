@@ -328,6 +328,7 @@ impl CodecUdpInput {
                             source_protocol.clone(),
                             message_type.clone(),
                         ),
+                        entity: None,
                     };
                     router.route(msg).await;
                 }

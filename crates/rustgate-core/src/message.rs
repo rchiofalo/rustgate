@@ -52,6 +52,18 @@ pub const SOURCE_MAVLINK: &str = "mavlink";
 /// Every inbound message is wrapped in this type before entering the router.
 /// The router inspects [`destination`](Self::destination) to determine delivery
 /// targets and uses [`source`](Self::source) for group membership checks.
+///
+/// # Optional attached entity
+///
+/// [`entity`](Self::entity) carries an optional parsed
+/// [`crate::entity::Entity`] alongside the raw [`payload`](Self::payload).
+/// It is `None` at every ingress today; codecs that have already decoded
+/// the payload into a canonical entity may attach it via
+/// [`RoutableMessage::with_entity`] so downstream consumers (Foundry
+/// projection, inference back-annotation) can skip a redundant re-decode.
+/// The field is wrapped in `Arc` so the frequently-cloned envelope stays
+/// cheap on the broadcast fan-out hot path — a clone is a refcount bump,
+/// not a deep copy of the entity. See ADR 0035.
 #[derive(Debug, Clone)]
 pub struct RoutableMessage {
     /// Identity of the sender, extracted from their client certificate.
@@ -62,6 +74,33 @@ pub struct RoutableMessage {
     pub payload: Bytes,
     /// Contextual information about message origin and lifecycle.
     pub metadata: Metadata,
+    /// Optional parsed entity attached alongside [`payload`](Self::payload).
+    ///
+    /// `None` at every construction site today — this is a purely
+    /// additive field. When a codec has already produced a canonical
+    /// [`crate::entity::Entity`], attaching it here via
+    /// [`RoutableMessage::with_entity`] lets the Foundry outbound and
+    /// inference back-annotation seams consume it directly instead of
+    /// re-decoding [`payload`](Self::payload). Wrapped in `Arc` so
+    /// cloning the envelope for per-recipient fan-out stays O(1). Refs
+    /// #1540, ADR 0035.
+    pub entity: Option<Arc<crate::entity::Entity>>,
+}
+
+impl RoutableMessage {
+    /// Builder-style setter for [`RoutableMessage::entity`]. Returns
+    /// `self` for chaining, mirroring the `Metadata::with_*` builders.
+    ///
+    /// Attach a parsed entity when the ingress codec has already decoded
+    /// the payload, so the Foundry outbound and inference seams can use
+    /// it directly rather than re-decoding [`RoutableMessage::payload`].
+    /// The entity is wrapped in `Arc` internally to keep envelope clones
+    /// cheap. Refs #1540, ADR 0035.
+    #[must_use]
+    pub fn with_entity(mut self, entity: crate::entity::Entity) -> Self {
+        self.entity = Some(Arc::new(entity));
+        self
+    }
 }
 
 /// Contextual metadata attached to every routed message.
@@ -389,6 +428,11 @@ impl<'a> Arbitrary<'a> for RoutableMessage {
             destination: u.arbitrary()?,
             payload: Bytes::from(payload_bytes),
             metadata: u.arbitrary()?,
+            // Additive #1540 field: the fuzzer exercises the envelope
+            // shape with no attached entity — the attach fast path has
+            // dedicated unit coverage, and keeping this `None` preserves
+            // the pre-#1540 corpus shape.
+            entity: None,
         })
     }
 }
@@ -911,6 +955,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload,
             metadata: Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position),
+            entity: None,
         };
         let cloned = msg.clone();
         // `Bytes` clone shares the same allocation — the as_ptr values
@@ -1427,5 +1472,85 @@ mod tests {
             \"classification\":\"//UNCLASSIFIED//\"}";
         let parsed: Metadata = serde_json::from_str(with_marking).expect("with marking");
         assert!(parsed.classification.is_some());
+    }
+
+    // ── attached-entity builder coverage (refs #1540, ADR 0035) ──────
+
+    fn sample_message() -> RoutableMessage {
+        RoutableMessage {
+            source: Identity {
+                cn: "alice".into(),
+                fingerprint: "fp".into(),
+                groups: std::collections::BTreeSet::new(),
+                tenant: None,
+                spiffe_id: None,
+                attributes: std::sync::Arc::new(std::collections::BTreeMap::new()),
+            },
+            destination: Destination::Broadcast,
+            payload: Bytes::from_static(b"<event/>"),
+            metadata: Metadata::new(SystemTime::now(), "cot".into(), MessageType::Position),
+            entity: None,
+        }
+    }
+
+    fn sample_entity() -> crate::entity::Entity {
+        crate::entity::Entity {
+            uid: "track-1".into(),
+            kind: crate::entity::EntityKind::Track,
+            position: None,
+            velocity: None,
+            timestamp: SystemTime::UNIX_EPOCH,
+            callsign: None,
+            mil_std_2525_sidc: None,
+            attributes: std::collections::BTreeMap::new(),
+            taskings: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn routable_message_defaults_entity_to_none() {
+        // The additive #1540 field must default to `None` at every
+        // construction site so the attach is purely opt-in — a
+        // regression that materialised a placeholder entity would
+        // change the Foundry/inference fast-path selection for every
+        // legacy message.
+        let msg = sample_message();
+        assert!(
+            msg.entity.is_none(),
+            "a plain RoutableMessage must carry no attached entity"
+        );
+    }
+
+    #[test]
+    fn routable_message_with_entity_attaches_and_wraps_in_arc() {
+        // `with_entity` populates the slot, returns `Self` for chaining,
+        // and leaves every other field untouched. Pin that the attached
+        // entity round-trips by value so the Foundry/inference seams see
+        // exactly what was attached.
+        let entity = sample_entity();
+        let msg = sample_message().with_entity(entity.clone());
+        let attached = msg.entity.as_ref().expect("entity must be attached");
+        assert_eq!(**attached, entity);
+        // Other fields are unchanged by the builder.
+        assert_eq!(msg.metadata.source_protocol, "cot");
+        assert!(matches!(msg.destination, Destination::Broadcast));
+    }
+
+    #[test]
+    fn routable_message_with_entity_clone_shares_entity_arc() {
+        // The attach is `Arc`-wrapped so cloning the envelope for
+        // per-recipient fan-out is a refcount bump, not a deep copy of
+        // the entity. Pin the pointer-sharing contract so a regression
+        // to a bare `Entity` (which would deep-copy on every fan-out
+        // clone) fails here.
+        let msg = sample_message().with_entity(sample_entity());
+        let cloned = msg.clone();
+        let a = msg.entity.as_ref().expect("orig entity");
+        let b = cloned.entity.as_ref().expect("cloned entity");
+        assert!(
+            Arc::ptr_eq(a, b),
+            "clone must share the attached-entity Arc, not deep-copy it"
+        );
     }
 }

@@ -1655,6 +1655,7 @@ async fn replay_entry(
             entry.source_protocol.clone(),
             parse_message_type(&entry.message_type),
         ),
+        entity: None,
     };
 
     // Rate-limit and oversize checks mirror the dispatch path so a
@@ -1769,6 +1770,7 @@ fn requeue_failed_entry(
             entry.source_protocol.clone(),
             parse_message_type(&entry.message_type),
         ),
+        entity: None,
     };
     if entry.delivery_id.is_empty() {
         // Pre-migration entry without an id: re-persist with a fresh
@@ -2254,6 +2256,7 @@ mod tests {
                     protocol.to_string(),
                     rustgate_core::message::MessageType::Position,
                 ),
+                entity: None,
             };
             publisher.publish(&msg);
         }
@@ -2280,6 +2283,7 @@ mod tests {
                 "tcp".to_string(),
                 rustgate_core::message::MessageType::Position,
             ),
+            entity: None,
         }
     }
 

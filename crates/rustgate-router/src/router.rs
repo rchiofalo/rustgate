@@ -5277,6 +5277,7 @@ mod tests {
             destination: dest,
             payload: Bytes::from_static(b"<event/>"),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position),
+            entity: None,
         }
     }
 
@@ -5286,6 +5287,7 @@ mod tests {
             destination: dest,
             payload: Bytes::from_static(b"<alert/>"),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Alert),
+            entity: None,
         }
     }
 
@@ -5295,6 +5297,7 @@ mod tests {
             destination: dest,
             payload: Bytes::from_static(b"<chat/>"),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         }
     }
 
@@ -6398,6 +6401,7 @@ mod tests {
             destination: Destination::Direct((*bob).clone()),
             payload: Bytes::from_static(b"hello bob"),
             metadata: Metadata::new(SystemTime::now(), "test".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(chat).await;
 
@@ -6448,6 +6452,7 @@ mod tests {
                         "test".to_string(),
                         MessageType::Chat,
                     ),
+                    entity: None,
                 })
                 .await;
         }
@@ -6485,6 +6490,7 @@ mod tests {
                         "test".to_string(),
                         MessageType::Chat,
                     ),
+                    entity: None,
                 })
                 .await;
         }
@@ -6528,6 +6534,7 @@ mod tests {
                 destination: Destination::Direct((*bob).clone()),
                 payload: Bytes::from_static(b"m0"),
                 metadata: Metadata::new(SystemTime::now(), "test".to_string(), MessageType::Chat),
+                entity: None,
             })
             .await;
         for _ in 0..200 {
@@ -6551,6 +6558,7 @@ mod tests {
                 destination: Destination::Direct((*bob).clone()),
                 payload: Bytes::from_static(b"m1"),
                 metadata: Metadata::new(SystemTime::now(), "test".to_string(), MessageType::Chat),
+                entity: None,
             })
             .await;
         for _ in 0..200 {
@@ -6589,6 +6597,7 @@ mod tests {
             destination: Destination::Direct((*ghost).clone()),
             payload: Bytes::from_static(b"into the void"),
             metadata: Metadata::new(SystemTime::now(), "test".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(chat).await;
         assert!(router.client_queue().is_none());
@@ -6604,6 +6613,7 @@ mod tests {
             destination: dest,
             payload: Bytes::from_static(payload),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         }
     }
 
@@ -8499,6 +8509,7 @@ mod tests {
                 source_protocol.to_string(),
                 MessageType::Other("test".into()),
             ),
+            entity: None,
         }
     }
 
@@ -8663,6 +8674,7 @@ mod tests {
             destination: Destination::Direct((*alice).clone()),
             payload: Bytes::from_static(b"any"),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
 
@@ -8704,6 +8716,7 @@ mod tests {
             destination: Destination::Direct((*alice).clone()),
             payload: Bytes::from_static(b"any"),
             metadata: Metadata::new(SystemTime::now(), "no-codec".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
 
@@ -8752,6 +8765,7 @@ mod tests {
             destination: Destination::Direct((*alice).clone()),
             payload: Bytes::from_static(b"any"),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
 
@@ -8804,6 +8818,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"any"),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
 
@@ -8848,6 +8863,7 @@ mod tests {
             destination: Destination::Direct((*alice).clone()),
             payload: Bytes::from_static(b"any"),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
 
@@ -8895,6 +8911,7 @@ mod tests {
             destination: Destination::Direct((*alice).clone()),
             payload: Bytes::from_static(b"malformed"),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
 
@@ -8929,6 +8946,7 @@ mod tests {
             destination: Destination::Direct((*alice).clone()),
             payload: payload.clone(),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
 
