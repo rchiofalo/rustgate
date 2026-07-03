@@ -119,6 +119,19 @@ needs a per-deployment framing decision; the datagram leg ships in #1484),
 the same `UdpAdmission` controls on a multicast listener), and **Meshtastic**
 (LoRa/serial — a distinct radio path, not a socket).
 
+> **Update (#1492) — stream-framed STANAG 4586 per-deployment framing
+> resolved.** The "per-deployment framing decision" this bullet defers is
+> now recorded in
+> [`docs/design/stanag4586-stream-framing.md`](../design/stanag4586-stream-framing.md):
+> because the Edition 2 message wrapper is NATO-restricted and cannot be
+> guessed without creating a parser differential (D2) on an unauthenticated
+> port, delimitation is driven by an operator-supplied `StreamProfile`
+> (header length / length-field offset / width / endianness, bounded by
+> `MAX_FRAME_SIZE`). The `stanag4586::stream` scaffold (feature `stream`)
+> ships a fail-closed decoder that returns `ProfileRequired` when no profile
+> is configured; server wiring (`start_stanag4586_tcp`) remains a deliberate
+> follow-up so no unverified framer reaches a live socket.
+
 ## Alternatives considered
 
 - **One bespoke listener per protocol.** Rejected as the primary

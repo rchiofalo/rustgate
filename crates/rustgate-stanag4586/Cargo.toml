@@ -10,6 +10,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Per-deployment STANAG 4586 stream framing (`src/stream.rs`). Gated so the
+# fail-closed `StreamProfile` scaffold — which is NOT wired into any live
+# ingress path — compiles out entirely by default. See
+# `docs/design/stanag4586-stream-framing.md` and issue #1492.
+stream = []
+
 [dependencies]
 rustgate-core = { workspace = true }
 # `vehicle_position` is implemented on top of `SchemaCodec`: the YAML
