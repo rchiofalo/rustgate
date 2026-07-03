@@ -475,4 +475,44 @@ mod tests {
             "CAS must let exactly BURST messages through under contention; got {total}"
         );
     }
+
+    #[test]
+    fn timestamp_wrap_does_not_over_refill() {
+        // SEC-23 (#1561): the packed millisecond timestamp is a u32, so it
+        // wraps to 0 once every ~49.7 days of session uptime. On the single
+        // `allow()` spanning that wrap the stored `last_ms` (just below
+        // u32::MAX) exceeds the freshly-computed `now_ms` (just above 0).
+        // The refill must FAIL CLOSED — `saturating_sub` clamps the elapsed
+        // time to 0, so that one tick simply skips its refill. A naive
+        // `now_ms - last_ms` would panic in debug or wrap to a ~49-day
+        // "elapsed" in release, granting a colossal over-refill and letting
+        // a rate-limited client burst without bound (fail-open).
+        //
+        // We plant the pre-wrap state directly (the wrap can't be reached
+        // through the public API without a 50-day-uptime clock), leaving an
+        // empty bucket and a `last_ms` near u32::MAX. Because `now_ms` right
+        // after construction is ~0, this reproduces the wrap crossing.
+        let throttle = ClientThrottle::new(1000, 5);
+
+        // Empty bucket, timestamp just before the u32 wrap boundary.
+        let pre_wrap_last_ms = u32::MAX - 10;
+        throttle
+            .state
+            .store(pack(0, pre_wrap_last_ms), Ordering::Relaxed);
+
+        // The next call crosses the wrap: last_ms > now_ms. The refill must
+        // be suppressed, so the empty bucket denies the message.
+        assert!(
+            !throttle.allow(),
+            "wrap-crossing refill must fail closed, not over-refill an empty bucket"
+        );
+
+        // State must not have been corrupted into a full bucket by a
+        // runaway refill; availability stays at zero.
+        assert_eq!(
+            throttle.available(),
+            0,
+            "wrap crossing must not resurrect tokens in an exhausted bucket"
+        );
+    }
 }
