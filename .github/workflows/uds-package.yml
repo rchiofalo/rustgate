@@ -34,6 +34,13 @@ on:
       - "zarf/**"
       - "bundle/**"
       - ".github/workflows/uds-package.yml"
+  # The image-pulling jobs (zarf-create / uds-create) only work once the
+  # versioned container images are published, which happens at release
+  # time — so they are gated to `release` events (see the per-job `if:`).
+  # The cheap, image-free checks (version-triangle, uds-package-cr) still
+  # run on every push/PR above.
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -146,11 +153,15 @@ jobs:
   # be pulled. ~3-4 minutes on the GitHub runner; the image pulls
   # dominate the wall time.
   #
-  # Skips on branches that don't yet have `zarf/zarf.yaml` (same
-  # incremental-landing tolerance as `version-triangle`).
+  # Release-gated: `zarf package create` pulls the versioned rustgate /
+  # rustgate-operator images, which only exist in the registry once a
+  # release is published. On PRs / main-dev those images 403, so this
+  # job would always fail — it is therefore restricted to `release`
+  # events, where the images it needs are available.
   # ------------------------------------------------------------------
   zarf-create:
     name: zarf package create
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: version-triangle
@@ -191,11 +202,13 @@ jobs:
   # Core init package. Pulls the UDS Core init package over the
   # network.
   #
-  # Skips on branches without both `zarf/zarf.yaml` and
-  # `bundle/uds-bundle.yaml` — the bundle composition needs both.
+  # Release-gated (same rationale as zarf-create): it composes the
+  # image-bearing Zarf package from job 2 and pulls the UDS Core init
+  # package, so it can only succeed once the release images exist.
   # ------------------------------------------------------------------
   uds-create:
     name: uds bundle create
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: zarf-create
