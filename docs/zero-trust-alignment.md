@@ -607,7 +607,8 @@ gap row does not constitute a certification claim.
 
 | Gap | Pillar | Tracking issue |
 |---|---|---|
-| Hardware-rooted identity (TPM / PKCS#11 / YubiKey / CAC/PIV) | User, Device | [#856](https://github.com/rchiofalo/rustgate/issues/856) — `feat(enrollment): Hardware-rooted identity — TPM, PKCS#11, YubiKey` |
+| Hardware-rooted identity — trait + fail-closed resolver + reference stub (shipped) | User, Device | [#856](https://github.com/rchiofalo/rustgate/issues/856) — `feat(enrollment): Hardware-rooted identity — TPM, PKCS#11, YubiKey` (the `HardwareIdentity` trait, `HardwareIdentityResolver`, and `Pkcs11StubBackend` in `rustgate-transport::hw_identity`) |
+| Hardware-rooted identity — real TPM2 / PKCS#11 / YubiKey driver bodies | Device | [#1539](https://github.com/rchiofalo/rustgate/issues/1539) — `roadmap: TPM/HSM hardware-rooted identity (rustgate-tpm)`. The `rustgate-tpm` crate now exists as the driver home: it re-exports the transport trait surface and reserves the fail-closed `tpm` / `pkcs11` / `yubikey` feature stubs. See [ADR 0028](adr/0028-hardware-rooted-identity.md). |
 | Classification tagging (CAPCO format) on `RoutableMessage::Metadata` | Data | [#849](https://github.com/rchiofalo/rustgate/issues/849) — `feat: Classification Marking Engine (CAPCO format)` |
 | W3C `traceparent` propagation across federation hops | Visibility | [#852](https://github.com/rchiofalo/rustgate/issues/852) — `feat: W3C Distributed Trace Context propagation across federation` |
 | Kubernetes operator + one-command deployment (closes platform-side gaps in Network and Automation pillars) | Network, Automation | [#874](https://github.com/rchiofalo/rustgate/issues/874) — `feat: Kubernetes operator + one-command deployment` |

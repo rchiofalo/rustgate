@@ -26,7 +26,7 @@ guidance:
 
 1. **Modular Design** — the system decomposes into self-contained units
    that can be independently built, tested, deprecated, and replaced. In
-   rustgate this is realized as a **39-crate workspace** under `crates/`,
+   rustgate this is realized as a **40-crate workspace** under `crates/`,
    each crate with a single responsibility, an explicit public API, and
    a CI-enforced workspace-dependency-inheritance rule (ADR-0017) so a
    downstream consumer never sees a hidden version skew.
@@ -72,7 +72,7 @@ mission-applications layer is the consumer.
 
 ## 3. Modular Architecture
 
-rustgate is a Cargo workspace with 39 crates under `crates/`, each crate
+rustgate is a Cargo workspace with 40 crates under `crates/`, each crate
 mapping 1:1 to a MOSA-aligned bounded context. The table below mirrors
 the README architecture map and is the load-bearing reference for
 identifying where new functionality belongs.

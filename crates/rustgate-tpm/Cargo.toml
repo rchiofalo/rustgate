@@ -1,0 +1,27 @@
+[package]
+name = "rustgate-tpm"
+description = "Hardware-rooted device identity facade for rustgate: TPM2 / PKCS#11 / YubiKey driver home (scaffold)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Reserved driver feature flags. Each is currently a documented no-op:
+# the module it gates only exposes a backend-name constant and a
+# fail-closed constructor. The real driver bodies (PKCS#11 C-library
+# wrap, TPM2 attestation, YubiKey PIN/FIDO2) land in follow-up PRs
+# under #1539 without reshaping this facade.
+tpm = []
+pkcs11 = []
+yubikey = []
+
+[dependencies]
+rustgate-transport = { workspace = true }
+
+[dev-dependencies]
+rustls = { workspace = true }
