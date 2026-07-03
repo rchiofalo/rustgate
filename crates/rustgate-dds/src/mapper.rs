@@ -74,10 +74,11 @@ pub struct EntityOverlay {
     /// Optional 2525 SIDC — populated when the property map lists
     /// `mil_std_2525_sidc`.
     pub mil_std_2525_sidc: Option<String>,
-    /// Optional position — populated when at least one of
-    /// `position.lat` / `position.lon` is present in the property
-    /// map AND in the inbound DDS sample. Missing `hae_meters`
-    /// stays `None`.
+    /// Optional position — populated only when BOTH `position.lat` and
+    /// `position.lon` are present in the property map AND in the inbound
+    /// DDS sample. A report carrying only one axis leaves this `None`
+    /// rather than defaulting the missing axis to 0.0 ("Null Island").
+    /// Missing `hae_meters` stays `None`.
     pub position: Option<Position>,
     /// Optional velocity — populated when at least one of
     /// `velocity.speed_m_s` / `velocity.course_deg` is present.
@@ -135,11 +136,33 @@ impl PropertyMapper {
         let Some(map) = props.as_object() else {
             return overlay;
         };
+        // Stage the two mandatory position axes separately so a report
+        // carrying only one of them does not silently default the other
+        // to 0.0 ("Null Island"). A `Position` is materialised only when
+        // both `lat` and `lon` are present; a lone axis is treated as an
+        // absent fix, not a fix at the equator/prime-meridian origin.
+        let mut lat: Option<f64> = None;
+        let mut lon: Option<f64> = None;
+        let mut hae: Option<f64> = None;
         for rule in &self.rules {
             let Some(value) = map.get(&rule.dds) else {
                 continue;
             };
-            apply_overlay(&mut overlay, &rule.entity, value);
+            apply_overlay(
+                &mut overlay,
+                &mut lat,
+                &mut lon,
+                &mut hae,
+                &rule.entity,
+                value,
+            );
+        }
+        if let (Some(lat), Some(lon)) = (lat, lon) {
+            overlay.position = Some(Position {
+                lat,
+                lon,
+                hae_meters: hae,
+            });
         }
         overlay
     }
@@ -184,7 +207,14 @@ fn resolve_entity_path(entity: &Entity, path: &str) -> Result<Option<Value>, Dds
 /// because the inbound wiring has no recourse for a malformed
 /// upstream payload, and the partial overlay still produces a
 /// usable downstream entity.
-fn apply_overlay(overlay: &mut EntityOverlay, path: &str, value: &Value) {
+fn apply_overlay(
+    overlay: &mut EntityOverlay,
+    lat: &mut Option<f64>,
+    lon: &mut Option<f64>,
+    hae: &mut Option<f64>,
+    path: &str,
+    value: &Value,
+) {
     match path {
         "uid" => {
             if let Some(s) = value.as_str() {
@@ -201,34 +231,23 @@ fn apply_overlay(overlay: &mut EntityOverlay, path: &str, value: &Value) {
                 overlay.mil_std_2525_sidc = Some(s.to_string());
             }
         }
+        // Position axes stage into the caller's accumulators; a
+        // `Position` is only assembled once both lat and lon arrive
+        // (see `dds_to_entity_overlay`), so a lone axis never defaults
+        // its partner to 0.0.
         "position.lat" => {
             if let Some(n) = value.as_f64() {
-                let pos = overlay.position.get_or_insert(Position {
-                    lat: 0.0,
-                    lon: 0.0,
-                    hae_meters: None,
-                });
-                pos.lat = n;
+                *lat = Some(n);
             }
         }
         "position.lon" => {
             if let Some(n) = value.as_f64() {
-                let pos = overlay.position.get_or_insert(Position {
-                    lat: 0.0,
-                    lon: 0.0,
-                    hae_meters: None,
-                });
-                pos.lon = n;
+                *lon = Some(n);
             }
         }
         "position.hae_meters" => {
             if let Some(n) = value.as_f64() {
-                let pos = overlay.position.get_or_insert(Position {
-                    lat: 0.0,
-                    lon: 0.0,
-                    hae_meters: None,
-                });
-                pos.hae_meters = Some(n);
+                *hae = Some(n);
             }
         }
         "velocity.speed_m_s" => {
@@ -438,6 +457,60 @@ mod tests {
             overlay.attributes.get("battery"),
             Some(&AttributeValue::Int(64))
         );
+    }
+
+    #[test]
+    fn reverse_projection_missing_lon_yields_no_position() {
+        // A DDS sample carrying only `position.lat` must NOT synthesise
+        // a fix at lon 0.0 ("Null Island"). The overlay position stays
+        // `None` until both axes are present.
+        let rules = vec![rule("lat", "position.lat"), rule("lon", "position.lon")];
+        let mapper = PropertyMapper::new(rules);
+        let props = serde_json::json!({ "lat": 41.0 });
+        let overlay = mapper.dds_to_entity_overlay(&props);
+        assert!(
+            overlay.position.is_none(),
+            "a lone lat must not default lon to 0.0"
+        );
+    }
+
+    #[test]
+    fn reverse_projection_missing_lat_yields_no_position() {
+        let rules = vec![rule("lat", "position.lat"), rule("lon", "position.lon")];
+        let mapper = PropertyMapper::new(rules);
+        let props = serde_json::json!({ "lon": -71.5 });
+        let overlay = mapper.dds_to_entity_overlay(&props);
+        assert!(
+            overlay.position.is_none(),
+            "a lone lon must not default lat to 0.0"
+        );
+    }
+
+    #[test]
+    fn reverse_projection_hae_without_axes_yields_no_position() {
+        // `hae_meters` alone can never make a valid fix — without both
+        // lat and lon there is no position to attach the altitude to.
+        let rules = vec![rule("hae", "position.hae_meters")];
+        let mapper = PropertyMapper::new(rules);
+        let props = serde_json::json!({ "hae": 120.0 });
+        let overlay = mapper.dds_to_entity_overlay(&props);
+        assert!(overlay.position.is_none());
+    }
+
+    #[test]
+    fn reverse_projection_both_axes_plus_hae_builds_full_position() {
+        let rules = vec![
+            rule("lat", "position.lat"),
+            rule("lon", "position.lon"),
+            rule("hae", "position.hae_meters"),
+        ];
+        let mapper = PropertyMapper::new(rules);
+        let props = serde_json::json!({ "lat": 41.0, "lon": -71.5, "hae": 120.0 });
+        let overlay = mapper.dds_to_entity_overlay(&props);
+        let pos = overlay.position.unwrap();
+        assert_eq!(pos.lat, 41.0);
+        assert_eq!(pos.lon, -71.5);
+        assert_eq!(pos.hae_meters, Some(120.0));
     }
 
     #[test]

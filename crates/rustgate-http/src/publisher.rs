@@ -78,9 +78,10 @@ const ADMISSION_DLQ_TARGET: &str = "admission";
 /// to share one across retries in the future.
 struct QueuedMessage {
     msg: Arc<RoutableMessage>,
-    // justification: field is pure RAII — held only so its `Drop`
-    // releases the gate's byte reservation when the worker finishes.
-    #[allow(dead_code)]
+    /// Byte reservation on the shared gate. Handed to `fan_out` so the
+    /// batching path can clone the `Arc` into a buffered entry (keeping
+    /// the reservation alive until flush); on the non-batching path it
+    /// drops with the `QueuedMessage` once dispatch finishes.
     permit: Option<Arc<BackpressurePermit>>,
 }
 
@@ -1048,8 +1049,10 @@ async fn dispatch_worker(
                 while let Some(queued) = rx.recv().await {
                     #[cfg(feature = "metrics")]
                     crate::metrics::queue_depth().dec();
-                    fan_out(&queued.msg, &targets, dlq.as_deref()).await;
-                    // `queued` drops here, releasing the permit.
+                    fan_out(&queued.msg, queued.permit.as_ref(), &targets, dlq.as_deref()).await;
+                    // `queued` drops here, releasing any permit not retained
+                    // by a batcher entry (the batching path clones the Arc so
+                    // buffered bytes stay accounted for until flush).
                     drop(queued);
                 }
                 // Drain every per-target batcher so buffered messages that
@@ -1066,8 +1069,10 @@ async fn dispatch_worker(
                         // Paired with the inc() in `HttpPublisher::publish`.
                         #[cfg(feature = "metrics")]
                         crate::metrics::queue_depth().dec();
-                        fan_out(&queued.msg, &targets, dlq.as_deref()).await;
-                        // `queued` drops here, releasing the permit.
+                        fan_out(&queued.msg, queued.permit.as_ref(), &targets, dlq.as_deref()).await;
+                        // `queued` drops here, releasing any permit not retained
+                        // by a batcher entry (the batching path clones the Arc so
+                        // buffered bytes stay accounted for until flush).
                         drop(queued);
                     }
                     None => {
@@ -1086,7 +1091,12 @@ async fn dispatch_worker(
 /// Dispatches are independent — a slow or failing target does not block
 /// delivery to other targets. Uses `join_all` within the current task
 /// (no spawn) so borrowed references remain valid.
-async fn fan_out(msg: &RoutableMessage, targets: &[TargetState], dlq: Option<&DeadLetterQueue>) {
+async fn fan_out(
+    msg: &RoutableMessage,
+    permit: Option<&Arc<BackpressurePermit>>,
+    targets: &[TargetState],
+    dlq: Option<&DeadLetterQueue>,
+) {
     let sanitized_cn = sanitize_for_log(&msg.source.cn);
 
     let futures: Vec<_> = targets
@@ -1113,7 +1123,7 @@ async fn fan_out(msg: &RoutableMessage, targets: &[TargetState], dlq: Option<&De
                 target = %target.name,
                 source_cn = %sanitized_cn,
             );
-            dispatch_to_target(target, msg, dlq).instrument(span)
+            dispatch_to_target(target, msg, permit, dlq).instrument(span)
         })
         .collect();
 
@@ -1124,6 +1134,7 @@ async fn fan_out(msg: &RoutableMessage, targets: &[TargetState], dlq: Option<&De
 async fn dispatch_to_target(
     target: &TargetState,
     msg: &RoutableMessage,
+    permit: Option<&Arc<BackpressurePermit>>,
     dlq: Option<&DeadLetterQueue>,
 ) {
     // Per-target rate limiting — shed excess traffic before any work.
@@ -1204,9 +1215,15 @@ async fn dispatch_to_target(
     // run per-message (they govern admission into the batcher, not the
     // outbound request cadence).
     if let Some(ref batcher_lock) = target.batcher {
+        // Hand the permit's `Arc` to the batcher so the gate keeps
+        // accounting for these buffered bytes until they are flushed and
+        // sent. Without this the reservation would be released the moment
+        // the `QueuedMessage` drops, under-counting real buffered memory.
+        // When a flush fires, `flush` owns the retained permits and they
+        // drop after `publish_with_retry` completes below.
         let flush = {
             let mut batcher = batcher_lock.lock();
-            batcher.push(body.clone())
+            batcher.push(body.clone(), permit.cloned())
         };
         let Some(flush) = flush else {
             return;

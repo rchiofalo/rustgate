@@ -66,6 +66,16 @@ impl ClientThrottle {
     /// Returns `true` if the message should be processed, `false` if it
     /// should be dropped (rate exceeded).
     pub fn allow(&self) -> bool {
+        // The millisecond offset is truncated into the packed u32, so it
+        // wraps to 0 once every ~49.7 days of session uptime. The wrap is
+        // benign and self-correcting: on the single cycle spanning the
+        // wrap, `last_ms` (just before u32::MAX) exceeds `now_ms` (just
+        // after 0), so `saturating_sub` clamps `elapsed_ms` to 0 and that
+        // one refill is skipped. The bucket simply misses one refill tick
+        // and resumes correctly on the next call — never an over-refill.
+        // Widening the packed layout past u64 to carry a full 64-bit
+        // timestamp is not worth the extra CAS width for a once-per-~50-day
+        // one-cycle stall on a connection that has stayed up that long.
         let now_ms = self.epoch.elapsed().as_millis() as u32;
 
         loop {

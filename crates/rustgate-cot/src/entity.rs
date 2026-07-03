@@ -71,6 +71,24 @@ use crate::ParseError;
 /// other codecs (MAVLink, ASTERIX, …) that will land alongside.
 const COT_PREFIX: &str = "cot.";
 
+/// Maximum `<detail>` nesting depth accepted by [`decode_cot`].
+///
+/// Matches the `MAX_XML_DEPTH = 256` cap enforced by the streaming XML
+/// codec in `rustgate-transport` and the certificate XML surfaces in
+/// `rustgate-tls`. CoT detail trees are 2-3 levels deep in practice; 256
+/// is generous while still rejecting a pathologically nested payload
+/// that would otherwise inflate the flattened attribute-key strings.
+const MAX_DETAIL_DEPTH: usize = 256;
+
+/// Maximum total size (keys + values) of the flattened `<detail>`
+/// attribute bag accepted by [`decode_cot`].
+///
+/// Matches the `MAX_ATTR_BAG_BYTES = 4 KiB` cap the certificate
+/// SAN/attribute extractor enforces. Bounds the per-entity attribute map
+/// against a payload built from thousands of tiny detail elements, each
+/// individually well under the frame limit.
+const MAX_ATTR_BAG_BYTES: usize = 4 * 1024;
+
 /// CoT XML codec for the canonical [`Entity`] shape.
 ///
 /// Stateless — the same instance is safe to reuse across every routed
@@ -140,6 +158,10 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
     let mut position: Option<Position> = None;
     let mut velocity: Option<Velocity> = None;
     let mut attributes: BTreeMap<String, AttributeValue> = BTreeMap::new();
+    // Running size (keys + values) of the flattened `<detail>` bag, capped
+    // at `MAX_ATTR_BAG_BYTES`. Only detail-derived inserts feed this — the
+    // fixed strict-subset `event`/`point` attributes are a bounded set.
+    let mut bag_bytes: usize = 0;
 
     // Path stack of detail-tree element local names. The root
     // `<detail>` itself is not pushed; only its children. A
@@ -204,6 +226,11 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                     // recognized children.
                     let local = String::from_utf8_lossy(name).into_owned();
                     detail_path.push(local.clone());
+                    if detail_path.len() > MAX_DETAIL_DEPTH {
+                        return Err(ParseError::DetailTooDeep {
+                            max: MAX_DETAIL_DEPTH,
+                        });
+                    }
                     let prefix = detail_attr_prefix(&detail_path);
                     if local == "track" {
                         let (v, attr_kvs) = read_track_attrs(&e)?;
@@ -211,7 +238,12 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                             velocity = v;
                         }
                         for (k, val) in attr_kvs {
-                            let _ = attributes.insert(format!("{prefix}.{k}"), val);
+                            insert_detail_attr(
+                                &mut attributes,
+                                &mut bag_bytes,
+                                format!("{prefix}.{k}"),
+                                val,
+                            )?;
                         }
                     } else if local == "contact" {
                         for attr in e.attributes().flatten() {
@@ -220,8 +252,12 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                             if k == "callsign" && callsign.is_none() {
                                 callsign = Some(v.clone());
                             }
-                            let _ =
-                                attributes.insert(format!("{prefix}.{k}"), AttributeValue::Str(v));
+                            insert_detail_attr(
+                                &mut attributes,
+                                &mut bag_bytes,
+                                format!("{prefix}.{k}"),
+                                AttributeValue::Str(v),
+                            )?;
                         }
                     } else {
                         for attr in e.attributes().flatten() {
@@ -230,8 +266,12 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                             if local == "usericon" && k == "iconsetpath" && sidc.is_none() {
                                 sidc = Some(v.clone());
                             }
-                            let _ =
-                                attributes.insert(format!("{prefix}.{k}"), AttributeValue::Str(v));
+                            insert_detail_attr(
+                                &mut attributes,
+                                &mut bag_bytes,
+                                format!("{prefix}.{k}"),
+                                AttributeValue::Str(v),
+                            )?;
                         }
                     }
                     pending_text_key = Some(format!("{prefix}.text"));
@@ -249,6 +289,11 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                 name if in_detail => {
                     let local = String::from_utf8_lossy(name).into_owned();
                     detail_path.push(local.clone());
+                    if detail_path.len() > MAX_DETAIL_DEPTH {
+                        return Err(ParseError::DetailTooDeep {
+                            max: MAX_DETAIL_DEPTH,
+                        });
+                    }
                     let prefix = detail_attr_prefix(&detail_path);
                     if local == "track" {
                         let (v, attr_kvs) = read_track_attrs(&e)?;
@@ -256,7 +301,12 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                             velocity = v;
                         }
                         for (k, val) in attr_kvs {
-                            let _ = attributes.insert(format!("{prefix}.{k}"), val);
+                            insert_detail_attr(
+                                &mut attributes,
+                                &mut bag_bytes,
+                                format!("{prefix}.{k}"),
+                                val,
+                            )?;
                         }
                     } else if local == "contact" {
                         for attr in e.attributes().flatten() {
@@ -265,8 +315,12 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                             if k == "callsign" && callsign.is_none() {
                                 callsign = Some(v.clone());
                             }
-                            let _ =
-                                attributes.insert(format!("{prefix}.{k}"), AttributeValue::Str(v));
+                            insert_detail_attr(
+                                &mut attributes,
+                                &mut bag_bytes,
+                                format!("{prefix}.{k}"),
+                                AttributeValue::Str(v),
+                            )?;
                         }
                     } else {
                         for attr in e.attributes().flatten() {
@@ -275,8 +329,12 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                             if local == "usericon" && k == "iconsetpath" && sidc.is_none() {
                                 sidc = Some(v.clone());
                             }
-                            let _ =
-                                attributes.insert(format!("{prefix}.{k}"), AttributeValue::Str(v));
+                            insert_detail_attr(
+                                &mut attributes,
+                                &mut bag_bytes,
+                                format!("{prefix}.{k}"),
+                                AttributeValue::Str(v),
+                            )?;
                         }
                     }
                     let _ = detail_path.pop();
@@ -289,7 +347,12 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                     if let (Some(key), Some(val)) =
                         (pending_text_key.take(), pending_text_value.take())
                     {
-                        let _ = attributes.insert(key, AttributeValue::Str(val));
+                        insert_detail_attr(
+                            &mut attributes,
+                            &mut bag_bytes,
+                            key,
+                            AttributeValue::Str(val),
+                        )?;
                     }
                     let _ = detail_path.pop();
                 }
@@ -332,6 +395,40 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
         taskings: Default::default(),
         files: Default::default(),
     })
+}
+
+/// Approximate byte footprint of an [`AttributeValue`] for the
+/// attribute-bag size cap. String values count their UTF-8 length;
+/// scalar values count a fixed 8-byte estimate (they are stored as
+/// primitives, not strings).
+fn attr_value_bytes(value: &AttributeValue) -> usize {
+    match value {
+        AttributeValue::Str(s) => s.len(),
+        _ => 8,
+    }
+}
+
+/// Insert one flattened `<detail>` attribute, enforcing the
+/// [`MAX_ATTR_BAG_BYTES`] running-size cap.
+///
+/// `bag_bytes` accumulates the key + value footprint of every
+/// detail-derived entry so a payload built from many tiny elements is
+/// rejected once the flattened bag would exceed the cap, mirroring the
+/// certificate attribute-bag limit enforced elsewhere in the workspace.
+fn insert_detail_attr(
+    attributes: &mut BTreeMap<String, AttributeValue>,
+    bag_bytes: &mut usize,
+    key: String,
+    value: AttributeValue,
+) -> Result<(), ParseError> {
+    *bag_bytes = bag_bytes.saturating_add(key.len() + attr_value_bytes(&value));
+    if *bag_bytes > MAX_ATTR_BAG_BYTES {
+        return Err(ParseError::AttrBagTooLarge {
+            max: MAX_ATTR_BAG_BYTES,
+        });
+    }
+    let _ = attributes.insert(key, value);
+    Ok(())
 }
 
 /// Dotted-path prefix for the current depth in the detail tree. The
@@ -919,5 +1016,87 @@ mod tests {
             e1.attributes.get(&format!("{COT_PREFIX}version")),
             e2.attributes.get(&format!("{COT_PREFIX}version")),
         );
+    }
+
+    #[test]
+    fn cot_detail_nesting_beyond_cap_is_rejected() {
+        // A `<detail>` subtree nested deeper than MAX_DETAIL_DEPTH must
+        // be rejected rather than flattened into unbounded attribute
+        // keys — mirroring the transport/TLS MAX_XML_DEPTH cap.
+        let mut xml = String::from(
+            r#"<event uid="x" type="a-f-G-U-C"><point lat="0" lon="0" hae="0"/><detail>"#,
+        );
+        let depth = MAX_DETAIL_DEPTH + 5;
+        for _ in 0..depth {
+            xml.push_str("<n>");
+        }
+        for _ in 0..depth {
+            xml.push_str("</n>");
+        }
+        xml.push_str("</detail></event>");
+        let codec = CotEntityCodec;
+        let err = codec
+            .to_entity(xml.as_bytes())
+            .expect_err("over-deep detail must be rejected");
+        assert!(
+            matches!(err, ParseError::DetailTooDeep { max } if max == MAX_DETAIL_DEPTH),
+            "expected DetailTooDeep, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cot_detail_at_cap_depth_is_accepted() {
+        // Exactly MAX_DETAIL_DEPTH levels must still parse — the cap is
+        // an upper bound, not an off-by-one rejection of legal payloads.
+        let mut xml = String::from(
+            r#"<event uid="x" type="a-f-G-U-C"><point lat="0" lon="0" hae="0"/><detail>"#,
+        );
+        for _ in 0..MAX_DETAIL_DEPTH {
+            xml.push_str("<n>");
+        }
+        for _ in 0..MAX_DETAIL_DEPTH {
+            xml.push_str("</n>");
+        }
+        xml.push_str("</detail></event>");
+        let codec = CotEntityCodec;
+        assert!(
+            codec.to_entity(xml.as_bytes()).is_ok(),
+            "detail nested to exactly the cap must be accepted"
+        );
+    }
+
+    #[test]
+    fn cot_detail_attr_bag_beyond_cap_is_rejected() {
+        // Many sibling detail elements whose flattened keys+values exceed
+        // MAX_ATTR_BAG_BYTES must be rejected — mirroring the certificate
+        // MAX_ATTR_BAG_BYTES cap. Each `<e_i k="…"/>` contributes well
+        // under the frame limit individually but sums past the bag cap.
+        let mut xml = String::from(
+            r#"<event uid="x" type="a-f-G-U-C"><point lat="0" lon="0" hae="0"/><detail>"#,
+        );
+        // Each element adds ~30+ bytes of key + value; 512 of them blow
+        // past the 4 KiB bag cap comfortably.
+        for i in 0..512 {
+            xml.push_str(&format!(r#"<elem{i} attr="valuevaluevalue"/>"#));
+        }
+        xml.push_str("</detail></event>");
+        let codec = CotEntityCodec;
+        let err = codec
+            .to_entity(xml.as_bytes())
+            .expect_err("oversized attribute bag must be rejected");
+        assert!(
+            matches!(err, ParseError::AttrBagTooLarge { max } if max == MAX_ATTR_BAG_BYTES),
+            "expected AttrBagTooLarge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cot_small_detail_bag_is_accepted() {
+        // A handful of small detail elements stays well under the bag cap
+        // and must parse cleanly — the cap only fires on pathological
+        // payloads, not ordinary CoT traffic.
+        let xml = br#"<event uid="x" type="a-f-G-U-C"><point lat="0" lon="0" hae="0"/><detail><contact callsign="alpha"/><__group name="Cyan"/></detail></event>"#;
+        let codec = CotEntityCodec;
+        assert!(codec.to_entity(xml).is_ok());
     }
 }
