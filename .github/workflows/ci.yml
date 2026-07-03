@@ -550,14 +550,14 @@ jobs:
         # regresses below the floor. `cargo llvm-cov report` re-reads the
         # profile data the step above already collected (no re-instrumentation,
         # no re-run of the test binaries) and `--fail-under-lines` makes it exit
-        # non-zero when the measured line rate drops under the threshold. The
-        # `--features` set must match the generation step so the same object
-        # files are attributed. The floor is deliberately seeded well below the
-        # current measured line rate so it never red-lines an in-flight PR on
-        # landing; bump it upward (toward `current − small margin`) as coverage
-        # climbs so it only ever ratchets forward and can never silently slide
-        # backward.
-        run: cargo llvm-cov report --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http,marti-compat,missions,video,correlation --fail-under-lines 55
+        # non-zero when the measured line rate drops under the threshold.
+        # `report` re-reads already-collected profile data, so it does NOT take
+        # `--features` (features only apply to the collection/nextest run above).
+        # The floor is deliberately seeded well below the current measured line
+        # rate so it never red-lines an in-flight PR on landing; bump it upward
+        # (toward `current − small margin`) as coverage climbs so it only ever
+        # ratchets forward and can never silently slide backward.
+        run: cargo llvm-cov report --locked --fail-under-lines 55
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
