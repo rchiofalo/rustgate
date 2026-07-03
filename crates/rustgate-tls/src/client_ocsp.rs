@@ -206,7 +206,7 @@ impl ClientOcspVerifier {
 
     /// Like [`Self::new`] but with an explicit re-validation window for cached
     /// `Good` answers (#1625). Exposed primarily for tests; production callers
-    /// use [`Self::new`], which applies [`DEFAULT_OCSP_GOOD_TTL_SECS`].
+    /// use [`Self::new`], which applies `DEFAULT_OCSP_GOOD_TTL_SECS`.
     pub fn new_with_good_ttl(
         inner: Arc<dyn ClientCertVerifier>,
         fetcher: Arc<dyn OcspFetcher>,

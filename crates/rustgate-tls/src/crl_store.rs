@@ -158,8 +158,9 @@ impl CrlStore {
     /// clock and refresh the cached [`CrlHealth`], returning it.
     ///
     /// Freshness is time-relative: a CRL that was fresh at the last reload can
-    /// age past its `nextUpdate` with no change to the file bytes. [`reload`]
-    /// short-circuits on byte-identical files (`Ok(false)`) and therefore does
+    /// age past its `nextUpdate` with no change to the file bytes.
+    /// [`CrlStore::reload`] short-circuits on byte-identical files
+    /// (`Ok(false)`) and therefore does
     /// **not** re-check staleness, so the fail-closed watcher must call this on
     /// every tick to observe a set that has silently gone stale (#1496,
     /// ADR-0025 Piece 2). Cheap — a read-lock to snapshot the `Arc<Vec<..>>`,
