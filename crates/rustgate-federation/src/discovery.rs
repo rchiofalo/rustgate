@@ -95,6 +95,15 @@ pub(crate) async fn read_capped_response_body(
 /// logged and the reconciler retries on the next tick — implementations must
 /// therefore be safe to call repeatedly and should not hold a lock across
 /// failures.
+///
+/// The `#[async_trait]` attribute is load-bearing, not a leftover: the
+/// reconciler consumes discovery backends as `Arc<dyn PeerDiscovery>` (see
+/// [`reconciler`]), so the trait must stay `dyn`-compatible. A `dyn` trait
+/// cannot yet host a native `async fn` — object safety for async trait
+/// methods is not stabilized — so `discover` is desugared by `async-trait`
+/// into a boxed-future method. Do not drop the `async-trait` dependency in
+/// favour of async-fn-in-trait here: it would make the trait no longer
+/// object-safe and break `Arc<dyn PeerDiscovery>` at every call site.
 #[async_trait]
 pub trait PeerDiscovery: Send + Sync + 'static {
     /// Resolve the current peer set from the backend.
