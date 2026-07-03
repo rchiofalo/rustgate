@@ -14,7 +14,9 @@
   [`docs/design/tactical-stream-ingress.md`](../design/tactical-stream-ingress.md)
   (stream design note),
   ADR 0013 (`configure_tactical_socket` for every TCP stream),
-  ADR 0018 (schema-first codec design)
+  ADR 0018 (schema-first codec design),
+  [ADR 0032](0032-meshtastic-serial-ingress-seam.md) (extends this seam's
+  non-mTLS admission model to Meshtastic's non-IP serial transport)
 
 ## Context
 

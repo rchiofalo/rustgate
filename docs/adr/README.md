@@ -61,6 +61,7 @@ does.
 | [0029](0029-discovered-peer-cn-pinning.md) | Discovered federation peers are never CN-pinned to their discovery id (SEC-1) | Proposed |
 | [0030](0030-tak-marti-application-layer.md) | TAK Server application-layer roadmap + Enterprise Sync first slice | Proposed |
 | [0031](0031-production-hardening-ha-and-edge.md) | Production hardening — HA direction, capacity, edge install, and SLOs | Proposed |
+| [0032](0032-meshtastic-serial-ingress-seam.md) | Meshtastic LoRa / serial ingress seam (non-IP admission; transport-owned de-encapsulation/decryption; serial-vs-bridge transport deferred) | Proposed |
 
 ## Authoring a new ADR
 

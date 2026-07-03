@@ -95,10 +95,15 @@
 //!   Meshtastic mesh frame envelope (PHY header, routing fields,
 //!   AES key wrap) is the transport's responsibility. This crate
 //!   consumes / emits the inner application payload only.
-//! - **Listener wiring.** UDP and serial-port glue land in a
-//!   separate change, mirroring how
+//! - **Listener wiring.** The live serial / bridge transport lands
+//!   in a follow-up change, mirroring how
 //!   [`rustgate-mavlink`](../rustgate_mavlink/index.html) gets a
-//!   listener in a follow-up to its codec PR.
+//!   listener in a follow-up to its codec PR. The ingress seam is
+//!   designed in `docs/design/meshtastic-serial-ingress.md` /
+//!   ADR 0032; the compile-safe, no-I/O scaffold (the `transport`
+//!   module, behind the off-by-default `meshtastic-ingress` feature) is the
+//!   first slice, and the live listener is gated on the design note's
+//!   one open transport fork (serial reader vs bridge contract).
 //! - **goTenna Pro X2 binding.** Documented as compatible above;
 //!   the binding crate is a follow-up that depends on this crate
 //!   and the goTenna SDK transport layer.
@@ -123,10 +128,21 @@ pub mod codec;
 pub mod error;
 pub mod proto;
 
+/// Compile-safe, no-I/O scaffold for the Meshtastic ingress seam
+/// (design note `docs/design/meshtastic-serial-ingress.md`, ADR 0032).
+/// Off by default behind the `meshtastic-ingress` feature; the live
+/// listener and any serial-transport dependency land in a follow-up PR.
+#[cfg(feature = "meshtastic-ingress")]
+pub mod transport;
+
 pub use codec::MeshtasticCodec;
 pub use error::MeshtasticError;
 pub use proto::{
     COORD_SCALE, COURSE_SCALE_HUNDREDTHS_DEG, Contact, GeoChat, Group, MAX_PAYLOAD_BYTES,
     PayloadVariant, Pli, SPEED_SCALE_CM_PER_S, Status, TakPacket, decode_tak_packet,
     encode_tak_packet,
+};
+#[cfg(feature = "meshtastic-ingress")]
+pub use transport::{
+    DEFAULT_INGRESS_CN, DEFAULT_RATE_LIMIT_PPS, MeshIngressConfig, MeshIngressError, MeshIngressKey,
 };
