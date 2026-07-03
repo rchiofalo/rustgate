@@ -120,6 +120,23 @@ curl http://localhost:9090/metrics
 
 > **Security note:** The metrics endpoint (port 9090) serves unauthenticated HTTP. It exposes session counts, message routing statistics, and NATS/federation status — information useful for attacker reconnaissance. In hostile or shared environments, bind the metrics port to `127.0.0.1` or a private interface and firewall it from untrusted networks. In Kubernetes, use a `NetworkPolicy` to restrict scraper access.
 
+### Running under systemd (bare-metal / edge)
+
+For a tactical edge node running the binary directly under systemd (no
+Kubernetes), a hardened unit file and setup guide ship in
+[`deploy/systemd/`](../deploy/systemd/README.md). The unit uses
+`Type=simple` (rustgate emits no `sd_notify` signal today), a `DynamicUser`
+sandbox, `NoNewPrivileges` / `ProtectSystem=strict`, an `EnvironmentFile`
+for secrets, and `Restart=on-failure`.
+
+### Sizing
+
+For how many clients an instance holds and how the admission-control knobs
+(`--max-queued-bytes`, `--max-connections`, `--max-concurrent-handshakes`)
+bound memory and CPU, see [`docs/capacity-planning.md`](capacity-planning.md)
+— including a worked 5,000-client example and a client-count → resource
+table.
+
 ## Docker Compose
 
 ### Quick Start

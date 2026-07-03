@@ -1,0 +1,83 @@
+[Unit]
+Description=rustgate tactical mTLS message router
+Documentation=https://github.com/rchiofalo/rustgate/tree/main/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# rustgate does not emit an sd_notify readiness signal today, so Type=notify
+# would leave systemd waiting forever and mark the unit failed. Use Type=simple.
+# If sd_notify is added server-side later, switch to Type=notify (see README.md).
+Type=simple
+
+# --- Secrets & configuration -------------------------------------------------
+# Put all rustgate flags/paths in this file as RUSTGATE_* env vars (the CLI
+# reads env fallbacks for every flag). Keep it 0600 and owned by root so the
+# CA key path, bearer tokens, etc. are not world-readable. See README.md.
+EnvironmentFile=/etc/rustgate/rustgate.env
+
+# --- Pre-flight --------------------------------------------------------------
+# Fail fast (before the main process starts) if a critical dependency is
+# unreachable. Exit non-zero aborts the start. Adjust/remove to taste.
+ExecStartPre=/usr/bin/rustgate test-connection --tcp ${RUSTGATE_BIND}
+
+# --- Main process ------------------------------------------------------------
+# Flags are supplied via the RUSTGATE_* env vars in EnvironmentFile above, so
+# the command line stays minimal and secrets never appear in `systemctl show`.
+ExecStart=/usr/bin/rustgate
+ExecReload=/bin/kill -HUP $MAINPID
+
+# --- Restart policy ----------------------------------------------------------
+Restart=on-failure
+RestartSec=5s
+# Give slow TLS material loads / large trust stores time to come up.
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+
+# --- Identity ----------------------------------------------------------------
+# DynamicUser gives the service a transient, unprivileged, per-start UID with
+# no home and no shell — nothing to compromise persistently. If you need a
+# stable UID (e.g. for file ownership on --nats-checkpoint-path or a redb
+# store-and-forward dir), replace DynamicUser with a fixed User=/Group= and
+# create that user out of band. See README.md.
+DynamicUser=yes
+
+# --- Sandboxing (defense in depth) -------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Read-only config; writable state only if store-and-forward / checkpoints are
+# enabled. StateDirectory creates /var/lib/rustgate owned by the service UID.
+ReadOnlyPaths=/etc/rustgate
+StateDirectory=rustgate
+StateDirectoryMode=0700
+
+# --- Resource limits ---------------------------------------------------------
+# rustgate is fd-hungry at scale (one+ fd per client). Raise for large fleets;
+# see docs/capacity-planning.md.
+LimitNOFILE=65536
+# Optional memory ceiling; align with --max-queued-bytes + per-client overhead.
+# MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
