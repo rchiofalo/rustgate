@@ -111,10 +111,11 @@ impl OcspFetcher for OcspStaplerFetcher {
                 .await
                 .map_err(|e| format!("ocsp query failed: {e:#}"))?;
             // The `Good` variant matches a "good" certificate status;
-            // anything else (Revoked, Unknown) is treated as revoked.
-            // We classify via the Debug repr to avoid taking a direct
-            // dependency on `rasn_ocsp` for a single enum match.
-            let good = format!("{:?}", response.cert_status).starts_with("Good");
+            // anything else (`Revoked`, `Unknown`) is treated as revoked.
+            // Match the enum variant directly rather than comparing the
+            // `Debug` repr: a future `rasn-ocsp` upgrade that reworded the
+            // Debug output would silently reclassify every cert as revoked.
+            let good = matches!(response.cert_status, rasn_ocsp::CertStatus::Good);
             Ok(good)
         })
     }
@@ -421,6 +422,28 @@ mod tests {
     use rustls::server::WebPkiClientVerifier;
 
     use super::*;
+
+    /// Locks the OCSP status classification: only the `Good` variant is
+    /// treated as good. This mirrors the `matches!` used in the real
+    /// fetcher and guards against a `rasn-ocsp` upgrade quietly changing
+    /// the enum shape (which the earlier Debug-string comparison would
+    /// have silently mis-handled).
+    #[cfg(feature = "ocsp")]
+    #[test]
+    fn cert_status_only_good_is_good() {
+        use rasn_ocsp::CertStatus;
+
+        // The classifier used by `OcspStaplerFetcher::fetch`.
+        fn is_good(status: &CertStatus) -> bool {
+            matches!(status, CertStatus::Good)
+        }
+
+        assert!(is_good(&CertStatus::Good), "Good must classify as good");
+        assert!(
+            !is_good(&CertStatus::Unknown(())),
+            "Unknown must not classify as good"
+        );
+    }
 
     /// Deterministic in-memory fetcher used by unit tests.
     struct FakeFetcher {

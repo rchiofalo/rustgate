@@ -13,7 +13,7 @@ workspace = true
 [features]
 fips = ["rustls/aws_lc_rs", "rustls/fips"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
-ocsp = ["dep:ocsp-stapler", "dep:lru"]
+ocsp = ["dep:ocsp-stapler", "dep:lru", "dep:rasn-ocsp"]
 spiffe = ["dep:spiffe"]
 
 [dependencies]
@@ -30,6 +30,7 @@ tracing = { workspace = true }
 x509-parser = { workspace = true }
 zeroize = { workspace = true }
 ocsp-stapler = { workspace = true, optional = true }
+rasn-ocsp = { workspace = true, optional = true }
 lru = { workspace = true, optional = true }
 spiffe = { workspace = true, optional = true }
 

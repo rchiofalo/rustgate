@@ -53,6 +53,9 @@ struct MtlsFixtures {
     ca_pem: String,
     client_cert_pem: String,
     client_key_pem: String,
+    /// Shared handle to the running service so tests can drive
+    /// server-side APIs (e.g. `broadcast`) after the handshake.
+    service: Arc<FederationService>,
 }
 
 /// Start a FederationService behind a TLS listener that requires
@@ -69,8 +72,13 @@ async fn start_mtls_server(
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
     let client_cert = ca.issue_client_cert(client_cn, &[]);
 
-    let svc = FederationService::new(federate_id.to_string(), groups, on_event);
-    let service = figpb::federated_channel_server::FederatedChannelServer::new(svc);
+    let svc = Arc::new(FederationService::new(
+        federate_id.to_string(),
+        groups,
+        on_event,
+    ));
+    let service =
+        figpb::federated_channel_server::FederatedChannelServer::from_arc(Arc::clone(&svc));
 
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(
@@ -102,6 +110,7 @@ async fn start_mtls_server(
         ca_pem: ca.cert_pem.clone(),
         client_cert_pem: client_cert.cert_pem,
         client_key_pem: client_cert.key_pem,
+        service: svc,
     }
 }
 
@@ -277,41 +286,28 @@ async fn server_federate_groups_stream_returns_groups() {
 
 #[tokio::test]
 async fn client_event_stream_receives_broadcast() {
-    let svc = FederationService::new(
-        "broadcast-server".into(),
+    // `client_event_stream` derives the outbound-stream key from the
+    // mTLS client certificate CN (#1510 L-5), so this test drives it over
+    // a real mTLS connection rather than a plaintext channel. The
+    // `Subscription.identity` payload deliberately claims a *different*
+    // name to confirm the cert-derived key is what registers.
+    let fixtures = start_mtls_server(
+        "broadcast-server",
         vec!["Alpha".into()],
         noop_on_event(),
-    );
-    let svc = Arc::new(svc);
-    let svc_for_broadcast = Arc::clone(&svc);
+        "stream-client",
+    )
+    .await;
+    let svc_for_broadcast = Arc::clone(&fixtures.service);
 
-    let service =
-        figpb::federated_channel_server::FederatedChannelServer::from_arc(Arc::clone(&svc));
+    let mut client = mtls_client(&fixtures).await;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    drop(tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(service)
-            .serve_with_incoming(incoming)
-            .await
-            .expect("server");
-    }));
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut client = FederatedChannelClient::connect(format!("http://{addr}"))
-        .await
-        .expect("connect");
-
-    // Open the client event stream (server sends us events)
+    // Open the client event stream (server sends us events). The payload
+    // identity ("spoofed-name") is ignored; the cert CN "stream-client"
+    // is what keys the outbound stream.
     let sub = figpb::Subscription {
         identity: Some(figpb::Identity {
-            name: "stream-client".into(),
+            name: "spoofed-name".into(),
             uid: "stream-uid".into(),
             ..Default::default()
         }),
@@ -528,6 +524,7 @@ async fn client_federate_groups_stream_tracks_groups() {
         ca_pem: ca.cert_pem.clone(),
         client_cert_pem: client_cert.cert_pem,
         client_key_pem: client_cert.key_pem,
+        service: Arc::clone(&svc_ref),
     };
 
     let mut client = mtls_client(&fixtures).await;
@@ -622,10 +619,15 @@ async fn start_compression_aware_mtls_server(
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
     let client_cert = ca.issue_client_cert(client_cn, &[]);
 
-    let svc = FederationService::new(federate_id.to_string(), groups, on_event);
-    let service = figpb::federated_channel_server::FederatedChannelServer::new(svc)
-        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-        .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+    let svc = Arc::new(FederationService::new(
+        federate_id.to_string(),
+        groups,
+        on_event,
+    ));
+    let service =
+        figpb::federated_channel_server::FederatedChannelServer::from_arc(Arc::clone(&svc))
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+            .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
 
     let tls = ServerTlsConfig::new()
         .identity(Identity::from_pem(
@@ -657,6 +659,7 @@ async fn start_compression_aware_mtls_server(
         ca_pem: ca.cert_pem.clone(),
         client_cert_pem: client_cert.cert_pem,
         client_key_pem: client_cert.key_pem,
+        service: svc,
     }
 }
 
