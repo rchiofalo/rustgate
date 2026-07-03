@@ -96,3 +96,79 @@ The forcing function for THIS ADR is twofold:
 - A future ADR superseding this one (pure ML-DSA migration) has a clear pointer to "this is what we decided in 2026 and why."
 
 **Migration path.** When CNSA 2.0 + rustls + aws-lc-rs converge (expected 2027–2028), the four sub-PRs (#501/#502/#503 plus the wiring) flip the `--cnsa2` flag from "scaffold" to "full enforcement." This ADR's status becomes **Accepted**; if NSA revises the algorithm suite before then, this ADR's body remains the historical record and a new ADR supersedes.
+
+## CNSA 2.0 residual-gap tracker
+
+This section extends ADR 0019 to serve as the umbrella tracker for #873.
+It maps each CNSA 2.0 requirement to the current code state with
+symbol-anchored `file:line` evidence and the owning sub-issue, and it
+names the two residual items #873 uniquely owns beyond the #500–#504
+menu. The full mapping table lives in
+[`docs/cnsa2-gap-analysis.md`](../cnsa2-gap-analysis.md); the checklist
+below is the implementation menu.
+
+**Two corrections to the #873 issue body.** The issue's status table is
+directionally correct but carries two stale claims that this tracker
+supersedes:
+
+1. **#500 did NOT deliver ML-DSA package-signature verification.** #500
+   closed on a *classical* scaffold. The landed `verify_signature()` in
+   `rustgate-enrollment/src/datapackage.rs` (symbol at the `fn
+   verify_signature` definition, ~line 423) tries **ECDSA-P256-SHA256**
+   then falls back to **RSA-PSS-SHA256** — no ML-DSA path, and no
+   `fips204` dependency anywhere in the tree. ADR 0019 § Decision (5)
+   already flags the `fips204` work as landing "in K3 in the next PR";
+   #500 closed on the classical scaffold, so ML-DSA package signing is
+   still an open residual item.
+2. **Federation JWT is NOT "HS256".** The `Algorithm` enum in
+   `rustgate-federation/src/jwt.rs` (symbol `enum Algorithm`, ~line 130)
+   supports **HS256 / ES256 / EdDSA**. It is still classical-only — there
+   is no ML-DSA (PQ) option — but characterizing it as HS256-only is
+   wrong.
+
+**Residual items #873 uniquely owns** (not covered by #500–#504):
+
+- **PQ federation JWT.** `enum Algorithm` in
+  `rustgate-federation/src/jwt.rs` has no ML-DSA variant. Adding one is
+  deferred: no ML-DSA signing crate is wired, and forcing an ML-DSA
+  federation JWT with no peer-verifier ecosystem breaks interop — the
+  same pure-PQ-too-early anti-pattern this ADR rejects for the TLS path
+  (§ Alternatives, "Pure ML-DSA-87 without hybrid composite"). Blocked on
+  the same `fips204`-adoption prerequisite as #500.
+- **PQ-signed CI release artifacts.** `.github/workflows/release.yml`
+  signs container images with **classical cosign keyless** (Sigstore /
+  OIDC — see the `cosign sign` step, ~line 109). CNSA 2.0's 2025
+  software-signing milestone wants quantum-resistant artifact signatures;
+  this is gated on a cosign PQ provider plus the same `fips204` scaffold.
+
+### Implementation checklist
+
+- [x] PQ TLS key exchange — `X25519MLKEM768` preferred
+      (`rustgate-tls/src/config.rs`, ~line 491 / kx-group match ~line
+      550). NIST L3 hybrid; L5 (`MLKEM1024`) pending upstream.
+- [x] `--cnsa2` CLI flag scaffold (#504) —
+      `rustgate-server/src/cli.rs`, ~line 300 (`pub(crate) cnsa2: bool`).
+- [ ] ML-DSA package-signature verification (#500 residual) — extend
+      `verify_signature()` in `rustgate-enrollment/src/datapackage.rs`
+      once `fips204` is wired. **Blocked** on `fips204` adoption.
+- [ ] ML-DSA TLS certificate verification (#501, open) — via rustls
+      `CryptoProvider` extension point; no workspace fork.
+- [ ] ML-DSA certificate + CRL issuance (#502, open) —
+      `rustgate-enrollment` must accept ML-DSA-65/87 OIDs (store-and-
+      forward even before runtime verification lands).
+- [ ] Hybrid dual-signature (Composite ML-DSA) certificates (#503, open).
+- [ ] **PQ federation JWT (#873)** — add an ML-DSA variant to `enum
+      Algorithm` in `rustgate-federation/src/jwt.rs`. **Deferred** until a
+      peer-verifier ecosystem exists (interop risk).
+- [ ] **PQ-signed CI release artifacts (#873)** — migrate
+      `.github/workflows/release.yml` cosign signing to a PQ provider.
+      **Blocked** on cosign PQ support + `fips204`.
+
+**Sequencing.** `fips204` adoption (the #500 K3 follow-up) is the
+unblocking prerequisite for the ML-DSA package-signing, PQ-JWT, and
+PQ-artifact-signing items — they all need a wired Pure-Rust ML-DSA
+signer before any code lands. The TLS-path items (#501/#502/#503) are
+gated instead on the upstream rustls + aws-lc-rs convergence per this
+ADR's migration path. No code, config, or behavior changes here — this
+is a design note and an implementation menu; each checkbox is a separate
+sub-PR with this ADR as its north star.
