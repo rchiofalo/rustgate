@@ -32,6 +32,7 @@ pub mod codec;
 pub mod config;
 pub mod constants;
 pub mod crypto;
+pub mod durable;
 pub mod egress;
 pub mod entity;
 pub mod error;
