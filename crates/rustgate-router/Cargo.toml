@@ -46,6 +46,18 @@ redb = { workspace = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 
+# Criterion benches use `criterion_main!`, so they must opt out of the
+# default libtest harness. Without these entries Cargo runs each bench
+# under libtest ("running 0 tests"), `criterion_main!` never executes,
+# and the benchmark-gate collects zero data (#1524).
+[[bench]]
+name = "router_fanout"
+harness = false
+
+[[bench]]
+name = "dedup_contention"
+harness = false
+
 [dev-dependencies]
 rustgate-test-utils = { workspace = true }
 rustgate-authz = { workspace = true }

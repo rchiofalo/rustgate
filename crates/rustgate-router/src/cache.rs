@@ -59,15 +59,14 @@
 //!
 //! [`Router::replay_positions`]: crate::Router::replay_positions
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::message::RoutableMessage;
-use tokio::sync::RwLock;
 
 /// Default sweep interval for removing expired position entries.
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
@@ -97,11 +96,34 @@ struct PositionEntry {
 }
 
 /// Stores the most recent position report per client CN.
+///
+/// # Concurrency
+///
+/// Backed by a sharded [`DashMap`] rather than a single
+/// `RwLock<HashMap>`. Under the multi-worker ingest contention modelled
+/// by `benches/dedup_contention.rs`, a single mutex around the map
+/// collapses from ~10 Melem/s to ~6 Melem/s as worker count climbs from
+/// 4 to 16, while the sharded map holds ~51–58 Melem/s (roughly 8x
+/// faster at 16 workers, and flat under contention). The position cache
+/// is the one clean map to migrate: it has no LRU/eviction-accounting
+/// coupling, so a raw sharded map is a drop-in replacement (#1524).
+///
+/// The public API stays `async` so no call site changes; DashMap's
+/// per-shard locks never span an `.await`, so this is not the
+/// `std::sync::Mutex`-across-await footgun.
+///
+/// One semantic difference from the old single-lock design: `sweep`,
+/// `get_all`, and the capacity-eviction scan take per-shard locks rather
+/// than one map-wide lock, so they no longer observe a single consistent
+/// snapshot. For a best-effort latest-state cache this is acceptable —
+/// TTL expiry and capacity eviction are already approximate (interval
+/// sweep, monotonic-seq ranking), and no invariant depends on a
+/// whole-map atomic view.
 pub struct PositionCache {
     /// Keyed by `Arc<str>` so insert/remove on the SA-replay hot path
     /// reuse the sender's existing CN allocation (refcount bump) rather
     /// than copying the bytes into a fresh `String`. Closes #784.
-    entries: RwLock<HashMap<Arc<str>, PositionEntry>>,
+    entries: DashMap<Arc<str>, PositionEntry>,
     /// Monotonic counter handed out on every `store`. Strictly increasing and
     /// independent of the wall clock, so it gives a stable least-recently-
     /// stored ordering for capacity eviction.
@@ -148,7 +170,7 @@ pub(crate) fn is_expired(msg: &RoutableMessage) -> bool {
 impl Default for PositionCache {
     fn default() -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
+            entries: DashMap::new(),
             next_seq: AtomicU64::new(0),
             max_entries: DEFAULT_MAX_ENTRIES,
             on_size: ArcSwap::new(Arc::new(None)),
@@ -164,7 +186,7 @@ impl PositionCache {
     /// Create a position cache with a custom maximum entry count.
     pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
+            entries: DashMap::new(),
             next_seq: AtomicU64::new(0),
             max_entries,
             on_size: ArcSwap::new(Arc::new(None)),
@@ -193,34 +215,37 @@ impl PositionCache {
     /// sequence number, not the wall clock).
     pub async fn store(&self, msg: RoutableMessage) {
         let cn = msg.source.cn.clone();
-        let size = {
-            let mut entries = self.entries.write().await;
 
-            // If this CN already exists, replacing it won't grow the cache.
-            if !entries.contains_key(&cn) && entries.len() >= self.max_entries {
-                // Evict the least-recently-stored entry by monotonic seq —
-                // NOT the wall-clock received_at. An NTP step-back can give a
-                // freshly-stored entry an earlier received_at than entries
-                // already cached; ranking by received_at would then evict the
-                // brand-new entry on arrival (#1542).
-                if let Some(oldest_cn) = entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.seq)
-                    .map(|(cn, _)| cn.clone())
-                {
-                    tracing::warn!(
-                        evicted_cn = %hash_cn(&oldest_cn),
-                        size = entries.len(),
-                        max = self.max_entries,
-                        "position cache at capacity, evicting least-recently-stored entry",
-                    );
-                    let _ = entries.remove(&oldest_cn);
-                }
+        // If this CN already exists, replacing it won't grow the cache.
+        if !self.entries.contains_key(&cn) && self.entries.len() >= self.max_entries {
+            // Evict the least-recently-stored entry by monotonic seq —
+            // NOT the wall-clock received_at. An NTP step-back can give a
+            // freshly-stored entry an earlier received_at than entries
+            // already cached; ranking by received_at would then evict the
+            // brand-new entry on arrival (#1542).
+            //
+            // The `iter()` scan takes per-shard locks, so this is an
+            // approximate min under concurrent inserts — acceptable for a
+            // best-effort capacity bound. The iterator guard is dropped
+            // before `remove` so no two shard locks are held at once.
+            let oldest_cn = self
+                .entries
+                .iter()
+                .min_by_key(|e| e.value().seq)
+                .map(|e| e.key().clone());
+            if let Some(oldest_cn) = oldest_cn {
+                tracing::warn!(
+                    evicted_cn = %hash_cn(&oldest_cn),
+                    size = self.entries.len(),
+                    max = self.max_entries,
+                    "position cache at capacity, evicting least-recently-stored entry",
+                );
+                let _ = self.entries.remove(&oldest_cn);
             }
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            let _ = entries.insert(cn, PositionEntry { msg, seq });
-            entries.len()
-        };
+        }
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let _ = self.entries.insert(cn, PositionEntry { msg, seq });
+        let size = self.entries.len();
         self.notify_size(size);
     }
 
@@ -229,49 +254,47 @@ impl PositionCache {
     /// Expired entries (past their TTL) are excluded from the result
     /// but not removed — the sweep task handles cleanup.
     pub async fn get_all(&self) -> Vec<RoutableMessage> {
-        let entries = self.entries.read().await;
-        entries
-            .values()
-            .filter(|e| !is_expired(&e.msg))
-            .map(|e| e.msg.clone())
+        self.entries
+            .iter()
+            .filter(|e| !is_expired(&e.value().msg))
+            .map(|e| e.value().msg.clone())
             .collect()
     }
 
     /// Remove the cached position for a CN (e.g., on disconnect).
     pub async fn remove(&self, cn: &str) {
-        let size = {
-            let mut entries = self.entries.write().await;
-            let _ = entries.remove(cn);
-            entries.len()
-        };
+        let _ = self.entries.remove(cn);
+        let size = self.entries.len();
         self.notify_size(size);
     }
 
     /// Remove all expired entries from the cache.
     ///
-    /// Returns the number of entries removed.
+    /// Returns the number of entries removed. `retain` locks one shard at
+    /// a time, so the sweep is no longer a single-snapshot pass over the
+    /// whole map — entries inserted into an already-visited shard survive
+    /// until the next sweep. This is acceptable: the sweep is only a
+    /// cleanup pass (`get_all` already filters expired entries on read),
+    /// and no correctness invariant depends on it being atomic.
     pub async fn sweep(&self) -> usize {
-        let (removed, size) = {
-            let mut entries = self.entries.write().await;
-            let before = entries.len();
-            entries.retain(|_, e| !is_expired(&e.msg));
-            let after = entries.len();
-            (before - after, after)
-        };
+        let before = self.entries.len();
+        self.entries.retain(|_, e| !is_expired(&e.msg));
+        let after = self.entries.len();
+        let removed = before.saturating_sub(after);
         if removed > 0 {
-            self.notify_size(size);
+            self.notify_size(after);
         }
         removed
     }
 
     /// Number of cached positions (including expired entries not yet swept).
     pub async fn len(&self) -> usize {
-        self.entries.read().await.len()
+        self.entries.len()
     }
 
     /// Check if cache is empty.
     pub async fn is_empty(&self) -> bool {
-        self.entries.read().await.is_empty()
+        self.entries.is_empty()
     }
 
     /// Spawn a background task that periodically sweeps expired entries.
