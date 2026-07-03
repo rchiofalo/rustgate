@@ -17,6 +17,10 @@
 //! * [`archive`] — JSONL CoT event archiver with optional encryption.
 //! * [`archive_rotation`] — size- and time-based retention task for the
 //!   archive directory.
+//! * `siem` — (feature `siem`, off by default) pure ArcSight CEF
+//!   payload formatter for shipping the audit trail to an enterprise
+//!   SIEM (ADR 0028, Phase 1a). No I/O; the syslog transport that
+//!   consumes it is deferred to Phase 1b.
 //!
 //! ## Wire format
 //!
@@ -29,11 +33,15 @@ pub mod archive;
 pub mod archive_rotation;
 pub mod audit_chain;
 pub mod encrypted;
+#[cfg(feature = "siem")]
+pub mod siem;
 
 pub use archive::*;
 pub use archive_rotation::*;
 pub use audit_chain::*;
 pub use encrypted::*;
+#[cfg(feature = "siem")]
+pub use siem::{AuditEvent, Severity, format_cef};
 
 #[cfg(test)]
 mod tests {
