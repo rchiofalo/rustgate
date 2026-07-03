@@ -1,6 +1,6 @@
 # ADR 0019: CNSA 2.0 with Composite ML-DSA hybrid certificates
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-05-19
 - **Deciders:** rchiofalo
 - **Related:** #500 (ML-DSA package signature verification),
@@ -11,6 +11,23 @@
   #873 (CNSA 2.0 PQ alignment umbrella),
   #731 (MAVLink PQ umbrella),
   [aws-lc-rs #964](https://github.com/aws/aws-lc-rs/issues/964) — upstream FIPS/ML-DSA mutual exclusion
+
+## Implementation status
+
+- **#502 (2026-07, this scaffold).** Landed the honest first slice of ML-DSA
+  cert/CRL issuance in `rustgate-enrollment`: a `CaAlgorithm` enum
+  (`ecdsa-p256`, `rsa-2048`, `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87`) with
+  `is_post_quantum()` / `is_composite_required()` predicates; an empty
+  `post-quantum` feature gate; and a **fail-closed** issuance guard. Selecting
+  any ML-DSA algorithm returns an actionable error
+  (`signing::issue_mldsa_unavailable`) citing the upstream blockers
+  ([aws-lc-rs #964](https://github.com/aws/aws-lc-rs/issues/964) + composite
+  OID finalization) rather than silently issuing a classical or a pure-ML-DSA
+  certificate. A `fips_pq_conflict()` guard rejects ML-DSA on a `fips` build.
+  **No** unstable rcgen feature is enabled and **no** cert format changes — the
+  scaffold intentionally does not wire the `--cnsa2` CLI flag (that couples to
+  #504's `--cnsa2`). This unblocks #503/#504 having a stable enum + public
+  surface to build against.
 
 ## Context
 

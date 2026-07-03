@@ -13,6 +13,12 @@ workspace = true
 [features]
 est = ["dep:cms", "dep:der", "dep:x509-cert"]
 fips = ["rcgen/fips"]
+# Scaffold gate for ML-DSA cert/CRL issuance (ADR 0019 Phase 3). Empty on
+# purpose: it does NOT enable rcgen's `aws_lc_rs_unstable` path, because that
+# would break FIPS builds and emit pure (owner-rejected) ML-DSA certificates.
+# ML-DSA selection fails closed via `signing::issue_mldsa_unavailable` until
+# the Composite ML-DSA path lands. See #502.
+post-quantum = []
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }

@@ -16,6 +16,7 @@ use rcgen::{
 use rustls_pki_types::PrivateKeyDer;
 use zeroize::Zeroizing;
 
+use crate::ca_algorithm::CaAlgorithm;
 use crate::error::EnrollmentError;
 use crate::keypair::ZeroizingKeyPair;
 
@@ -150,6 +151,36 @@ impl CsrSigner {
         Ok(signed.der().to_vec())
     }
 
+    /// Sign a CSR under an explicitly selected CA [`CaAlgorithm`].
+    ///
+    /// This is the algorithm-aware entry point that the future `--cnsa2`
+    /// wiring (#504) calls. It fails closed for post-quantum selections:
+    /// the ML-DSA variants return [`issue_mldsa_unavailable`] rather than
+    /// issuing a certificate, because rustgate's Composite ML-DSA path is
+    /// blocked on upstream crypto (ADR 0019 Phase 3). Classical selections
+    /// delegate to [`sign_csr`](CsrSigner::sign_csr) unchanged.
+    ///
+    /// The `fips` conflict guard runs first, so an ML-DSA selection on a
+    /// FIPS build produces the more specific [`fips_pq_conflict`] error.
+    pub fn sign_csr_with_algorithm(
+        &self,
+        csr_pem: &str,
+        username: &str,
+        algorithm: CaAlgorithm,
+    ) -> Result<Vec<u8>, EnrollmentError> {
+        fips_pq_conflict(algorithm)?;
+
+        if algorithm.is_post_quantum() {
+            return Err(issue_mldsa_unavailable(algorithm));
+        }
+
+        // Classical algorithms issue via the existing, unchanged path. The
+        // CA key's own algorithm determines the signature; this scaffold does
+        // not yet re-key the CA per requested classical algorithm — that is a
+        // separate slice tracked alongside #504.
+        self.sign_csr(csr_pem, username)
+    }
+
     /// The original CA certificate DER bytes for enrollment responses.
     pub fn ca_cert_der(&self) -> &[u8] {
         &self.ca_cert_der
@@ -159,6 +190,67 @@ impl CsrSigner {
     pub fn organization(&self) -> &str {
         &self.organization
     }
+}
+
+/// Fail-closed stub for post-quantum (ML-DSA) certificate issuance.
+///
+/// Returns an [`EnrollmentError::Signing`] with an actionable message
+/// pointing at the two upstream blockers (aws-lc-rs #964 and the composite
+/// OID finalization) and ADR 0019 Phase 3. This is the **only** ML-DSA
+/// branch in [`CsrSigner`]: selecting an ML-DSA algorithm refuses issuance
+/// with a clear diagnostic instead of silently emitting a classical or a
+/// pure-ML-DSA certificate (both of which would be wrong — see the module
+/// docs of [`crate::ca_algorithm`]).
+///
+/// # Panics
+///
+/// Never panics; the `debug_assert!` only fires in debug builds if a caller
+/// mis-routes a classical algorithm here.
+#[must_use]
+pub fn issue_mldsa_unavailable(alg: CaAlgorithm) -> EnrollmentError {
+    debug_assert!(
+        alg.is_post_quantum(),
+        "issue_mldsa_unavailable called with a classical algorithm: {alg}"
+    );
+    EnrollmentError::Signing(format!(
+        "ML-DSA issuance blocked on aws-lc-rs #964 / composite OID finalization \
+         (ADR 0019 Phase 3): requested `{alg}` is a post-quantum algorithm rustgate \
+         cannot yet issue. rustgate commits to Composite ML-DSA + ECDSA hybrid \
+         certificates, not pure ML-DSA; the composite path lands when upstream \
+         crypto converges. Select a classical algorithm (ecdsa-p256, rsa-2048) \
+         until then."
+    ))
+}
+
+/// Guard rejecting an ML-DSA algorithm selection on a `fips`-enabled build.
+///
+/// The `fips` and `post-quantum` features are separate, mutually exclusive
+/// compile-time gates at the crypto layer (ADR 0019 Decision §4; aws-lc-rs
+/// #964): rcgen's ML-DSA support is gated `not(feature = "fips")`. Combining
+/// them cannot produce a valid signer, so this fails closed at the API
+/// boundary with a clear message rather than surfacing an opaque crypto-
+/// provider error deeper down.
+///
+/// Returns `Ok(())` for any classical algorithm, and for ML-DSA algorithms
+/// on a non-FIPS build (where [`issue_mldsa_unavailable`] takes over). It
+/// only errors for the ML-DSA + `fips` combination.
+pub fn fips_pq_conflict(alg: CaAlgorithm) -> Result<(), EnrollmentError> {
+    #[cfg(feature = "fips")]
+    {
+        if alg.is_post_quantum() {
+            return Err(EnrollmentError::Config(format!(
+                "requested post-quantum CA algorithm `{alg}` is incompatible with a FIPS build: \
+                 the `fips` and `post-quantum` features are mutually exclusive at the crypto \
+                 layer (ADR 0019 §4 / aws-lc-rs #964). Build without `fips` to use ML-DSA \
+                 algorithms, or select a classical algorithm (ecdsa-p256, rsa-2048)."
+            )));
+        }
+    }
+
+    // On non-FIPS builds `alg` is unused when it is classical; the guard is a
+    // no-op success. Reference it so the parameter is always live.
+    let _ = alg;
+    Ok(())
 }
 
 /// Ensure a CSR string has PEM headers.
@@ -797,5 +889,87 @@ cyOZxZiK
         // Empty PEM body
         let empty_body = "-----BEGIN CERTIFICATE REQUEST-----\n-----END CERTIFICATE REQUEST-----\n";
         assert!(signer.sign_csr(empty_body, "test-user").is_err());
+    }
+
+    #[test]
+    fn issue_mldsa_unavailable_carries_actionable_upstream_message() {
+        for alg in [
+            CaAlgorithm::MlDsa44,
+            CaAlgorithm::MlDsa65,
+            CaAlgorithm::MlDsa87,
+        ] {
+            let err = issue_mldsa_unavailable(alg);
+            let msg = err.to_string();
+            assert!(
+                matches!(err, EnrollmentError::Signing(_)),
+                "must be a Signing error, got {err:?}"
+            );
+            assert!(
+                msg.contains("aws-lc-rs #964"),
+                "cite upstream blocker: {msg}"
+            );
+            assert!(msg.contains("ADR 0019"), "cite the ADR: {msg}");
+            assert!(
+                msg.contains(alg.as_str()),
+                "name the requested algorithm: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_csr_with_algorithm_classical_still_issues() {
+        let (cert_pem, key_pem) = test_ca();
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
+        let csr_pem = generate_csr("ignored-cn");
+
+        let signed_der = signer
+            .sign_csr_with_algorithm(&csr_pem, "test-client", CaAlgorithm::EcdsaP256)
+            .expect("classical selection must still issue");
+        let (_, cert) = x509_parser::parse_x509_certificate(&signed_der).expect("parse");
+        assert_eq!(
+            cert.subject()
+                .iter_common_name()
+                .next()
+                .and_then(|cn| cn.as_str().ok()),
+            Some("test-client")
+        );
+    }
+
+    #[test]
+    fn sign_csr_with_algorithm_fails_closed_on_mldsa() {
+        let (cert_pem, key_pem) = test_ca();
+        let signer = CsrSigner::from_pem(&cert_pem, &key_pem, "TestOrg").expect("signer");
+        let csr_pem = generate_csr("ignored-cn");
+
+        let err = signer
+            .sign_csr_with_algorithm(&csr_pem, "test-client", CaAlgorithm::MlDsa87)
+            .expect_err("ML-DSA selection must NOT issue a certificate");
+        let msg = err.to_string();
+        // On a non-FIPS build this is the issuance-blocked message; on a FIPS
+        // build the conflict guard fires first. Either way it must reference
+        // ADR 0019 and refuse to issue.
+        assert!(msg.contains("ADR 0019"), "error must cite ADR 0019: {msg}");
+    }
+
+    #[test]
+    fn fips_pq_conflict_allows_classical() {
+        assert!(fips_pq_conflict(CaAlgorithm::EcdsaP256).is_ok());
+        assert!(fips_pq_conflict(CaAlgorithm::Rsa2048).is_ok());
+    }
+
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn fips_pq_conflict_is_noop_for_mldsa_without_fips() {
+        // Without the `fips` feature the conflict guard passes; the
+        // fail-closed refusal comes from `issue_mldsa_unavailable` instead.
+        assert!(fips_pq_conflict(CaAlgorithm::MlDsa87).is_ok());
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_pq_conflict_rejects_mldsa_on_fips_build() {
+        let err = fips_pq_conflict(CaAlgorithm::MlDsa87).expect_err("ML-DSA + fips must conflict");
+        assert!(matches!(err, EnrollmentError::Config(_)));
+        assert!(err.to_string().contains("FIPS"));
     }
 }
