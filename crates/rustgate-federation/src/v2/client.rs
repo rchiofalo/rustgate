@@ -1681,6 +1681,118 @@ mod tests {
         }
     }
 
+    /// Cross-layer regression for #1519 / #763: a hop count persisted at
+    /// the boundary via the real redb-backed [`crate::replay_persist`]
+    /// store, decoded back through `load_all`, and fed through
+    /// [`drain_decision_for`], must produce a **drop** — the same
+    /// decision the live SendOneEvent path would reach for a message
+    /// bumped to `max_hops`.
+    ///
+    /// The per-layer tests pin each half in isolation
+    /// (`store_forward_persists_post_increment_hops` proves the store
+    /// round-trips the post-increment value; `drain_rejects_message_at_hop_limit`
+    /// proves the drain gate drops at `max_hops`). This test joins the
+    /// seam: it drives a *persisted* value through the *drain* decision
+    /// so a regression that corrupts the hop count on the persistence
+    /// round-trip — re-opening the store-forward hop-leak #1519 tracks —
+    /// fails a test instead of silently letting a stale-hop message
+    /// through on reconnect.
+    #[test]
+    fn persisted_boundary_hop_count_drives_drain_drop() {
+        // A live first-hop emit bumps to 1; a message that reaches the
+        // limit is persisted at post-increment `max_hops`. Round-trip
+        // that boundary value through disk and assert drain drops it.
+        let max_hops: u32 = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::replay_persist::ReplayStore::open(dir.path(), 1 << 20).unwrap();
+        store
+            .put(
+                "peer-a",
+                1,
+                1_000,
+                None,
+                max_hops,
+                &[],
+                &bytes::Bytes::from_static(b"at-limit"),
+            )
+            .unwrap();
+        drop(store);
+
+        // Re-open (as on restart) and decode through the production path.
+        let store = crate::replay_persist::ReplayStore::open(dir.path(), 1 << 20).unwrap();
+        let restored = store.load_all().unwrap();
+        assert_eq!(restored.len(), 1, "exactly one persisted record");
+        let entry = &restored[0];
+        assert_eq!(
+            entry.current_hops, max_hops,
+            "post-increment hop count must survive the persistence round-trip",
+        );
+        assert!(
+            !entry.is_legacy_pre_increment,
+            "a v2-encoded record must not be flagged legacy",
+        );
+
+        // Rehydrate into the drain-side envelope exactly as the manager
+        // does when refilling the replay ring from disk, then run the
+        // production drain gate.
+        let msg = BufferedMessage {
+            seq: entry.seq,
+            payload: entry.payload.clone(),
+            groups: entry.groups.clone(),
+            enqueued_at_unix_ms: entry.enqueued_at_unix_ms,
+            ttl_ms: entry.ttl_ms,
+            current_hops: entry.current_hops,
+            is_legacy_pre_increment: entry.is_legacy_pre_increment,
+        };
+        match drain_decision_for(&msg, max_hops) {
+            DrainDecision::Drop { effective_hops } => {
+                assert_eq!(
+                    effective_hops, max_hops,
+                    "persisted-then-drained boundary hop must drop at max_hops",
+                );
+            }
+            DrainDecision::Emit { .. } => {
+                panic!("persisted record at the hop limit must drop on drain, not emit");
+            }
+        }
+
+        // One step below the boundary must survive the same round-trip,
+        // proving the drop above is the boundary check and not a blanket
+        // reject of every restored record.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = crate::replay_persist::ReplayStore::open(dir2.path(), 1 << 20).unwrap();
+        store2
+            .put(
+                "peer-a",
+                1,
+                1_000,
+                None,
+                max_hops - 1,
+                &[],
+                &bytes::Bytes::from_static(b"one-below"),
+            )
+            .unwrap();
+        let below = store2.load_all().unwrap();
+        let below_msg = BufferedMessage {
+            seq: below[0].seq,
+            payload: below[0].payload.clone(),
+            groups: below[0].groups.clone(),
+            enqueued_at_unix_ms: below[0].enqueued_at_unix_ms,
+            ttl_ms: below[0].ttl_ms,
+            current_hops: below[0].current_hops,
+            is_legacy_pre_increment: below[0].is_legacy_pre_increment,
+        };
+        match drain_decision_for(&below_msg, max_hops) {
+            DrainDecision::Emit { effective_hops } => {
+                assert_eq!(effective_hops, max_hops - 1);
+            }
+            DrainDecision::Drop { .. } => {
+                panic!("persisted record one below the limit must emit on drain");
+            }
+        }
+    }
+
     /// Build a tracing subscriber that captures `target = "audit"`
     /// records into a shared byte buffer. The callsite emits the audit
     /// inline at the drain drop site, so we set this up as the default
