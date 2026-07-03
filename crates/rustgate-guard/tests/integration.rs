@@ -51,6 +51,8 @@ fn config(tmp: &TempDir, low_bps: u64, high_bps: u64, mandatory: bool) -> GuardC
         mandatory_marking: mandatory,
         audit_log_path: tmp.path().join("boundary-audit.jsonl"),
         direction: GuardDirection::Bidirectional,
+        warmup_log_only: false,
+        audit_chain_fail_open: false,
     }
 }
 

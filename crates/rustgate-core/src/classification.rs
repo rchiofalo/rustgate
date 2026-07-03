@@ -105,6 +105,32 @@ impl Classification {
             other => Err(ParseError::UnknownClassification(other.to_owned())),
         }
     }
+
+    /// Parse a *bare* classification token — a level name (or the small
+    /// set of abbreviations real tactical traffic carries) without the
+    /// surrounding `//…//` CAPCO banner delimiters.
+    ///
+    /// Externally-sourced CoT routinely labels a `<marking>` element with
+    /// a naked level (`value="UNCLASSIFIED"`, `value="SECRET"`, or the
+    /// short forms `U`/`C`/`S`/`TS`) rather than a full canonical banner.
+    /// Treating those as unparseable would fail-close the cross-domain
+    /// guard on benign admission traffic (ADR 0024, revision 1). This
+    /// helper recognises the bare forms so only genuinely unknown tokens
+    /// stay unparseable; it is intentionally case-sensitive to match the
+    /// strictness of [`Classification::parse`] and the wire grammar.
+    ///
+    /// `TOP SECRET` is also accepted with a single interior space so a
+    /// banner-less `value="TOP SECRET"` round-trips to the same level as
+    /// the abbreviation `TS`.
+    fn parse_bare(token: &str) -> Result<Self, ParseError> {
+        match token {
+            "UNCLASSIFIED" | "U" => Ok(Self::Unclassified),
+            "CONFIDENTIAL" | "C" => Ok(Self::Confidential),
+            "SECRET" | "S" => Ok(Self::Secret),
+            "TOP SECRET" | "TS" => Ok(Self::TopSecret),
+            other => Err(ParseError::UnknownClassification(other.to_owned())),
+        }
+    }
 }
 
 impl fmt::Display for Classification {
@@ -461,9 +487,25 @@ impl FromStr for ClassificationMarking {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let trimmed = s.trim();
-        let body = trimmed
-            .strip_prefix("//")
-            .ok_or(ParseError::MissingLeadingDelimiter)?;
+        let body = match trimmed.strip_prefix("//") {
+            Some(body) => body,
+            // Tolerate a *bare* level name (no `//…//` banner) — real
+            // tactical CoT carries `value="UNCLASSIFIED"` and friends on
+            // `<marking>` elements. Only when the whole string is not a
+            // recognised bare level do we surface the missing-delimiter
+            // error (ADR 0024, revision 1). A bare form has no caveat
+            // blocks by construction.
+            None => {
+                let classification = Classification::parse_bare(trimmed)
+                    .map_err(|_| ParseError::MissingLeadingDelimiter)?;
+                return Ok(Self::with_caveats(
+                    classification,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+        };
         // Optional trailing `//` is allowed but not required.
         let body = body.strip_suffix("//").unwrap_or(body);
 
@@ -1143,6 +1185,76 @@ mod tests {
     fn reject_only_delimiters() {
         let err: ParseError = "////".parse::<ClassificationMarking>().unwrap_err();
         assert!(matches!(err, ParseError::MissingClassification));
+    }
+
+    // -- 4b. Bare-level tolerance (ADR 0024, revision 1) --------------
+
+    #[test]
+    fn bare_level_names_parse_to_their_level() {
+        // Real tactical CoT labels `<marking>` with a naked level rather
+        // than a full `//…//` banner. Each must parse to the right level
+        // with no caveats so the guard does not fail-close benign traffic.
+        for (raw, expected) in [
+            ("UNCLASSIFIED", Classification::Unclassified),
+            ("CONFIDENTIAL", Classification::Confidential),
+            ("SECRET", Classification::Secret),
+            ("TOP SECRET", Classification::TopSecret),
+        ] {
+            let m: ClassificationMarking = raw
+                .parse()
+                .unwrap_or_else(|e| panic!("bare `{raw}` must parse: {e}"));
+            assert_eq!(m.classification, expected, "bare `{raw}`");
+            assert!(m.sci_controls.is_empty(), "bare `{raw}` has no SCI");
+            assert!(
+                m.dissemination.is_empty(),
+                "bare `{raw}` has no dissemination"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_level_abbreviations_parse_to_their_level() {
+        for (raw, expected) in [
+            ("U", Classification::Unclassified),
+            ("C", Classification::Confidential),
+            ("S", Classification::Secret),
+            ("TS", Classification::TopSecret),
+        ] {
+            let m: ClassificationMarking = raw
+                .parse()
+                .unwrap_or_else(|e| panic!("bare `{raw}` must parse: {e}"));
+            assert_eq!(m.classification, expected, "bare `{raw}`");
+        }
+    }
+
+    #[test]
+    fn bare_whitespace_padding_tolerated() {
+        let m: ClassificationMarking = "  UNCLASSIFIED  ".parse().expect("padded bare parses");
+        assert_eq!(m.classification, Classification::Unclassified);
+    }
+
+    #[test]
+    fn genuine_garbage_still_unparseable() {
+        // The tolerance must NOT lower the bar for actual garbage — a
+        // token that is neither a banner nor a recognised bare level
+        // stays an error so the guard treats it as unparseable.
+        for raw in [
+            "INVALID_CLASSIFICATION_LEVEL",
+            "SECRET//NOFORN", // no leading `//` and not a bare level
+            "unclassified",   // case-sensitive: lower-case is not accepted
+            "TOPSECRET",      // missing interior space, not an abbreviation
+        ] {
+            let err = raw
+                .parse::<ClassificationMarking>()
+                .expect_err("garbage must not parse");
+            assert!(
+                matches!(
+                    err,
+                    ParseError::MissingLeadingDelimiter | ParseError::UnknownClassification(_)
+                ),
+                "unexpected error for `{raw}`: {err:?}"
+            );
+        }
     }
 
     #[test]

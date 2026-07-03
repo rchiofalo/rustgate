@@ -182,6 +182,30 @@ pub struct GuardConfig {
     /// [`CrossDomainGuard::evaluate`].
     #[serde(default = "default_direction")]
     pub direction: GuardDirection,
+    /// When `true`, an unparseable classification marking (H-1) is
+    /// **logged but not dropped** — the guard emits a `decision = "warn"`
+    /// audit record with `reason = "unparseable_marking"` and *admits*
+    /// the message instead of denying it. This is the ADR 0024 revision-1
+    /// warm-up mode: operators enable it to observe exactly which
+    /// production markings *would* start being denied, fleet-wide, before
+    /// flipping to enforcement. Defaults to `false` (fail-closed
+    /// enforcement). Warm-up applies **only** to the unparseable-marking
+    /// path; rate-limit, missing-marking, multi-marking, and
+    /// unauthorized-classification denies always enforce.
+    #[serde(default = "default_warmup_log_only")]
+    pub warmup_log_only: bool,
+    /// When `true`, a guard whose dedicated audit hash-chain cannot be
+    /// resumed at startup (corrupt/torn/pre-`seq` tail) still comes up:
+    /// it writes a sanctioned `boundary.chain_break` continuity record,
+    /// carries the sequence number forward from the best-known prior
+    /// maximum (never resetting to 1), and resumes with the prev-hash
+    /// link restarted from genesis. Defaults to `false` (fail-closed):
+    /// an unreadable chain aborts server startup so a truncated/corrupted
+    /// tamper-evident log cannot be silently restarted (ADR 0024, H-2).
+    /// Mirrors the `--authz-fail-open` precedent — a secure default with
+    /// an explicit, audited operator opt-out.
+    #[serde(default = "default_audit_chain_fail_open")]
+    pub audit_chain_fail_open: bool,
 }
 
 fn default_low_to_high_max_bps() -> u64 {
@@ -199,6 +223,12 @@ fn default_audit_log_path() -> PathBuf {
 fn default_direction() -> GuardDirection {
     GuardDirection::Bidirectional
 }
+fn default_warmup_log_only() -> bool {
+    false
+}
+fn default_audit_chain_fail_open() -> bool {
+    false
+}
 
 impl Default for GuardConfig {
     /// Fail-closed v1 defaults — see the field-level `#[serde(default)]`
@@ -211,6 +241,8 @@ impl Default for GuardConfig {
             mandatory_marking: default_mandatory_marking(),
             audit_log_path: default_audit_log_path(),
             direction: default_direction(),
+            warmup_log_only: default_warmup_log_only(),
+            audit_chain_fail_open: default_audit_chain_fail_open(),
         }
     }
 }
@@ -231,6 +263,17 @@ pub enum GuardConfigError {
     /// The audit log path is empty.
     #[error("guard audit-log-path must not be empty")]
     EmptyAuditPath,
+    /// Two guard instances were configured against the same audit-log
+    /// path. Interleaving two independently-resumed sequence series into
+    /// one file would collide the `seq` counters and make the chain
+    /// unverifiable, so this is rejected at config time (ADR 0024).
+    #[error(
+        "guard audit-log-path `{path}` is already claimed by another configured guard instance — each guard needs its own audit log"
+    )]
+    DuplicateAuditPath {
+        /// The already-claimed audit-log path.
+        path: String,
+    },
 }
 
 impl GuardConfig {
@@ -250,11 +293,20 @@ impl GuardConfig {
     /// Validate a deserialized config before it is handed to
     /// [`CrossDomainGuard::new`].
     ///
+    /// Also **claims** the audit-log path process-wide: a second
+    /// `validate()` against the same path returns
+    /// [`GuardConfigError::DuplicateAuditPath`] so two guards cannot
+    /// interleave two resumed `seq` series into one file (ADR 0024). The
+    /// claim is released by [`GuardConfig::release_audit_path`] so a
+    /// reload of the same guard does not spuriously self-collide.
+    ///
     /// # Errors
     ///
     /// - [`GuardConfigError::ZeroCap`] if either throughput cap is zero.
     /// - [`GuardConfigError::EmptyAuditPath`] if the audit log path is
     ///   empty.
+    /// - [`GuardConfigError::DuplicateAuditPath`] if the audit-log path is
+    ///   already claimed by another guard instance in this process.
     pub fn validate(&self) -> std::result::Result<(), GuardConfigError> {
         if self.low_to_high_max_bps == 0 {
             return Err(GuardConfigError::ZeroCap {
@@ -269,8 +321,32 @@ impl GuardConfig {
         if self.audit_log_path.as_os_str().is_empty() {
             return Err(GuardConfigError::EmptyAuditPath);
         }
+        let mut claimed = claimed_audit_paths().lock();
+        if !claimed.insert(self.audit_log_path.clone()) {
+            return Err(GuardConfigError::DuplicateAuditPath {
+                path: self.audit_log_path.display().to_string(),
+            });
+        }
         Ok(())
     }
+
+    /// Release a previously-claimed audit-log path so the same guard can
+    /// be reconfigured/reloaded without tripping
+    /// [`GuardConfigError::DuplicateAuditPath`] against itself. Idempotent
+    /// — releasing an unclaimed path is a no-op.
+    pub fn release_audit_path(&self) {
+        let _ = claimed_audit_paths().lock().remove(&self.audit_log_path);
+    }
+}
+
+/// Process-wide set of audit-log paths already claimed by a validated
+/// [`GuardConfig`]. Guards it behind [`parking_lot::Mutex`] (the workspace
+/// standard for sync state — no poisoning). Used only at config-validation
+/// time, never on the hot path.
+fn claimed_audit_paths() -> &'static parking_lot::Mutex<std::collections::HashSet<PathBuf>> {
+    static PATHS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    PATHS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Errors returned by [`CrossDomainGuard::evaluate`].
@@ -296,6 +372,24 @@ pub enum GuardError {
     #[error("inbound message classification {marking} is not authorized for direction {direction}")]
     UnauthorizedClassification {
         /// Sanitized marking string from the inbound payload.
+        marking: String,
+        /// Direction the message was attempting to cross.
+        direction: GuardDirection,
+    },
+    /// A CAPCO marking (or an XML-intent payload the guard must inspect)
+    /// is present but cannot be parsed into a classification the guard
+    /// can reason about. Distinct from [`GuardError::MissingMarking`]: a
+    /// *present-but-unintelligible* banner is a marking the guard can
+    /// make no release or admission decision about, so it fails closed in
+    /// **both** directions (ADR 0024, H-1). Kept separate from
+    /// [`GuardError::UnauthorizedClassification`] so a SIEM can tell a
+    /// malformed banner from a known-too-high one.
+    #[error(
+        "inbound message carries an unparseable classification marking — cannot authorize for direction {direction}"
+    )]
+    UnparseableMarking {
+        /// Sanitized raw marking string (or a placeholder when the whole
+        /// XML envelope was uninspectable).
         marking: String,
         /// Direction the message was attempting to cross.
         direction: GuardDirection,
@@ -327,6 +421,24 @@ pub enum GuardError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+    /// The dedicated audit hash-chain could not be resumed at
+    /// construction time (corrupt/torn/pre-`seq` tail) and the operator
+    /// has **not** opted into `audit-chain-fail-open`. The guard refuses
+    /// to construct so `start_guard` fails and the server aborts before
+    /// any traffic crosses the boundary (ADR 0024, H-2). Deliberately
+    /// **not** `#[from] io::Error` — the plain [`GuardError::Io`] variant
+    /// already owns that conversion, and a chain-load failure is a
+    /// distinct, fail-closed construction event rather than an ordinary
+    /// write fault.
+    #[error(
+        "cross-domain guard audit chain at `{path}` could not be resumed ({reason}); refusing to start (set audit-chain-fail-open to override)"
+    )]
+    AuditChainUnreadable {
+        /// Sanitized audit-log path.
+        path: String,
+        /// Sanitized underlying read-error string.
+        reason: String,
+    },
 }
 
 impl GuardError {
@@ -344,8 +456,10 @@ impl GuardError {
             Self::MissingMarking => "missing_marking",
             Self::MultipleMarkings { .. } => "multiple_markings",
             Self::UnauthorizedClassification { .. } => "unauthorized_classification",
+            Self::UnparseableMarking { .. } => "unparseable_marking",
             Self::Audit { .. } => "audit_error",
             Self::Io { .. } => "io_error",
+            Self::AuditChainUnreadable { .. } => "audit_chain_unreadable",
         }
     }
 }
@@ -385,28 +499,107 @@ impl std::fmt::Debug for CrossDomainGuard {
 impl CrossDomainGuard {
     /// Build a guard from a parsed [`GuardConfig`].
     ///
-    /// Opens the audit log in append mode (creating it if missing) and
-    /// resumes the hash chain from the existing tip via
+    /// Opens the audit log **once** in append mode (creating it if
+    /// missing) and resumes the hash chain from the existing tip via
     /// [`rustgate_archive::audit_chain::read_chain_state`] when the file
     /// is non-empty. A brand-new audit log starts at
     /// [`rustgate_archive::audit_chain::GENESIS_PREV`].
     ///
+    /// # Fail-closed chain resume (ADR 0024, H-2)
+    ///
+    /// When the existing chain state cannot be read (corrupt/torn/pre-`seq`
+    /// tail) the behaviour is governed by
+    /// [`GuardConfig::audit_chain_fail_open`]:
+    ///
+    /// - **default (`false`)** — return
+    ///   [`GuardError::AuditChainUnreadable`] so `start_guard` fails and
+    ///   the server aborts before any traffic crosses. A truncated
+    ///   tamper-evident log is never silently re-genesised.
+    /// - **opt-out (`true`)** — recover the best-known prior maximum
+    ///   sequence number, write a sanctioned `boundary.chain_break`
+    ///   continuity record as the **first** new record (carrying the
+    ///   reason and prior max seq), emit
+    ///   [`rustgate_core::audit::guard_chain_reset`], and resume with the
+    ///   prev-hash link restarted from genesis but the seq counter
+    ///   **carried forward** (never reset to 1).
+    ///
     /// # Errors
     ///
     /// Returns [`GuardError::Io`] when the audit log path cannot be
-    /// opened or its chain state cannot be read.
+    /// opened, [`GuardError::AuditChainUnreadable`] when the chain cannot
+    /// be resumed and `audit_chain_fail_open` is `false`, or
+    /// [`GuardError::Audit`] if the chain-break marker cannot be written.
     pub fn new(config: GuardConfig) -> Result<Self> {
-        let (prev, next_seq) = if config.audit_log_path.exists() {
-            rustgate_archive::audit_chain::read_chain_state(&config.audit_log_path)
-                .unwrap_or_else(|_| (GENESIS_PREV.to_string(), 1))
+        // Determine how to resume the chain BEFORE opening the writer so
+        // the marker (if any) and every subsequent record share one file
+        // handle (ADR 0024, revision 4).
+        enum Resume {
+            /// Clean resume (or brand-new log): (prev_tip, next_seq).
+            Clean(String, u64),
+            /// Unreadable tail, opt-out engaged: emit a chain-break seam
+            /// carrying (reason, prior_max_seq); resume at prior_max + 1.
+            Break { reason: String, prior_max_seq: u64 },
+        }
+
+        let resume = if config.audit_log_path.exists() {
+            match rustgate_archive::audit_chain::read_chain_state(&config.audit_log_path) {
+                Ok((prev, next_seq)) => Resume::Clean(prev, next_seq),
+                Err(e) => {
+                    if config.audit_chain_fail_open {
+                        let prior_max_seq =
+                            rustgate_archive::audit_chain::recover_max_seq(&config.audit_log_path);
+                        Resume::Break {
+                            reason: e.to_string(),
+                            prior_max_seq,
+                        }
+                    } else {
+                        return Err(GuardError::AuditChainUnreadable {
+                            path: sanitize_for_log(&config.audit_log_path.display().to_string()),
+                            reason: sanitize_for_log(&e.to_string()),
+                        });
+                    }
+                }
+            }
         } else {
-            (GENESIS_PREV.to_string(), 1)
+            Resume::Clean(GENESIS_PREV.to_string(), 1)
         };
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&config.audit_log_path)?;
-        let audit_writer = HashChainWriter::new(file, prev).with_next_seq(next_seq);
+
+        let (prev, next_seq) = match &resume {
+            Resume::Clean(prev, next_seq) => (prev.clone(), *next_seq),
+            // Only the prev-hash link restarts (genesis); the seq series
+            // continues from prior_max + 1 so the marker cannot collide
+            // with a seq a downstream SIEM already forwarded.
+            Resume::Break { prior_max_seq, .. } => {
+                (GENESIS_PREV.to_string(), prior_max_seq.saturating_add(1))
+            }
+        };
+
+        let mut audit_writer = HashChainWriter::new(file, prev).with_next_seq(next_seq);
+
+        // If we are on the opt-out break path, the chain-break marker is
+        // the FIRST record written through the resumed writer.
+        if let Resume::Break {
+            reason,
+            prior_max_seq,
+        } = &resume
+        {
+            let reason_safe = sanitize_for_log(reason);
+            let path_safe = config.audit_log_path.display().to_string();
+            write_chain_break_marker(&mut audit_writer, &reason_safe, *prior_max_seq)?;
+            rustgate_core::audit::guard_chain_reset(&path_safe, &reason_safe, *prior_max_seq);
+            tracing::warn!(
+                path = %sanitize_for_log(&path_safe),
+                reason = %reason_safe,
+                prior_max_seq = *prior_max_seq,
+                "cross-domain guard audit chain was unreadable — audit-chain-fail-open engaged: wrote boundary.chain_break seam and resumed"
+            );
+        }
+
         // Token-bucket capacity is 1s of throughput so a brief burst is
         // admitted but a sustained over-cap stream is throttled. The
         // `f64` cast is safe for any realistic operator config (max
@@ -495,13 +688,15 @@ impl CrossDomainGuard {
             return Err(GuardError::MultipleMarkings { direction });
         }
 
-        // Step 2: classification dominance check. A `TopSecret`
-        // payload moving HighToLow is per-policy unauthorized; we
-        // record `unauthorized_classification` rather than degrading
-        // silently.
-        if let Some(ref m) = marking
-            && let Some(reject) = check_classification_authorized(m, direction)
-        {
+        // Step 1.75: malformed-ENVELOPE bypass (ADR 0024, revision 2).
+        // On a release boundary, an XML payload the guard cannot fully
+        // walk (broken structure) must NOT be treated as "no marking →
+        // permissible". Cannot-inspect equals cannot-release: deny. Only
+        // fires on HighToLow (admission is elevation, permissible) and
+        // only when the envelope is genuinely uninspectable — well-formed
+        // XML with no marking falls through to the mandatory-marking
+        // decision already made in step 1.
+        if direction == GuardDirection::HighToLow && xml_envelope_uninspectable(&payload) {
             self.write_audit_record(
                 direction,
                 msg,
@@ -509,9 +704,55 @@ impl CrossDomainGuard {
                 &input_sha,
                 &output_sha,
                 "deny",
-                "unauthorized_classification",
+                "unparseable_marking",
             )?;
-            return Err(reject);
+            return Err(GuardError::UnparseableMarking {
+                marking: "<uninspectable-envelope>".to_string(),
+                direction,
+            });
+        }
+
+        // Step 2: classification dominance check. A `TopSecret` payload
+        // moving HighToLow is per-policy unauthorized; a present-but-
+        // unparseable banner is one the guard cannot reason about and
+        // fails closed in both directions (ADR 0024, H-1). The audit
+        // `reason` is taken from the error's own `reason_token()` so a
+        // malformed banner (`unparseable_marking`) is distinguishable in
+        // the SIEM from a known-too-high level
+        // (`unauthorized_classification`).
+        if let Some(ref m) = marking
+            && let Some(reject) = check_classification_authorized(m, direction)
+        {
+            let reason = reject.reason_token();
+            // Warm-up (ADR 0024, revision 1): an operator running
+            // `warmup-log-only` observes which markings WOULD be denied
+            // before enforcing. Only the unparseable-marking path is
+            // softened — a known-too-high level always enforces.
+            let is_unparseable = matches!(reject, GuardError::UnparseableMarking { .. });
+            if is_unparseable && self.config.warmup_log_only {
+                self.write_audit_record(
+                    direction,
+                    msg,
+                    marking.as_deref(),
+                    &input_sha,
+                    &output_sha,
+                    "warn",
+                    "unparseable_marking",
+                )?;
+                // Do NOT deny — fall through to admit so warm-up
+                // telemetry never drops production traffic.
+            } else {
+                self.write_audit_record(
+                    direction,
+                    msg,
+                    marking.as_deref(),
+                    &input_sha,
+                    &output_sha,
+                    "deny",
+                    reason,
+                )?;
+                return Err(reject);
+            }
         }
 
         // Step 3: throughput cap. The bucket charges one token per
@@ -742,6 +983,51 @@ fn sha256_hex(payload: &[u8]) -> String {
     hex::encode(digest)
 }
 
+/// Write the sanctioned `boundary.chain_break` continuity record through a
+/// freshly-genesis-linked [`HashChainWriter`]. This is the first record on
+/// the `audit-chain-fail-open` opt-out path: it documents (in the same file
+/// the SIEM already tails) that the prior tip was unreadable, why, and the
+/// prior maximum sequence number the resumed series continues from
+/// (ADR 0024, revision 3). `reason` must already be sanitized.
+fn write_chain_break_marker(
+    writer: &mut HashChainWriter<File>,
+    reason: &str,
+    prior_max_seq: u64,
+) -> Result<()> {
+    let mut map = serde_json::Map::new();
+    let _ = map.insert(
+        "ts".to_string(),
+        serde_json::Value::String(current_timestamp_rfc3339()),
+    );
+    let _ = map.insert(
+        "event".to_string(),
+        serde_json::Value::String(rustgate_archive::audit_chain::CHAIN_BREAK_EVENT.to_string()),
+    );
+    let _ = map.insert(
+        "reason".to_string(),
+        serde_json::Value::String(reason.to_string()),
+    );
+    let _ = map.insert(
+        "prior_max_seq".to_string(),
+        serde_json::Value::Number(prior_max_seq.into()),
+    );
+    let _ = map.insert(
+        "decision".to_string(),
+        serde_json::Value::String("chain_break".to_string()),
+    );
+    let line =
+        serde_json::to_vec(&serde_json::Value::Object(map)).map_err(|e| GuardError::Audit {
+            source: AuditChainError::InvalidJson {
+                line_number: 0,
+                source: e,
+            },
+        })?;
+    writer.write_all(&line)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
 /// Extract the CAPCO marking string from a CoT XML payload's
 /// `<marking value="..."/>` child of `<detail>`. Returns `None` when
 /// no marking element is present (or the payload is not XML — non-XML
@@ -772,6 +1058,39 @@ fn extract_marking(payload: &[u8]) -> Option<String> {
             }
             Ok(Event::Eof) => return None,
             Err(_) => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+/// Return `true` when the payload *looks like* XML (leading `<`) but the
+/// parser hits a structural error before a clean end-of-document — i.e. the
+/// guard **cannot fully inspect** the envelope for a marking.
+///
+/// This closes the malformed-ENVELOPE bypass (ADR 0024, revision 2):
+/// [`extract_marking`] returns `None` on an XML read error just as it does
+/// for a well-formed envelope with no `<marking>`, so on a permissive
+/// (`mandatory_marking = false`) HighToLow deployment, corrupting the XML
+/// *structure* would otherwise skip the dominance check entirely. On a
+/// release boundary, cannot-inspect must equal cannot-release. Returns
+/// `false` for non-XML payloads (they legitimately carry no marking) and
+/// for well-formed XML that simply has no marking.
+fn xml_envelope_uninspectable(payload: &[u8]) -> bool {
+    if !is_xml_intent(payload) {
+        return false;
+    }
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+    let mut reader = Reader::from_reader(payload);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            // A structural parse error means we could not walk the whole
+            // envelope — treat it as uninspectable.
+            Err(_) => return true,
+            Ok(Event::Eof) => return false,
             _ => {}
         }
         buf.clear();
@@ -882,12 +1201,20 @@ fn check_classification_authorized(
     use rustgate_core::classification::{Classification, ClassificationMarking};
     let parsed: std::result::Result<ClassificationMarking, _> = raw_marking.parse();
     let Ok(parsed) = parsed else {
-        // Unparseable marking — let the caller see the raw string in
-        // the audit record but do not reject here; mandatory_marking
-        // already fired upstream, and a malformed marking on a
-        // permissive-config deployment should not silently elevate to
-        // a hard reject.
-        return None;
+        // Present-but-unparseable marking — the guard cannot make a
+        // release *or* admission decision about a banner it does not
+        // understand, so it fails closed in BOTH directions (ADR 0024,
+        // H-1). This is distinct from the absent-marking case
+        // (`MissingMarking`) and from a known-too-high level
+        // (`UnauthorizedClassification`); the caller may soften it to a
+        // log-only warn under the warm-up knob, but the default is deny.
+        // The bare-level parser tolerance in `rustgate_core::classification`
+        // (revision 1) keeps benign forms like `value="UNCLASSIFIED"`
+        // parseable so only genuinely garbage banners reach this branch.
+        return Some(GuardError::UnparseableMarking {
+            marking: raw_marking.to_string(),
+            direction,
+        });
     };
     match direction {
         GuardDirection::HighToLow => {
@@ -968,6 +1295,8 @@ mod tests {
             mandatory_marking: mandatory,
             audit_log_path: tmp.path().join("boundary-audit.jsonl"),
             direction: GuardDirection::Bidirectional,
+            warmup_log_only: false,
+            audit_chain_fail_open: false,
         }
     }
 
@@ -1149,6 +1478,261 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"reason\":\"missing_marking\""));
         assert!(contents.contains("\"decision\":\"deny\""));
+    }
+
+    // ---- H-1: unparseable marking fails closed (ADR 0024) ----
+
+    #[test]
+    fn unparseable_marking_denies_both_directions() {
+        // A present-but-unparseable banner must fail closed regardless of
+        // direction — the guard cannot make any decision about it.
+        for direction in [GuardDirection::HighToLow, GuardDirection::LowToHigh] {
+            let tmp = TempDir::new().unwrap();
+            // mandatory_marking = false so the absent-marking gate does NOT
+            // fire — this isolates the unparseable path.
+            let cfg = test_config(&tmp, 1_000_000, 1_000_000, false);
+            let path = cfg.audit_log_path.clone();
+            let mut g = CrossDomainGuard::new(cfg).unwrap();
+            let msg = make_message(cot_with_marking("u-bad", "INVALID_CLASSIFICATION_LEVEL"));
+            let err = g
+                .evaluate(&msg, direction)
+                .expect_err("unparseable marking must be denied");
+            assert!(
+                matches!(err, GuardError::UnparseableMarking { .. }),
+                "direction {direction:?}: got {err:?}"
+            );
+            assert_eq!(err.reason_token(), "unparseable_marking");
+            assert_eq!(g.audit_records_written(), 1, "exactly one deny record");
+            drop(g);
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert!(contents.contains("\"reason\":\"unparseable_marking\""));
+            assert!(contents.contains("\"decision\":\"deny\""));
+        }
+    }
+
+    #[test]
+    fn empty_marking_value_denies_as_unparseable() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp, 1_000_000, 1_000_000, false);
+        let mut g = CrossDomainGuard::new(cfg).unwrap();
+        let msg = make_message(cot_with_marking("u-empty", ""));
+        let err = g
+            .evaluate(&msg, GuardDirection::HighToLow)
+            .expect_err("empty marking value is unparseable");
+        assert_eq!(err.reason_token(), "unparseable_marking");
+    }
+
+    #[test]
+    fn well_formed_top_secret_stays_unauthorized_not_unparseable() {
+        // Token distinctness: a KNOWN-too-high level must still surface as
+        // `unauthorized_classification`, not `unparseable_marking`.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp, 1_000_000, 1_000_000, false);
+        let mut g = CrossDomainGuard::new(cfg).unwrap();
+        let msg = make_message(cot_with_marking("u-ts", "//TOP SECRET//"));
+        let err = g
+            .evaluate(&msg, GuardDirection::HighToLow)
+            .expect_err("TopSecret HighToLow is unauthorized");
+        assert_eq!(err.reason_token(), "unauthorized_classification");
+    }
+
+    #[test]
+    fn bare_unclassified_marking_is_allowed_low_to_high() {
+        // Revision 1 parser tolerance: a bare `value="UNCLASSIFIED"` (no
+        // `//…//` banner) parses and is admitted — it must NOT trip the
+        // unparseable-marking deny.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp, 1_000_000, 1_000_000, false);
+        let mut g = CrossDomainGuard::new(cfg).unwrap();
+        let msg = make_message(cot_with_marking("u-bare", "UNCLASSIFIED"));
+        assert!(
+            g.evaluate(&msg, GuardDirection::LowToHigh).is_ok(),
+            "bare UNCLASSIFIED must be admitted, not denied as unparseable"
+        );
+    }
+
+    #[test]
+    fn malformed_envelope_denies_high_to_low() {
+        // Revision 2: a broken XML envelope on the release boundary is
+        // uninspectable — cannot-inspect equals cannot-release. Even with
+        // mandatory_marking = false (so the absent-marking gate is off),
+        // the guard must deny rather than release the unwalkable payload.
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp, 1_000_000, 1_000_000, false);
+        let mut g = CrossDomainGuard::new(cfg).unwrap();
+        // Unterminated element: `<detail>` never closes.
+        let broken = Bytes::from_static(b"<event uid=\"u\"><detail><marking value=\"//SECRET//");
+        let msg = make_message(broken);
+        let err = g
+            .evaluate(&msg, GuardDirection::HighToLow)
+            .expect_err("malformed envelope must be denied on release");
+        assert_eq!(err.reason_token(), "unparseable_marking");
+    }
+
+    #[test]
+    fn warmup_log_only_admits_unparseable_and_records_warn() {
+        // Revision 1 warm-up: with the log-only knob on, an unparseable
+        // marking is admitted (NOT dropped) and a `decision = "warn"`
+        // record is written so operators observe would-be denies.
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(&tmp, 1_000_000, 1_000_000, false);
+        cfg.warmup_log_only = true;
+        let path = cfg.audit_log_path.clone();
+        let mut g = CrossDomainGuard::new(cfg).unwrap();
+        let msg = make_message(cot_with_marking("u-warn", "INVALID_CLASSIFICATION_LEVEL"));
+        assert!(
+            g.evaluate(&msg, GuardDirection::HighToLow).is_ok(),
+            "warm-up must admit, not deny"
+        );
+        drop(g);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"decision\":\"warn\""), "{contents}");
+        assert!(contents.contains("\"reason\":\"unparseable_marking\""));
+    }
+
+    // ---- H-2: audit-chain fail-closed (ADR 0024) ----
+
+    #[test]
+    fn unreadable_chain_refuses_construction_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp, 1_000_000, 1_000_000, false);
+        let path = cfg.audit_log_path.clone();
+        // Write a pre-`seq` record so read_chain_state errors (no seq).
+        std::fs::write(&path, "{\"event\":\"legacy\",\"sha256\":\"deadbeef\"}\n").unwrap();
+        let err = CrossDomainGuard::new(cfg)
+            .expect_err("default fail-closed must refuse an unreadable chain");
+        assert!(
+            matches!(err, GuardError::AuditChainUnreadable { .. }),
+            "got {err:?}"
+        );
+        // No fresh genesis record was appended — the file is unchanged.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains("boundary.chain_break"),
+            "must not write any marker on the fail-closed path"
+        );
+        assert!(!after.contains("boundary.evaluate"));
+    }
+
+    #[test]
+    fn unreadable_chain_opt_out_carries_seq_forward_and_verifies() {
+        let tmp = TempDir::new().unwrap();
+        // Build a real chain first, then corrupt its tail.
+        let cfg1 = test_config(&tmp, 1_000_000, 1_000_000, false);
+        let path = cfg1.audit_log_path.clone();
+        let mut g = CrossDomainGuard::new(cfg1).unwrap();
+        for i in 0..3 {
+            let msg = make_message(cot_with_marking(&format!("u-{i}"), "//SECRET//"));
+            let _ = g.evaluate(&msg, GuardDirection::LowToHigh).unwrap();
+        }
+        drop(g);
+        // Prior max seq is 3. Defeat clean resume: append a complete
+        // record that has a `sha256` (so read_chain_tip accepts it as the
+        // tip) but NO `seq` field — read_chain_state then errors with
+        // InvalidData ("no seq"), which is exactly the unreadable-tail
+        // case the opt-out handles. recover_max_seq still finds max seq 3
+        // among the earlier records.
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"{\"event\":\"legacy\",\"sha256\":\"deadbeef\"}\n")
+                .unwrap();
+        }
+
+        // Opt in to fail-open.
+        let mut cfg2 = test_config(&tmp, 1_000_000, 1_000_000, false);
+        cfg2.audit_chain_fail_open = true;
+        let g2 = CrossDomainGuard::new(cfg2).expect("opt-out must construct");
+        drop(g2);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        // The chain-break marker is the FIRST new record and it must
+        // carry the seq FORWARD from the prior max (3) to 4, never reset
+        // to 1 (revision 3 — the single most important assertion).
+        let seam_line = contents
+            .lines()
+            .find(|l| l.contains("boundary.chain_break"))
+            .expect("chain-break marker must be written");
+        let seam: serde_json::Value = serde_json::from_str(seam_line).unwrap();
+        assert_eq!(
+            seam["seq"].as_u64().unwrap(),
+            4,
+            "seq must carry forward across the seam (prior max 3 → 4), not reset to 1"
+        );
+        assert_eq!(
+            seam["prior_max_seq"].as_u64().unwrap(),
+            3,
+            "marker must record the recovered prior max seq"
+        );
+        // The seam links its prev-hash back to genesis (only the hash
+        // link restarts, not the seq series).
+        assert_eq!(seam["prev_sha256"].as_str().unwrap(), GENESIS_PREV);
+    }
+
+    #[test]
+    fn healthy_chain_resumes_without_marker() {
+        // Existing resume behaviour must stay identical for a healthy log:
+        // no chain-break marker, records continue in one series.
+        let tmp = TempDir::new().unwrap();
+        let cfg1 = test_config(&tmp, 1_000_000, 1_000_000, false);
+        let path = cfg1.audit_log_path.clone();
+        let mut g = CrossDomainGuard::new(cfg1).unwrap();
+        let msg = make_message(cot_with_marking("u-0", "//SECRET//"));
+        let _ = g.evaluate(&msg, GuardDirection::LowToHigh).unwrap();
+        drop(g);
+
+        let cfg2 = test_config(&tmp, 1_000_000, 1_000_000, false);
+        let mut g2 = CrossDomainGuard::new(cfg2).unwrap();
+        let msg2 = make_message(cot_with_marking("u-1", "//SECRET//"));
+        let _ = g2.evaluate(&msg2, GuardDirection::LowToHigh).unwrap();
+        drop(g2);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("boundary.chain_break"),
+            "a healthy chain must resume without a seam: {contents}"
+        );
+        let report = rustgate_archive::audit_chain::verify_audit_log(&path).unwrap();
+        assert_eq!(report.records, 2);
+        assert_eq!(report.tip_seq, 2);
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_audit_path() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("dup-audit.jsonl");
+        let a = GuardConfig::defaults_for_v1(p.clone());
+        let b = GuardConfig::defaults_for_v1(p.clone());
+        a.validate().expect("first claim succeeds");
+        assert!(
+            matches!(
+                b.validate(),
+                Err(GuardConfigError::DuplicateAuditPath { .. })
+            ),
+            "second guard on the same path must be rejected"
+        );
+        // Release so the claim does not leak into other tests.
+        a.release_audit_path();
+    }
+
+    #[test]
+    fn new_config_fields_default_false_and_round_trip_through_toml() {
+        let cfg: GuardConfig = toml::from_str(
+            "low-to-high-max-bps = 2048\nhigh-to-low-max-bps = 1024\naudit-log-path = \"/tmp/g.jsonl\"\n",
+        )
+        .unwrap();
+        assert!(!cfg.warmup_log_only, "warmup-log-only defaults false");
+        assert!(
+            !cfg.audit_chain_fail_open,
+            "audit-chain-fail-open defaults false"
+        );
+
+        let cfg2: GuardConfig = toml::from_str(
+            "low-to-high-max-bps = 2048\nhigh-to-low-max-bps = 1024\naudit-log-path = \"/tmp/g.jsonl\"\nwarmup-log-only = true\naudit-chain-fail-open = true\n",
+        )
+        .unwrap();
+        assert!(cfg2.warmup_log_only);
+        assert!(cfg2.audit_chain_fail_open);
     }
 
     #[test]

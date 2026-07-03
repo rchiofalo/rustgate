@@ -81,10 +81,37 @@ audit-log-path       = "/var/log/rustgate/boundary-audit.jsonl"
 #   "bidirectional" — a two-way bridge; resolves to the least-restrictive
 #                     low-to-high for the per-call evaluation in v1
 direction            = "bidirectional"
+
+# Warm-up (log-only) mode for the unparseable-marking control. When true,
+# a marking the guard cannot parse is LOGGED (decision="warn") but NOT
+# dropped — use it to observe which production markings would start being
+# denied before flipping to enforcement. Applies ONLY to the
+# unparseable-marking path; every other denial always enforces. Default
+# false (enforce). (ADR 0024)
+warmup-log-only      = false
+
+# Fail-open for the tamper-evident audit hash-chain. Default false
+# (fail-closed): if the chain tip cannot be read at startup
+# (corrupt/torn/pre-seq tail) the server ABORTS rather than silently
+# re-genesising the chain. When true, the guard instead writes a
+# sanctioned `boundary.chain_break` continuity record, carries the
+# sequence number forward from the prior maximum (never resetting to 1),
+# and resumes. Mirrors `--authz-fail-open`. (ADR 0024, H-2)
+audit-chain-fail-open = false
 ```
 
-All keys are required and unknown keys are rejected (`deny_unknown_fields`)
-so a typo fails fast rather than silently disabling a control.
+Unknown keys are rejected (`deny_unknown_fields`) so a typo fails fast
+rather than silently disabling a control. Every field has a fail-closed
+default, so a minimal `[guard]` block (e.g. just the two caps and an
+audit-log path) inherits `mandatory-marking = true`, `warmup-log-only =
+false`, and `audit-chain-fail-open = false`.
+
+`audit-chain-fail-open` can also be forced on at the command line with
+`--guard-audit-chain-fail-open` (env `RUSTGATE_GUARD_AUDIT_CHAIN_FAIL_OPEN`);
+the CLI flag overrides the TOML key only when set to `true`, and the
+`[guard]` block remains the primary source of truth. Two guards may not be
+configured against the same `audit-log-path` — validation rejects it so two
+resumed sequence series cannot interleave into one file.
 
 ### Direction in v1
 
@@ -104,9 +131,16 @@ event). These are the single source of truth from `rustgate-guard`:
 |-------|---------|
 | `rate_limit` | The direction's `*-max-bps` token bucket was exhausted. |
 | `missing_marking` | `mandatory-marking = true` and the message had no data marking. |
-| `unauthorized_classification` | The message's marking is not permitted to cross in this direction. |
+| `multiple_markings` | The payload carried more than one marking — ambiguous classification on `high-to-low`. |
+| `unauthorized_classification` | The message's marking parses but is not permitted to cross in this direction (e.g. a `TOP SECRET` release). |
+| `unparseable_marking` | The marking is present but cannot be parsed (or an XML-intent envelope could not be inspected on `high-to-low`). Fails closed in **both** directions unless `warmup-log-only` is set (then `decision="warn"` and the message is admitted). Distinct from `unauthorized_classification` so a malformed banner is greppable separately from a known-too-high one. |
 | `audit_error` | The boundary audit log could not be written — fail-closed denial. |
 | `io_error` | An I/O error occurred while evaluating the message. |
+
+`audit_chain_unreadable` is **not** a denial reason — it is a *construction*
+error: with `audit-chain-fail-open = false` (the default) a guard whose audit
+chain cannot be resumed refuses to start, so the server aborts before any
+traffic crosses.
 
 ## Observability
 
@@ -114,9 +148,15 @@ event). These are the single source of truth from `rustgate-guard`:
   direction and mandatory-marking flag.
 - `audit.guard.rejected` — emitted per denial with source CN, sink,
   direction, and reason token.
+- `audit.guard.chain_reset` — emitted only on the `audit-chain-fail-open`
+  opt-out path when an unreadable chain is resumed across a
+  `boundary.chain_break` seam; carries the audit-log path, the underlying
+  read-error reason, and the recovered prior maximum sequence number.
 - The dedicated boundary audit log (`audit-log-path`) is a SHA-256
   hash-chained JSONL trail; verify it with the standard audit-chain
-  verifier.
+  verifier, which recognises a `boundary.chain_break` record as a
+  sanctioned hash seam (the prev-hash link restarts from genesis while the
+  `seq` series continues, so a deletion still surfaces as a seq gap).
 
 ## Interaction with ACL / authz
 
