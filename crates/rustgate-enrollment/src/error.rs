@@ -14,6 +14,19 @@ pub enum EnrollmentError {
     #[error("signing: {0}")]
     Signing(String),
 
+    /// A hybrid (composite classical + post-quantum) certificate operation
+    /// was requested, but the feature is not yet implementable against the
+    /// current dependency stack.
+    ///
+    /// This is an honest "blocked upstream" surface, not a runtime failure of
+    /// a working path: rcgen has no composite-signature construction API,
+    /// rustls has no ML-DSA verification path (#501), and ML-DSA issuance
+    /// (#502) is not yet available. See `docs/adr/0019-cnsa2-hybrid-mldsa.md`
+    /// (the "#503 Hybrid Certificate Issuance" section) for the design and the
+    /// upstream gates that must land first.
+    #[error("hybrid-unsupported: {0}")]
+    HybridUnsupported(String),
+
     #[error("config: {0}")]
     Config(String),
 
