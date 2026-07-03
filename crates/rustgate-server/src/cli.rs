@@ -2771,6 +2771,7 @@ define_config_file! {
     mavlink_pq_bootstrap_file in mavlink: Option<String>,
     mavlink_v1_fallback_cn in mavlink: Option<String>,
     guard_config_file in integrations: Option<String>,
+    guard_audit_chain_fail_open in integrations: bool,
     inference_config_file in integrations: Option<String>,
     dis_bind in ingress: Option<String>,
     dis_group in ingress: String,
