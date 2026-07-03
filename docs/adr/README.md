@@ -59,6 +59,7 @@ does.
 | [0027](0027-maskpoint-fail-closed.md) | MaskPoint fails closed for unmaskable position protocols (DIS/Link 16/ASTERIX/…) | Proposed |
 | [0028](0028-sharded-maps-for-contended-hot-path.md) | `dashmap` for the position cache; single mutex stays for LRU/window maps | Accepted |
 | [0029](0029-discovered-peer-cn-pinning.md) | Discovered federation peers are never CN-pinned to their discovery id (SEC-1) | Proposed |
+| [0030](0030-tak-marti-application-layer.md) | TAK Server application-layer roadmap + Enterprise Sync first slice | Proposed |
 
 ## Authoring a new ADR
 

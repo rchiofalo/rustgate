@@ -304,7 +304,7 @@ cargo build --release --all-features
 | `jemalloc` | jemalloc allocator | — |
 | `video` | CoT `b-i-v` video stream catalog with `GET /api/video/streams` | — |
 | `missions` | TAK data-package REST API (`/api/packages`); needs `metrics` + `--packages-dir` | — |
-| `marti-compat` | Marti API compatibility shim (`/Marti/api/*`) for drop-in TAK Server replacement | — |
+| `marti-compat` | Marti API compatibility shim (`/Marti/api/*` + Enterprise Sync `/Marti/sync/*`) for drop-in TAK Server replacement | — |
 
 #### SPIFFE workload identity
 
