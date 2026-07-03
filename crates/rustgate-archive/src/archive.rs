@@ -679,6 +679,7 @@ mod tests {
             keys,
             key_expirations: std::collections::BTreeMap::new(),
             key_derivations: std::collections::BTreeMap::new(),
+            tenant_key_map: std::collections::BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&kf).expect("serialize");
         let ring =
@@ -912,6 +913,7 @@ mod tests {
             keys,
             key_expirations: std::collections::BTreeMap::new(),
             key_derivations: std::collections::BTreeMap::new(),
+            tenant_key_map: std::collections::BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&kf).unwrap();
         let ring = std::sync::Arc::new(crate::encrypted::KeyRing::from_bytes(&bytes).unwrap());
@@ -948,6 +950,7 @@ mod tests {
             keys,
             key_expirations: std::collections::BTreeMap::new(),
             key_derivations: std::collections::BTreeMap::new(),
+            tenant_key_map: std::collections::BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&kf).unwrap();
         let ring = std::sync::Arc::new(crate::encrypted::KeyRing::from_bytes(&bytes).unwrap());
