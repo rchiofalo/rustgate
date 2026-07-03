@@ -34,11 +34,14 @@ Enable **X25519MLKEM768** (X25519 + ML-KEM 768) hybrid key exchange in rustls. T
 
 ### Phase 2: PQ Certificate Authentication (Future)
 
-Once NIST finalizes ML-DSA (FIPS 204) and the X.509 ecosystem supports PQ signature algorithms, migrate server and client certificates to hybrid or pure PQ signatures.
+Once NIST finalizes ML-DSA (FIPS 204) and the X.509 ecosystem supports PQ signature algorithms, migrate server and client certificates to hybrid or pure PQ signatures. The architectural direction — Composite ML-DSA-87 + ECDSA-P384 hybrid certificates for CNSA 2.0 Level 5 — is locked in [ADR 0019](adr/0019-cnsa2-hybrid-mldsa.md), which decomposes this phase into #501 (ML-DSA TLS cert verification), #502 (ML-DSA cert + CRL issuance), and #503 (hybrid dual-signature certs).
+
+**Scaffold shipped (#501).** The verification seam is in place ahead of upstream: an opt-in, no-op-by-default `post-quantum-sig` compile gate plus a read-only `rustgate_tls::verifier::mldsa_schemes_available()` diagnostic that reports whether the installed rustls `CryptoProvider` advertises any ML-DSA `SignatureScheme`. No verification logic changed — `DynamicCertVerifier` already delegates TLS 1.3 signature checks to the provider, so ML-DSA schemes flow through automatically once upstream advertises them. On today's dependency tree the diagnostic reports "not available" (see blockers below); functional acceptance of ML-DSA-signed chains is deferred until rustls + aws-lc-rs converge.
 
 **Blockers:**
-- Rustls PQ signature support is not yet available
-- CA tooling (e.g., `openssl`, `rcgen`) needs ML-DSA support
+- Rustls PQ *signature verification* is not yet advertised by the stable providers — the `SignatureScheme::ML_DSA_*` variants exist, but neither `ring` nor `aws-lc-rs` lists them in `signature_verification_algorithms`
+- aws-lc-rs's ML-DSA lives in a FIPS-exclusive `unstable` module ([aws-lc-rs #964](https://github.com/aws/aws-lc-rs/issues/964))
+- CA tooling (e.g., `openssl`, `rcgen`) needs ML-DSA support (#502)
 - Client devices must support PQ certificates
 
 ### Phase 3: PQ Federation (Future)

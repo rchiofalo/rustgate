@@ -1,6 +1,8 @@
 # ADR 0019: CNSA 2.0 with Composite ML-DSA hybrid certificates
 
-- **Status:** Proposed
+- **Status:** Accepted (phased — Phase 1 shipped in #504; Phase 3 ML-DSA
+  cert-verification seam scaffolded in #501, functional enablement deferred
+  upstream — see Decision §2)
 - **Date:** 2026-05-19
 - **Deciders:** rchiofalo
 - **Related:** #500 (ML-DSA package signature verification),
@@ -50,6 +52,18 @@ The forcing function for THIS ADR is twofold:
    - **Phase 1 — scaffold (this batch, K1)**: flag exists, errors if `--features post-quantum` missing, emits a startup diagnostic naming the gap between requested and delivered config. No certificate or key-exchange behavior change.
    - **Phase 2 — partial PQ KEX (`--features post-quantum`)**: when set, `--cnsa2` forces `--tls-min-version 1.3` and overrides `--kx-groups` to prefer MLKEM-1024 (when aws-lc-rs ships it; today only MLKEM-768 is in the FIPS-disallowed `unstable` module). Logs "key exchange is NIST L5 PQ; signatures are still classical."
    - **Phase 3 — full CNSA 2.0**: ML-DSA-87 hybrid certs via #503; ML-DSA-87 verification via #501; ML-DSA-87 issuance via #502. The `--cnsa2` flag's runtime asserts all three are available and refuses to start if any are missing.
+
+   **Phase 3 scaffold shipped (#501).** The verification half (#501) landed its
+   *seam* ahead of upstream: a no-op-by-default `post-quantum-sig` compile gate
+   (`rustgate-tls`, forwarded through `rustgate-transport` and `rustgate-server`)
+   plus a read-only `verifier::mldsa_schemes_available()` diagnostic that reports
+   whether the installed `CryptoProvider` advertises any ML-DSA `SignatureScheme`.
+   No verification logic changed — `DynamicCertVerifier` already delegates
+   TLS 1.3 signature checks to the provider's `signature_verification_algorithms`,
+   so ML-DSA schemes flow through automatically once rustls + aws-lc-rs advertise
+   them. On today's dependency tree the diagnostic reports "not available"
+   ([aws-lc-rs #964](https://github.com/aws/aws-lc-rs/issues/964)); functional
+   acceptance of ML-DSA-signed chains is deferred until that upstream converges.
 
 3. **rustls is the only TLS provider** (per ADR 0xxx / workspace policy). The implementation path for #501/#502/#503 is whatever the upstream rustls roadmap supports — currently Composite ML-DSA via the same `CryptoProvider` extension point that landed X25519MLKEM768. **The workspace will not fork rustls.**
 

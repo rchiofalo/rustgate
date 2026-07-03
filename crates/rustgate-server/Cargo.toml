@@ -75,6 +75,9 @@ mqtt = ["dep:rustgate-mqtt"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "rustgate-http?/otel"]
 fips = ["rustgate-tls/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips", "rustgate-http?/fips"]
 post-quantum = ["rustgate-tls/post-quantum", "rustgate-federation?/post-quantum", "rustgate-http?/post-quantum"]
+# ML-DSA cert-verification scaffold gate (ADR 0019 Phase 3, #501). No-op today:
+# turns on the read-only provider-capability diagnostic seam in rustgate-tls.
+post-quantum-sig = ["rustgate-tls/post-quantum-sig", "rustgate-transport/post-quantum-sig"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 ocsp = ["rustgate-tls/ocsp"]
 spiffe = ["rustgate-tls/spiffe"]

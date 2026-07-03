@@ -312,6 +312,65 @@ impl ClientCertVerifier for DynamicCertVerifier {
     }
 }
 
+/// Reports whether the installed [`CryptoProvider`](rustls::crypto::CryptoProvider)
+/// advertises any ML-DSA ([FIPS 204]) signature scheme in its
+/// `signature_verification_algorithms`.
+///
+/// This is a **read-only diagnostic seam** for the CNSA 2.0 ML-DSA TLS
+/// certificate-verification slice (ADR 0019 Phase 3, #501/#502/#503). It does
+/// **not** change verification behavior — [`DynamicCertVerifier`] already
+/// delegates `verify_tls13_signature` / `supported_verify_schemes` to the
+/// provider's `signature_verification_algorithms`, so ML-DSA schemes flow
+/// through automatically the moment rustls + aws-lc-rs advertise them. This
+/// helper only *observes* that delegation path so operators (and the #502/#503
+/// wiring) can confirm provider capability without exercising verification.
+///
+/// # Current state
+///
+/// Expect `false` on today's dependency tree: neither `ring` nor `aws-lc-rs`
+/// exposes ML-DSA in the stable `signature_verification_algorithms` set
+/// ([aws-lc-rs #964] gates ML-DSA behind a FIPS-exclusive `unstable` module).
+/// This is a forward-looking seam, not a working feature.
+///
+/// Returns `None` when no crypto provider is installed — callers get an
+/// `Option`, never a panic (mirrors the `ok_or_else` handling on the verify
+/// path).
+///
+/// [FIPS 204]: https://csrc.nist.gov/pubs/fips/204/final
+/// [aws-lc-rs #964]: https://github.com/aws/aws-lc-rs/issues/964
+#[cfg(feature = "post-quantum-sig")]
+pub fn mldsa_schemes_available() -> Option<bool> {
+    let provider = rustls::crypto::CryptoProvider::get_default()?;
+    let available = provider
+        .signature_verification_algorithms
+        .supported_schemes()
+        .iter()
+        .any(|scheme| {
+            matches!(
+                scheme,
+                SignatureScheme::ML_DSA_44
+                    | SignatureScheme::ML_DSA_65
+                    | SignatureScheme::ML_DSA_87
+            )
+        });
+
+    if available {
+        debug!(
+            target: "audit",
+            capability = "mldsa-tls-verify",
+            "installed crypto provider advertises ML-DSA signature verification schemes"
+        );
+    } else {
+        debug!(
+            target: "audit",
+            capability = "mldsa-tls-verify",
+            "installed crypto provider does not advertise ML-DSA signature verification schemes (blocked upstream: aws-lc-rs #964)"
+        );
+    }
+
+    Some(available)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
@@ -833,5 +892,25 @@ mod tests {
         let as_trait: Arc<dyn ClientCertVerifier> = verifier;
         assert!(!as_trait.root_hint_subjects().is_empty());
         assert!(!as_trait.supported_verify_schemes().is_empty());
+    }
+
+    // The ML-DSA diagnostic seam (ADR 0019 Phase 3) is gated behind
+    // `post-quantum-sig`; its test compiles only when the feature is on.
+    #[cfg(feature = "post-quantum-sig")]
+    #[test]
+    fn mldsa_schemes_available_is_callable() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // The seam must never panic and must return a concrete bool for the
+        // installed provider. On today's dependency tree the `ring` provider
+        // does not advertise ML-DSA, so `false` is the expected — and honest —
+        // answer; this documents the current "not yet available" state rather
+        // than asserting a capability upstream has not shipped.
+        let result = mldsa_schemes_available();
+        assert_eq!(
+            result,
+            Some(false),
+            "ring provider is not expected to advertise ML-DSA yet (aws-lc-rs #964)"
+        );
     }
 }

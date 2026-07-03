@@ -13,6 +13,13 @@ workspace = true
 [features]
 fips = ["rustls/aws_lc_rs", "rustls/fips"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+# Opt-in, no-op-by-default compile gate for the ML-DSA TLS certificate
+# verification slice (ADR 0019 Phase 3, #501/#502/#503). Enables only a
+# read-only diagnostic seam in `verifier.rs`; it does NOT change verify
+# behavior. The verifier already delegates signature checks to the installed
+# `CryptoProvider`, so ML-DSA schemes flow through automatically once rustls +
+# aws-lc-rs advertise them — this feature is where #502/#503 wiring hangs.
+post-quantum-sig = []
 ocsp = ["dep:ocsp-stapler", "dep:lru"]
 spiffe = ["dep:spiffe"]
 

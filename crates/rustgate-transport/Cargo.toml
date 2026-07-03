@@ -19,6 +19,8 @@ mavlink = ["dep:rustgate-mavlink"]
 # in `rustgate-tls`; transport just forwards the flag.
 fips = ["rustgate-tls/fips"]
 post-quantum = ["rustgate-tls/post-quantum"]
+# Forward the ML-DSA cert-verification scaffold gate (ADR 0019 Phase 3, #501).
+post-quantum-sig = ["rustgate-tls/post-quantum-sig"]
 ocsp = ["rustgate-tls/ocsp"]
 spiffe = ["rustgate-tls/spiffe"]
 
