@@ -57,6 +57,7 @@ does.
 | [0025](0025-revocation-lifecycle.md) | Live certificate-revocation lifecycle (CRL refresh, fail-closed staleness, active mid-session disconnect) | Proposed |
 | [0026](0026-archive-xchacha-v3.md) | Wider-nonce v3 archive format (XChaCha20-Poly1305) | Proposed |
 | [0027](0027-maskpoint-fail-closed.md) | MaskPoint fails closed for unmaskable position protocols (DIS/Link 16/ASTERIX/…) | Proposed |
+| [0028](0028-siem-forwarding-and-idp-auth.md) | SIEM forwarding (phased; CEF formatter shipped) and external IdP authentication | Proposed |
 
 ## Authoring a new ADR
 

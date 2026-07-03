@@ -237,6 +237,7 @@ its CoT-XML parsing fuzz targets.
 | Feature | Pulls in |
 |---|---|
 | `metrics` | (no extra deps; exposes archive metrics) |
+| `siem` | (no extra deps; gates the pure ArcSight CEF audit-event formatter — ADR 0028, Phase 1a. Off by default; no I/O, the syslog transport that consumes it is deferred to Phase 1b.) |
 
 ### `rustgate-admin`
 
