@@ -1,5 +1,22 @@
 name: CodeQL
 
+# Private-repo / no-GHAS rationale:
+# SARIF upload to the GitHub Security tab requires GitHub Advanced Security,
+# which this private repo does not license. Rather than upload (and swallow the
+# failure with continue-on-error, which makes the job incapable of ever going
+# red), we run CodeQL with `upload: false`, emit the SARIF locally, and gate the
+# job ourselves by inspecting the results. This turns the job into a real
+# pass/fail check that can be registered as a required status check.
+#
+# BRANCH PROTECTION (owner action, out-of-band — not a file change):
+# After the first green run establishes the check context, register the exact
+# context string `CodeQL / Analyze` as a required status check on `main`:
+#   gh api -X PUT \
+#     repos/:owner/:repo/branches/main/protection/required_status_checks/contexts \
+#     -f 'contexts[]=CodeQL / Analyze'
+# The context string must match `<workflow name> / <job name>` exactly
+# (`CodeQL` / `Analyze`); a mismatch silently leaves the gate non-blocking.
+
 on:
   push:
     branches: [main]
@@ -18,7 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write # required to upload SARIF
       actions: read # required for private repos
 
     steps:
@@ -39,9 +55,47 @@ jobs:
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@e46ed2cbd01164d986452f91f178727624ae40d7 # v4.35.3
-        # SARIF upload requires GitHub Advanced Security, which is not available
-        # on private repos without a GHAS license. Allow this step to fail
-        # gracefully so the workflow does not block PRs.
-        continue-on-error: true
         with:
           category: "/language:actions"
+          # No GHAS on this private repo: skip the Security-tab upload and write
+          # the SARIF locally so the gate step below can inspect it. There is no
+          # continue-on-error here — a genuine analysis failure now fails the job.
+          upload: false
+          output: codeql-results
+
+      - name: Gate on findings
+        shell: bash
+        run: |
+          # Fail the job when CodeQL reports any error-severity result.
+          # We intentionally filter to level == "error": the `actions` query
+          # pack also emits note/warning-severity results on legitimate workflow
+          # patterns, and gating on those would block every PR fleet-wide.
+          # `output` is a directory; iterate every *.sarif it produced.
+          shopt -s nullglob
+          files=(codeql-results/*.sarif)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::CodeQL produced no SARIF output — analysis did not run as expected."
+            exit 1
+          fi
+          errors=0
+          for f in "${files[@]}"; do
+            n=$(jq '[.runs[].results[]? | select(.level == "error")] | length' "$f")
+            echo "$f: $n error-severity result(s)"
+            errors=$((errors + n))
+          done
+          if [ "$errors" -gt 0 ]; then
+            echo "::error::CodeQL found $errors error-severity finding(s). See the SARIF above."
+            exit 1
+          fi
+          echo "CodeQL gate passed: no error-severity findings."
+
+      # If a GitHub Advanced Security license is added later, re-enable the
+      # Security-tab upload by setting `upload: true` on the analyze step above
+      # (and dropping `output`/the gate), or keep the local SARIF and add an
+      # explicit upload step here, mirroring scorecard.yml. The job would then
+      # also need `security-events: write` back in its `permissions:` block:
+      #
+      # - name: Upload SARIF to GitHub Security tab
+      #   uses: github/codeql-action/upload-sarif@e46ed2cbd01164d986452f91f178727624ae40d7 # v4.35.3
+      #   with:
+      #     sarif_file: codeql-results
