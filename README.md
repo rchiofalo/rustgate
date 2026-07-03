@@ -88,6 +88,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | Crate | Purpose |
 |-------|---------|
 | [`rustgate-core`](crates/rustgate-core/README.md) | Codec trait, shared types: Identity, RoutableMessage, Destination, framing strategies |
+| [`rustgate-entity`](crates/rustgate-entity/README.md) | Canonical protocol-agnostic entity model — skeleton crate re-exporting the in-core `Entity` seam ahead of the type migration (ADR 0028) |
 | [`rustgate-cot`](crates/rustgate-cot/README.md) | Cursor on Target XML parsing and message building |
 | [`rustgate-tls`](crates/rustgate-tls/README.md) | TLS/mTLS configuration, X.509 identity extraction, OCSP, SPIFFE, TCP listeners |
 | [`rustgate-router`](crates/rustgate-router/README.md) | Routing engine: Router, ACL, dedup, store-and-forward, position cache, throttling, quota, obligations, egress |
