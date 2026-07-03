@@ -58,6 +58,7 @@ does.
 | [0026](0026-archive-xchacha-v3.md) | Wider-nonce v3 archive format (XChaCha20-Poly1305) | Proposed |
 | [0027](0027-maskpoint-fail-closed.md) | MaskPoint fails closed for unmaskable position protocols (DIS/Link 16/ASTERIX/…) | Proposed |
 | [0028](0028-sharded-maps-for-contended-hot-path.md) | `dashmap` for the position cache; single mutex stays for LRU/window maps | Accepted |
+| [0029](0029-discovered-peer-cn-pinning.md) | Discovered federation peers are never CN-pinned to their discovery id (SEC-1) | Proposed |
 
 ## Authoring a new ADR
 

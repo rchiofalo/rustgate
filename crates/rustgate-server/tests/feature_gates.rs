@@ -142,6 +142,7 @@ mod federation_gate {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         assert_eq!(peer.id.as_str(), "peer-1");
         assert!(peer.enabled);

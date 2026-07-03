@@ -15,6 +15,7 @@
 //! `?index=N` to react instantly to catalog changes, but that would
 //! complicate error handling and is not required for v1.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,6 +25,16 @@ use tracing::debug;
 use super::PeerDiscovery;
 use crate::config::{PeerConfig, RoutingMode};
 use crate::error::{FederationError, Result};
+
+/// Consul service-meta key that carries an operator-supplied, trusted
+/// certificate CN for a discovered peer.
+///
+/// The value is copied verbatim into [`PeerConfig::trust_cert_cn`], which
+/// pins the peer's server certificate. A discovered peer with no such key
+/// is left unpinned by the SEC-1 pin resolver (never pinned to its
+/// attacker-influenced `ServiceID`). See
+/// `docs/adr/0029-discovered-peer-cn-pinning.md`.
+const TRUST_CN_META_KEY: &str = "rustgate-trust-cn";
 
 /// Default HTTP timeout for catalog requests.
 ///
@@ -45,6 +56,12 @@ struct CatalogEntry {
     service_address: Option<String>,
     service_port: u16,
     address: String,
+    /// Service metadata (`ServiceMeta` in the Consul catalog API). The
+    /// well-known [`TRUST_CN_META_KEY`] entry, when present, supplies the
+    /// operator-controlled trusted certificate CN for this peer. Absent
+    /// for services registered without metadata, hence `Option`.
+    #[serde(default)]
+    service_meta: Option<HashMap<String, String>>,
 }
 
 /// Consul peer discovery source.
@@ -113,6 +130,16 @@ impl ConsulDiscovery {
         } else {
             format!("{host}:{}", entry.service_port)
         };
+        // SEC-1: a discovered peer is only pinned when the operator supplied
+        // a trusted CN via Consul service metadata. The peer id (ServiceID)
+        // is attacker-influenced service metadata and is never used as a CN
+        // pin — see `resolve_pinned_peer_cn` and ADR 0029.
+        let trust_cert_cn = entry
+            .service_meta
+            .as_ref()
+            .and_then(|meta| meta.get(TRUST_CN_META_KEY))
+            .map(|cn| cn.trim().to_string())
+            .filter(|cn| !cn.is_empty());
         PeerConfig {
             id: entry.service_id.clone().into(),
             address,
@@ -121,7 +148,7 @@ impl ConsulDiscovery {
             outbound_groups: None,
             enabled: true,
             is_outbound: true,
-            trust_cert_cn: None,
+            trust_cert_cn,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
@@ -131,6 +158,7 @@ impl ConsulDiscovery {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: true,
         }
     }
 }
@@ -196,6 +224,7 @@ mod tests {
             service_address: Some("10.0.0.5".into()),
             service_port: 9000,
             address: "consul-node.example".into(),
+            service_meta: None,
         };
         let peer = ConsulDiscovery::entry_to_peer(&entry);
         assert_eq!(peer.id.as_str(), "rustgate-1");
@@ -210,6 +239,7 @@ mod tests {
             service_address: Some(String::new()),
             service_port: 9000,
             address: "consul-node.example".into(),
+            service_meta: None,
         };
         let peer = ConsulDiscovery::entry_to_peer(&entry);
         assert_eq!(peer.address, "consul-node.example:9000");
@@ -222,6 +252,7 @@ mod tests {
             service_address: Some("fe80::1".into()),
             service_port: 9000,
             address: String::new(),
+            service_meta: None,
         };
         let peer = ConsulDiscovery::entry_to_peer(&entry);
         assert_eq!(peer.address, "[fe80::1]:9000");
@@ -296,6 +327,7 @@ mod tests {
             service_address: Some("10.0.0.1".into()),
             service_port: 9000,
             address: "consul-node.example".into(),
+            service_meta: None,
         };
         let peer = ConsulDiscovery::entry_to_peer(&entry);
 
@@ -313,9 +345,12 @@ mod tests {
         assert!(peer.is_outbound, "Consul peers are outbound by default");
 
         // Trust + auth: no static overrides — cert verification uses the
-        // federation trust store.
+        // federation trust store. With no `rustgate-trust-cn` service meta
+        // the peer is unpinned, and the provenance marker flags it as
+        // discovered so the SEC-1 pin resolver refuses the id fallback.
         assert!(peer.trust_cert_cn.is_none());
         assert!(peer.jwt_token.is_none());
+        assert!(peer.discovered, "Consul peers are provenance-marked");
 
         // Routing.
         assert_eq!(peer.routing_mode, RoutingMode::default());
@@ -341,6 +376,7 @@ mod tests {
             service_address: Some("[2001:db8::1]".into()),
             service_port: 9000,
             address: String::new(),
+            service_meta: None,
         };
         let peer = ConsulDiscovery::entry_to_peer(&entry);
         assert_eq!(peer.address, "[2001:db8::1]:9000");
@@ -415,5 +451,78 @@ mod tests {
         let _ = ConsulDiscovery::new("http://consul:8500", "rustgate").unwrap();
         let _ = ConsulDiscovery::new(String::from("http://consul:8500"), String::from("rustgate"))
             .unwrap();
+    }
+
+    #[test]
+    fn entry_to_peer_reads_trust_cn_from_service_meta() {
+        // SEC-1: an operator-supplied trusted CN in the `rustgate-trust-cn`
+        // service-meta entry must populate `trust_cert_cn`, which lets the
+        // pin resolver pin the discovered peer despite its attacker-
+        // influenced id.
+        let mut meta = HashMap::new();
+        let _ = meta.insert("rustgate-trust-cn".to_string(), "fed-prod-east".to_string());
+        let entry = CatalogEntry {
+            service_id: "rustgate-pinned".into(),
+            service_address: Some("10.0.0.7".into()),
+            service_port: 9000,
+            address: "consul-node.example".into(),
+            service_meta: Some(meta),
+        };
+        let peer = ConsulDiscovery::entry_to_peer(&entry);
+        assert_eq!(peer.trust_cert_cn.as_deref(), Some("fed-prod-east"));
+        assert!(peer.discovered);
+    }
+
+    #[test]
+    fn entry_to_peer_ignores_blank_trust_cn_meta() {
+        // A whitespace-only meta value must not produce an empty-string pin
+        // (no certificate CN can match it) — it is treated as absent.
+        let mut meta = HashMap::new();
+        let _ = meta.insert("rustgate-trust-cn".to_string(), "   ".to_string());
+        let entry = CatalogEntry {
+            service_id: "rustgate-blank".into(),
+            service_address: Some("10.0.0.8".into()),
+            service_port: 9000,
+            address: "consul-node.example".into(),
+            service_meta: Some(meta),
+        };
+        let peer = ConsulDiscovery::entry_to_peer(&entry);
+        assert!(peer.trust_cert_cn.is_none());
+        assert!(peer.discovered);
+    }
+
+    #[test]
+    fn entry_to_peer_without_matching_meta_key_leaves_cn_none() {
+        // Service meta present but without the well-known key must leave the
+        // peer unpinned.
+        let mut meta = HashMap::new();
+        let _ = meta.insert("some-other-key".to_string(), "value".to_string());
+        let entry = CatalogEntry {
+            service_id: "rustgate-other".into(),
+            service_address: Some("10.0.0.9".into()),
+            service_port: 9000,
+            address: "consul-node.example".into(),
+            service_meta: Some(meta),
+        };
+        let peer = ConsulDiscovery::entry_to_peer(&entry);
+        assert!(peer.trust_cert_cn.is_none());
+    }
+
+    #[test]
+    fn catalog_entry_deserializes_service_meta_from_wire() {
+        // The `ServiceMeta` wire field (PascalCase) must deserialize into
+        // `service_meta` so real Consul responses carrying metadata are
+        // parsed. A regression dropping the field would silently strip the
+        // trusted CN, leaving every metadata-pinned peer unpinned.
+        let json = r#"{
+            "ServiceID": "rustgate-meta",
+            "ServiceAddress": "10.0.0.10",
+            "ServicePort": 9100,
+            "Address": "consul-node.example",
+            "ServiceMeta": { "rustgate-trust-cn": "fed-west" }
+        }"#;
+        let entry: CatalogEntry = serde_json::from_str(json).unwrap();
+        let peer = ConsulDiscovery::entry_to_peer(&entry);
+        assert_eq!(peer.trust_cert_cn.as_deref(), Some("fed-west"));
     }
 }

@@ -414,6 +414,27 @@ pub struct PeerConfig {
     // read alias so any config dumped by an older build still loads.
     #[serde(default, alias = "topologyRole")]
     pub topology_role: TopologyRole,
+    /// Provenance marker: `true` when this peer was synthesized by a
+    /// discovery backend (Consul, etcd, DNS-SD) rather than authored by an
+    /// operator in a static config file.
+    ///
+    /// **Not serialized** (`#[serde(skip)]`): it is not an operator-facing
+    /// config knob and must never appear in a static config file. Static
+    /// peers keep the default (`false`); the discovery backends set it to
+    /// `true` on the peers they emit. Because the field is skipped, it does
+    /// not interact with `deny_unknown_fields` — a config file that (wrongly)
+    /// contains a `discovered` key is still rejected as an unknown field.
+    ///
+    /// The pin resolver (`resolve_pinned_peer_cn` in [`crate::manager`])
+    /// consults this flag to close the SEC-1 discovered-peer trust gap: a
+    /// discovered peer id is attacker-influenced service metadata, so it is
+    /// never used as a certificate-CN pin. A discovered peer is only pinned
+    /// when a backend supplies an explicit, operator-controlled
+    /// [`trust_cert_cn`](PeerConfig::trust_cert_cn); otherwise it is left
+    /// unpinned (chain-only) even when `require_peer_cn_match` is set. See
+    /// `docs/adr/0029-discovered-peer-cn-pinning.md`.
+    #[serde(skip)]
+    pub discovered: bool,
 }
 
 impl PeerConfig {
@@ -542,6 +563,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -574,6 +596,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: TopologyRole::Standby,
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(
@@ -742,6 +765,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -768,6 +792,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -794,6 +819,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         assert!(!peer.enabled);
     }
@@ -824,6 +850,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -857,6 +884,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -883,6 +911,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Alpha", "Bravo"]);
         assert_eq!(peer.effective_outbound_groups(), &["Alpha", "Bravo"]);
@@ -908,6 +937,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1", "Inbound2"]);
         assert_eq!(peer.effective_outbound_groups(), &["Outbound1"]);
@@ -933,6 +963,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         assert_eq!(peer.effective_inbound_groups(), &["Inbound1"]);
         // outbound falls back to groups
@@ -959,6 +990,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(json.contains("inbound_groups"));
@@ -992,6 +1024,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(!json.contains("inbound_groups"));
@@ -1022,6 +1055,41 @@ mod tests {
         assert!(
             err.contains("unknown field"),
             "error should mention unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn peer_config_discovered_defaults_false_and_is_not_serialized() {
+        // The `discovered` provenance marker is `#[serde(skip)]`: it must
+        // never appear in serialized output and must default to `false` on
+        // deserialize (static-peer default). Discovery backends set it in
+        // code, not on the wire.
+        let json = r#"{"id":"p","address":"1.2.3.4:9001","groups":[],"enabled":true,"is_outbound":false,"trust_cert_cn":null}"#;
+        let parsed: PeerConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            !parsed.discovered,
+            "static peers default to discovered=false"
+        );
+
+        let mut peer = parsed;
+        peer.discovered = true;
+        let dumped = serde_json::to_string(&peer).expect("serialize");
+        assert!(
+            !dumped.contains("discovered"),
+            "discovered must be skipped in serialized output: {dumped}"
+        );
+    }
+
+    #[test]
+    fn peer_config_rejects_discovered_key_on_the_wire() {
+        // Because the field is `#[serde(skip)]`, a config file that (wrongly)
+        // sets `discovered` hits `deny_unknown_fields` and is rejected — the
+        // marker is code-internal, not an operator knob.
+        let json = r#"{"id":"p","address":"1.2.3.4:9001","groups":[],"enabled":true,"is_outbound":false,"trust_cert_cn":null,"discovered":true}"#;
+        let result = serde_json::from_str::<PeerConfig>(json);
+        assert!(
+            result.is_err(),
+            "a wire `discovered` key must be rejected as unknown"
         );
     }
 
@@ -1106,6 +1174,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(
@@ -1136,6 +1205,7 @@ mod tests {
             compression: Some(CompressionKind::Zstd),
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         assert!(json.contains("\"zstd\""), "expected zstd token: {json}");
@@ -1163,6 +1233,7 @@ mod tests {
             compression: Some(CompressionKind::Gzip),
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let json = serde_json::to_string(&peer).expect("serialize");
         let parsed: PeerConfig = serde_json::from_str(&json).expect("deserialize");

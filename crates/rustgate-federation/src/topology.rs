@@ -201,6 +201,7 @@ mod tests {
             compression: None,
             tenants: tenants.into_iter().map(str::to_string).collect(),
             topology_role: role,
+            discovered: false,
         };
         let handle = Arc::new(PeerHandle::new(config));
         // `is_available()` = connected AND circuit closed. The circuit
