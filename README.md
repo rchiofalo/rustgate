@@ -92,6 +92,7 @@ For production certificate management see [docs/tls-certificates.md](docs/tls-ce
 | [`rustgate-tls`](crates/rustgate-tls/README.md) | TLS/mTLS configuration, X.509 identity extraction, OCSP, SPIFFE, TCP listeners |
 | [`rustgate-router`](crates/rustgate-router/README.md) | Routing engine: Router, ACL, dedup, store-and-forward, position cache, throttling, quota, obligations, egress |
 | [`rustgate-transport`](crates/rustgate-transport/README.md) | Codec / framing primitives, hardware identity, UDP / multicast — pure post-handshake |
+| [`rustgate-tpm`](crates/rustgate-tpm/README.md) | Hardware-rooted device-identity driver home — facade re-exporting the transport `HardwareIdentity` trait; `tpm` / `pkcs11` / `yubikey` driver stubs (fail-closed, real bodies land under #1539) |
 | [`rustgate-codec-schema`](crates/rustgate-codec-schema/README.md) | Declarative schema format + generic `SchemaCodec` runtime for tactical wire formats |
 | [`rustgate-resilience`](crates/rustgate-resilience/README.md) | Circuit breakers, backoff, rate limiters, token buckets |
 | [`rustgate-websocket`](crates/rustgate-websocket/README.md) | WebSocket (wss://) listener with mTLS client authentication |

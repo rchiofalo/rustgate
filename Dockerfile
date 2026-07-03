@@ -48,6 +48,7 @@ COPY crates/rustgate-server/Cargo.toml      crates/rustgate-server/Cargo.toml
 COPY crates/rustgate-stanag4586/Cargo.toml  crates/rustgate-stanag4586/Cargo.toml
 COPY crates/rustgate-test-utils/Cargo.toml  crates/rustgate-test-utils/Cargo.toml
 COPY crates/rustgate-tls/Cargo.toml         crates/rustgate-tls/Cargo.toml
+COPY crates/rustgate-tpm/Cargo.toml         crates/rustgate-tpm/Cargo.toml
 COPY crates/rustgate-router/Cargo.toml      crates/rustgate-router/Cargo.toml
 COPY crates/rustgate-sapient/Cargo.toml     crates/rustgate-sapient/Cargo.toml
 COPY crates/rustgate-nffi/Cargo.toml        crates/rustgate-nffi/Cargo.toml

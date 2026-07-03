@@ -5080,6 +5080,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-tpm"
+version = "0.9.0"
+dependencies = [
+ "rustgate-transport",
+ "rustls",
+]
+
+[[package]]
 name = "rustgate-transport"
 version = "0.9.0"
 dependencies = [
