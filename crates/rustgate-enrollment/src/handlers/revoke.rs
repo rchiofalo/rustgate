@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode};
 
-use super::util::build_response;
+use super::util::{build_response, redact_paths};
 use crate::auth::Credentials;
 use crate::revocation::RevocationStore;
 
@@ -25,12 +25,16 @@ use crate::revocation::RevocationStore;
     skip_all,
     fields(peer = %rustgate_core::masking::mask_ip(&peer.to_string())),
 )]
-pub(crate) async fn handle_revoke(
-    req: Request<hyper::body::Incoming>,
+pub(crate) async fn handle_revoke<B>(
+    req: Request<B>,
     peer: std::net::SocketAddr,
     credentials: &Credentials,
     revocation: &RevocationStore,
-) -> Response<Full<Bytes>> {
+) -> Response<Full<Bytes>>
+where
+    B: hyper::body::Body,
+    B::Data: bytes::Buf,
+{
     // Validate Basic Auth
     let auth_header = req
         .headers()
@@ -64,10 +68,15 @@ pub(crate) async fn handle_revoke(
     let request: RevokeRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
+            // Full error (may carry file context) stays server-side for
+            // triage; the client-facing copy has any filesystem path
+            // redacted so shared logs cannot leak deployment topology.
+            tracing::warn!(error = %e, "revoke request body was not valid JSON");
+            let safe = redact_paths(&e.to_string());
             return build_response(
                 StatusCode::BAD_REQUEST,
                 "application/json",
-                Bytes::from(format!(r#"{{"error":"invalid JSON: {e}"}}"#)),
+                Bytes::from(format!(r#"{{"error":"invalid JSON: {safe}"}}"#)),
             );
         }
     };
@@ -111,11 +120,14 @@ pub(crate) async fn handle_revoke(
             )),
         ),
         Err(e) => {
+            // Full error (may embed the revocation DB path via io::Error)
+            // is logged server-side; the client sees a path-redacted copy.
             tracing::error!(error = %e, serial = %request.serial, "revocation failed");
+            let safe = redact_paths(&e.to_string());
             build_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "application/json",
-                Bytes::from(format!(r#"{{"error":"revocation failed: {e}"}}"#)),
+                Bytes::from(format!(r#"{{"error":"revocation failed: {safe}"}}"#)),
             )
         }
     }
@@ -204,6 +216,94 @@ mod tests {
             .await
             .unwrap();
         (dir, store)
+    }
+
+    fn basic_auth_header(user: &str, pass: &str) -> String {
+        format!(
+            "Basic {}",
+            rustgate_core::b64::encode(format!("{user}:{pass}"))
+        )
+    }
+
+    /// Build a `Request<Full<Bytes>>` for `handle_revoke`. The handler is
+    /// generic over the body type, so a `Full`-bodied request stands in
+    /// for the production `Incoming` body (which has no public constructor
+    /// and cannot be built in a unit test).
+    fn revoke_request_with_body(auth: &str, body: &str) -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(hyper::Method::POST)
+            .uri("/api/revoke")
+            .header(hyper::header::AUTHORIZATION, auth)
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap()
+    }
+
+    /// End-to-end split-surface guarantee at the handler boundary
+    /// (F-149, #1526). `serde_json`'s `deny_unknown_fields` error echoes
+    /// the offending field name verbatim, so a request body carrying an
+    /// unknown field whose name is a filesystem path drives a genuine
+    /// path fragment into the error string. The client-facing JSON
+    /// response must still signal failure correctly (HTTP 400, well-formed
+    /// JSON, still names "invalid JSON") but must NOT contain any `/`
+    /// path fragment — `handle_revoke` routes the error through
+    /// `redact_paths` before rendering. The full, unredacted error stays
+    /// server-side via `tracing::warn!` per the split-surface policy.
+    ///
+    /// This is non-vacuous: without the redaction call, the raw serde
+    /// error `unknown field `/etc/rustgate/ca.key`, expected …` would put
+    /// a `/`-rooted path straight into the body (asserted below via the
+    /// `raw` control string).
+    #[tokio::test]
+    async fn handle_revoke_response_redacts_path_from_error_body() {
+        let (_dir, store) = fresh_store().await;
+        let creds = crate::auth::Credentials::new(
+            "admin".to_string(),
+            zeroize::Zeroizing::new("secret".to_string()),
+        );
+        let auth = basic_auth_header("admin", "secret");
+        // Unknown field name IS an absolute path; deny_unknown_fields will
+        // echo it into the serde error.
+        let leaky_field = "/etc/rustgate/ca.key";
+        let body = format!(r#"{{"serial":"deadbeef","{leaky_field}":"x"}}"#);
+        let req = revoke_request_with_body(&auth, &body);
+        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 4444));
+
+        // Control: the raw (un-redacted) serde error really does carry the
+        // path, so the no-slash assertion below is meaningful.
+        let raw = match serde_json::from_slice::<RevokeRequest>(body.as_bytes()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("unknown field must fail to parse"),
+        };
+        assert!(
+            raw.contains(leaky_field),
+            "precondition: raw serde error must embed the path, got: {raw}"
+        );
+
+        let resp = handle_revoke(req, peer, &creds, &store).await;
+        let (status, content_type, resp_body) = collect_body(resp).await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a bad body must still surface as a 400 — redaction does not swallow the failure"
+        );
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        let body_str = std::str::from_utf8(&resp_body).expect("utf8 body");
+        assert!(
+            body_str.contains("invalid JSON"),
+            "client message must still name the failure mode: {body_str}"
+        );
+        assert!(
+            !body_str.contains('/'),
+            "client response must not leak any filesystem path fragment: {body_str}"
+        );
+        // The response must still be well-formed JSON despite redaction.
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&resp_body).expect("error response must be valid JSON");
+        assert!(
+            parsed.get("error").and_then(|v| v.as_str()).is_some(),
+            "error response must carry a string `error` field: {body_str}"
+        );
     }
 
     #[tokio::test]
