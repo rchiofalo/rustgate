@@ -45,6 +45,7 @@ ADR — that is what this file is the index of.
 | Accept a tactical TCP stream | `rustgate_core::net::configure_tactical_socket(&stream)` | [ADR 0013](adr/0013-tactical-tcp-socket-hardening.md) |
 | Accept a bulk-only TCP stream | `rustgate_core::net::configure_tcp_keepalive(&stream)` | [ADR 0013](adr/0013-tactical-tcp-socket-hardening.md) |
 | Run a WebSocket listener | `tokio-tungstenite` over `tokio-rustls` | [ADR 0005](adr/0005-tokio-tungstenite-over-soketto.md) |
+| Speak the canonical entity model | `rustgate_entity::{Entity, EntityCodec, EntityCodecRegistry}` (re-exports `rustgate_core::entity` during migration) | [ADR 0028](adr/0028-canonical-entity-crate.md) |
 
 ## Secrets and security
 

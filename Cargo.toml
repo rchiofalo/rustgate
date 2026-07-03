@@ -40,6 +40,7 @@ members = [
     "crates/rustgate-operator",
     "crates/rustgate-inference",
     "crates/rustgate-codec-schema",
+    "crates/rustgate-entity",
 ]
 exclude = ["fuzz"]
 
@@ -283,6 +284,7 @@ rustgate-correlation = { path = "crates/rustgate-correlation" }
 rustgate-operator = { path = "crates/rustgate-operator" }
 rustgate-inference = { path = "crates/rustgate-inference" }
 rustgate-codec-schema = { path = "crates/rustgate-codec-schema" }
+rustgate-entity = { path = "crates/rustgate-entity" }
 
 [profile.release]
 lto = true

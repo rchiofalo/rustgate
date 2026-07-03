@@ -4535,6 +4535,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgate-entity"
+version = "0.9.0"
+dependencies = [
+ "rustgate-core",
+]
+
+[[package]]
 name = "rustgate-federation"
 version = "0.9.0"
 dependencies = [

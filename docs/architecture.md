@@ -4,7 +4,7 @@ rustgate is a Rust-native secure message router built for tactical edge deployme
 
 ## Crate Structure
 
-The workspace ships **39 crates** under `crates/`. The full table — kept in
+The workspace ships **40 crates** under `crates/`. The full table — kept in
 sync with `cargo metadata` via the `cargo-toml-drift` CI check — is in the
 top-level [`README.md`](https://github.com/rchiofalo/rustgate/blob/main/README.md#architecture). The architectural
 groupings are:
@@ -14,6 +14,7 @@ groupings are:
 | Crate | Purpose |
 |---|---|
 | `rustgate-core` | Shared types: `Identity`, `RoutableMessage`, `Destination`, framing strategies |
+| `rustgate-entity` | Canonical protocol-agnostic entity model (re-export skeleton over the in-core `Entity` seam; ADR 0028) |
 | `rustgate-cot` | Cursor on Target XML parsing, MessageBuilder |
 | `rustgate-tls` | TLS/mTLS configuration, X.509 identity extraction, OCSP, SPIFFE, TCP listeners |
 | `rustgate-authz` | RBAC/ABAC policy evaluation (Cedar backend) |
