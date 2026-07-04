@@ -77,6 +77,15 @@ pub(crate) const RPC_SERVER_ROL_STREAM: &str = "server_rol_stream";
 /// for ROL state lands in a separate follow-up).
 pub(crate) const RPC_CLIENT_ROL_STREAM: &str = "client_rol_stream";
 
+/// Canonical `rpc` label used for `ClientEventStream` audit and metric
+/// records. The `ClientEventStream` RPC is server-streaming: the remote
+/// peer sends a single `Subscription` and we open a stream of
+/// `FederatedEvent` messages back to them, keyed in `outbound_streams`
+/// by the peer's mTLS-derived identity (never the self-asserted
+/// `Subscription.identity`). The subscription open records peer-auth +
+/// allowlist check + audit + metric like the sibling stream handlers.
+pub(crate) const RPC_CLIENT_EVENT_STREAM: &str = "client_event_stream";
+
 /// Canonical `rpc` label used for `ServerFederateGroupsStream` audit
 /// and metric records (refs #864). The `ServerFederateGroupsStream` RPC
 /// is server-streaming: the remote peer sends a single `Subscription`
@@ -1602,18 +1611,45 @@ impl FederatedChannel for FederationService {
         &self,
         request: Request<figpb::Subscription>,
     ) -> Result<Response<Self::ClientEventStreamStream>, Status> {
-        let sub = request.into_inner();
-        let peer_id = sub
-            .identity
-            .as_ref()
-            .map(|i| {
-                if !i.name.is_empty() {
-                    i.name.clone()
-                } else {
-                    i.uid.clone()
-                }
-            })
-            .unwrap_or_else(|| "unknown".to_string());
+        // Derive the peer identity from the mTLS certificate CN, never
+        // from the self-asserted `Subscription.identity` payload. Keying
+        // `outbound_streams` on the cert-derived id stops a peer from
+        // registering its event channel under another peer's name (#1510
+        // L-5). The `Subscription` body is still consumed below for any
+        // non-identity fields, but its identity is no longer trusted.
+        let peer_id = Self::peer_id_from_request(&request)?;
+        let _ = super::traceparent::extract_into_current_span(&request, &peer_id);
+
+        // Allowlist check on subscription open — a peer absent from the
+        // inbound allowlist must not be able to keep an outbound event
+        // stream half-open. Mirrors the ClientROLStream /
+        // ServerFederateGroupsStream gate so the audit reason vocabulary
+        // stays uniform across the RPC suite.
+        if let Some(ref allowed) = self.allowed_peer_groups
+            && !allowed.contains_key(&peer_id)
+        {
+            rustgate_core::audit::federation_event_rejected(
+                RPC_CLIENT_EVENT_STREAM,
+                &peer_id,
+                "peer_not_in_allowlist",
+            );
+            return Err(Status::permission_denied("peer not in inbound allowlist"));
+        }
+
+        let _sub = request.into_inner();
+
+        // Subscription accepted: count the SUBSCRIPTION open and emit the
+        // audit record before returning the stream, matching the
+        // ClientROLStream side (one-Subscription-in, many-events-out, so
+        // per-event observation isn't a meaningful shape here).
+        #[cfg(feature = "api")]
+        {
+            crate::metrics::messages_in().inc();
+            crate::metrics::messages_in_by_rpc()
+                .with_label_values(&[RPC_CLIENT_EVENT_STREAM])
+                .inc();
+        }
+        rustgate_core::audit::federation_event_received(RPC_CLIENT_EVENT_STREAM, &peer_id);
 
         info!(peer = %peer_id, "client_event_stream opened (sending events)");
 
@@ -1926,6 +1962,64 @@ mod tests {
 
         let received = rx.recv().await.expect("should receive event");
         assert_eq!(received.event.expect("event").uid, "broadcast-test");
+    }
+
+    #[tokio::test]
+    async fn client_event_stream_keys_on_cert_cn_not_payload() {
+        // A peer whose mTLS cert CN is "attacker-peer" opens the event
+        // stream but claims to be "victim-peer" in the Subscription
+        // payload. The outbound_streams map must key on the cert-derived
+        // id, never the self-asserted payload (#1510 L-5).
+        let svc = FederationService::new("s".into(), vec![], noop_on_event());
+
+        let sub = figpb::Subscription {
+            identity: Some(figpb::Identity {
+                name: "victim-peer".into(),
+                uid: "victim-uid".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = svc
+            .client_event_stream(request_with_peer_cn(sub, "attacker-peer"))
+            .await;
+        assert!(result.is_ok());
+
+        let streams = svc.outbound_streams.read().await;
+        assert!(
+            streams.contains_key("attacker-peer"),
+            "stream must be keyed on the cert CN"
+        );
+        assert!(
+            !streams.contains_key("victim-peer"),
+            "self-asserted payload identity must not become the map key"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_event_stream_rejects_peer_absent_from_allowlist() {
+        // A peer whose cert CN is not in allowed_peer_groups must be
+        // rejected before any outbound stream is registered.
+        let mut allowed = HashMap::new();
+        allowed.insert(
+            "known-peer".to_string(),
+            HashSet::from(["Alpha".to_string()]),
+        );
+        let svc = FederationService::new("s".into(), vec![], noop_on_event())
+            .with_allowed_peer_groups(allowed);
+
+        let sub = figpb::Subscription::default();
+        let result = svc
+            .client_event_stream(request_with_peer_cn(sub, "stranger-peer"))
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            svc.outbound_streams.read().await.len(),
+            0,
+            "rejected peer must not register an outbound stream"
+        );
     }
 
     #[tokio::test]

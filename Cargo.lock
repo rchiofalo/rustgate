@@ -5064,6 +5064,7 @@ dependencies = [
  "lru",
  "ocsp-stapler",
  "parking_lot",
+ "rasn-ocsp",
  "rustgate-core",
  "rustgate-test-utils",
  "rustls",
