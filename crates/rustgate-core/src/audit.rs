@@ -210,6 +210,41 @@ pub fn guard_activated(sink: &str, direction: &str, mandatory_marking: bool) {
     );
 }
 
+/// Record a sanctioned restart of the cross-domain guard's tamper-evident
+/// audit hash-chain after an unreadable on-disk tip.
+///
+/// Emitted only on the explicit `audit-chain-fail-open` opt-out path
+/// (ADR 0024, revision 3): the guard could not read its prior chain tip
+/// but the operator has opted to keep serving. The prev-hash link
+/// restarts from genesis while the sequence number **carries forward**
+/// from the best-known prior maximum, so a SIEM sees exactly one
+/// hash-seam and no seq collision. The corresponding
+/// `boundary.chain_break` continuity record is also written into the
+/// dedicated guard chain itself; this event mirrors the reset into the
+/// operational audit stream so a SIEM tailing the main log observes the
+/// discontinuity without tailing the guard chain.
+///
+/// `path` is the guard audit-log path; `reason` is the sanitized
+/// underlying read-error string; `prior_max_seq` is the last sequence
+/// number recovered from the unreadable log (`0` when none could be
+/// recovered).
+///
+/// Sanitization: `path` and `reason` are sanitized at the audit boundary
+/// (the path is operator-supplied and the reason wraps an I/O error
+/// string).
+pub fn guard_chain_reset(path: &str, reason: &str, prior_max_seq: u64) {
+    let path = s(path);
+    let reason = s(reason);
+    audit!(
+        "guard.chain_reset",
+        path = %path,
+        reason = %reason,
+        prior_max_seq = prior_max_seq,
+        action = "guard_chain_reset",
+        result = "chain_break"
+    );
+}
+
 /// Record a message dropped at a cross-domain guard boundary.
 ///
 /// The guard crate writes its own tamper-evident `boundary.evaluate`
@@ -3984,6 +4019,55 @@ mod tests {
                 event["fields"]["result"].as_str().expect("result string"),
                 "active"
             );
+        }
+
+        #[test]
+        fn guard_chain_reset_emits_documented_shape() {
+            let snapshot = capture_audit(|| {
+                guard_chain_reset(
+                    "/var/log/rustgate/boundary-audit.jsonl",
+                    "torn tail past rewind budget",
+                    41,
+                )
+            });
+            let event = parse_event(&snapshot, "guard.chain_reset");
+            assert_eq!(
+                event["fields"]["path"].as_str().expect("path string"),
+                "/var/log/rustgate/boundary-audit.jsonl"
+            );
+            assert_eq!(
+                event["fields"]["reason"].as_str().expect("reason string"),
+                "torn tail past rewind budget"
+            );
+            assert_eq!(
+                event["fields"]["prior_max_seq"]
+                    .as_u64()
+                    .expect("prior_max_seq u64"),
+                41
+            );
+            assert_eq!(
+                event["fields"]["result"].as_str().expect("result string"),
+                "chain_break"
+            );
+        }
+
+        #[test]
+        fn guard_chain_reset_sanitizes_reason() {
+            // `reason` wraps an I/O error string; a crafted path in the
+            // error must not forge a log line.
+            let snapshot = capture_audit(|| {
+                guard_chain_reset("/log\r\n\x1b[31mFAKE\x1b[0m", "boom\r\ninjected", 0)
+            });
+            let event = parse_event(&snapshot, "guard.chain_reset");
+            let path = event["fields"]["path"].as_str().expect("path string");
+            let reason = event["fields"]["reason"].as_str().expect("reason string");
+            for forbidden in &['\n', '\r', '\x1b'] {
+                assert!(!path.contains(*forbidden), "forge byte in path: {path:?}");
+                assert!(
+                    !reason.contains(*forbidden),
+                    "forge byte in reason: {reason:?}"
+                );
+            }
         }
 
         #[test]

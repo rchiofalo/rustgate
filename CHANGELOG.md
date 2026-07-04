@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Cross-domain guard fail-open paths closed — full ADR 0024 (closes #1495).**
+  The strictest fail-closed control had two paths that silently failed *open*.
+  **H-1:** a present-but-unparseable classification marking was authorized
+  (`check_classification_authorized` returned "authorize" on parse failure), so
+  a malformed banner wrapping a TopSecret payload could ride across a
+  `HighToLow` boundary. It now denies with the new stable reason token
+  `unparseable_marking` in **both** directions (distinct from
+  `unauthorized_classification`). To avoid an availability regression on benign
+  traffic, `rustgate-core::classification` now tolerates the bare-level forms
+  real CoT carries (`value="UNCLASSIFIED"`, bare `SECRET`, `U`/`C`/`S`/`TS`) so
+  only genuinely garbage banners are unparseable, and a new `warmup-log-only`
+  guard knob emits a `decision="warn"` audit record without dropping so
+  operators can observe would-be denies before enforcing. The malformed-ENVELOPE
+  bypass is closed too: an XML-intent payload the guard cannot fully walk is
+  treated as cannot-inspect == cannot-release on `HighToLow`. **H-2:** an
+  unreadable audit hash-chain was silently re-genesised, destroying
+  non-repudiation. The guard now **refuses to start** by default when the chain
+  cannot be resumed; the audited `audit-chain-fail-open` opt-out (TOML
+  `[guard]` key, `--guard-audit-chain-fail-open` /
+  `RUSTGATE_GUARD_AUDIT_CHAIN_FAIL_OPEN`) instead writes a sanctioned
+  `boundary.chain_break` continuity record, emits a new `guard.chain_reset`
+  audit event, and **carries the sequence number forward** from the prior
+  maximum (never resetting to 1). `verify_audit_log` now recognises the
+  `boundary.chain_break` seam as a legitimate hash restart while still enforcing
+  seq contiguity across it. `GuardConfig::validate()` rejects two guards
+  configured against the same audit-log path.
+
 - **Five low-severity correctness/cleanup nits from the deep scan (closes #1511).** (L-2) `rustgate-dds` and `rustgate-foundry` reverse property-map projection (`mapper.rs`) defaulted a missing latitude or longitude to `0.0`, silently landing a partial position report at "Null Island" (lat/lon 0,0); a lone axis is now treated as an absent fix and yields `position: None` unless *both* axes are present. (L-6) The `rustgate-http` batcher (`publisher.rs` / `batch.rs`) released the message's `BackpressurePermit` the moment `dispatch_to_target` buffered `body.clone()`, so the gate under-counted bytes still held in the batcher; the permit's `Arc` is now retained in the buffered `BatchEntry` and released only after the batch is flushed and sent. (L-7) `decode_cot` (`rustgate-cot/src/entity.rs`) flattened `<detail>` into the attribute bag with no bounds; it now enforces `MAX_DETAIL_DEPTH = 256` and `MAX_ATTR_BAG_BYTES = 4 KiB`, matching the XML-depth / attribute-bag caps the transport and TLS surfaces already apply. (L-10) `PeerConfig.topology_role` (`rustgate-federation/src/config.rs`) serialized to camelCase `topologyRole` among snake_case siblings; it now serializes as `topology_role` (documented key) while still accepting the camelCase alias on read. (L-1) The `rustgate-router` client throttle's ~49.7-day `u32`-ms refill-clock wrap is documented in place and kept as-is — the wrap is benign (a single skipped refill tick, never an over-refill) and widening the packed state is not worth it.
 
 - **MAVLink altitude datum (MSL) no longer mislabeled as HAE — fixes cross-protocol fusion error (SEC-22, closes #1560).** `decode_global_position_int` (`crates/rustgate-mavlink/src/entity.rs`) populated `Entity.position.hae_meters` directly from `GLOBAL_POSITION_INT.alt`, but that field is millimetres above **mean sea level (MSL)**, not height above the WGS-84 **ellipsoid (HAE)** — the datum CoT (`<point hae>`), DIS (ECEF→ellipsoid), and Link 16 use. Mixing a MAVLink "HAE" with real HAE consumers injected a tens-of-metres altitude error (the geoid undulation) into fusion/correlation. The decoder now leaves `hae_meters` **unset** (no fabricated datum, no EGM96 geoid dependency — honest labeling over silent approximation) and preserves the raw MSL value verbatim in the existing `mavlink.global_position_int.alt_mm` attribute, adding `mavlink.global_position_int.alt_datum = "msl"` so fusion consumers pick their own conversion. The encoder now re-emits `alt_mm` (falling back to `hae_meters` only for HAE-native entities carrying no MAVLink datum), so the same-codec round-trip stays lossless. Module docs gain an "Altitude datum (MSL vs HAE)" section; a future geoid-conversion tier can populate `hae_meters` without changing this shape.

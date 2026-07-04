@@ -1,17 +1,19 @@
 # ADR 0024: Fail-closed semantics for the cross-domain guard
 
-- **Status:** Proposed
-- **Date:** 2026-06-25
+- **Status:** Accepted
+- **Date:** 2026-06-25 (accepted 2026-07-03)
 - **Deciders:** rchiofalo
 - **Related:** #1495 (guard fail-open paths), ADR 0022 (cross-domain guard
   egress seam), `rustgate-core::classification`, `rustgate-core::audit_chain`
 
-> **Review status — needs revision before implementation.** The problem
-> statements below are verified against source, and the fail-closed direction
-> is correct, but an adversarial review found that the H-1 fix as first drafted
-> is an **availability regression** for real ATAK traffic. See
-> [Required revisions](#required-revisions-from-adversarial-review) — items 1–4
-> are prerequisites, not follow-ups.
+> **Status — Accepted with all four required revisions incorporated.**
+> Implemented in the #1495 fix branch: the four
+> [required revisions](#required-revisions-from-adversarial-review) were
+> prerequisites and all four landed together with the H-1/H-2 fixes (parser
+> tolerance + log-only warm-up, malformed-ENVELOPE closure, seq-carry-forward
+> chain-break seam, single-file-handle construction with a non-`#[from]`
+> construction error). The problem statements are verified against source and
+> the fail-closed direction is correct.
 
 ## Context
 

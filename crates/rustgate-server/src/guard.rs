@@ -91,9 +91,24 @@ pub(crate) fn start_guard(cli: &Cli, router: &Arc<Router>) -> anyhow::Result<()>
     struct Wrapper {
         guard: GuardConfig,
     }
-    let cfg: GuardConfig = toml::from_str::<Wrapper>(&raw)
+    let mut cfg: GuardConfig = toml::from_str::<Wrapper>(&raw)
         .with_context(|| format!("parsing `[guard]` block in `{path}`"))?
         .guard;
+
+    // The CLI flag (env `RUSTGATE_GUARD_AUDIT_CHAIN_FAIL_OPEN`) overrides
+    // the TOML `audit-chain-fail-open` key only when set to `true` — a
+    // secure default cannot be re-tightened by omitting the flag, but an
+    // operator can opt into fail-open at the command line without editing
+    // the guard file (ADR 0024, H-2; the TOML block stays primary).
+    if cli.integrations.guard_audit_chain_fail_open {
+        cfg.audit_chain_fail_open = true;
+    }
+    if cfg.audit_chain_fail_open {
+        tracing::warn!(
+            "cross-domain guard audit-chain-fail-open is ENABLED — an unreadable audit chain will resume with a boundary.chain_break seam instead of aborting startup; the tamper-evident chain link restarts (seq carried forward)"
+        );
+    }
+
     cfg.validate().context("invalid `[guard]` configuration")?;
 
     let direction = per_call_direction(cfg.direction);

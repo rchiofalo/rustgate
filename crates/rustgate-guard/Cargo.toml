@@ -23,6 +23,7 @@ bytes = { workspace = true }
 quick-xml = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

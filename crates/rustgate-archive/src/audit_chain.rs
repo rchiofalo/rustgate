@@ -64,6 +64,17 @@ use sha2::{Digest, Sha256};
 /// Genesis previous-hash value: 64 zero hex characters.
 pub const GENESIS_PREV: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// `event` value marking a sanctioned hash-chain seam.
+///
+/// A record carrying this `event` — written on the cross-domain guard's
+/// audited `audit-chain-fail-open` opt-out when the prior chain tip was
+/// unreadable (ADR 0024, revision 3) — is permitted to link its
+/// `prev_sha256` back to [`GENESIS_PREV`] while its `seq` continues the
+/// prior series. [`verify_audit_log`] recognises this exact string as a
+/// legitimate prev-hash restart rather than tampering. SIEM rules grep on
+/// this spelling — treat it as a wire contract.
+pub const CHAIN_BREAK_EVENT: &str = "boundary.chain_break";
+
 /// Maximum number of bytes read from the end of an existing chain file when
 /// recovering the tip across a process restart. Caps startup cost and bounds
 /// the torn-write recovery walk regardless of file size.
@@ -369,6 +380,15 @@ pub enum VerifyError {
 /// highest seq it has seen surfaces the truncation immediately on the next
 /// record (or on the next verifier run, if no new records have been
 /// emitted since the truncation).
+///
+/// # Sanctioned hash seam
+///
+/// A record whose `event` is [`CHAIN_BREAK_EVENT`] and whose `prev_sha256`
+/// is [`GENESIS_PREV`] is accepted as a legitimate prev-hash restart
+/// rather than a [`VerifyError::PrevMismatch`]: it is the cross-domain
+/// guard's audited chain-break marker (ADR 0024). Sequence contiguity is
+/// still enforced across the seam, so the marker cannot be used to hide a
+/// deletion — only the hash link restarts, and only for that one record.
 pub fn verify_audit_log(path: &Path) -> Result<VerifyReport, VerifyError> {
     let file = OpenOptions::new().read(true).open(path)?;
     let reader = BufReader::new(file);
@@ -422,6 +442,23 @@ pub fn verify_audit_log(path: &Path) -> Result<VerifyReport, VerifyError> {
                 expected: expected_seq,
                 found: seq,
             });
+        }
+        // A `boundary.chain_break` continuity record is a *sanctioned*
+        // hash-seam: the cross-domain guard could not read its prior
+        // chain tip, so on the audited `audit-chain-fail-open` opt-out it
+        // restarts the prev-hash link from genesis while carrying the
+        // sequence number forward (ADR 0024, revision 3). Accept a
+        // genesis-linked prev on exactly this record so the seam is not
+        // flagged as tampering; the seq-contiguity check above still
+        // holds across the seam, and the record's own `sha256` is still
+        // recomputed and verified below (from `GENESIS_PREV`).
+        let is_chain_break_seam = map
+            .get("event")
+            .and_then(|v| v.as_str())
+            .is_some_and(|e| e == CHAIN_BREAK_EVENT)
+            && actual_prev == GENESIS_PREV;
+        if is_chain_break_seam {
+            prev = GENESIS_PREV.to_string();
         }
         if actual_prev != prev {
             return Err(VerifyError::PrevMismatch {
@@ -673,6 +710,65 @@ pub fn read_chain_state(path: &Path) -> io::Result<(String, u64)> {
         }
     };
     Ok((tip, next_seq))
+}
+
+/// Best-effort recovery of the highest `seq` value present in an audit log
+/// whose chain tip could **not** be read cleanly.
+///
+/// [`read_chain_state`] refuses (returns `Err`) when the tail is torn past
+/// the rewind budget, corrupt, or pre-`seq`. In that situation the
+/// cross-domain guard's audited `audit-chain-fail-open` opt-out still needs
+/// the best-known prior maximum sequence number so it can carry the series
+/// forward across the sanctioned [`CHAIN_BREAK_EVENT`] seam rather than
+/// restarting at `1` and recreating the cross-segment collision the seq
+/// counter exists to prevent (ADR 0024, revision 3).
+///
+/// Unlike [`read_chain_tip`], this is **read-only** — it never truncates or
+/// otherwise mutates the file — and it is tolerant of corruption: it scans
+/// the bounded trailing window and returns the largest `seq` among the
+/// records that happen to parse, or `0` when the file is missing, empty, or
+/// yields no parseable `seq`. The returned value is a floor: the resumed
+/// writer will start at `max + 1`, which is `>=` any seq a downstream SIEM
+/// has already forwarded from an intact prefix.
+pub fn recover_max_seq(path: &Path) -> u64 {
+    let mut file = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let file_len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return 0,
+    };
+    if file_len == 0 {
+        return 0;
+    }
+    let start = file_len.saturating_sub(REWIND_BUDGET);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return 0;
+    }
+    let mut bytes = Vec::with_capacity(file_len.saturating_sub(start) as usize);
+    if file.read_to_end(&mut bytes).is_err() {
+        return 0;
+    }
+    // Drop a leading partial line if we did not start at offset 0.
+    if start > 0
+        && let Some(first_nl) = bytes.iter().position(|&b| b == b'\n')
+    {
+        let _ = bytes.drain(..=first_nl);
+    }
+    let mut max_seq = 0u64;
+    for line in bytes.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_slice::<serde_json::Value>(line)
+            && let Some(seq) = map.get("seq").and_then(|v| v.as_u64())
+        {
+            max_seq = max_seq.max(seq);
+        }
+    }
+    max_seq
 }
 
 /// Compute the anchor-file path for a given audit-log path. Kept as a
@@ -2016,5 +2112,121 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&anchor);
+    }
+
+    /// Append a `boundary.chain_break` seam record (genesis-linked prev,
+    /// seq carried forward) exactly as the guard's fail-open opt-out does.
+    fn append_chain_break_seam(path: &Path, next_seq: u64) {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        let mut w = HashChainWriter::new(file, GENESIS_PREV.to_string()).with_next_seq(next_seq);
+        w.write_all(format!(r#"{{"event":"{CHAIN_BREAK_EVENT}","reason":"torn"}}"#).as_bytes())
+            .unwrap();
+        w.write_all(b"\n").unwrap();
+        w.flush().unwrap();
+    }
+
+    #[test]
+    fn verify_accepts_sanctioned_chain_break_seam() {
+        let f = NamedTempFile::new().unwrap();
+        write_records(
+            f.path(),
+            &[r#"{"event":"a"}"#, r#"{"event":"b"}"#, r#"{"event":"c"}"#],
+        );
+        // Seam continues the seq (prior max was 3, next is 4) but restarts
+        // the prev-hash link from genesis.
+        append_chain_break_seam(f.path(), 4);
+        // A normal record follows the seam and must chain off it.
+        let (tip, next_seq) = read_chain_state(f.path()).unwrap();
+        assert_eq!(next_seq, 5, "seq continues past the seam");
+        let file = OpenOptions::new().append(true).open(f.path()).unwrap();
+        let mut w = HashChainWriter::new(file, tip).with_next_seq(next_seq);
+        w.write_all(br#"{"event":"d"}"#).unwrap();
+        w.write_all(b"\n").unwrap();
+        w.flush().unwrap();
+
+        let report = verify_audit_log(f.path()).unwrap();
+        assert_eq!(report.records, 5, "seam + surrounding records all verify");
+        assert_eq!(report.tip_seq, 5);
+    }
+
+    #[test]
+    fn verify_still_rejects_genesis_prev_on_ordinary_record() {
+        // A genesis-linked prev on a record that is NOT a chain-break
+        // marker must still fail — the seam exemption is scoped to the
+        // sanctioned event only.
+        let f = NamedTempFile::new().unwrap();
+        write_records(f.path(), &[r#"{"event":"a"}"#, r#"{"event":"b"}"#]);
+        let file = OpenOptions::new().append(true).open(f.path()).unwrap();
+        // Ordinary event, genesis prev, seq continues — this is exactly
+        // the tampering shape the exemption must NOT admit.
+        let mut w = HashChainWriter::new(file, GENESIS_PREV.to_string()).with_next_seq(3);
+        w.write_all(br#"{"event":"not_a_seam"}"#).unwrap();
+        w.write_all(b"\n").unwrap();
+        w.flush().unwrap();
+
+        let err = verify_audit_log(f.path()).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::PrevMismatch { line: 3, .. }),
+            "expected PrevMismatch on line 3, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_seq_reset_at_chain_break_seam() {
+        // The seam may restart the hash link but NOT the seq — resetting
+        // seq to 1 is exactly the cross-segment collision the counter
+        // exists to refuse (ADR 0024, revision 3).
+        let f = NamedTempFile::new().unwrap();
+        write_records(
+            f.path(),
+            &[r#"{"event":"a"}"#, r#"{"event":"b"}"#, r#"{"event":"c"}"#],
+        );
+        append_chain_break_seam(f.path(), 1); // WRONG: reset instead of carry-forward
+
+        let err = verify_audit_log(f.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VerifyError::Gap {
+                    line: 4,
+                    expected: 4,
+                    found: 1
+                }
+            ),
+            "expected seq Gap at the seam, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn recover_max_seq_reads_highest_seq() {
+        let f = NamedTempFile::new().unwrap();
+        write_records(
+            f.path(),
+            &[r#"{"event":"a"}"#, r#"{"event":"b"}"#, r#"{"event":"c"}"#],
+        );
+        assert_eq!(recover_max_seq(f.path()), 3);
+    }
+
+    #[test]
+    fn recover_max_seq_missing_or_empty_is_zero() {
+        assert_eq!(recover_max_seq(Path::new("/nonexistent/audit.jsonl")), 0);
+        let f = NamedTempFile::new().unwrap();
+        assert_eq!(recover_max_seq(f.path()), 0);
+    }
+
+    #[test]
+    fn recover_max_seq_tolerates_corrupt_tail() {
+        let f = NamedTempFile::new().unwrap();
+        write_records(f.path(), &[r#"{"event":"a"}"#, r#"{"event":"b"}"#]);
+        // Append a garbage (unparseable) trailing line; recover_max_seq
+        // must skip it and still return the highest parseable seq.
+        let mut file = OpenOptions::new().append(true).open(f.path()).unwrap();
+        file.write_all(b"{ this is not json\n").unwrap();
+        file.flush().unwrap();
+        assert_eq!(recover_max_seq(f.path()), 2);
     }
 }

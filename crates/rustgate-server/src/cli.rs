@@ -473,6 +473,24 @@ pub(crate) struct IntegrationArgs {
     #[arg(long, env = "RUSTGATE_GUARD_CONFIG")]
     pub(crate) guard_config_file: Option<String>,
 
+    /// Fail-open mode for the cross-domain guard's tamper-evident audit
+    /// hash-chain: when the chain tip cannot be read at startup
+    /// (corrupt/torn/pre-`seq` tail), continue serving by writing a
+    /// sanctioned `boundary.chain_break` continuity record and resuming
+    /// with the sequence number carried forward, instead of aborting.
+    /// Default (`false`) is fail-closed — an unreadable audit chain
+    /// prevents the server from coming up so a truncated tamper-evident
+    /// log cannot be silently restarted (ADR 0024, H-2). Mirrors
+    /// `--authz-fail-open`. Overrides the `[guard]` TOML
+    /// `audit-chain-fail-open` key only when set to `true`; the TOML key
+    /// is otherwise the primary source of truth.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_GUARD_AUDIT_CHAIN_FAIL_OPEN"
+    )]
+    pub(crate) guard_audit_chain_fail_open: bool,
+
     /// Directory backing the lightweight TAK data-package store. When
     /// set (and the binary is built with `--features missions,metrics`),
     /// the bearer-token-authenticated `/api/packages` REST surface is
@@ -2753,6 +2771,7 @@ define_config_file! {
     mavlink_pq_bootstrap_file in mavlink: Option<String>,
     mavlink_v1_fallback_cn in mavlink: Option<String>,
     guard_config_file in integrations: Option<String>,
+    guard_audit_chain_fail_open in integrations: bool,
     inference_config_file in integrations: Option<String>,
     dis_bind in ingress: Option<String>,
     dis_group in ingress: String,
