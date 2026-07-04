@@ -154,6 +154,30 @@ impl CrlStore {
             .unwrap_or_default()
     }
 
+    /// Re-evaluate freshness of the *currently loaded* CRL set against the wall
+    /// clock and refresh the cached [`CrlHealth`], returning it.
+    ///
+    /// Freshness is time-relative: a CRL that was fresh at the last reload can
+    /// age past its `nextUpdate` with no change to the file bytes.
+    /// [`CrlStore::reload`] short-circuits on byte-identical files
+    /// (`Ok(false)`) and therefore does
+    /// **not** re-check staleness, so the fail-closed watcher must call this on
+    /// every tick to observe a set that has silently gone stale (#1496,
+    /// ADR-0025 Piece 2). Cheap — a read-lock to snapshot the `Arc<Vec<..>>`,
+    /// then re-parse `nextUpdate` outside the lock, then a short write-lock to
+    /// store the recomputed summary.
+    pub fn reevaluate_health(&self) -> CrlHealth {
+        let crls = match self.state.read() {
+            Ok(guard) => Arc::clone(&guard.crls),
+            Err(_) => return CrlHealth::default(),
+        };
+        let health = summarize_health(&crls, &self.path);
+        if let Ok(mut guard) = self.state.write() {
+            guard.health = health.clone();
+        }
+        health
+    }
+
     /// Current generation counter (test/diagnostic accessor).
     pub fn generation(&self) -> u64 {
         self.state.read().map(|g| g.generation).unwrap_or(0)
@@ -165,6 +189,25 @@ impl CrlStore {
     /// the file read runs on a blocking thread so it never stalls the runtime.
     /// A zero interval is a no-op — the caller gates on `--crl-refresh-interval`.
     pub fn spawn_watcher(self: &Arc<Self>, interval: Duration) {
+        self.spawn_watcher_with_observer(interval, None);
+    }
+
+    /// Like [`spawn_watcher`](Self::spawn_watcher), but invokes `observer` with
+    /// the current [`CrlHealth`] on **every** tick — after a reload attempt and
+    /// *including* ticks where the file bytes were unchanged.
+    ///
+    /// This is the hook that drives the opt-in fail-closed staleness gate
+    /// ([`crate::FailClosedGate`]): freshness is time-relative, so the observer
+    /// must run each tick to catch a set that has aged past its `nextUpdate`
+    /// with no change to the file bytes. When the file *did* change and reloads
+    /// to a healthy set, the observer sees `all_stale == false` and can release
+    /// the gate synchronously — recovery does not wait for inbound traffic
+    /// (#1496, ADR-0025 Piece 2). `None` reproduces the plain watcher.
+    pub fn spawn_watcher_with_observer(
+        self: &Arc<Self>,
+        interval: Duration,
+        observer: Option<CrlHealthObserver>,
+    ) {
         if interval.is_zero() {
             debug!("CRL watcher skipped: refresh interval is 0");
             return;
@@ -189,10 +232,30 @@ impl CrlStore {
                         warn!(path = %path, error = %e, "CRL reload task panicked");
                     }
                 }
+                // Re-evaluate freshness every tick (even on an unchanged file:
+                // `reload` short-circuits byte-identical bytes and never
+                // re-checks staleness). Feed the result to the fail-closed
+                // observer so a set that aged into staleness still engages the
+                // gate, and a fresh set releases it.
+                if let Some(observe) = &observer {
+                    let s = Arc::clone(&store);
+                    match tokio::task::spawn_blocking(move || s.reevaluate_health()).await {
+                        Ok(health) => observe(&health),
+                        Err(e) => {
+                            warn!(error = %e, "CRL freshness re-evaluation task panicked");
+                        }
+                    }
+                }
             }
         });
     }
 }
+
+/// Observer invoked with the current [`CrlHealth`] on every watcher tick.
+///
+/// Drives the opt-in fail-closed staleness gate; see
+/// [`CrlStore::spawn_watcher_with_observer`].
+pub type CrlHealthObserver = Arc<dyn Fn(&CrlHealth) + Send + Sync>;
 
 /// Read the CRL file. CRLs are public — a plain read, no secret-file handling.
 fn read_crl_file(path: &Path) -> Result<Vec<u8>> {
@@ -357,6 +420,42 @@ mod tests {
             CrlStore::from_path(&expired).unwrap().health().all_stale,
             "a CRL with a past nextUpdate must be all-stale"
         );
+    }
+
+    #[test]
+    fn empty_but_fresh_crl_is_healthy_not_all_stale() {
+        // ADR-0025 revision 3 regression: an empty-but-fresh CRL — a legal
+        // published "nothing is revoked, I am current" list with zero revoked
+        // serials and a future nextUpdate — must be HEALTHY (all_stale=false)
+        // so the opt-in fail-closed gate never engages on it (#1496).
+        let ca = TestCa::new("crl-store-ca");
+        let p = write_temp(&ca.generate_crl(&[]));
+        let store = CrlStore::from_path(&p).unwrap();
+        let health = store.health();
+        assert!(
+            health.parsed_count > 0,
+            "a CRL carrying a nextUpdate must be counted as parsed"
+        );
+        assert!(
+            !health.all_stale,
+            "an empty-but-fresh CRL must not be all-stale"
+        );
+    }
+
+    #[test]
+    fn reevaluate_health_recomputes_from_loaded_set() {
+        // `reload` short-circuits byte-identical files and never re-checks
+        // freshness, so the fail-closed watcher relies on `reevaluate_health`
+        // to observe the current staleness of the loaded set. A fresh CRL
+        // re-evaluates to not-all-stale; an expired one to all-stale.
+        let ca = TestCa::new("crl-store-ca");
+        let fresh = write_temp(&ca.generate_crl(&[]));
+        let store = CrlStore::from_path(&fresh).unwrap();
+        assert!(!store.reevaluate_health().all_stale);
+
+        let expired = write_temp(&ca.generate_expired_crl(&[]));
+        let store = CrlStore::from_path(&expired).unwrap();
+        assert!(store.reevaluate_health().all_stale);
     }
 
     #[test]

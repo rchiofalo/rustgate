@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Opt-in fail-closed CRL staleness with a bounded grace window (#1496, ADR-0025 Piece 2).** Building on the live CRL hot-reload landed in #1634, `rustgate-server` gains `--crl-fail-closed` (default `false`, env `RUSTGATE_CRL_FAIL_CLOSED`) and `--crl-grace-secs` (default `0`, env `RUSTGATE_CRL_GRACE_SECS`), both no-ops without `--crl` and `--crl-refresh-interval > 0`. When enabled, a new `FailClosedGate` in `rustgate-tls` (`verifier.rs`) rejects **all** client-certificate handshakes once every loaded CRL has been stale (`nextUpdate` in the past) continuously for longer than the grace window — closing the window where a stalled CRL publisher would otherwise let revoked certificates keep authenticating. The gate is consulted at the top of `DynamicCertVerifier::verify_client_cert` before delegating to the inner `WebPkiClientVerifier` (and, under `--features ocsp`, before the OCSP wrapper's "good" verdict can apply), driven from the CRL watcher which now re-evaluates freshness every tick even on an unchanged file. A fresh, non-stale CRL clears the gate synchronously on the next tick so recovery does not wait for inbound traffic; an empty-but-fresh CRL (future `nextUpdate`, zero revocations) stays healthy and never engages the gate. Defaults keep a deployment byte-for-byte fail-open. The SIGHUP CRL log line no longer falsely claims a restart is required when a refresh interval is set.
+
 - **Cross-domain guard fail-open paths closed — full ADR 0024 (closes #1495).**
   The strictest fail-closed control had two paths that silently failed *open*.
   **H-1:** a present-but-unparseable classification marking was authorized

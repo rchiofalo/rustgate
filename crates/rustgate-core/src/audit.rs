@@ -1546,6 +1546,34 @@ pub fn verifier_rebuild_failed(error: &str) {
     );
 }
 
+/// Record the (opt-in) CRL fail-closed gate engaging.
+///
+/// Emitted when every parsed CRL has gone stale past the configured grace
+/// window and `--crl-fail-closed` is set: all subsequent client-certificate
+/// handshakes are rejected until a fresh CRL is published. This is a
+/// deliberate availability-for-security trade — record it prominently so the
+/// forensic trail explains a fleet-wide handshake-rejection event (#1496).
+pub fn crl_fail_closed_engaged(grace_secs: u64) {
+    audit!(
+        "crl.fail_closed_engaged",
+        grace_secs = grace_secs,
+        action = "deny_all_client_certs",
+        result = "engaged"
+    );
+}
+
+/// Record the (opt-in) CRL fail-closed gate clearing.
+///
+/// Emitted when a fresh, non-stale CRL generation is observed and the gate is
+/// released, so client-certificate handshakes resume (#1496).
+pub fn crl_fail_closed_cleared() {
+    audit!(
+        "crl.fail_closed_cleared",
+        action = "deny_all_client_certs",
+        result = "cleared"
+    );
+}
+
 /// Record a store-forward message drop due to writer channel overflow.
 ///
 /// Sanitization: `cn` and `reason` are sanitized at the audit boundary.
@@ -2958,6 +2986,13 @@ mod tests {
         fn test_reload_failed() {
             crl_reload_failed("/etc/rustgate/crls/revoked.pem", "file not found");
             crl_reload_failed("", "permission denied");
+        }
+
+        #[test]
+        fn test_fail_closed_engaged_and_cleared() {
+            crl_fail_closed_engaged(0);
+            crl_fail_closed_engaged(30);
+            crl_fail_closed_cleared();
         }
     }
 

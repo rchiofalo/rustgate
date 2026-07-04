@@ -347,6 +347,22 @@
       ],
       "default": null
     },
+    "crl-fail-closed": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "crl-grace-secs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
     "crl-refresh-interval": {
       "type": [
         "integer",

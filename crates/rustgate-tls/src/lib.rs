@@ -54,11 +54,13 @@ pub use config::{
 };
 #[cfg(feature = "post-quantum")]
 pub use config::{install_pq_provider, install_provider_with_kx_groups};
-pub use crl_store::{CrlHealth, CrlStore};
+pub use crl_store::{CrlHealth, CrlHealthObserver, CrlStore};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
 pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 #[cfg(feature = "spiffe")]
 pub use spiffe::{SpiffeConfig, SpiffeHooks, SpiffeIdentity};
-pub use verifier::{CrlProvider, DynamicCertVerifier, RootStoreProvider};
+pub use verifier::{
+    CrlProvider, DynamicCertVerifier, FailClosedGate, GraceClock, RootStoreProvider, SystemClock,
+};

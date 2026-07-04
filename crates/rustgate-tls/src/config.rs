@@ -216,19 +216,41 @@ impl TlsConfig {
     pub fn build_dynamic_crl_verifier(
         &self,
         crl_store: &Arc<crate::crl_store::CrlStore>,
-    ) -> Result<Arc<dyn ClientCertVerifier>> {
+    ) -> Result<Arc<crate::verifier::DynamicCertVerifier>> {
+        self.build_dynamic_crl_verifier_with_gate(crl_store, None)
+    }
+
+    /// Like [`build_dynamic_crl_verifier`](Self::build_dynamic_crl_verifier),
+    /// but attaches the opt-in fail-closed staleness gate
+    /// ([`crate::FailClosedGate`]). When `fail_closed` is `Some`, the returned
+    /// verifier rejects **all** client-certificate handshakes while the gate is
+    /// engaged (every parsed CRL stale past the grace window). `None` preserves
+    /// the fail-open behavior (#1496, ADR-0025 Piece 2).
+    ///
+    /// Returns the concrete [`crate::verifier::DynamicCertVerifier`] (rather
+    /// than an `Arc<dyn ClientCertVerifier>`) so the caller can reach
+    /// [`crate::verifier::DynamicCertVerifier::fail_closed_gate`] to drive the
+    /// watcher observer.
+    pub fn build_dynamic_crl_verifier_with_gate(
+        &self,
+        crl_store: &Arc<crate::crl_store::CrlStore>,
+        fail_closed: Option<Arc<crate::verifier::FailClosedGate>>,
+    ) -> Result<Arc<crate::verifier::DynamicCertVerifier>> {
         let root_store = Arc::clone(&self.client_ca_store);
         let root_provider: crate::verifier::RootStoreProvider =
             Box::new(move || (0, (*root_store).clone()));
         let store = Arc::clone(crl_store);
         let crl_provider: crate::verifier::CrlProvider = Box::new(move || store.snapshot());
-        crate::verifier::DynamicCertVerifier::with_crl_provider(root_provider, crl_provider)
-            .map(|v| v as Arc<dyn ClientCertVerifier>)
-            .map_err(|e| {
-                RustgateError::from(ConfigError::Other(format!(
-                    "failed to build dynamic client verifier: {e}"
-                )))
-            })
+        crate::verifier::DynamicCertVerifier::with_crl_provider_and_gate(
+            root_provider,
+            crl_provider,
+            fail_closed,
+        )
+        .map_err(|e| {
+            RustgateError::from(ConfigError::Other(format!(
+                "failed to build dynamic client verifier: {e}"
+            )))
+        })
     }
 
     /// Build a `rustls::ServerConfig` using a custom client certificate verifier
