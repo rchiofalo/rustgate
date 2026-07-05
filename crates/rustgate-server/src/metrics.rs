@@ -4055,14 +4055,14 @@ mod tests {
                 ),
             };
 
-            cache.store(msg).await;
+            cache.store(msg);
             assert_eq!(
                 position_cache_size().get(),
                 prior + 1,
                 "store must increment gauge via callback"
             );
 
-            cache.remove("alice").await;
+            cache.remove("alice");
             assert_eq!(
                 position_cache_size().get(),
                 prior,

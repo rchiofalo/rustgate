@@ -2714,7 +2714,7 @@ impl Router {
             }
         }
         drop(state);
-        self.cache.remove(cn).await;
+        self.cache.remove(cn);
         // Prune the per-CN replay bucket entry (issue #724). A
         // CN-churning attacker that opens and closes thousands of
         // distinct CNs would otherwise inflate this map without bound;
@@ -3531,7 +3531,7 @@ impl Router {
         //    snapshot and deny operators the ability to tighten masking
         //    rules after the fact.
         if msg.metadata.message_type == MessageType::Position {
-            self.cache.store(msg.clone()).await;
+            self.cache.store(msg.clone());
         }
 
         // Apply data-plane Send obligations to the owned `msg` *after*
@@ -4065,7 +4065,7 @@ impl Router {
             // payload. The cost is one read-lock + filter pass; the
             // alternative (estimating from `len`) would over-count
             // expired entries.
-            let attempted = self.cache.get_all().await.len();
+            let attempted = self.cache.get_all().len();
             let session_hash = hash_cn(&handle.identity.cn);
             warn!(
                 session = %session_hash,
@@ -4087,7 +4087,7 @@ impl Router {
         let authz: Option<&Arc<dyn PolicyEngine>> = (**authz_guard).as_ref();
         let mut dropped = 0u32;
         let mut total = 0u32;
-        for mut msg in self.cache.get_all().await {
+        for mut msg in self.cache.get_all() {
             let shared = msg
                 .source
                 .groups
@@ -5364,7 +5364,7 @@ mod tests {
 
         // Cache a position from alpha_user
         let pos = make_position(&alpha_user, Destination::Broadcast);
-        router.cache().store(pos).await;
+        router.cache().store(pos);
 
         // bravo_user connects — should NOT receive alpha_user's position
         let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
@@ -5386,7 +5386,7 @@ mod tests {
 
         // Cache a position from alice
         let pos = make_position(&alice, Destination::Broadcast);
-        router.cache().store(pos).await;
+        router.cache().store(pos);
 
         // Bob connects — shares "shared" group with alice
         // Position messages go to priority channel
@@ -5413,7 +5413,7 @@ mod tests {
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["alpha"]);
         let pos = make_position(&alice, Destination::Broadcast);
-        router.cache().store(pos).await;
+        router.cache().store(pos);
 
         // First 4 replay invocations under bob's CN must each deliver
         // alice's cached position — burst=4 means four tokens available
@@ -5457,7 +5457,7 @@ mod tests {
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["alpha"]);
         let pos = make_position(&alice, Destination::Broadcast);
-        router.cache().store(pos).await;
+        router.cache().store(pos);
 
         let (ptx, ntx, mut prx, _nrx) = make_channels(16, 16);
         let handle = SessionHandle::new(bob.clone(), ptx, ntx);
@@ -5508,7 +5508,7 @@ mod tests {
         let bob = make_identity("bob", &["alpha"]);
         let charlie = make_identity("charlie", &["alpha"]);
         let pos = make_position(&alice, Destination::Broadcast);
-        router.cache().store(pos).await;
+        router.cache().store(pos);
 
         // Bob exhausts his bucket (burst=1, then the next call sheds).
         let (ptx, ntx, _prx, _nrx) = make_channels(16, 16);
@@ -5545,7 +5545,7 @@ mod tests {
         let alice = make_identity("alice", &["alpha"]);
         let bob = make_identity("bob", &["alpha"]);
         let pos = make_position(&alice, Destination::Broadcast);
-        router.cache().store(pos).await;
+        router.cache().store(pos);
 
         // A single replay must always deliver — the default must never
         // shed the very first reconnect.
@@ -5665,12 +5665,12 @@ mod tests {
 
         // Cache a position
         let pos = make_position(&alice, Destination::Broadcast);
-        router.cache().store(pos).await;
-        assert_eq!(router.cache().len().await, 1);
+        router.cache().store(pos);
+        assert_eq!(router.cache().len(), 1);
 
         // Unregister should also evict from cache
         router.unregister("alice", session_id).await;
-        assert_eq!(router.cache().len().await, 0);
+        assert_eq!(router.cache().len(), 0);
     }
 
     #[tokio::test]
@@ -6177,7 +6177,7 @@ mod tests {
 
         // Cache a position from alice
         let pos = make_position(&alice, Destination::Broadcast);
-        router.cache().store(pos).await;
+        router.cache().store(pos);
 
         // Bob connects — member of alpha but NOT in receive ACL
         // Position messages go to priority channel
@@ -6305,7 +6305,7 @@ mod tests {
 
         // Cache a position from alice
         let pos = make_position(&alice, Destination::Broadcast);
-        router.cache().store(pos).await;
+        router.cache().store(pos);
 
         // Swap in ACL: bob cannot receive from alpha
         let mut groups = std::collections::HashMap::new();

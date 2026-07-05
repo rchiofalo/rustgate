@@ -425,7 +425,7 @@ async fn jetstream_replay() {
         .expect("replay");
 
     assert_eq!(count, 3, "should replay 3 tracks");
-    assert_eq!(router.cache().len().await, 3);
+    assert_eq!(router.cache().len(), 3);
 }
 
 /// Verify that publishing the same UID twice results in only the latest
@@ -791,7 +791,7 @@ async fn jetstream_replay_count_limit() {
         .expect("replay");
 
     assert_eq!(count, 2, "replay should stop at max_replay_count");
-    assert_eq!(router.cache().len().await, 2);
+    assert_eq!(router.cache().len(), 2);
 }
 
 /// Wire format round-trip: verify WireEvent serialization/deserialization
