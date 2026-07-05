@@ -4737,4 +4737,43 @@ mod tests {
             assert_eq!(modify_after - modify_before, 1);
         }
     }
+
+    // ── #1525: authz cache hit-rate export contract ─────────────────
+
+    #[test]
+    fn record_authz_cache_stats_adds_nonzero_deltas_and_skips_zero() {
+        // Locks in the authz decision-cache hit-rate export that #1525
+        // claimed was still missing. `record_authz_cache_stats` is the
+        // background-timer sink (pumped every ~10s from `main.rs`) that
+        // turns the engine's cumulative hit/miss counters into the
+        // Prometheus series `rustgate_authz_cache_hits_total` /
+        // `rustgate_authz_cache_misses_total`. The contract has two
+        // load-bearing properties a future refactor could silently
+        // break:
+        //   1. A positive delta is *added* to the counter (inc_by), not
+        //      assigned — successive timer ticks must accumulate.
+        //   2. A zero delta is a no-op guard, so an idle tick where the
+        //      engine reported no new lookups does not perturb the
+        //      series (and cannot underflow a saturating counter).
+        ensure_init();
+
+        let hits_before = authz_cache_hits().get();
+        let misses_before = authz_cache_misses().get();
+
+        // First tick: both counters advance by their deltas.
+        record_authz_cache_stats(3, 5);
+        assert_eq!(authz_cache_hits().get(), hits_before + 3);
+        assert_eq!(authz_cache_misses().get(), misses_before + 5);
+
+        // Second tick accumulates rather than overwrites.
+        record_authz_cache_stats(2, 0);
+        assert_eq!(authz_cache_hits().get(), hits_before + 5);
+        // A zero misses delta leaves the misses counter untouched.
+        assert_eq!(authz_cache_misses().get(), misses_before + 5);
+
+        // A fully-zero tick perturbs neither series.
+        record_authz_cache_stats(0, 0);
+        assert_eq!(authz_cache_hits().get(), hits_before + 5);
+        assert_eq!(authz_cache_misses().get(), misses_before + 5);
+    }
 }
