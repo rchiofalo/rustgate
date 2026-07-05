@@ -63,6 +63,7 @@
 - [REST API](./reference/rest-api.md)
 - [Configuration Reference](./reference/configuration.md)
 - [Feature Flags Reference](./reference/feature-flags.md)
+- [Alignment Roadmap (2026–2035)](./reference/alignment-roadmap.md)
 
 ---
 
