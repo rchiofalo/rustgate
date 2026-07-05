@@ -39,6 +39,16 @@ use crate::error::{FederationError, Result};
 /// non-outbound peers should continue to use `--federation-peers-file`.
 const DEFAULT_GROUPS: &[&str] = &["__ANON__"];
 
+/// DNS-SD TXT record key carrying an operator-supplied, trusted certificate
+/// CN for a discovered peer.
+///
+/// When a responder advertises `trust_cn=<CN>` in its TXT record, the value
+/// is copied into [`PeerConfig::trust_cert_cn`] and pins the peer's server
+/// certificate. Without it a discovered peer is left unpinned (chain-only)
+/// by the SEC-1 pin resolver — the responder-controlled instance name is
+/// never used as a CN pin. See `docs/adr/0029-discovered-peer-cn-pinning.md`.
+const TRUST_CN_TXT_KEY: &str = "trust_cn";
+
 /// DNS-SD / mDNS peer discovery source.
 ///
 /// Spawns a `ServiceDaemon` on construction and begins browsing for the
@@ -114,6 +124,16 @@ impl DnsSdDiscovery {
             .unwrap_or(&resolved.fullname)
             .to_string();
 
+        // SEC-1: a discovered peer is only pinned when the responder
+        // advertises an operator-supplied trusted CN via the `trust_cn=` TXT
+        // record. The instance name (the peer id) is responder-controlled and
+        // is never used as a CN pin — see `resolve_pinned_peer_cn` and ADR
+        // 0029.
+        let trust_cert_cn = resolved
+            .get_property_val_str(TRUST_CN_TXT_KEY)
+            .map(|cn| cn.trim().to_string())
+            .filter(|cn| !cn.is_empty());
+
         Some(PeerConfig {
             id: id.into(),
             address,
@@ -122,7 +142,7 @@ impl DnsSdDiscovery {
             outbound_groups: None,
             enabled: true,
             is_outbound: true,
-            trust_cert_cn: None,
+            trust_cert_cn,
             routing_mode: RoutingMode::default(),
             protocol_version: 2,
             jwt_token: None,
@@ -132,6 +152,7 @@ impl DnsSdDiscovery {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: true,
         })
     }
 
@@ -327,12 +348,38 @@ mod tests {
         assert_eq!(peer.priority, 100);
         assert!(peer.inbound_groups.is_none());
         assert!(peer.outbound_groups.is_none());
+        // No `trust_cn=` TXT record → unpinned, but provenance-marked so the
+        // SEC-1 pin resolver refuses the instance-name id fallback.
         assert!(peer.trust_cert_cn.is_none());
+        assert!(peer.discovered);
         assert!(peer.jwt_token.is_none());
         assert!(peer.region.is_none());
         assert!(peer.zone.is_none());
         assert_eq!(peer.routing_mode, RoutingMode::default());
         assert_eq!(peer.groups, vec!["__ANON__".to_string()]);
+    }
+
+    #[test]
+    fn resolved_to_peer_reads_trust_cn_from_txt_record() {
+        // SEC-1: a `trust_cn=<CN>` TXT record supplies the operator-trusted
+        // certificate CN, letting the pin resolver pin the discovered peer
+        // despite its responder-controlled instance name.
+        let mut txt = HashMap::new();
+        let _ = txt.insert("trust_cn".to_string(), "fed-prod-east".to_string());
+        let resolved = ServiceInfo::new(
+            "_rustgate._tcp.local.",
+            "epsilon",
+            "epsilon.local.",
+            "10.0.0.1",
+            9001,
+            txt,
+        )
+        .expect("ServiceInfo::new")
+        .as_resolved_service();
+        let peer =
+            DnsSdDiscovery::resolved_to_peer("_rustgate._tcp.local.", &resolved).expect("peer");
+        assert_eq!(peer.trust_cert_cn.as_deref(), Some("fed-prod-east"));
+        assert!(peer.discovered);
     }
 
     #[test]

@@ -95,7 +95,16 @@ impl EtcdDiscovery {
         let trimmed_value = value.trim();
         if trimmed_value.starts_with('{') {
             match serde_json::from_str::<PeerConfig>(trimmed_value) {
-                Ok(cfg) => Some(cfg),
+                Ok(mut cfg) => {
+                    // `discovered` is `#[serde(skip)]`, so the deserialized
+                    // config always carries the `false` default. Stamp the
+                    // provenance marker so the SEC-1 pin resolver treats this
+                    // peer as discovered — an explicit `trust_cert_cn` in the
+                    // JSON still pins, but a missing one is never derived from
+                    // the id. See ADR 0029.
+                    cfg.discovered = true;
+                    Some(cfg)
+                }
                 Err(e) => {
                     warn!(key = %key, error = %e, "etcd peer entry is not valid JSON PeerConfig");
                     None
@@ -110,15 +119,28 @@ impl EtcdDiscovery {
                 warn!(key = %key, "etcd peer entry has empty id after prefix strip");
                 return None;
             }
+            // Bare-value form: `host:port` optionally followed by a
+            // whitespace-separated `trust-cn=<CN>` token that carries the
+            // operator-supplied trusted certificate CN. The first token is
+            // always the address; the `trust-cn=` token, when present, pins
+            // the peer's server certificate. Without it a discovered peer is
+            // left unpinned (chain-only) by the SEC-1 pin resolver — the id
+            // is never used as a CN pin. See ADR 0029.
+            let mut tokens = trimmed_value.split_whitespace();
+            let address = tokens.next().unwrap_or(trimmed_value).to_string();
+            let trust_cert_cn = tokens
+                .find_map(|tok| tok.strip_prefix("trust-cn="))
+                .map(|cn| cn.trim().to_string())
+                .filter(|cn| !cn.is_empty());
             Some(PeerConfig {
                 id: id.into(),
-                address: trimmed_value.to_string(),
+                address,
                 groups: vec!["__ANON__".into()],
                 inbound_groups: None,
                 outbound_groups: None,
                 enabled: true,
                 is_outbound: true,
-                trust_cert_cn: None,
+                trust_cert_cn,
                 routing_mode: RoutingMode::default(),
                 protocol_version: 2,
                 jwt_token: None,
@@ -128,6 +150,7 @@ impl EtcdDiscovery {
                 compression: None,
                 tenants: Default::default(),
                 topology_role: Default::default(),
+                discovered: true,
             })
         }
     }
@@ -213,6 +236,59 @@ mod tests {
         assert_eq!(cfg.address, "10.0.0.1:9000");
         assert!(cfg.is_outbound);
         assert_eq!(cfg.protocol_version, 2);
+        // Provenance: bare-value entries are discovered peers, and without a
+        // `trust-cn=` token they carry no pin.
+        assert!(cfg.discovered);
+        assert!(cfg.trust_cert_cn.is_none());
+    }
+
+    #[test]
+    fn decode_entry_bare_value_reads_trust_cn_suffix() {
+        // SEC-1: an operator can pin a discovered etcd peer by appending a
+        // whitespace-separated `trust-cn=<CN>` token to the bare address.
+        let cfg = EtcdDiscovery::decode_entry(
+            "rustgate/peers/",
+            "rustgate/peers/pinned",
+            "10.0.0.1:9000 trust-cn=fed-prod-east",
+        )
+        .expect("decode");
+        assert_eq!(cfg.address, "10.0.0.1:9000");
+        assert_eq!(cfg.trust_cert_cn.as_deref(), Some("fed-prod-east"));
+        assert!(cfg.discovered);
+    }
+
+    #[test]
+    fn decode_entry_bare_value_blank_trust_cn_suffix_is_ignored() {
+        // A `trust-cn=` token with no value must not produce an empty-string
+        // pin; the address still parses.
+        let cfg = EtcdDiscovery::decode_entry(
+            "rustgate/peers/",
+            "rustgate/peers/blank",
+            "10.0.0.1:9000 trust-cn=",
+        )
+        .expect("decode");
+        assert_eq!(cfg.address, "10.0.0.1:9000");
+        assert!(cfg.trust_cert_cn.is_none());
+    }
+
+    #[test]
+    fn decode_entry_json_branch_marks_discovered_and_honours_trust_cn() {
+        // The JSON branch honours an explicit `trust_cert_cn` and stamps the
+        // discovered provenance marker (which is `#[serde(skip)]`, so it must
+        // be set after deserialize rather than carried on the wire).
+        let json = r#"{
+            "id": "gamma",
+            "address": "10.0.0.3:9001",
+            "groups": ["east"],
+            "enabled": true,
+            "is_outbound": true,
+            "trust_cert_cn": "fed-west",
+            "protocol_version": 2
+        }"#;
+        let cfg = EtcdDiscovery::decode_entry("rustgate/peers/", "rustgate/peers/gamma", json)
+            .expect("decode");
+        assert_eq!(cfg.trust_cert_cn.as_deref(), Some("fed-west"));
+        assert!(cfg.discovered, "JSON-sourced etcd peers are discovered");
     }
 
     #[test]

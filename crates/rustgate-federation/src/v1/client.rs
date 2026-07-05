@@ -739,6 +739,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -826,6 +827,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -895,6 +897,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -962,6 +965,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});
@@ -1037,6 +1041,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1101,6 +1106,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1166,6 +1172,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1251,6 +1258,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1317,6 +1325,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
 
         let peer = Arc::new(PeerHandle::new(peer_config));
@@ -1388,6 +1397,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let peer = Arc::new(PeerHandle::new(peer_config));
         let on_msg: OnMessage = Arc::new(|_id, _data| {});

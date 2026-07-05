@@ -1285,6 +1285,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         }))
     }
 

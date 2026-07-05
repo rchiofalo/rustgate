@@ -261,16 +261,27 @@ fn peers_equal(a: &crate::config::PeerConfig, b: &crate::config::PeerConfig) -> 
         && a.priority == b.priority
 }
 
-/// Resolve the pinned certificate CN for an outbound V1 peer (SEC-1).
+/// Resolve the pinned certificate CN for an outbound peer (SEC-1).
 ///
 /// Precedence:
 /// 1. An explicit, non-empty [`crate::config::PeerConfig::trust_cert_cn`]
 ///    is **always** the pin (per-peer opt-in, honoured regardless of the
-///    global flag).
-/// 2. Otherwise, when `require_match` is set, the peer is pinned to its
-///    configured `id`.
-/// 3. Otherwise the peer is unpinned (`None`) — chain-only validation, the
-///    historical default.
+///    global flag). For discovered peers this is the operator-supplied CN
+///    carried in backend metadata (Consul `rustgate-trust-cn`, etcd
+///    `trust-cn=`, DNS-SD `trust_cn=`).
+/// 2. Otherwise, when `require_match` is set **and the peer is static**
+///    (operator-authored config), the peer is pinned to its configured
+///    `id`. The id of a static peer is trusted operator input.
+/// 3. Otherwise the peer is unpinned (`None`) — chain-only validation.
+///
+/// **SEC-1 discovered-peer gap.** A peer synthesized by a discovery backend
+/// (`peer_config.discovered == true`) is *never* pinned to its `id`, even
+/// under `require_match`: a discovered id is attacker-influenced service
+/// metadata, and pinning to it would let whoever controls the discovery
+/// backend nominate the CN the connection trusts. Such a peer is left
+/// unpinned and a [`audit::federation_discovered_peer_unpinned`] event is
+/// emitted so operators can attach a trusted CN via backend metadata. See
+/// `docs/adr/0029-discovered-peer-cn-pinning.md`.
 ///
 /// A blank `trust_cert_cn` (`Some("")`) is treated as unset and falls
 /// through to the flag-driven default rather than pinning to the empty
@@ -281,6 +292,20 @@ fn resolve_pinned_peer_cn(
 ) -> Option<String> {
     match peer_config.trust_cert_cn.as_deref() {
         Some(cn) if !cn.trim().is_empty() => Some(cn.to_string()),
+        _ if require_match && peer_config.discovered => {
+            // SEC-1: refuse to derive a CN pin from an attacker-influenced
+            // discovery id. Leave the peer unpinned (chain-only) and record
+            // the residual gap for operators.
+            warn!(
+                peer_id = %peer_config.id,
+                address = %peer_config.address,
+                "discovered peer left CN-unpinned under require_peer_cn_match: \
+                 no trusted CN in discovery metadata; pinning to the discovery \
+                 id is refused (SEC-1). Attach a trusted CN via backend metadata."
+            );
+            audit::federation_discovered_peer_unpinned(&peer_config.id, &peer_config.address);
+            None
+        }
         _ if require_match => Some(peer_config.id.to_string()),
         _ => None,
     }
@@ -2254,6 +2279,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         }
     }
 
@@ -2342,6 +2368,86 @@ mod tests {
             resolve_pinned_peer_cn(true, &cfg),
             Some("peer-id-7".to_string()),
             "blank trust_cert_cn with flag on must fall back to the id"
+        );
+    }
+
+    #[test]
+    fn pin_resolution_discovered_peer_with_require_match_is_unpinned() {
+        // SEC-1 regression guard: a discovered peer under require_match with
+        // no trusted CN must NOT be pinned to its (attacker-influenced)
+        // discovery id — it is left unpinned (chain-only). This is the whole
+        // point of the fix; if a future refactor reintroduced the id
+        // fallback for discovered peers, this test fails.
+        let mut cfg = test_peer_config("discovered-node-42", vec!["Alpha".into()]);
+        cfg.discovered = true;
+        assert_eq!(
+            resolve_pinned_peer_cn(true, &cfg),
+            None,
+            "discovered peer must never be pinned to its discovery id"
+        );
+    }
+
+    #[test]
+    fn pin_resolution_discovered_peer_with_explicit_cn_still_pins() {
+        // An operator-supplied trusted CN carried in discovery metadata
+        // (e.g. Consul `rustgate-trust-cn`) must still pin the discovered
+        // peer — the SEC-1 refusal only applies to the id fallback, not to
+        // an explicit metadata CN.
+        let mut cfg = test_peer_config("discovered-node-42", vec!["Alpha".into()]);
+        cfg.discovered = true;
+        cfg.trust_cert_cn = Some("federation-prod-east".into());
+        assert_eq!(
+            resolve_pinned_peer_cn(true, &cfg),
+            Some("federation-prod-east".to_string()),
+            "explicit metadata CN must pin a discovered peer"
+        );
+        assert_eq!(
+            resolve_pinned_peer_cn(false, &cfg),
+            Some("federation-prod-east".to_string()),
+            "explicit metadata CN pins regardless of the global flag"
+        );
+    }
+
+    #[test]
+    fn pin_resolution_static_peer_keeps_id_fallback_under_require_match() {
+        // The discovered-peer refusal must not regress static peers: a
+        // static (operator-authored) peer with no explicit CN still pins to
+        // its id under require_match, because a static id is trusted
+        // operator input.
+        let cfg = test_peer_config("static-peer", vec!["Alpha".into()]);
+        assert!(!cfg.discovered, "test helper builds a static peer");
+        assert_eq!(
+            resolve_pinned_peer_cn(true, &cfg),
+            Some("static-peer".to_string()),
+            "static peers keep the id fallback"
+        );
+    }
+
+    #[test]
+    fn pin_resolution_discovered_peer_flag_off_is_unpinned() {
+        // With require_match off, a discovered peer with no CN is simply
+        // unpinned — same as any peer. No audit event is expected on this
+        // path (the event only fires when the flag is on and the id
+        // fallback is refused).
+        let mut cfg = test_peer_config("discovered-node", vec!["Alpha".into()]);
+        cfg.discovered = true;
+        assert_eq!(resolve_pinned_peer_cn(false, &cfg), None);
+    }
+
+    #[test]
+    fn peers_equal_ignores_discovered_provenance_marker() {
+        // `discovered` is a provenance marker, not a connection parameter.
+        // Two otherwise-identical peers that differ only in `discovered`
+        // must compare equal so the hot-reload diff does not churn a live
+        // connection when a peer transitions between static and discovered
+        // sourcing.
+        let mut a = test_peer_config("peer-x", vec!["Alpha".into()]);
+        let mut b = test_peer_config("peer-x", vec!["Alpha".into()]);
+        a.discovered = false;
+        b.discovered = true;
+        assert!(
+            peers_equal(&a, &b),
+            "discovered marker must not affect structural equality"
         );
     }
 
@@ -3409,6 +3515,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         }
     }
 
@@ -3612,6 +3719,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let err = mgr
             .connect_outbound_peer(&cfg)
@@ -3677,6 +3785,7 @@ mod tests {
             compression: None,
             tenants: Default::default(),
             topology_role: Default::default(),
+            discovered: false,
         };
         let err = mgr
             .connect_outbound_peer(&cfg)

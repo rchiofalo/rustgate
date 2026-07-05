@@ -83,6 +83,7 @@ fn peer(id: &str, addr: &str) -> PeerConfig {
         compression: None,
         tenants: Default::default(),
         topology_role: Default::default(),
+        discovered: false,
     }
 }
 

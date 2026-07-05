@@ -74,7 +74,7 @@ Each peer in the JSON array has these fields:
 | `groups` | string[] | yes | — | Groups this peer participates in |
 | `enabled` | bool | yes | — | Whether the connection is active |
 | `is_outbound` | bool | yes | — | `true` = we connect to them; `false` = they connect to us |
-| `trust_cert_cn` | string? | no | null | Expected certificate CN for this peer |
+| `trust_cert_cn` | string? | no | null | Expected certificate CN to pin for this peer (see [Discovered-peer CN pinning](#discovered-peer-cn-pinning-issue-1612)) |
 | `routing_mode` | string | no | `"matrix"` | `"matrix"` or `"broadcast"` |
 | `protocol_version` | int | no | `2` | `1` for V1 XML, `2` for V2 gRPC |
 
@@ -265,6 +265,42 @@ peer's identity is the CN of that certificate; rustgate never falls back
 to the remote IP address when CN extraction fails (see issue #759). An
 attacker without a certificate signed by a trusted CA cannot reach any
 federation RPC.
+
+### Discovered-peer CN pinning (issue #1612)
+
+Beyond chain validation, federation can **pin** a peer's server
+certificate to an expected CN. Pinning is controlled by
+`--federation-require-peer-cn-match` (strict mode) and the per-peer
+`trust_cert_cn` field:
+
+- An explicit, non-empty `trust_cert_cn` **always** pins the peer,
+  regardless of the strict flag.
+- With the strict flag on and no `trust_cert_cn`, a **static** peer
+  (authored in a config file) is pinned to its configured `id` — the id
+  is trusted operator input.
+
+**Discovered peers are different.** A peer synthesized by a discovery
+backend (Consul, etcd, DNS-SD) carries an attacker-influenced `id`: a
+Consul `ServiceID`, an etcd key suffix, an mDNS instance name. Whoever
+can register a service in the backend chooses that id, so pinning to it
+would let the same actor nominate the CN the connection trusts. Under
+strict mode, rustgate therefore **refuses to derive a CN pin from a
+discovered peer's id** — the peer is left unpinned (chain-only
+validation) and a `federation.discovered_peer_unpinned` audit event is
+emitted so operators can see the residual gap.
+
+To pin a discovered peer, publish a trusted CN through the backend's
+metadata channel — the value flows into `trust_cert_cn`:
+
+| Backend | Metadata channel | Example |
+|---------|------------------|---------|
+| Consul  | `rustgate-trust-cn` service meta | `ServiceMeta: { "rustgate-trust-cn": "fed-prod-east" }` |
+| etcd    | `trust-cn=<CN>` token on the bare `host:port` value, or `trust_cert_cn` in the JSON `PeerConfig` form | `10.0.0.1:9000 trust-cn=fed-prod-east` |
+| DNS-SD  | `trust_cn=<CN>` TXT record | `trust_cn=fed-prod-east` |
+
+See [ADR 0029](adr/0029-discovered-peer-cn-pinning.md) for the full
+trust-model rationale and the alternatives considered (including why the
+default is chain-only rather than fail-closed).
 
 ### Cross-origin group claims (issue #720)
 

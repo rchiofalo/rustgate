@@ -385,6 +385,33 @@ pub fn federation_peer_rejected(remote_addr: &str, reason: &str) {
     );
 }
 
+/// Record that a discovery-sourced peer was left certificate-CN-unpinned
+/// despite `require_peer_cn_match` being enabled (SEC-1).
+///
+/// Emitted once per pin-resolution when a peer synthesized by a discovery
+/// backend (Consul, etcd, DNS-SD) carries no operator-supplied
+/// `trust_cert_cn` while strict CN matching is on. The discovered peer id
+/// is attacker-influenced service metadata, so it is deliberately **not**
+/// used to derive a certificate-CN pin — the connection falls back to
+/// chain-only validation. This audit event surfaces the residual trust gap
+/// so operators can attach a trusted CN via backend metadata
+/// (`rustgate-trust-cn` service meta, `trust-cn=` on an etcd bare value, or
+/// a `trust_cn=` TXT record). See
+/// `docs/adr/0029-discovered-peer-cn-pinning.md`.
+///
+/// Sanitization: `peer_id` is a typed [`PeerId`] and bypasses sanitization;
+/// `address` is sanitized at the audit boundary.
+pub fn federation_discovered_peer_unpinned(peer_id: &PeerId, address: &str) {
+    let address = s(address);
+    audit!(
+        "federation.discovered_peer_unpinned",
+        peer_id = %peer_id,
+        address = %address,
+        action = "pin_skipped",
+        result = "unpinned"
+    );
+}
+
 /// Record a rejection of wire-claimed federation group memberships.
 ///
 /// Emitted when a federation peer forwards an event whose
