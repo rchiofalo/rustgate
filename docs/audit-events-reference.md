@@ -347,12 +347,19 @@ reconnecting client requests more replays than its budget allows.
 
 The `security.rate_limited` event is the generic per-IP rate-limit
 signal; `quota.tenant_throughput_exceeded` fires when the
-per-tenant aggregate-throughput token bucket is exhausted (issue #883).
+per-tenant aggregate-throughput token bucket is exhausted (issue #883);
+`quota.tenant_queued_bytes_exceeded` fires when a tenant's
+instantaneous in-flight footprint would exceed its configured
+`max_queued_bytes` cap at the router egress path (issue #1514). The two
+quota events are distinct mechanisms — `throughput` is a bytes/sec rate
+cap, `queued_bytes` is an instantaneous in-flight cap that only releases
+as recipient channels drain.
 
 | Event | Fields | Purpose |
 |---|---|---|
 | `security.rate_limited` | `peer`, `endpoint`, `limit`, `action`, `result` | Per-IP rate limit triggered. |
 | `quota.tenant_throughput_exceeded` | `tenant`, `uid`, `requested`, `available`, `action`, `result` | Per-tenant aggregate throughput exhausted. |
+| `quota.tenant_queued_bytes_exceeded` | `tenant`, `uid`, `requested`, `reserved_cap`, `action`, `result` | Per-tenant instantaneous queued-byte cap exceeded at router egress. |
 
 ## `tenant` — label-cardinality protection
 

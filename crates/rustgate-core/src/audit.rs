@@ -1752,6 +1752,43 @@ pub fn tenant_throughput_exceeded(tenant: &str, msg_uid: &str, requested: u64, a
     );
 }
 
+/// Record a message being dropped because the per-tenant instantaneous
+/// queued-byte reservation was exhausted (issue #1514).
+///
+/// Distinct from [`tenant_throughput_exceeded`]: that event guards a
+/// bytes/second *rate* bucket, whereas this one guards the aggregate
+/// *queued-byte* footprint held in-flight across every active session
+/// for the tenant. A noisy tenant that hits its `max_queued_bytes` cap
+/// is shed here so it cannot consume the whole global backpressure
+/// budget and starve quiet tenants.
+///
+/// `requested` is the payload size the message asked to reserve;
+/// `reserved_cap` is the tenant's configured `max_queued_bytes` ceiling
+/// at evaluation time. Together they show an operator how far over the
+/// cap the tenant's in-flight footprint was.
+///
+/// Sanitization: `tenant` and `msg_uid` are sanitized at the audit
+/// boundary so a noisy CoT `uid="…"` carrying control characters
+/// cannot forge log lines.
+pub fn tenant_queued_bytes_exceeded(
+    tenant: &str,
+    msg_uid: &str,
+    requested: usize,
+    reserved_cap: u64,
+) {
+    let tenant = s(tenant);
+    let msg_uid = s(msg_uid);
+    audit!(
+        "quota.tenant_queued_bytes_exceeded",
+        tenant = %tenant,
+        uid = %msg_uid,
+        requested = requested,
+        reserved_cap = reserved_cap,
+        action = "send",
+        result = "rejected"
+    );
+}
+
 /// Record a dead-letter queue write failure.
 ///
 /// Sanitization: `target` and `error` are sanitized at the audit
