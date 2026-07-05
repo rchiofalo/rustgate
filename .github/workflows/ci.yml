@@ -545,11 +545,83 @@ jobs:
           mkdir -p coverage
           cargo llvm-cov --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http,marti-compat,missions,video,correlation --cobertura --output-path coverage/cobertura.xml nextest
 
+      - name: Enforce line-coverage floor
+        # Ratchet gate (SEC-17): fail the build if workspace line coverage
+        # regresses below the floor. `cargo llvm-cov report` re-reads the
+        # profile data the step above already collected (no re-instrumentation,
+        # no re-run of the test binaries) and `--fail-under-lines` makes it exit
+        # non-zero when the measured line rate drops under the threshold.
+        # `report` re-reads already-collected profile data, so it does NOT take
+        # `--features` (features only apply to the collection/nextest run above).
+        # The floor is deliberately seeded well below the current measured line
+        # rate so it never red-lines an in-flight PR on landing; bump it upward
+        # (toward `current − small margin`) as coverage climbs so it only ever
+        # ratchets forward and can never silently slide backward.
+        run: cargo llvm-cov report --locked --fail-under-lines 55
+
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
           path: coverage/cobertura.xml
+
+  fuzz-smoke:
+    # Per-PR shallow libFuzzer smoke (SEC-17). The nightly/weekly fuzz jobs run
+    # a long deep budget; this job instead spends a fixed ~45s per target on the
+    # highest-risk ingress/codec framers so a crash reachable from a freshly
+    # introduced parser bug fails the PR that introduced it, not a run days
+    # later. Skipped on draft PRs like the other heavyweight jobs.
+    if: github.event.pull_request.draft == false || github.event_name == 'push'
+    needs: [lint, clippy]
+    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    strategy:
+      # Do not cancel every sibling on the first crash — surface all failing
+      # framers in one run so a reviewer sees the full blast radius.
+      fail-fast: false
+      matrix:
+        target:
+          # Ingress/codec framers that parse untrusted bytes on the hot path.
+          - xml_stream_codec
+          - obligation_apply
+          - length_prefixed_codec
+          - tak_frame_codec
+          - federation_frame_parse
+          - ws_frame
+          - mavlink_v2_frame
+    name: fuzz-smoke (${{ matrix.target }})
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+
+      - name: Install protoc
+        # No-op on self-hosted runners where protobuf-compiler is baked into
+        # the container image; apt-get install on the GitHub-hosted fallback.
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Install cargo-fuzz
+        # No-op on self-hosted runners where cargo-fuzz is baked into the
+        # container image; installs via cargo on the GitHub-hosted fallback.
+        run: |
+          if ! command -v cargo-fuzz >/dev/null 2>&1; then
+            cargo +nightly install cargo-fuzz --locked
+          fi
+
+      - name: Smoke-fuzz ${{ matrix.target }} (~45s)
+        # -max_total_time caps the wall budget; the target still replays the
+        # checked-in corpus first, so this catches both a corpus-reachable
+        # regression and any new crash libFuzzer finds inside the window.
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=45
 
   fips:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
