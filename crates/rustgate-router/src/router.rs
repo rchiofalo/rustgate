@@ -49,6 +49,12 @@ use rustgate_authz::{
     Action as AuthzAction, AuthzContext, Decision as AuthzDecision, Obligation, PolicyEngine,
     Resource as AuthzResource, Subject as AuthzSubject,
 };
+// `SmolStr` here is deliberate interop with `rustgate-authz`, not an
+// arbitrary string choice: `Obligation.rule_id` is `Option<SmolStr>`
+// (authz `model.rs`), and the router carries that identifier end-to-end
+// into the classified-delivery audit record without re-typing it. Keeping
+// it as `SmolStr` avoids a `String` allocation per obligation on the
+// delivery fan-out. Do not replace it with `Arc<str>`/`String`.
 use smol_str::SmolStr;
 
 use crate::egress::{
@@ -768,6 +774,10 @@ struct ClassifiedAuditCtx {
     recipient_cn: Arc<str>,
     resource_kind: &'static str,
     resource_id: String,
+    /// Mirrors `rustgate_authz::Obligation.rule_id` (`Option<SmolStr>`) so
+    /// the authorizing rule id travels into the audit record without a
+    /// re-allocation. Kept as `SmolStr` for authz interop — do not widen
+    /// to `Arc<str>`/`String`.
     rule_id: Option<smol_str::SmolStr>,
 }
 
