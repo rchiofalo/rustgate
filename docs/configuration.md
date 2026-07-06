@@ -90,9 +90,29 @@ Per-UID delta encoding reduces outbound bandwidth for CoT workloads where the sa
 | `--authz-policy-format` | `RUSTGATE_AUTHZ_POLICY_FORMAT` | `native` | Policy format: `native` (default JSON ruleset) or `cedar` (requires `--features cedar`). |
 | `--authz-reload-interval` | `RUSTGATE_AUTHZ_RELOAD_INTERVAL` | `5` | Seconds between hot-reload polls of the policy file. Must be >= 1 when `--authz-policy-file` is set. Native backend only. |
 | `--authz-fail-open` | `RUSTGATE_AUTHZ_FAIL_OPEN` | `false` | When the initial load fails, start without an engine instead of aborting. Default is fail-closed. |
+| `--authz-no-policy-allow` | `RUSTGATE_AUTHZ_NO_POLICY_ALLOW` | `false` | Secure-by-default warm-up opt-out ([ADR 0036](adr/0036-secure-by-default-warmup.md)). Acknowledge that no routing policy is configured on purpose (router stays app-layer-open) and silence the no-policy warm-up warning. No behaviour change this release. |
 
 See [docs/authorization.md](authorization.md) for the policy format and
 [docs/runbooks/authz.md](runbooks/authz.md) for operational guidance.
+
+### Secure-by-default warm-up (ADR 0036)
+
+Three convenient-but-unsafe defaults are being tightened over two
+releases. **This release only warns** — it names, at startup, what will
+change and gives each an opt-out flag to pre-pin the current posture and
+silence the warning. See
+[ADR 0036](adr/0036-secure-by-default-warmup.md) for the full staging.
+
+| Warm-up warning fires when… | Opt-out flag | Env Var |
+|---|---|---|
+| Neither `--group-acl-file` nor `--authz-policy-file` is set (routing is app-layer-open) | `--authz-no-policy-allow` | `RUSTGATE_AUTHZ_NO_POLICY_ALLOW` |
+| `--metrics-bind` is set but `--metrics-token-file` is not (metrics endpoint unauthenticated) | `--metrics-no-auth` | `RUSTGATE_METRICS_NO_AUTH` |
+| `--ws-max-frames-per-sec` / `--ws-max-bytes-per-sec` / `--udp-rate-limit` is `0`, or `--udp-bind` is set with no `--udp-allowed-cidrs` (unbounded rate limits) | `--insecure-unbounded-rate-limits` | `RUSTGATE_INSECURE_UNBOUNDED_RATE_LIMITS` |
+
+A future enforcement release will make the no-policy case default-deny,
+require a metrics token, and give the rate limits finite defaults —
+each unless the matching opt-out above is set. Setting the opt-out now
+makes that release a no-op for your deployment.
 
 ### NATS (requires `--features nats`)
 
