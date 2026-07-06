@@ -10,6 +10,14 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Off by default. Compile-safe, no-I/O scaffold for the Meshtastic LoRa /
+# serial ingress seam (docs/design/meshtastic-serial-ingress.md, ADR 0032):
+# the transport-agnostic config type, the ingress error enum, and the
+# non-IP admission key. Adds no dependency; the live listener and any
+# `tokio-serial` dependency land in a follow-up PR gated on design-note D1.
+meshtastic-ingress = []
+
 [dependencies]
 rustgate-core = { workspace = true }
 bytes = { workspace = true }
