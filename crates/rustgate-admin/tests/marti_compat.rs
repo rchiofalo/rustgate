@@ -358,3 +358,52 @@ async fn bearer_token_gates_read_only_endpoints() {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }
+
+#[tokio::test]
+async fn enterprise_sync_round_trip_upload_search_content() {
+    // #1455: the first Enterprise Sync slice — upload a mission package,
+    // confirm it surfaces in /Marti/sync/search, and fetch the exact
+    // bytes back via /Marti/sync/content?hash=.
+    let dir = tempfile::tempdir().unwrap();
+    let store = PackageStore::new(
+        dir.path().to_path_buf(),
+        b"marti-sync-integration-key-32bytes".to_vec(),
+        StoreLimits::default(),
+    )
+    .await
+    .unwrap();
+    let mut state = MartiCompatState::empty();
+    state.packages = Some(store);
+
+    let zip = b"PK\x03\x04-integration-mission-package";
+    let resp = handle_request(
+        &Method::POST,
+        "/Marti/sync/missionupload",
+        None,
+        Some("application/zip"),
+        zip,
+        &state,
+    )
+    .await
+    .unwrap();
+    let (status, uploaded) = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let hash = uploaded["Hash"].as_str().unwrap().to_string();
+    assert_eq!(hash.len(), 64);
+
+    let resp = handle_request(&Method::GET, "/Marti/sync/search", None, None, b"", &state)
+        .await
+        .unwrap();
+    let (status, search) = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search["resultCount"], 1);
+    assert_eq!(search["results"][0]["Hash"], hash);
+
+    let path = format!("/Marti/sync/content?hash={hash}");
+    let resp = handle_request(&Method::GET, &path, None, None, b"", &state)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.as_ref(), zip);
+}

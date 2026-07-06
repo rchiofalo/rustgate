@@ -27,11 +27,30 @@
 //! | `GET  /Marti/api/contacts/all`       | Connected client list from the router                                     |
 //! | `GET  /Marti/api/video`              | Video stream catalog from `rustgate-admin::video` (#1328)                 |
 //! | `GET  /Marti/api/tls/config`         | TLS configuration export (CA cert + accepted ciphers + protocol versions) |
+//! | `GET  /Marti/sync/search`            | `rustgate-missions` [`PackageStore::list`] in the Marti sync envelope     |
+//! | `GET  /Marti/sync/content`           | `rustgate-missions` [`PackageStore::download`] → raw `application/zip`     |
+//! | `POST /Marti/sync/{missionupload,upload}` | `rustgate-missions` [`PackageStore::upload`] (multipart or raw ZIP)  |
+//!
+//! # Enterprise Sync (#1455)
+//!
+//! The `/Marti/sync/*` routes are the first slice of the TAK
+//! application-layer roadmap recorded in
+//! [ADR 0030](../../../docs/adr/0030-tak-marti-application-layer.md).
+//! They are a pure adapter over the content-addressed
+//! [`rustgate_missions::PackageStore`] — no new persistence layer is
+//! introduced. Because the exact TAK Server wire shape (query-param
+//! names, the search-results JSON envelope, and which of
+//! `missionupload`/`upload` an ATAK build posts to) is defined
+//! clean-room from protocol knowledge per ADR 0021, these routes are
+//! **best-effort pending live-client validation**: both upload path
+//! spellings are accepted, and the search envelope is a stable
+//! superset of the fields ATAK reads.
 //!
 //! # Out of scope (deferred)
 //!
-//! - `Marti/api/sync/*` — full mission sync (lands with the rest of #860)
 //! - `Marti/api/cot/xml` — live CoT push (would need a WebSocket tap into the router)
+//! - Mission API / data-sync (`/Marti/mission/*`) — needs the replayable
+//!   CoT persistence store tracked in #1455 / ADR 0030; not this slice.
 //! - Deprecated XML response variants (we ship JSON only — ATAK is tolerant about format)
 //!
 //! # Auth model
@@ -51,7 +70,10 @@ use http_body_util::Full;
 use hyper::header::CONTENT_TYPE;
 use hyper::{Method, Response, StatusCode};
 use rustgate_enrollment::{ContactsProvider, Credentials, CsrSigner, pkcs12};
-use rustgate_missions::PackageStore;
+use rustgate_missions::{
+    MissionsError, PackageStore, extract_boundary, extract_multipart_field,
+    extract_multipart_filename,
+};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -213,15 +235,21 @@ async fn route(
     method: &Method,
     path: &str,
     authorization: Option<&str>,
-    // `content_type` is part of the public handler shape so a future
-    // multipart-upload variant on `signClient` (or a JSON v2 alias)
-    // can land without a signature change. Today no MVP route reads
-    // it, so it rides unused.
-    _content_type: Option<&str>,
+    // Read by the Enterprise Sync upload route to slice the
+    // `multipart/form-data` body; the other routes ignore it.
+    content_type: Option<&str>,
     body: &[u8],
     state: &MartiCompatState,
 ) -> Response<Full<Bytes>> {
-    match (method, path) {
+    // A TAK client appends a query string to the sync routes
+    // (`?hash=…`). Split it off so the exact-path match below stays
+    // stable regardless of whether the transport already stripped it.
+    let (base_path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+
+    match (method, base_path) {
         (&Method::GET, "/Marti/api/tls/config") => {
             match deny_unless_authorized(authorization, state) {
                 Some(deny) => deny,
@@ -255,6 +283,28 @@ async fn route(
             Some(deny) => deny,
             None => handle_video(state),
         },
+        // Enterprise Sync (#1455) — thin adapter over `PackageStore`.
+        (&Method::GET, "/Marti/sync/search") => {
+            match deny_unless_authorized(authorization, state) {
+                Some(deny) => deny,
+                None => handle_sync_search(state).await,
+            }
+        }
+        (&Method::GET, "/Marti/sync/content") => {
+            match deny_unless_authorized(authorization, state) {
+                Some(deny) => deny,
+                None => handle_sync_content(state, query).await,
+            }
+        }
+        // ATAK builds disagree on the upload path spelling; accept both
+        // so a real client's POST is never silently 404'd (best-effort
+        // per ADR 0030, pending live-client validation).
+        (&Method::POST, "/Marti/sync/missionupload") | (&Method::POST, "/Marti/sync/upload") => {
+            match deny_unless_authorized(authorization, state) {
+                Some(deny) => deny,
+                None => handle_sync_upload(state, content_type, body).await,
+            }
+        }
         _ => json_error(StatusCode::NOT_FOUND, "not found"),
     }
 }
@@ -511,6 +561,195 @@ fn infer_protocol(url: &str) -> Option<String> {
         None
     } else {
         Some(scheme)
+    }
+}
+
+/// Map a [`MissionsError`] onto the Marti sync HTTP status + message.
+///
+/// Mirrors the mapping in [`crate::missions_api`]: a malformed hash is
+/// a client error (`400`), a well-formed-but-absent hash is `404`, and
+/// everything else collapses to `500` without leaking filesystem
+/// detail to the caller.
+fn map_missions_error(err: &MissionsError) -> (StatusCode, &'static str) {
+    match err {
+        MissionsError::InvalidHash => (StatusCode::BAD_REQUEST, "invalid hash"),
+        MissionsError::NotFound { .. } => (StatusCode::NOT_FOUND, "package not found"),
+        MissionsError::EmptyUpload => (StatusCode::BAD_REQUEST, "empty upload"),
+        MissionsError::PackageTooLarge { .. } | MissionsError::CapacityExceeded { .. } => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "package too large")
+        }
+        MissionsError::Manifest(_) => (StatusCode::BAD_REQUEST, "invalid mission package"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+    }
+}
+
+/// Return the value of `key` from a `&`-joined query string, if present.
+///
+/// A minimal non-allocating scan — sufficient for the single `hash`
+/// param the Enterprise Sync content route reads. No percent-decoding
+/// is applied because a SHA-256 hash is already URL-safe hex; a value
+/// carrying reserved characters simply fails
+/// [`PackageStore::download`]'s hash validation and returns `400`.
+fn query_param<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    query?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
+/// `GET /Marti/sync/search`
+///
+/// Re-emits the [`PackageStore`] inventory in the Marti sync
+/// `results` envelope. Empty (and `200`, not `500`) when no store is
+/// wired or the listing fails — an ATAK client polling for content
+/// should see "nothing here yet", not an error it will retry-spam.
+async fn handle_sync_search(state: &MartiCompatState) -> Response<Full<Bytes>> {
+    let results = match state.packages.as_ref() {
+        Some(store) => match store.list().await {
+            Ok(items) => items
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "UID": m.hash,
+                        "Name": m.name,
+                        "Hash": m.hash,
+                        "PrimaryKey": m.hash,
+                        "SubmissionUser": m.creator_uid,
+                        "CreatorUid": m.creator_uid,
+                        "SubmissionDateTime": m.upload_time,
+                        "Keywords": Vec::<String>::new(),
+                        "MIMEType": "application/zip",
+                        "Size": m.size,
+                        "Tool": "public",
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::debug!(error = %e, "Marti sync search listing failed");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+
+    let body = serde_json::json!({
+        "resultCount": results.len(),
+        "results": results,
+    });
+    json_response(StatusCode::OK, Bytes::from(body.to_string()))
+}
+
+/// `GET /Marti/sync/content?hash={h}`
+///
+/// Streams the raw ZIP body for a content-addressed package with
+/// `Content-Type: application/zip`. A missing `hash` param is `400`; a
+/// malformed hash is `400` (via [`PackageStore::download`]); a
+/// well-formed-but-absent hash is `404`.
+async fn handle_sync_content(
+    state: &MartiCompatState,
+    query: Option<&str>,
+) -> Response<Full<Bytes>> {
+    let Some(store) = state.packages.as_ref() else {
+        return unavailable("mission package store not configured");
+    };
+    let Some(hash) = query_param(query, "hash") else {
+        return json_error(StatusCode::BAD_REQUEST, "missing hash parameter");
+    };
+
+    match store.download(hash).await {
+        Ok((meta, bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/zip")
+            .header(
+                "content-disposition",
+                format!("attachment; filename=\"{}\"", meta.name),
+            )
+            .body(Full::new(Bytes::from(bytes)))
+            .unwrap_or_else(|_| internal_error_response()),
+        Err(e) => {
+            let (status, msg) = map_missions_error(&e);
+            tracing::debug!(error = %e, "Marti sync content download failed");
+            json_error(status, msg)
+        }
+    }
+}
+
+/// `POST /Marti/sync/{missionupload,upload}`
+///
+/// Accepts either a `multipart/form-data` form (the canonical TAK
+/// client shape — the ZIP rides in a field named `assetfile`, falling
+/// back to `file`) or a raw `application/zip` body, and forwards it to
+/// [`PackageStore::upload`]. Returns the stored package's content hash
+/// so the client can immediately reference it via
+/// `/Marti/sync/content?hash={h}`.
+async fn handle_sync_upload(
+    state: &MartiCompatState,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Response<Full<Bytes>> {
+    let Some(store) = state.packages.as_ref() else {
+        return unavailable("mission package store not configured");
+    };
+    if body.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "empty request body");
+    }
+
+    // Two accepted shapes, mirroring the native missions upload path:
+    //   1. multipart/form-data — the ZIP is the `assetfile` field
+    //      (ATAK's spelling), with `file` accepted as a fallback.
+    //   2. raw application/zip — the curl/integration-test path.
+    let (zip_bytes, name): (&[u8], String) =
+        if let Some(ct) = content_type.filter(|ct| ct.starts_with("multipart/form-data")) {
+            let Some(boundary) = extract_boundary(ct).map(|s| s.to_string()) else {
+                return json_error(StatusCode::BAD_REQUEST, "missing multipart boundary");
+            };
+            let Some(zip) = extract_multipart_field(body, &boundary, "assetfile")
+                .or_else(|| extract_multipart_field(body, &boundary, "file"))
+            else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "multipart body missing `assetfile` field",
+                );
+            };
+            let filename = extract_multipart_filename(body, &boundary)
+                .unwrap_or_else(|| "package.zip".to_string());
+            (zip, filename)
+        } else {
+            (body, "package.zip".to_string())
+        };
+
+    if zip_bytes.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "empty package body");
+    }
+
+    // TAK sync uploads are anonymous at the transport layer here; the
+    // bearer-token principal stands in as the creator until per-token
+    // identity is wired through the admin auth layer.
+    let creator_uid = "marti-sync";
+    match store.upload(zip_bytes, &name, creator_uid).await {
+        Ok(meta) => {
+            tracing::info!(
+                target: "audit",
+                event_type = "marti.sync_upload",
+                hash = %meta.hash,
+                name = %rustgate_core::sanitize::sanitize_for_log(&meta.name),
+                size = meta.size,
+                "mission package uploaded via Marti Enterprise Sync",
+            );
+            let body = serde_json::json!({
+                "UID": meta.hash,
+                "Hash": meta.hash,
+                "Name": meta.name,
+                "Size": meta.size,
+                "SubmissionUser": meta.creator_uid,
+            });
+            json_response(StatusCode::OK, Bytes::from(body.to_string()))
+        }
+        Err(e) => {
+            let (status, msg) = map_missions_error(&e);
+            tracing::debug!(error = %e, "Marti sync upload failed");
+            json_error(status, msg)
+        }
     }
 }
 
@@ -994,10 +1233,230 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    async fn store_with_package(body: &[u8], name: &str) -> (tempfile::TempDir, PackageStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::new(
+            dir.path().to_path_buf(),
+            b"marti-sync-integrity-key-32-bytes".to_vec(),
+            StoreLimits::default(),
+        )
+        .await
+        .unwrap();
+        let _ = store.upload(body, name, "tester").await.unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn sync_search_empty_without_store() {
+        let state = MartiCompatState::empty();
+        let resp = handle_request(&Method::GET, "/Marti/sync/search", None, None, b"", &state)
+            .await
+            .unwrap();
+        let (status, body) = body_string(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["resultCount"], 0);
+        assert!(parsed["results"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_round_trip_upload_search_content() {
+        // Upload a raw ZIP body, confirm it surfaces in search, then
+        // fetch the exact bytes back via content?hash=.
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::new(
+            dir.path().to_path_buf(),
+            b"marti-sync-integrity-key-32-bytes".to_vec(),
+            StoreLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut state = MartiCompatState::empty();
+        state.packages = Some(store);
+
+        let zip = b"PK\x03\x04-fake-mission-package-body";
+        let resp = handle_request(
+            &Method::POST,
+            "/Marti/sync/upload",
+            None,
+            Some("application/zip"),
+            zip,
+            &state,
+        )
+        .await
+        .unwrap();
+        let (status, body) = body_string(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let uploaded: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let hash = uploaded["Hash"].as_str().unwrap().to_string();
+        assert_eq!(hash.len(), 64);
+
+        // Search must now list the package.
+        let resp = handle_request(&Method::GET, "/Marti/sync/search", None, None, b"", &state)
+            .await
+            .unwrap();
+        let (status, body) = body_string(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["resultCount"], 1);
+        assert_eq!(parsed["results"][0]["Hash"], hash);
+
+        // Content must return the exact bytes with application/zip.
+        let path = format!("/Marti/sync/content?hash={hash}");
+        let resp = handle_request(&Method::GET, &path, None, None, b"", &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/zip")
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), zip);
+    }
+
+    #[tokio::test]
+    async fn sync_upload_accepts_multipart_assetfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PackageStore::new(
+            dir.path().to_path_buf(),
+            b"marti-sync-integrity-key-32-bytes".to_vec(),
+            StoreLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut state = MartiCompatState::empty();
+        state.packages = Some(store);
+
+        let boundary = "----martisyncboundary";
+        let mut multipart = Vec::new();
+        multipart.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        multipart.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"assetfile\"; filename=\"pkg.zip\"\r\n",
+        );
+        multipart.extend_from_slice(b"Content-Type: application/zip\r\n\r\n");
+        multipart.extend_from_slice(b"PK\x03\x04-multipart-body");
+        multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let ct = format!("multipart/form-data; boundary={boundary}");
+        let resp = handle_request(
+            &Method::POST,
+            "/Marti/sync/missionupload",
+            None,
+            Some(&ct),
+            &multipart,
+            &state,
+        )
+        .await
+        .unwrap();
+        let (status, body) = body_string(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["Name"], "pkg.zip");
+        assert_eq!(parsed["Hash"].as_str().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn sync_content_missing_hash_is_400() {
+        let (_dir, store) = store_with_package(b"body", "demo.zip").await;
+        let mut state = MartiCompatState::empty();
+        state.packages = Some(store);
+
+        let resp = handle_request(&Method::GET, "/Marti/sync/content", None, None, b"", &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sync_content_absent_hash_is_404_malformed_is_400() {
+        let (_dir, store) = store_with_package(b"body", "demo.zip").await;
+        let mut state = MartiCompatState::empty();
+        state.packages = Some(store);
+
+        // Well-formed (64 hex) but never stored → 404.
+        let absent = format!("/Marti/sync/content?hash={}", "a".repeat(64));
+        let resp = handle_request(&Method::GET, &absent, None, None, b"", &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Malformed hash → 400.
+        let malformed = "/Marti/sync/content?hash=not-a-valid-hash";
+        let resp = handle_request(&Method::GET, malformed, None, None, b"", &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sync_routes_gated_by_bearer_token() {
+        let (_dir, store) = store_with_package(b"body", "demo.zip").await;
+        let mut state = MartiCompatState::empty();
+        state.packages = Some(store);
+        state.auth_token = Some(Zeroizing::new(token_bytes()));
+
+        // Search: 401 without a token.
+        let resp = handle_request(&Method::GET, "/Marti/sync/search", None, None, b"", &state)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Content: 401 with a wrong token (even before hash validation).
+        let resp = handle_request(
+            &Method::GET,
+            &format!("/Marti/sync/content?hash={}", "a".repeat(64)),
+            Some("Bearer wrong"),
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Upload: 401 without a token.
+        let resp = handle_request(
+            &Method::POST,
+            "/Marti/sync/upload",
+            None,
+            Some("application/zip"),
+            b"PK\x03\x04body",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct token admits search.
+        let auth = format!("Bearer {}", String::from_utf8(token_bytes()).unwrap());
+        let resp = handle_request(
+            &Method::GET,
+            "/Marti/sync/search",
+            Some(&auth),
+            None,
+            b"",
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[test]
     fn infer_protocol_extracts_scheme() {
         assert_eq!(infer_protocol("rtsp://1.2.3.4/feed"), Some("rtsp".into()));
         assert_eq!(infer_protocol("HTTPS://x"), Some("https".into()));
         assert_eq!(infer_protocol("no-scheme-here"), None);
+    }
+
+    #[test]
+    fn query_param_extracts_hash() {
+        assert_eq!(query_param(Some("hash=abc&x=1"), "hash"), Some("abc"));
+        assert_eq!(query_param(Some("x=1&hash=def"), "hash"), Some("def"));
+        assert_eq!(query_param(Some("x=1"), "hash"), None);
+        assert_eq!(query_param(None, "hash"), None);
     }
 }
