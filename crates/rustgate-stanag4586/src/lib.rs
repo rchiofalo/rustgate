@@ -110,6 +110,8 @@ pub mod payload_status;
 pub mod route_upload_command;
 pub mod sensor_pointing_command;
 pub mod sensor_status;
+#[cfg(feature = "stream")]
+pub mod stream;
 pub mod system_state;
 pub mod vehicle_position;
 pub mod waypoint_command;
@@ -129,6 +131,10 @@ pub use payload_status::{PayloadKind, PayloadStatus, RecordingState, StreamingSt
 pub use route_upload_command::{MAX_ROUTE_WAYPOINTS, RouteKind, RouteUploadCommand};
 pub use sensor_pointing_command::{PointingMode, SensorPointingCommand};
 pub use sensor_status::{OperationalState, SensorStatus, SensorType};
+#[cfg(feature = "stream")]
+pub use stream::{
+    LengthFieldSize, Stanag4586StreamDecoder, Stanag4586StreamError, StreamFrame, StreamProfile,
+};
 pub use system_state::{BitStatusFlags, MissionPhase, OperatingMode, SystemState};
 pub use vehicle_position::{FlightState, VehiclePosition};
 pub use waypoint_command::{CommandKind, WaypointCommand};
