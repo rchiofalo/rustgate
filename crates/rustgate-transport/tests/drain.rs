@@ -31,6 +31,7 @@ fn make_chat(source: &Arc<Identity>, dest: Destination, seq: usize) -> RoutableM
         destination: dest,
         payload: Bytes::from(format!("<chat seq=\"{seq}\"/>")),
         metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        entity: None,
     }
 }
 

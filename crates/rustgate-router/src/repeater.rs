@@ -225,6 +225,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from(payload.to_string()),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Alert),
+            entity: None,
         }
     }
 
@@ -235,6 +236,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event type=\"a-f-G\" uid=\"pos1\" />"),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position),
+            entity: None,
         }
     }
 

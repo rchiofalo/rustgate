@@ -375,6 +375,7 @@ impl WireEvent {
             destination: Destination::Broadcast,
             payload,
             metadata: Metadata::new(SystemTime::now(), "nats".to_string(), message_type),
+            entity: None,
         })
     }
 

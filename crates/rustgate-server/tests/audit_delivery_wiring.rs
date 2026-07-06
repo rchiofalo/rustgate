@@ -96,6 +96,7 @@ fn make_msg(source: &Arc<Identity>, dest: Destination, payload: &'static [u8]) -
         destination: dest,
         payload: Bytes::from_static(payload),
         metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Chat),
+        entity: None,
     }
 }
 

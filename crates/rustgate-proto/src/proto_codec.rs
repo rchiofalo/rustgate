@@ -144,6 +144,7 @@ mod tests {
                 "test".to_string(),
                 MessageType::Other("test".to_string()),
             ),
+            entity: None,
         };
         let err = codec.encode_payload(&msg).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

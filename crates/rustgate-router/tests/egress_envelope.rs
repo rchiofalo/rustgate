@@ -75,6 +75,7 @@ fn position(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
         destination: dest,
         payload: Bytes::from_static(SAMPLE_COT),
         metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position),
+        entity: None,
     }
 }
 

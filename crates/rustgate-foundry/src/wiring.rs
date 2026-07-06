@@ -224,37 +224,44 @@ pub struct PendingUpsert {
 
 /// Project a single message through the mapper table and either
 /// upsert or queue.
-//
-// The function is `async` even though the body has no awaits today
-// because the `Entity` attach (#847 step 2) will turn the body into
-// a `dispatch_entity(...).await` call. Keeping the async signature
-// here avoids a churn-only diff later. The `unused_async` lint is
-// suppressed with a justification accordingly.
-// justification: scaffold awaiting #847 step 2 — once `Entity` is
-// attached to `RoutableMessage`, this function awaits
-// `dispatch_entity` and the lint becomes self-clearing. Suppressing
-// here keeps the function shape stable through that landing.
-#[allow(clippy::unused_async)]
+///
+/// When the envelope carries an attached [`Entity`] (the #1540 attach
+/// seam — see ADR 0035), the message is projected and dispatched
+/// through [`dispatch_entity`]. A dispatch error is logged and
+/// swallowed: the outbound loop must not abort on a single unmapped or
+/// malformed entity. When no entity is attached — the shape at every
+/// router ingress today, since no codec populates the attach yet — the
+/// message is logged at `debug` and dropped. That branch is the
+/// deliberate scaffold until an ingress codec starts attaching entities;
+/// the router-driven live-registration path (`spawn_outbound` wiring)
+/// remains a documented follow-up.
 async fn handle_outbound(
     bridge: &Arc<dyn FoundryBridge>,
     mappers: &std::collections::HashMap<String, BoundMapper>,
     offline_queue: &mut VecDeque<PendingUpsert>,
     msg: RoutableMessage,
 ) {
-    // The wiring expects an Entity to ride alongside the message.
-    // Today the router does not yet attach an `Entity` to
-    // `RoutableMessage` (#847 step 2 — the registry exists, the
-    // attach lands separately). Until then, the wiring is a
-    // pass-through: the test harness drives the outbound task
-    // directly with manufactured `Entity` envelopes via
-    // `dispatch_entity`. The router-driven path goes through this
-    // function and produces a `tracing::debug!` until the attach
-    // lands.
-    let _ = (bridge, mappers, offline_queue, msg);
-    debug!(
-        "foundry outbound received a RoutableMessage without an attached Entity; \
-         this code path is the deliberate scaffold awaiting #847 step 2"
-    );
+    match msg.entity.as_ref() {
+        Some(entity) => {
+            if let Err(e) = dispatch_entity(bridge, mappers, offline_queue, entity).await {
+                // A single unmapped / malformed entity must not tear
+                // down the outbound loop; `dispatch_entity` already
+                // logs offline-queueing and warns on hard failures.
+                debug!(error = %e, "foundry outbound: dispatch_entity failed for attached entity");
+            }
+        }
+        None => {
+            // No attached entity — the shape at every router ingress
+            // today, since no codec populates the #1540 attach yet.
+            // Drop with a debug trace; the router-driven live path is a
+            // documented follow-up in ADR 0035.
+            let _ = (bridge, mappers, offline_queue);
+            debug!(
+                "foundry outbound received a RoutableMessage without an attached Entity; \
+                 this code path is the deliberate scaffold until an ingress codec attaches one"
+            );
+        }
+    }
 }
 
 /// Project an `Entity` and dispatch it through the bridge. This is
@@ -491,6 +498,7 @@ fn change_to_message(
             // `unknown` bucket.
             MessageType::Other("foundry".to_string()),
         ),
+        entity: None,
     })
 }
 
@@ -554,6 +562,19 @@ pub mod testing {
         entity: &Entity,
     ) -> Result<(), FoundryError> {
         super::dispatch_entity(bridge, mappers, offline_queue, entity).await
+    }
+
+    /// Re-export of the per-message outbound handler so integration
+    /// tests can drive the #1540 attached-entity dispatch path (and the
+    /// no-entity scaffold branch) exactly as the router-fed outbound
+    /// loop would. See ADR 0035.
+    pub async fn handle_outbound_for_test(
+        bridge: &Arc<dyn FoundryBridge>,
+        mappers: &std::collections::HashMap<String, BoundMapper>,
+        offline_queue: &mut VecDeque<PendingUpsert>,
+        msg: RoutableMessage,
+    ) {
+        super::handle_outbound(bridge, mappers, offline_queue, msg).await;
     }
 
     /// Inspect the current queue depth.

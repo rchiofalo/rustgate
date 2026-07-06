@@ -505,6 +505,7 @@ fn sample_to_message(
             // `unknown` bucket.
             MessageType::Other("dds".to_string()),
         ),
+        entity: None,
     })
 }
 

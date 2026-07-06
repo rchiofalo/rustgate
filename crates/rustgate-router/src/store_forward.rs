@@ -1354,6 +1354,7 @@ pub fn decode(raw: &[u8]) -> Result<DecodedEnvelope, StoreForwardError> {
             destination,
             payload,
             metadata,
+            entity: None,
         },
         queued_at_ms,
     })
@@ -1607,6 +1608,7 @@ mod tests {
             destination: Destination::Direct(ident(to)),
             payload: Bytes::copy_from_slice(payload),
             metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Chat),
+            entity: None,
         }
     }
 

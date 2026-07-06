@@ -836,6 +836,7 @@ mod tests {
                 "tcp".into(),
                 MessageType::Other("mavlink-heartbeat".into()),
             ),
+            entity: None,
         }
     }
 
@@ -886,6 +887,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::copy_from_slice(payload),
             metadata: Metadata::new(now, proto.into(), MessageType::Other("raw".into())),
+            entity: None,
         };
         assert!(!c.check_message(&make("dis")), "first protocol admitted");
         assert!(

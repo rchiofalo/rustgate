@@ -62,6 +62,7 @@ fn chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
         destination: dest,
         payload: Bytes::from_static(b"<chat/>"),
         metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        entity: None,
     }
 }
 
@@ -438,6 +439,7 @@ fn position(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
         destination: dest,
         payload: Bytes::from_static(SAMPLE_COT),
         metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position),
+        entity: None,
     }
 }
 
@@ -1265,6 +1267,7 @@ fn federated_position(peer_source: &Arc<Identity>) -> RoutableMessage {
             "federation".to_string(),
             MessageType::Position,
         ),
+        entity: None,
     }
 }
 

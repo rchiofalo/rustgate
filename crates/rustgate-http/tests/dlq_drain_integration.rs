@@ -55,6 +55,7 @@ fn make_msg(cn: &str) -> RoutableMessage {
         destination: Destination::Broadcast,
         payload: Bytes::from_static(b"<event uid='drain-test-1'/>"),
         metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Position),
+        entity: None,
     }
 }
 

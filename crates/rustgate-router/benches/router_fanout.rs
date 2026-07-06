@@ -214,6 +214,7 @@ fn make_chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
         destination: dest,
         payload: Bytes::from(vec![0u8; PAYLOAD_BYTES]),
         metadata: Metadata::new(SystemTime::now(), "bench".to_string(), MessageType::Chat),
+        entity: None,
     }
 }
 

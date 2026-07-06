@@ -75,6 +75,7 @@ fn msg_for(from: &str, to: &str, payload: &[u8]) -> RoutableMessage {
         destination: Destination::Direct(ident(to)),
         payload: Bytes::copy_from_slice(payload),
         metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Chat),
+        entity: None,
     }
 }
 

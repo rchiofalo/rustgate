@@ -226,6 +226,7 @@ mod tests {
                 "tcp".to_string(),
                 MessageType::Position,
             ),
+            entity: None,
         }
     }
 

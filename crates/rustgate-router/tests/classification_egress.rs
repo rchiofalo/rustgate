@@ -68,6 +68,7 @@ fn chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
             b"<event uid=\"u1\" type=\"a-f-G-U-C\"><detail><contact callsign=\"A\"/></detail></event>",
         ),
         metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        entity: None,
     }
 }
 

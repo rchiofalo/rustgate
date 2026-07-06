@@ -61,6 +61,7 @@ fn broadcast(payload_bytes: usize) -> RoutableMessage {
             MessageType::Chat,
         ),
         payload: Bytes::from(vec![0u8; payload_bytes]),
+        entity: None,
     }
 }
 

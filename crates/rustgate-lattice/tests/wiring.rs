@@ -49,6 +49,7 @@ fn position_msg(cn: &str, payload: &'static [u8]) -> RoutableMessage {
         destination: Destination::Broadcast,
         payload: Bytes::from_static(payload),
         metadata: meta,
+        entity: None,
     }
 }
 

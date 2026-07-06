@@ -24,6 +24,7 @@ fn make_message(payload: &[u8], source_protocol: &str) -> RoutableMessage {
             source_protocol.into(),
             MessageType::Position,
         ),
+        entity: None,
     }
 }
 

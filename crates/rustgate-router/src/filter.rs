@@ -197,6 +197,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from(payload.to_string()),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position),
+            entity: None,
         }
     }
 
@@ -380,6 +381,7 @@ mod tests {
                 "protobuf".to_string(),
                 MessageType::Position,
             ),
+            entity: None,
         };
         assert!(
             filter.matches(&msg),
@@ -406,6 +408,7 @@ mod tests {
                 destination: Destination::Broadcast,
                 payload: Bytes::from_static(&[0x00]),
                 metadata: Metadata::new(SystemTime::now(), "binary".to_string(), mtype.clone()),
+                entity: None,
             };
             assert!(
                 !filter.matches(&msg),

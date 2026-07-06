@@ -90,6 +90,7 @@ fn build_message(payload: &'static [u8], source_protocol: &str) -> RoutableMessa
             source_protocol.to_string(),
             MessageType::Other("xml".into()),
         ),
+        entity: None,
     }
 }
 

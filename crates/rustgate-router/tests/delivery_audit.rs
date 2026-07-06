@@ -163,6 +163,7 @@ fn make_msg(
         destination: dest,
         payload: Bytes::from_static(payload),
         metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), msg_type),
+        entity: None,
     }
 }
 
@@ -479,6 +480,7 @@ fn make_msg_with_trace(
         payload: Bytes::from_static(payload),
         metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), msg_type)
             .with_trace_context(ctx),
+        entity: None,
     }
 }
 

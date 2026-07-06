@@ -32,6 +32,7 @@ fn make_msg(bytes: usize) -> RoutableMessage {
             MessageType::Chat,
         ),
         payload: Bytes::from(vec![0u8; bytes]),
+        entity: None,
     }
 }
 

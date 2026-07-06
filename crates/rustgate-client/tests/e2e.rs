@@ -36,6 +36,7 @@ fn build_message(source: &Identity, payload: &[u8]) -> RoutableMessage {
             "tcp".into(),
             MessageType::Other("raw".into()),
         ),
+        entity: None,
     }
 }
 

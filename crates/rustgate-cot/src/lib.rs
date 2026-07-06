@@ -901,6 +901,7 @@ impl MessageBuilder {
             destination,
             payload,
             metadata,
+            entity: None,
         }
     }
 
@@ -921,6 +922,7 @@ impl MessageBuilder {
                 source_protocol.to_string(),
                 MessageType::Other("raw".into()),
             ),
+            entity: None,
         }
     }
 

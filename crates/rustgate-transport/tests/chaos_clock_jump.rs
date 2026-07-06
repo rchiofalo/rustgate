@@ -69,6 +69,7 @@ fn position_with_received_at(
         destination: Destination::Broadcast,
         payload: Bytes::from_static(b"<event/>"),
         metadata,
+        entity: None,
     }
 }
 

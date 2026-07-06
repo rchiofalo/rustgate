@@ -77,6 +77,7 @@ fn make_position(source: &Arc<Identity>) -> RoutableMessage {
         destination: Destination::Broadcast,
         payload: Bytes::from_static(b"<event/>"),
         metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Position),
+        entity: None,
     }
 }
 

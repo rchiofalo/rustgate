@@ -278,6 +278,7 @@ fn entity_to_message(entity: Entity) -> Option<RoutableMessage> {
         destination: Destination::Group(Arc::<str>::from(DEFAULT_LATTICE_GROUP)),
         payload: entity.payload,
         metadata,
+        entity: None,
     })
 }
 
@@ -324,6 +325,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from_static(b"<event/>"),
             metadata: meta,
+            entity: None,
         }
     }
 

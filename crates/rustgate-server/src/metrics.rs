@@ -4053,6 +4053,7 @@ mod tests {
                     "cot".to_string(),
                     rustgate_core::message::MessageType::Position,
                 ),
+                entity: None,
             };
 
             cache.store(msg);

@@ -658,6 +658,7 @@ async fn publish_will_message(
             "mqtt".into(),
             MessageType::Other("mqtt".into()),
         ),
+        entity: None,
     };
 
     debug!(
@@ -1726,6 +1727,7 @@ async fn handle_publish_v5_inner(
             "mqtt".into(),
             MessageType::Other("mqtt".into()),
         ),
+        entity: None,
     };
 
     // Capture the post-Send-PEP form so NATS / federation / HTTP egress
@@ -1915,6 +1917,7 @@ async fn handle_pubrel_v5(
             "mqtt".into(),
             MessageType::Other("mqtt".into()),
         ),
+        entity: None,
     };
 
     if let Some(routed) = router.route_for_egress(msg).await {
@@ -2105,6 +2108,7 @@ async fn handle_publish_v4_inner(
             "mqtt".into(),
             MessageType::Other("mqtt".into()),
         ),
+        entity: None,
     };
 
     // See `handle_publish_v5` for the identical rationale — the egress
@@ -2219,6 +2223,7 @@ async fn handle_pubrel_v4(
             "mqtt".into(),
             MessageType::Other("mqtt".into()),
         ),
+        entity: None,
     };
 
     if let Some(routed) = router.route_for_egress(msg).await {
@@ -3740,6 +3745,7 @@ mod tests {
                 "test".into(),
                 MessageType::Other("test".into()),
             ),
+            entity: None,
         }
     }
 

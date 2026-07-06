@@ -33,6 +33,7 @@ fn make_msg(cn: &str, protocol: &str, msg_type: MessageType) -> RoutableMessage 
         destination: Destination::Broadcast,
         payload: Bytes::from_static(b"<event uid='test-1'/>"),
         metadata: Metadata::new(SystemTime::now(), protocol.to_string(), msg_type),
+        entity: None,
     }
 }
 

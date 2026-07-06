@@ -254,6 +254,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from(payload.to_vec()),
             metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Position),
+            entity: None,
         }
     }
 

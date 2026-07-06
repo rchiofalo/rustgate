@@ -107,6 +107,7 @@ fn make_msg(payload: Bytes, protocol: &str) -> RoutableMessage {
             protocol.to_string(),
             MessageType::Other("proptest".to_string()),
         ),
+        entity: None,
     }
 }
 

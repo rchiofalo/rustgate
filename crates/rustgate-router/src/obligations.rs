@@ -1007,6 +1007,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload: Bytes::from_static(payload),
             metadata: Metadata::new(SystemTime::now(), "tcp".into(), message_type),
+            entity: None,
         }
     }
 

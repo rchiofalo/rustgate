@@ -420,6 +420,7 @@ async fn route_frame(
             source_protocol.to_string(),
             message_type.clone(),
         ),
+        entity: None,
     };
     router.route(msg).await;
 }

@@ -48,6 +48,7 @@ fn synth_b_i_v_msg(uid: &str, url: &str, ttl: Option<Duration>) -> RoutableMessa
         destination: Destination::Broadcast,
         payload: Bytes::from(payload),
         metadata: meta,
+        entity: None,
     }
 }
 
@@ -147,6 +148,7 @@ async fn non_video_messages_do_not_populate_catalog() {
         destination: Destination::Broadcast,
         payload: Bytes::from(payload),
         metadata: Metadata::new(SystemTime::now(), "tcp".to_string(), MessageType::Position),
+        entity: None,
     };
     let _ = router.route_for_egress(msg).await;
 

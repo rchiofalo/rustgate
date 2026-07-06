@@ -90,6 +90,7 @@ async fn end_to_end_full_state_round_trip() {
         destination: Destination::Broadcast,
         payload: Bytes::from(payload),
         metadata: meta,
+        entity: None,
     });
 
     let contacts = mock_contacts(vec![

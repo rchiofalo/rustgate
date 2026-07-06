@@ -285,6 +285,7 @@ async fn group_send_backpressure_drops_without_panic() {
             destination: Destination::Group("team".into()),
             payload: Bytes::from(format!("msg-{i}")),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
     }
@@ -341,6 +342,7 @@ async fn disconnected_receiver_drops_gracefully() {
             destination: Destination::Direct((*bob).clone()),
             payload: Bytes::from(format!("direct-{i}")),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
     }
@@ -352,6 +354,7 @@ async fn disconnected_receiver_drops_gracefully() {
             destination: Destination::Broadcast,
             payload: Bytes::from(format!("broadcast-{i}")),
             metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+            entity: None,
         };
         router.route(msg).await;
     }

@@ -36,6 +36,7 @@ fn make_chat(source: &Arc<Identity>, dest: Destination) -> RoutableMessage {
         destination: dest,
         payload: Bytes::from_static(b"<chat/>"),
         metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        entity: None,
     }
 }
 
@@ -137,6 +138,7 @@ async fn direct_message_to_nonexistent_session_no_panic() {
         destination: Destination::Direct(ghost),
         payload: Bytes::from_static(b"hello?"),
         metadata: Metadata::new(SystemTime::now(), "cot".to_string(), MessageType::Chat),
+        entity: None,
     };
 
     // Must not panic

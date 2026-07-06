@@ -195,6 +195,7 @@ fn routable_message_with_broadcast_destination() {
         destination: Destination::Broadcast,
         payload: Bytes::from_static(b"hello"),
         metadata: make_metadata(),
+        entity: None,
     };
     assert!(matches!(msg.destination, Destination::Broadcast));
     assert_eq!(&msg.payload[..], b"hello");
@@ -207,6 +208,7 @@ fn routable_message_with_group_destination() {
         destination: Destination::Group("team-alpha".into()),
         payload: Bytes::from_static(b"data"),
         metadata: make_metadata(),
+        entity: None,
     };
     assert!(matches!(msg.destination, Destination::Group(ref g) if &**g == "team-alpha"));
 }
@@ -219,6 +221,7 @@ fn routable_message_with_direct_destination() {
         destination: Destination::Direct(target),
         payload: Bytes::from_static(b"secret"),
         metadata: make_metadata(),
+        entity: None,
     };
     assert!(matches!(msg.destination, Destination::Direct(ref id) if &*id.cn == "bob"));
 }
@@ -231,6 +234,7 @@ fn routable_message_payload_preservation() {
         destination: Destination::Broadcast,
         payload: payload.clone(),
         metadata: make_metadata(),
+        entity: None,
     };
     assert_eq!(msg.payload, payload);
 }
@@ -245,6 +249,7 @@ fn routable_message_metadata_fields() {
         destination: Destination::Broadcast,
         payload: Bytes::new(),
         metadata: meta,
+        entity: None,
     };
     assert_eq!(msg.metadata.source_protocol, "websocket");
     assert_eq!(msg.metadata.ttl, Some(Duration::from_secs(60)));
@@ -266,6 +271,7 @@ fn routable_message_large_payload() {
         destination: Destination::Broadcast,
         payload,
         metadata: make_metadata(),
+        entity: None,
     };
     assert_eq!(msg.payload.len(), 10 * 1024 * 1024);
 }
@@ -277,6 +283,7 @@ fn routable_message_empty_payload() {
         destination: Destination::Broadcast,
         payload: Bytes::new(),
         metadata: make_metadata(),
+        entity: None,
     };
     assert!(msg.payload.is_empty());
 }
@@ -288,6 +295,7 @@ fn routable_message_clone() {
         destination: Destination::Broadcast,
         payload: Bytes::from_static(b"test"),
         metadata: make_metadata(),
+        entity: None,
     };
     let cloned = msg.clone();
     assert_eq!(&*cloned.source.cn, &*msg.source.cn);

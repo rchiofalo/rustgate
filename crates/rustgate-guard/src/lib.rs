@@ -1285,6 +1285,7 @@ mod tests {
             destination: Destination::Broadcast,
             payload,
             metadata: Metadata::new(SystemTime::now(), "tcp".into(), MessageType::Position),
+            entity: None,
         }
     }
 

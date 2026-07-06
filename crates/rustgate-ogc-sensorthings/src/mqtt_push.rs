@@ -374,6 +374,7 @@ async fn handle_publish(topic: &str, payload: &[u8], router: &Arc<Router>) {
             SOURCE_OGC_SENSORTHINGS.to_string(),
             MessageType::Status,
         ),
+        entity: None,
     };
     router.route(msg).await;
 }

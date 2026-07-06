@@ -181,6 +181,7 @@ mod tests {
                 "test".to_string(),
                 MessageType::Position,
             ),
+            entity: None,
         })
     }
 
