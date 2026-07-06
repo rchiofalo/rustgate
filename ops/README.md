@@ -18,7 +18,8 @@ ops/
 │       └── rustgate-security.json    # Authz decisions, store-forward, backpressure, dedup
 └── prometheus/
     ├── alerts.yml                     # Alerting rules (warning / critical)
-    └── recording-rules.yml            # Recording rules for SLO queries
+    ├── recording-rules.yml            # Recording rules for SLO queries
+    └── slo.rules.yml                  # SLO recording rules + multi-window burn-rate alerts
 ```
 
 ## Grafana dashboards
@@ -44,13 +45,35 @@ Load the rule files from your Prometheus config:
 rule_files:
   - /etc/prometheus/rules/rustgate-alerts.yml
   - /etc/prometheus/rules/rustgate-recording.yml
+  - /etc/prometheus/rules/rustgate-slo.yml
 ```
 
 Validate locally with `promtool`:
 
 ```bash
-promtool check rules ops/prometheus/alerts.yml ops/prometheus/recording-rules.yml
+promtool check rules ops/prometheus/alerts.yml ops/prometheus/recording-rules.yml ops/prometheus/slo.rules.yml
 ```
+
+### SLOs and error budgets
+
+`slo.rules.yml` ships **reference** SLO recording rules and multi-window
+burn-rate alerts:
+
+- **Availability SLO** — ≥ 99.9% TLS-handshake success, computed from
+  `rustgate_handshake_failures_total / rustgate_negotiations_total`.
+- **Delivery SLO** — ≥ 99.9% of routed messages not dropped at the
+  per-client queue, computed from
+  `rustgate_client_queue_drops_total / rustgate_messages_routed_total`.
+
+Each SLO exposes burn-rate recording rules over 5m/1h/6h/3d windows and a
+fast-burn (page) plus slow-burn (ticket) alert that requires **both** the
+long and short window to be burning before firing (Google SRE workbook
+pattern), suppressing flaps on brief spikes.
+
+The 99.9% targets are conventional defaults, not measured commitments — tune
+them and the burn-rate thresholds to your service level before paging on
+them. See [`docs/capacity-planning.md`](../docs/capacity-planning.md) and
+[ADR 0031](../docs/adr/0031-production-hardening-ha-and-edge.md).
 
 ### Recording rule naming convention
 

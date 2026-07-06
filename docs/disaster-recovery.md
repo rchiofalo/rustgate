@@ -115,6 +115,14 @@ If NATS itself is lost, all HA coordination stops. Recovery:
 2. Pods will re-establish KV buckets (`federation-claims`, `federation-connections`, `federation-peers`) automatically.
 3. Peer ownership will be renegotiated within 30-60 seconds.
 
+> **HA depends on NATS today.** Multi-pod HA coordination has a hard NATS
+> dependency — there is no NATS-free clustering path yet. The direction for a
+> restart-safe, NATS-optional HA story (durable-store-backed ownership
+> leases) is recorded in
+> [ADR 0031](adr/0031-production-hardening-ha-and-edge.md); native leaderless
+> clustering is deferred to a follow-up issue. Until it lands, keep NATS
+> highly available if you rely on multi-pod HA.
+
 ## NATS JetStream Recovery
 
 ### Checkpoint Recovery

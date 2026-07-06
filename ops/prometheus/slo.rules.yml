@@ -1,0 +1,164 @@
+# Reference SLO recording rules + multi-window burn-rate alerts for rustgate.
+#
+# These are a STARTING POINT. The SLO targets (99.9% handshake success,
+# 99.9% of routed messages not dropped) are conventional defaults, not
+# measured commitments — tune them to your service level before paging on
+# them. See docs/capacity-planning.md and
+# docs/adr/0031-production-hardening-ha-and-edge.md.
+#
+# Every metric referenced here is already emitted by rustgate and is used in
+# ops/prometheus/{recording-rules,alerts}.yml:
+#   rustgate_handshake_failures_total, rustgate_negotiations_total,
+#   rustgate_client_queue_drops_total, rustgate_messages_routed_total.
+#
+# Multi-window, multi-burn-rate alerting follows the Google SRE workbook:
+# a fast-burn (page) window pair and a slow-burn (ticket) window pair, each
+# requiring BOTH a long and a short window to be burning to fire — this
+# suppresses flapping on brief spikes while still catching sustained burn.
+#
+# Load alongside the existing rule files:
+#   rule_files:
+#     - /etc/prometheus/rules/rustgate-alerts.yml
+#     - /etc/prometheus/rules/rustgate-recording.yml
+#     - /etc/prometheus/rules/rustgate-slo.yml
+#
+# Validate: promtool check rules ops/prometheus/slo.rules.yml
+
+groups:
+  # -------------------------------------------------------------------------
+  # SLO 1: Handshake availability.
+  # Objective: >= 99.9% of TLS negotiations succeed (error budget = 0.1%).
+  # The "bad" event is a handshake failure; the "total" is all negotiations.
+  # -------------------------------------------------------------------------
+  - name: rustgate.slo.availability
+    interval: 30s
+    rules:
+      # Burn-rate = (failure ratio over window) / (error budget = 0.001).
+      # A burn rate of 1 exhausts the 30-day budget in exactly 30 days.
+      - record: rustgate:slo_availability_burnrate:5m
+        expr: |
+          (
+            sum(rate(rustgate_handshake_failures_total[5m]))
+              /
+            clamp_min(sum(rate(rustgate_negotiations_total[5m])), 1)
+          ) / 0.001
+
+      - record: rustgate:slo_availability_burnrate:1h
+        expr: |
+          (
+            sum(rate(rustgate_handshake_failures_total[1h]))
+              /
+            clamp_min(sum(rate(rustgate_negotiations_total[1h])), 1)
+          ) / 0.001
+
+      - record: rustgate:slo_availability_burnrate:6h
+        expr: |
+          (
+            sum(rate(rustgate_handshake_failures_total[6h]))
+              /
+            clamp_min(sum(rate(rustgate_negotiations_total[6h])), 1)
+          ) / 0.001
+
+      - record: rustgate:slo_availability_burnrate:3d
+        expr: |
+          (
+            sum(rate(rustgate_handshake_failures_total[3d]))
+              /
+            clamp_min(sum(rate(rustgate_negotiations_total[3d])), 1)
+          ) / 0.001
+
+      # Fast burn: 14.4x for 1h/5m -> ~2% of the 30-day budget in 1h. Page.
+      - alert: RustgateAvailabilitySLOFastBurn
+        expr: |
+          rustgate:slo_availability_burnrate:1h > 14.4
+            and
+          rustgate:slo_availability_burnrate:5m > 14.4
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "rustgate handshake availability SLO fast burn (14.4x)"
+          description: "Handshake-success error budget is burning at >14.4x over both the 1h and 5m windows. At this rate the 30-day budget is gone in ~2 days. Check CA / CRL / client cert validity."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/tls-handshake-failures.md"
+
+      # Slow burn: 6x for 6h/3d -> ticket, not a page.
+      - alert: RustgateAvailabilitySLOSlowBurn
+        expr: |
+          rustgate:slo_availability_burnrate:6h > 6
+            and
+          rustgate:slo_availability_burnrate:3d > 6
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "rustgate handshake availability SLO slow burn (6x)"
+          description: "Handshake-success error budget is burning at >6x over both the 6h and 3d windows — sustained low-level handshake failures. Investigate before the budget is exhausted."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/tls-handshake-failures.md"
+
+  # -------------------------------------------------------------------------
+  # SLO 2: Message-delivery drop budget.
+  # Objective: >= 99.9% of routed messages are not dropped at the per-client
+  # queue (error budget = 0.1%). The "bad" event is a client-queue drop; the
+  # "total" is routed messages. Drops come from slow readers overflowing the
+  # bounded per-session queue.
+  # -------------------------------------------------------------------------
+  - name: rustgate.slo.delivery
+    interval: 30s
+    rules:
+      - record: rustgate:slo_delivery_burnrate:5m
+        expr: |
+          (
+            sum(rate(rustgate_client_queue_drops_total[5m]))
+              /
+            clamp_min(sum(rate(rustgate_messages_routed_total[5m])), 1)
+          ) / 0.001
+
+      - record: rustgate:slo_delivery_burnrate:1h
+        expr: |
+          (
+            sum(rate(rustgate_client_queue_drops_total[1h]))
+              /
+            clamp_min(sum(rate(rustgate_messages_routed_total[1h])), 1)
+          ) / 0.001
+
+      - record: rustgate:slo_delivery_burnrate:6h
+        expr: |
+          (
+            sum(rate(rustgate_client_queue_drops_total[6h]))
+              /
+            clamp_min(sum(rate(rustgate_messages_routed_total[6h])), 1)
+          ) / 0.001
+
+      - record: rustgate:slo_delivery_burnrate:3d
+        expr: |
+          (
+            sum(rate(rustgate_client_queue_drops_total[3d]))
+              /
+            clamp_min(sum(rate(rustgate_messages_routed_total[3d])), 1)
+          ) / 0.001
+
+      - alert: RustgateDeliverySLOFastBurn
+        expr: |
+          rustgate:slo_delivery_burnrate:1h > 14.4
+            and
+          rustgate:slo_delivery_burnrate:5m > 14.4
+        labels:
+          severity: critical
+          slo: delivery
+        annotations:
+          summary: "rustgate message-delivery SLO fast burn (14.4x)"
+          description: "Client-queue-drop error budget is burning at >14.4x over both the 1h and 5m windows. Slow readers are dropping messages fast. Check client_queue_depth / client_queue_bytes for the affected sessions and consider store-and-forward."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/high-memory.md"
+
+      - alert: RustgateDeliverySLOSlowBurn
+        expr: |
+          rustgate:slo_delivery_burnrate:6h > 6
+            and
+          rustgate:slo_delivery_burnrate:3d > 6
+        labels:
+          severity: warning
+          slo: delivery
+        annotations:
+          summary: "rustgate message-delivery SLO slow burn (6x)"
+          description: "Client-queue-drop error budget is burning at >6x over both the 6h and 3d windows — sustained low-level message loss to slow clients. Investigate before the budget is exhausted."
+          runbook_url: "https://github.com/rchiofalo/rustgate/tree/main/docs/runbooks/high-memory.md"
