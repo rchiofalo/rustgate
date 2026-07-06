@@ -59,6 +59,7 @@ fn make_msg(source: &Arc<Identity>, len: usize, uid: &str) -> RoutableMessage {
         len.saturating_sub(80)
     );
     RoutableMessage {
+        entity: None,
         source: (**source).clone(),
         destination: Destination::Broadcast,
         payload: Bytes::from(payload),
