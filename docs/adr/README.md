@@ -63,6 +63,7 @@ does.
 | [0031](0031-production-hardening-ha-and-edge.md) | Production hardening — HA direction, capacity, edge install, and SLOs | Proposed |
 | [0032](0032-meshtastic-serial-ingress-seam.md) | Meshtastic LoRa / serial ingress seam (non-IP admission; transport-owned de-encapsulation/decryption; serial-vs-bridge transport deferred) | Proposed |
 | [0033](0033-http-client-stack.md) | `reqwest` (rustls-only) as the sanctioned outbound-HTTP client; `hyper-util` migration deferred | Documented |
+| [0034](0034-multi-tenant-at-rest-isolation.md) | Per-tenant at-rest crypto isolation for archives (tenant→key-id resolver) | Proposed |
 
 ## Authoring a new ADR
 

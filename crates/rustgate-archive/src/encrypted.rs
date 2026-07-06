@@ -23,6 +23,24 @@
 //! key still present in the file may be used to decrypt historical data,
 //! enabling key rotation without rewriting the archive.
 //!
+//! ## Per-tenant key resolution (seam)
+//!
+//! The key file may carry an optional `tenant_key_map` mapping a tenant id
+//! (the certificate `O` field, matching the bucket already used to
+//! path-namespace archives) to the key id that tenant's archives should be
+//! encrypted under. [`KeyRing::key_id_for_tenant`] resolves a tenant to its
+//! key id (falling back to the active key for unmapped / tenant-less
+//! traffic), [`KeyRing::key_for_tenant`] returns the resolved key material,
+//! and [`EncryptedWriter::create_for_tenant`] opens a file under the
+//! tenant's key. An empty map — the default — makes every accessor resolve
+//! to the active key, so existing single-key deployments are unchanged.
+//!
+//! This is the resolution seam only: the archive write path does not yet
+//! pass a real tenant into the writer. The wiring is a follow-up slice — see
+//! [ADR 0034](../../../docs/adr/0034-multi-tenant-at-rest-isolation.md),
+//! which also records the nonce-domain and misconfiguration risks that the
+//! wiring slice must address.
+//!
 //! ## Key derivation
 //!
 //! Operators have three options for how a 32-byte key reaches the [`KeyRing`]:
@@ -269,6 +287,24 @@ pub struct KeyFile {
     /// config-file error rejected at load.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub key_derivations: BTreeMap<String, Derivation>,
+    /// Optional per-tenant key-id overrides, indexed by tenant id.
+    ///
+    /// Maps a tenant identifier (the certificate `O` field, matching the
+    /// bucket already used to path-namespace archives — see
+    /// `resolve_tenant_bucket`) to the id of the key that tenant's archives
+    /// must be encrypted under. Any id listed here must appear in either
+    /// `keys` or `key_derivations`. A tenant absent from this map — and
+    /// unauthenticated / tenant-less traffic — falls back to
+    /// [`KeyFile::active_key_id`], so an empty map (the default for every
+    /// pre-existing key file) reproduces today's single-key behaviour
+    /// exactly.
+    ///
+    /// This map is the resolution seam only: the archive write path does not
+    /// yet consult it (see [ADR 0034](../../../docs/adr/0034-multi-tenant-at-rest-isolation.md)).
+    /// Wiring the per-tenant key into the writer is a follow-up slice; until
+    /// then the field is inert and changes no on-disk bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenant_key_map: BTreeMap<String, String>,
 }
 
 /// Key-derivation recipe for a single entry in [`KeyFile::key_derivations`].
@@ -469,6 +505,7 @@ pub struct KeyRing {
     active_key_id: String,
     keys: BTreeMap<String, Arc<Zeroizing<[u8; 32]>>>,
     not_after: BTreeMap<String, i64>,
+    tenant_key_map: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for KeyRing {
@@ -477,6 +514,7 @@ impl std::fmt::Debug for KeyRing {
             .field("active_key_id", &self.active_key_id)
             .field("key_count", &self.keys.len())
             .field("expiring_key_count", &self.not_after.len())
+            .field("tenant_key_count", &self.tenant_key_map.len())
             .finish()
     }
 }
@@ -552,10 +590,23 @@ impl KeyRing {
             }
         }
 
+        // A tenant map that points at a key id absent from the ring would
+        // fail closed at write time with `UnknownKeyId` — surface it at
+        // load instead so operators catch the misconfiguration on startup
+        // rather than the first time that tenant's archive is written.
+        for (tenant, id) in parsed.tenant_key_map.iter() {
+            if !id_is_known(id) {
+                return Err(EncryptError::KeyFile(format!(
+                    "tenant_key_map entry for tenant {tenant:?} references unknown key id {id:?}"
+                )));
+            }
+        }
+
         let ring = Self {
             active_key_id: parsed.active_key_id,
             keys,
             not_after: parsed.key_expirations,
+            tenant_key_map: parsed.tenant_key_map,
         };
 
         // Operator-facing rotation hygiene signals — emitted at load
@@ -676,6 +727,47 @@ impl KeyRing {
             Some(&not_after) => not_after <= now_unix_seconds,
             None => false,
         }
+    }
+
+    /// Resolve the key id that should encrypt `tenant`'s archives.
+    ///
+    /// Returns the id mapped for `tenant` in the key file's
+    /// `tenant_key_map`, or falls back to [`Self::active_key_id`] when the
+    /// tenant is unmapped or `None` (unauthenticated / tenant-less traffic).
+    /// With an empty `tenant_key_map` — the default — this always returns
+    /// the active key id, reproducing today's single-key behaviour.
+    ///
+    /// The returned reference is tied to `&self`, so it borrows either the
+    /// map entry or the active-key-id field without allocating.
+    pub fn key_id_for_tenant(&self, tenant: Option<&str>) -> &str {
+        tenant
+            .and_then(|t| self.tenant_key_map.get(t))
+            .map(String::as_str)
+            .unwrap_or(&self.active_key_id)
+    }
+
+    /// Look up the raw 32-byte key that should encrypt `tenant`'s archives.
+    ///
+    /// Resolves the tenant to a key id via [`Self::key_id_for_tenant`] and
+    /// returns that key's material. Returns [`EncryptError::UnknownKeyId`]
+    /// if the resolved id is not present in the ring — this cannot happen
+    /// for a ring built via [`Self::from_bytes`] (both the active key and
+    /// every `tenant_key_map` target are validated at load), but is
+    /// surfaced explicitly rather than falling back to a sentinel key so a
+    /// directly-constructed ring cannot silently encrypt with an absent id.
+    ///
+    /// Like [`Self::active_key`], this does **not** check expiration —
+    /// callers gating new writes must consult [`Self::active_key_expired_at`]
+    /// (or, once wired, a tenant-aware equivalent) first.
+    pub fn key_for_tenant(
+        &self,
+        tenant: Option<&str>,
+    ) -> Result<Arc<Zeroizing<[u8; 32]>>, EncryptError> {
+        let id = self.key_id_for_tenant(tenant);
+        self.keys
+            .get(id)
+            .cloned()
+            .ok_or_else(|| EncryptError::UnknownKeyId(id.to_string()))
     }
 }
 
@@ -931,19 +1023,49 @@ impl EncryptedWriter {
     /// catastrophic nonce reuse on append. Callers that need rotation should
     /// use a fresh path per rotation window (e.g. a new file per UTC date).
     pub fn create(path: &Path, key_ring: &KeyRing) -> Result<Self, EncryptError> {
-        let key_id = key_ring.active_key_id().to_string();
+        Self::create_for_tenant(path, key_ring, None)
+    }
+
+    /// Create or open `path` for writing, resolving the encryption key by
+    /// `tenant`.
+    ///
+    /// Identical to [`Self::create`] except the key id (and its expiry
+    /// gate) are resolved via [`KeyRing::key_id_for_tenant`] rather than
+    /// always using the active key. Passing `None` — or a tenant absent
+    /// from the ring's `tenant_key_map` — resolves to the active key, so
+    /// `create_for_tenant(path, ring, None)` is byte-for-byte equivalent
+    /// to `create(path, ring)`.
+    ///
+    /// The same destructive, non-resumable truncation semantics as
+    /// [`Self::create`] apply.
+    ///
+    /// Note: as of [ADR 0034](../../../docs/adr/0034-multi-tenant-at-rest-isolation.md)
+    /// no caller passes a real tenant yet — the archive write path wiring is
+    /// a follow-up slice.
+    pub fn create_for_tenant(
+        path: &Path,
+        key_ring: &KeyRing,
+        tenant: Option<&str>,
+    ) -> Result<Self, EncryptError> {
+        let key_id = key_ring.key_id_for_tenant(tenant).to_string();
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        if key_ring.active_key_expired_at(now_unix) {
-            let not_after = key_ring.not_after(&key_id).unwrap_or(0);
+        // Gate new-write admission on the resolved key's expiry, mirroring
+        // the active-key check `create` performed. `active_key_expired_at`
+        // only inspects the active key, so consult the resolved id's
+        // `not_after` directly: a tenant pinned to a rotated-out key must
+        // not open a new file with it either.
+        if let Some(not_after) = key_ring.not_after(&key_id)
+            && not_after <= now_unix
+        {
             return Err(EncryptError::ActiveKeyExpired {
                 id: key_id,
                 not_after,
             });
         }
-        let key_bytes = key_ring.active_key()?;
+        let key_bytes = key_ring.key_for_tenant(tenant)?;
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
 
         if let Some(parent) = path.parent()
@@ -1386,8 +1508,19 @@ pub struct SharedEncryptedWriter {
 impl SharedEncryptedWriter {
     /// Create a new shared writer at `path`.
     pub fn create(path: &Path, key_ring: &KeyRing) -> Result<Self, EncryptError> {
+        Self::create_for_tenant(path, key_ring, None)
+    }
+
+    /// Create a new shared writer at `path`, resolving the encryption key by
+    /// `tenant`. See [`EncryptedWriter::create_for_tenant`] for the
+    /// resolution semantics; `None` reproduces [`Self::create`].
+    pub fn create_for_tenant(
+        path: &Path,
+        key_ring: &KeyRing,
+        tenant: Option<&str>,
+    ) -> Result<Self, EncryptError> {
         Ok(Self {
-            inner: Mutex::new(EncryptedWriter::create(path, key_ring)?),
+            inner: Mutex::new(EncryptedWriter::create_for_tenant(path, key_ring, tenant)?),
         })
     }
 
@@ -1436,6 +1569,7 @@ mod tests {
             keys: map,
             key_expirations: BTreeMap::new(),
             key_derivations: BTreeMap::new(),
+            tenant_key_map: BTreeMap::new(),
         };
         let json = serde_json::to_vec(&kf).unwrap();
         KeyRing::from_bytes(&json).unwrap()
@@ -1455,6 +1589,142 @@ mod tests {
         }
         decrypt_file(&enc_path, &dec_path, &ring).unwrap();
         assert_eq!(std::fs::read(&dec_path).unwrap(), b"hello world\n");
+    }
+
+    /// A two-key ring with a tenant map: tenant-a is pinned to `ka`,
+    /// everything else falls back to the active key `kactive`.
+    fn tenant_ring_json() -> Vec<u8> {
+        let json = serde_json::json!({
+            "active_key_id": "kactive",
+            "keys": {
+                "kactive": hex::encode([0x01u8; 32]),
+                "ka": hex::encode([0x0au8; 32]),
+            },
+            "tenant_key_map": { "tenant-a": "ka" },
+        });
+        serde_json::to_vec(&json).unwrap()
+    }
+
+    #[test]
+    fn key_id_for_tenant_maps_and_falls_back() {
+        let ring = KeyRing::from_bytes(&tenant_ring_json()).unwrap();
+        // Mapped tenant resolves to its pinned key id.
+        assert_eq!(ring.key_id_for_tenant(Some("tenant-a")), "ka");
+        // Unmapped tenant and tenant-less traffic fall back to active.
+        assert_eq!(ring.key_id_for_tenant(Some("tenant-z")), "kactive");
+        assert_eq!(ring.key_id_for_tenant(None), "kactive");
+        // key_for_tenant returns the matching material.
+        let ka = ring.key_for_tenant(Some("tenant-a")).unwrap();
+        let active = ring.key_for_tenant(None).unwrap();
+        assert_eq!(**ka, [0x0au8; 32]);
+        assert_eq!(**active, [0x01u8; 32]);
+    }
+
+    #[test]
+    fn key_file_without_tenant_map_deserializes_and_round_trips() {
+        // A key file with no `tenant_key_map` field must deserialize (serde
+        // default) and behave exactly as before: every tenant resolves to
+        // the active key.
+        let json = serde_json::json!({
+            "active_key_id": "k1",
+            "keys": { "k1": hex::encode([0x11u8; 32]) },
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let ring = KeyRing::from_bytes(&bytes).unwrap();
+        assert_eq!(ring.key_id_for_tenant(Some("anything")), "k1");
+        assert_eq!(ring.key_id_for_tenant(None), "k1");
+
+        // Empty tenant map is omitted on serialize (skip_serializing_if).
+        let kf = KeyFile {
+            active_key_id: "k1".to_string(),
+            keys: {
+                let mut m = BTreeMap::new();
+                let _ = m.insert("k1".to_string(), hex::encode([0x11u8; 32]));
+                m
+            },
+            key_expirations: BTreeMap::new(),
+            key_derivations: BTreeMap::new(),
+            tenant_key_map: BTreeMap::new(),
+        };
+        let out = serde_json::to_string(&kf).unwrap();
+        assert!(
+            !out.contains("tenant_key_map"),
+            "empty tenant map must be omitted: {out}"
+        );
+    }
+
+    #[test]
+    fn tenant_key_map_referencing_unknown_id_is_rejected() {
+        let json = serde_json::json!({
+            "active_key_id": "k1",
+            "keys": { "k1": hex::encode([0x11u8; 32]) },
+            "tenant_key_map": { "tenant-a": "missing" },
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let err = KeyRing::from_bytes(&bytes).unwrap_err();
+        match err {
+            EncryptError::KeyFile(msg) => {
+                assert!(msg.contains("tenant-a") && msg.contains("missing"), "{msg}");
+            }
+            other => panic!("expected KeyFile error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_for_tenant_uses_independent_keys() {
+        let dir = tempdir();
+        let ring = KeyRing::from_bytes(&tenant_ring_json()).unwrap();
+
+        // Encrypt tenant-a's data under its pinned key `ka`.
+        let enc_path = dir.join("tenant-a.enc");
+        let dec_path = dir.join("tenant-a.txt");
+        {
+            let mut w =
+                EncryptedWriter::create_for_tenant(&enc_path, &ring, Some("tenant-a")).unwrap();
+            w.write_chunk(b"secret-a\n").unwrap();
+            w.finish().unwrap();
+        }
+        // Same full ring decrypts (the header names key id `ka`).
+        decrypt_file(&enc_path, &dec_path, &ring).unwrap();
+        assert_eq!(std::fs::read(&dec_path).unwrap(), b"secret-a\n");
+
+        // A ring lacking `ka` cannot decrypt — proving cross-tenant keys
+        // are cryptographically independent, not a shared active key.
+        let stripped_json = serde_json::json!({
+            "active_key_id": "kactive",
+            "keys": { "kactive": hex::encode([0x01u8; 32]) },
+        });
+        let stripped = KeyRing::from_bytes(&serde_json::to_vec(&stripped_json).unwrap()).unwrap();
+        let err = decrypt_file(&enc_path, &dir.join("nope.txt"), &stripped).unwrap_err();
+        assert!(matches!(err, EncryptError::UnknownKeyId(_)), "{err:?}");
+    }
+
+    #[test]
+    fn create_and_create_for_tenant_none_are_equivalent() {
+        let dir = tempdir();
+        let ring = KeyRing::from_bytes(&tenant_ring_json()).unwrap();
+
+        // create() and create_for_tenant(.., None) must select the same
+        // (active) key id, so a file written by one decrypts and reads the
+        // same as a file written by the other.
+        let p1 = dir.join("via-create.enc");
+        let p2 = dir.join("via-none.enc");
+        {
+            let mut w = EncryptedWriter::create(&p1, &ring).unwrap();
+            w.write_chunk(b"payload\n").unwrap();
+            w.finish().unwrap();
+        }
+        {
+            let mut w = EncryptedWriter::create_for_tenant(&p2, &ring, None).unwrap();
+            w.write_chunk(b"payload\n").unwrap();
+            w.finish().unwrap();
+        }
+        let d1 = dir.join("d1.txt");
+        let d2 = dir.join("d2.txt");
+        decrypt_file(&p1, &d1, &ring).unwrap();
+        decrypt_file(&p2, &d2, &ring).unwrap();
+        assert_eq!(std::fs::read(&d1).unwrap(), b"payload\n");
+        assert_eq!(std::fs::read(&d2).unwrap(), std::fs::read(&d1).unwrap());
     }
 
     #[test]
@@ -1567,6 +1837,7 @@ mod tests {
             active_key_id: "ghost".to_string(),
             keys: BTreeMap::new(),
             not_after: BTreeMap::new(),
+            tenant_key_map: BTreeMap::new(),
         };
         let err = ring.active_key().unwrap_err();
         match err {
@@ -2134,6 +2405,7 @@ mod tests {
                 keys,
                 key_expirations: expirations,
                 key_derivations: BTreeMap::new(),
+                tenant_key_map: BTreeMap::new(),
             };
             let json = serde_json::to_vec(&kf).expect("serialize");
             let round: KeyFile = serde_json::from_slice(&json).expect("deserialize");
@@ -2158,6 +2430,7 @@ mod tests {
                 },
                 key_expirations: BTreeMap::new(),
                 key_derivations: BTreeMap::new(),
+                tenant_key_map: BTreeMap::new(),
             };
             let json = serde_json::to_string(&kf).expect("serialize");
             assert!(
@@ -2548,6 +2821,7 @@ mod tests {
                 keys: BTreeMap::new(),
                 key_expirations: BTreeMap::new(),
                 key_derivations: derivations,
+                tenant_key_map: BTreeMap::new(),
             };
             let json = serde_json::to_vec(&kf).expect("serialize");
             let round: KeyFile = serde_json::from_slice(&json).expect("deserialize");
@@ -2588,6 +2862,7 @@ mod tests {
                 },
                 key_expirations: BTreeMap::new(),
                 key_derivations: BTreeMap::new(),
+                tenant_key_map: BTreeMap::new(),
             };
             let json = serde_json::to_string(&kf).expect("serialize");
             assert!(
