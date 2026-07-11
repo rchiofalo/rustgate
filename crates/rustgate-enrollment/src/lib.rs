@@ -27,6 +27,8 @@ pub mod error;
 pub mod est;
 mod handlers;
 mod keypair;
+#[cfg(feature = "post-quantum")]
+pub mod mldsa;
 pub mod pkcs12;
 pub mod response;
 pub mod revocation;
@@ -38,6 +40,8 @@ pub use ca_algorithm::{CaAlgorithm, ParseCaAlgorithmError};
 pub use contacts::{ContactInfo, ContactsProvider, cached_contacts_provider};
 pub use datapackage::DataPackageStore;
 pub use error::EnrollmentError;
+#[cfg(feature = "post-quantum")]
+pub use mldsa::{MlDsaCa, MlDsaRevokedCert};
 pub use revocation::RevocationStore;
 pub use server::{
     DEFAULT_SIGN_RATE_LIMIT, DEFAULT_SIGN_RATE_WINDOW, EnrollmentServer, RateLimitCallback,

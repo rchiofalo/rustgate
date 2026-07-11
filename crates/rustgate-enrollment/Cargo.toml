@@ -13,12 +13,14 @@ workspace = true
 [features]
 est = ["dep:cms", "dep:der", "dep:x509-cert"]
 fips = ["rcgen/fips"]
-# Scaffold gate for ML-DSA cert/CRL issuance (ADR 0019 Phase 3). Empty on
-# purpose: it does NOT enable rcgen's `aws_lc_rs_unstable` path, because that
-# would break FIPS builds and emit pure (owner-rejected) ML-DSA certificates.
-# ML-DSA selection fails closed via `signing::issue_mldsa_unavailable` until
-# the Composite ML-DSA path lands. See #502.
-post-quantum = []
+# Pure ML-DSA-87 X.509 cert/CRL issuance (RFC 9881, #502). rcgen cannot emit
+# ML-DSA, so the `mldsa` module hand-assembles the TBS with x509-cert/der and
+# signs the DER with the pure-Rust `fips204` crate. `der`/`x509-cert` are
+# shared with the `est` feature (both must build independently and together).
+# Composite ML-DSA + ECDSA hybrid certs (ADR 0019) remain deferred until the
+# IETF composite-signature draft becomes an RFC; ML-DSA selection still fails
+# closed unless an `MlDsaCa` is configured on the signer.
+post-quantum = ["dep:fips204", "dep:der", "dep:x509-cert"]
 
 [dependencies]
 rustgate-core = { workspace = true, features = ["pem"] }
@@ -45,9 +47,10 @@ ring = { workspace = true }
 cms = { workspace = true, optional = true }
 der = { workspace = true, optional = true }
 x509-cert = { workspace = true, optional = true }
+fips204 = { workspace = true, optional = true }
 
 [dev-dependencies]
-rustgate-test-utils = { workspace = true }
+rustgate-test-utils = { workspace = true, features = ["mldsa"] }
 x509-parser = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

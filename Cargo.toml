@@ -82,6 +82,14 @@ hkdf = "0.12"
 aws-lc-rs = "1.16"
 # CBOR for the MAVLink rekey envelope payload (ADR 0020 §5).
 ciborium = "0.2"
+# Pure-Rust FIPS 204 (ML-DSA) signatures for the enrollment CA's pure
+# ML-DSA-87 X.509 issuance path (RFC 9881, `rustgate-enrollment`
+# `post-quantum` feature, #502). Pure/safe Rust with no C/openssl/Go
+# toolchain requirement, so it does not carry the aws-lc build burden the
+# `fips`/`post-quantum` aws-lc-rs surfaces do. rcgen cannot emit ML-DSA
+# certificates, so the issuance module hand-assembles the TBS with
+# x509-cert/der and signs the DER with this crate.
+fips204 = "0.4.6"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 bytes = "1"
 quick-xml = "0.41"

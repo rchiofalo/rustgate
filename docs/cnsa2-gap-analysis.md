@@ -41,7 +41,7 @@ rather than pure ML-DSA (see ADR 0019 § Decision).
 | `--cnsa2` operator switch | **Done (scaffold)** | `pub(crate) cnsa2: bool` @ `crates/rustgate-server/src/cli.rs:300` | #504 (closed) |
 | ML-DSA package-signature verification | **Missing** | `fn verify_signature` @ `crates/rustgate-enrollment/src/datapackage.rs:423` tries `ECDSA_P256_SHA256_ASN1` (line 432) then `RSA_PSS_2048_8192_SHA256` (line 441) — no ML-DSA, no `fips204` dep in tree | #500 (closed on classical scaffold — residual) |
 | ML-DSA TLS certificate verification | **Missing** | rustls `CryptoProvider` verifier path accepts no ML-DSA signatures yet (upstream-blocked) | #501 (open) |
-| ML-DSA certificate + CRL issuance | **Missing** | `rustgate-enrollment` issues classical certs only | #502 (open) |
+| ML-DSA certificate + CRL issuance | **Done (pure ML-DSA-87)** | `rustgate_enrollment::mldsa` hand-assembles + `fips204`-signs leaves/CRLs under id-ml-dsa-87 (RFC 9881); `post-quantum` feature. Composite hybrid form still deferred (#503) | #502 (closed — pure) |
 | Hybrid dual-signature (Composite ML-DSA) certs | **Missing** | — | #503 (open) |
 | Hybrid mode fallback (classical when peer lacks PQ) | **Partial** | KEX negotiates down to X25519; signature side is classical-only, so effectively classical certs today | #501/#503 |
 | **PQ federation JWT** | **Missing** | `enum Algorithm` @ `crates/rustgate-federation/src/jwt.rs:130` = `{ Hs256, Es256, EdDsa }` — classical-only, no ML-DSA variant | **#873** |

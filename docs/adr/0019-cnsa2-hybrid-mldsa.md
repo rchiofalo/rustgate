@@ -14,20 +14,29 @@
 
 ## Implementation status
 
-- **#502 (2026-07, this scaffold).** Landed the honest first slice of ML-DSA
-  cert/CRL issuance in `rustgate-enrollment`: a `CaAlgorithm` enum
-  (`ecdsa-p256`, `rsa-2048`, `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87`) with
-  `is_post_quantum()` / `is_composite_required()` predicates; an empty
-  `post-quantum` feature gate; and a **fail-closed** issuance guard. Selecting
-  any ML-DSA algorithm returns an actionable error
-  (`signing::issue_mldsa_unavailable`) citing the upstream blockers
-  ([aws-lc-rs #964](https://github.com/aws/aws-lc-rs/issues/964) + composite
-  OID finalization) rather than silently issuing a classical or a pure-ML-DSA
-  certificate. A `fips_pq_conflict()` guard rejects ML-DSA on a `fips` build.
-  **No** unstable rcgen feature is enabled and **no** cert format changes — the
-  scaffold intentionally does not wire the `--cnsa2` CLI flag (that couples to
-  #504's `--cnsa2`). This unblocks #503/#504 having a stable enum + public
-  surface to build against.
+- **#502 (2026-07, pure ML-DSA-87 issuance delivered — RFC 9881).** The
+  `post-quantum` feature now performs **real pure ML-DSA-87 certificate and
+  CRL issuance**, superseding the earlier fail-closed scaffold. Because
+  `rcgen` cannot emit ML-DSA (its path is behind `aws_lc_rs_unstable`,
+  mutually exclusive with `fips`, and produces a cert shape we do not
+  control), a new `rustgate_enrollment::mldsa` module hand-assembles the
+  `TBSCertificate` / `TBSCertList` with `x509-cert`/`der` and signs the DER
+  with the pure-Rust `fips204` crate under the id-ml-dsa-87 OID
+  (`2.16.840.1.101.3.4.3.19`, parameters absent). `MlDsaCa::verify_csr_pop`
+  enforces the ML-DSA proof-of-possession before issuance; `issue_leaf`
+  mirrors the classical allowlist hardening (authenticated-username CN,
+  random serial, `CA:FALSE` / `digitalSignature` / `clientAuth`, no SANs);
+  `issue_crl` emits an ML-DSA-signed CRL with a monotonic `crlNumber`.
+  `CsrSigner::with_mldsa_ca` and `RevocationStore::new_mldsa` route to this
+  path when an ML-DSA CA is attached; otherwise `ml-dsa-44`/`-65`, an absent
+  ML-DSA CA, or a non-`post-quantum` build all still **fail closed** via
+  `signing::issue_mldsa_unavailable`. A `fips_pq_conflict()` guard still
+  rejects any ML-DSA selection on a `fips` build. The `CaAlgorithm` enum uses
+  explicit per-variant serde renames (not `rename_all = "kebab-case"`).
+  This delivers the **pure** ML-DSA path only; the Composite ML-DSA + ECDSA
+  hybrid form this ADR targets for the transition window remains **deferred**
+  until `draft-ietf-lamps-pq-composite-sigs` becomes an RFC and the composite
+  OIDs are finalized. The `--cnsa2` CLI wiring stays with #504.
 
 ## Context
 
@@ -170,9 +179,10 @@ supersedes:
       once `fips204` is wired. **Blocked** on `fips204` adoption.
 - [ ] ML-DSA TLS certificate verification (#501, open) — via rustls
       `CryptoProvider` extension point; no workspace fork.
-- [ ] ML-DSA certificate + CRL issuance (#502, open) —
-      `rustgate-enrollment` must accept ML-DSA-65/87 OIDs (store-and-
-      forward even before runtime verification lands).
+- [x] **Pure** ML-DSA-87 certificate + CRL issuance (#502, delivered) —
+      `rustgate_enrollment::mldsa` hand-assembles + `fips204`-signs leaves
+      and CRLs under id-ml-dsa-87 (RFC 9881). Composite ML-DSA (#503)
+      remains deferred until the IETF composite-signature draft is an RFC.
 - [ ] Hybrid dual-signature (Composite ML-DSA) certificates (#503, open).
 - [ ] **PQ federation JWT (#873)** — add an ML-DSA variant to `enum
       Algorithm` in `rustgate-federation/src/jwt.rs`. **Deferred** until a

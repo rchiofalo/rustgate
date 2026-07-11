@@ -11,5 +11,8 @@
 pub mod certs;
 pub mod tls;
 
+#[cfg(feature = "mldsa")]
+pub mod mldsa;
+
 #[cfg(feature = "nats")]
 pub mod nats;

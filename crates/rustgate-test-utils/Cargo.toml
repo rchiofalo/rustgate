@@ -23,6 +23,10 @@ unused_async = "warn"
 [features]
 default = []
 nats = ["dep:tempfile", "dep:tokio", "dep:async-nats"]
+# Self-signed ML-DSA-87 CA generation for post-quantum issuance tests (#502,
+# #501). Pulls the pure-Rust `fips204` plus `x509-cert`/`der` used to
+# hand-assemble the self-signed CA certificate.
+mldsa = ["dep:fips204", "dep:x509-cert", "dep:der"]
 
 [dependencies]
 rcgen = { workspace = true }
@@ -30,6 +34,11 @@ rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 x509-parser = { workspace = true }
 time = { workspace = true }
+
+# Optional deps for the `mldsa` feature
+fips204 = { workspace = true, optional = true }
+x509-cert = { workspace = true, optional = true }
+der = { workspace = true, optional = true }
 
 # Optional deps for the `nats` feature
 tempfile = { workspace = true, optional = true }

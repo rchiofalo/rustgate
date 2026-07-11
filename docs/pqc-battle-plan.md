@@ -21,45 +21,49 @@ The `--cnsa2` operator surface (#504) lands in phases, mirroring ADR 0019
   verification (#501), and ML-DSA issuance (#502). `--cnsa2` refuses to
   start if any of the three is unavailable.
 
-## Phase 3A — issuance scaffold (#502, landed)
+## Phase 3A — pure ML-DSA-87 issuance (#502, delivered)
 
-Phase 3 is gated on upstream crypto (rustls + aws-lc-rs) that is not yet
-available: rcgen's ML-DSA path is behind `aws_lc_rs_unstable`, is mutually
-exclusive with `fips` ([aws-lc-rs #964][awslc964]), and emits **pure**
-ML-DSA certificates — the format ADR 0019 explicitly rejects for the
-2026–2030 transition. The composite ML-DSA OIDs are not finalized until
-late 2026.
-
-Rather than wait, **Phase 3A** lands the honest, fail-closed first slice
-in `rustgate-enrollment` so #503/#504 have a stable public surface to
-build against:
+`rcgen` cannot emit ML-DSA: its path is behind `aws_lc_rs_unstable`, is
+mutually exclusive with `fips` ([aws-lc-rs #964][awslc964]), and produces a
+cert shape rustgate does not control. **Phase 3A** therefore delivers real
+**pure** ML-DSA-87 issuance (RFC 9881) in `rustgate-enrollment` without
+rcgen — the `mldsa` module hand-assembles the X.509 structures with
+`x509-cert`/`der` and signs the DER with the pure-Rust `fips204` crate:
 
 - **`CaAlgorithm` enum** (`ca_algorithm.rs`): `ecdsa-p256`, `rsa-2048`,
-  `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87` with `FromStr`/`Display`, serde
-  kebab-case, and `is_post_quantum()` / `is_composite_required()`
-  predicates.
-- **`post-quantum` feature gate** (empty): does **not** enable rcgen's
-  unstable path — that would break FIPS builds and emit the wrong cert
-  format.
-- **Fail-closed issuance** (`signing.rs`): `CsrSigner::sign_csr_with_algorithm`
-  routes every ML-DSA selection to `issue_mldsa_unavailable`, which
-  returns an actionable error pointing at the upstream blockers and ADR
-  0019. It never silently issues a classical or pure-ML-DSA certificate.
-- **FIPS conflict guard** (`fips_pq_conflict`): rejects ML-DSA on a `fips`
-  build.
+  `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87` with `FromStr`/`Display`,
+  **explicit per-variant serde renames** (not `rename_all = "kebab-case"`,
+  which would drop the digit separators), and `is_post_quantum()` /
+  `is_composite_required()` predicates.
+- **`post-quantum` feature gate**: pulls `fips204` + `x509-cert`/`der` and
+  compiles the `mldsa` issuance module. Does **not** enable rcgen's unstable
+  path.
+- **Pure ML-DSA-87 issuance** (`mldsa.rs`): `MlDsaCa::verify_csr_pop`
+  verifies the ML-DSA proof-of-possession over the DER-encoded
+  `CertReqInfo`; `issue_leaf` mirrors the classical allowlist hardening
+  (authenticated-username CN, random serial, `CA:FALSE` /
+  `digitalSignature` / `clientAuth`, no SANs); `issue_crl` emits an
+  ML-DSA-signed CRL with a monotonic `crlNumber`. `CsrSigner::with_mldsa_ca`
+  + `sign_csr_with_algorithm` and `RevocationStore::new_mldsa` route to it.
+- **Fail-closed fallback** (`signing.rs`): `ml-dsa-44`/`-65`, an absent
+  ML-DSA CA, or a non-`post-quantum` build still route to
+  `issue_mldsa_unavailable`.
+- **FIPS conflict guard** (`fips_pq_conflict`): rejects any ML-DSA selection
+  on a `fips` build.
 
 Deliberately **out of scope** for Phase 3A: the `--cnsa2` CLI flag wiring
 into `rustgate-server` (couples to #504's flag) and any change to the
 classical issuance path (byte-for-byte unchanged).
 
-### What unblocks Phase 3B
+### What unblocks Phase 3B (Composite ML-DSA)
 
 - rustls certificate verifier accepts Composite ML-DSA signatures (#501).
 - aws-lc-rs resolves the FIPS / ML-DSA mutual exclusion ([#964][awslc964]).
-- IETF LAMPS composite ML-DSA OIDs finalized.
+- IETF LAMPS `draft-ietf-lamps-pq-composite-sigs` becomes an RFC and the
+  composite ML-DSA OIDs are finalized.
 
-When those land, `issue_mldsa_unavailable` is replaced by the real
-composite-issuance path behind the `post-quantum` gate, and the `--cnsa2`
-runtime assertion (Phase 3) can require it.
+When those land, the composite (hybrid ML-DSA + ECDSA) issuance path is
+added behind the `post-quantum` gate alongside the pure path, and the
+`--cnsa2` runtime assertion (Phase 3) can require it.
 
 [awslc964]: https://github.com/aws/aws-lc-rs/issues/964

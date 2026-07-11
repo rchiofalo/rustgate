@@ -19,6 +19,8 @@ use zeroize::Zeroizing;
 use crate::ca_algorithm::CaAlgorithm;
 use crate::error::EnrollmentError;
 use crate::keypair::ZeroizingKeyPair;
+#[cfg(feature = "post-quantum")]
+use crate::mldsa::MlDsaCa;
 
 /// Signs PKCS#10 certificate signing requests with the server CA.
 pub struct CsrSigner {
@@ -34,6 +36,11 @@ pub struct CsrSigner {
     ca_cert_der: Vec<u8>,
     /// Organization name for /tls/config responses.
     organization: String,
+    /// Optional pure ML-DSA-87 issuing CA (RFC 9881, #502). When present,
+    /// [`Self::sign_csr_with_algorithm`] routes an `ml-dsa-87` selection to
+    /// the hand-assembled `MlDsaCa` issuance path instead of failing closed.
+    #[cfg(feature = "post-quantum")]
+    mldsa_ca: Option<MlDsaCa>,
 }
 
 impl std::fmt::Debug for CsrSigner {
@@ -82,7 +89,22 @@ impl CsrSigner {
             issuer,
             ca_cert_der,
             organization: organization.to_string(),
+            #[cfg(feature = "post-quantum")]
+            mldsa_ca: None,
         })
+    }
+
+    /// Attach a pure ML-DSA-87 issuing CA (RFC 9881, #502).
+    ///
+    /// With a CA attached, [`Self::sign_csr_with_algorithm`] issues real
+    /// ML-DSA-87 leaf certificates for an `ml-dsa-87` selection; without one
+    /// the selection continues to fail closed via
+    /// [`issue_mldsa_unavailable`].
+    #[cfg(feature = "post-quantum")]
+    #[must_use]
+    pub fn with_mldsa_ca(mut self, ca: MlDsaCa) -> Self {
+        self.mldsa_ca = Some(ca);
+        self
     }
 
     /// Sign a PKCS#10 CSR and return the signed client certificate as DER bytes.
@@ -154,11 +176,16 @@ impl CsrSigner {
     /// Sign a CSR under an explicitly selected CA [`CaAlgorithm`].
     ///
     /// This is the algorithm-aware entry point that the future `--cnsa2`
-    /// wiring (#504) calls. It fails closed for post-quantum selections:
-    /// the ML-DSA variants return [`issue_mldsa_unavailable`] rather than
-    /// issuing a certificate, because rustgate's Composite ML-DSA path is
-    /// blocked on upstream crypto (ADR 0019 Phase 3). Classical selections
-    /// delegate to [`sign_csr`](CsrSigner::sign_csr) unchanged.
+    /// wiring (#504) calls.
+    ///
+    /// - Classical selections delegate to [`sign_csr`](CsrSigner::sign_csr)
+    ///   unchanged.
+    /// - `ml-dsa-87` issues a real pure ML-DSA-87 certificate (RFC 9881, #502)
+    ///   **iff** an `MlDsaCa` was attached via `Self::with_mldsa_ca`;
+    ///   otherwise it fails closed via [`issue_mldsa_unavailable`].
+    /// - `ml-dsa-44` / `ml-dsa-65`, and any ML-DSA selection with no CA
+    ///   attached (or on a build without the `post-quantum` feature), fail
+    ///   closed.
     ///
     /// The `fips` conflict guard runs first, so an ML-DSA selection on a
     /// FIPS build produces the more specific [`fips_pq_conflict`] error.
@@ -171,6 +198,19 @@ impl CsrSigner {
         fips_pq_conflict(algorithm)?;
 
         if algorithm.is_post_quantum() {
+            #[cfg(feature = "post-quantum")]
+            {
+                // Only pure ML-DSA-87 issuance is implemented (RFC 9881). The
+                // -44/-65 parameter sets and the Composite ML-DSA hybrid path
+                // (ADR 0019) remain deferred and fall through to fail closed.
+                if let Some(ca) = &self.mldsa_ca
+                    && algorithm == CaAlgorithm::MlDsa87
+                {
+                    let csr_der = csr_pem_to_der(csr_pem)?;
+                    let subject_pubkey = MlDsaCa::verify_csr_pop(&csr_der)?;
+                    return ca.issue_leaf(&subject_pubkey, username, &self.organization);
+                }
+            }
             return Err(issue_mldsa_unavailable(algorithm));
         }
 
@@ -251,6 +291,23 @@ pub fn fips_pq_conflict(alg: CaAlgorithm) -> Result<(), EnrollmentError> {
     // no-op success. Reference it so the parameter is always live.
     let _ = alg;
     Ok(())
+}
+
+/// Decode a PEM-encoded (or raw base64) CSR into its DER bytes.
+///
+/// Reuses [`ensure_pem_headers`] to tolerate the header-less base64 that some
+/// TAK clients send, then base64-decodes the body. Used only by the ML-DSA
+/// issuance path, which parses the DER directly with `x509-cert` rather than
+/// through rcgen.
+#[cfg(feature = "post-quantum")]
+fn csr_pem_to_der(csr_pem: &str) -> Result<Vec<u8>, EnrollmentError> {
+    let normalized = ensure_pem_headers(csr_pem);
+    let body: String = normalized
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    rustgate_core::b64::decode(body.trim())
+        .map_err(|e| EnrollmentError::Csr(format!("failed to base64-decode CSR: {e}")))
 }
 
 /// Ensure a CSR string has PEM headers.

@@ -20,6 +20,8 @@ use tokio::sync::RwLock;
 
 use crate::error::EnrollmentError;
 use crate::keypair::ZeroizingKeyPair;
+#[cfg(feature = "post-quantum")]
+use crate::mldsa::{MlDsaCa, MlDsaRevokedCert};
 
 /// Default CRL validity period in days.
 const DEFAULT_CRL_VALIDITY_DAYS: u32 = 7;
@@ -122,11 +124,18 @@ pub struct RevocationStore {
     db_path: PathBuf,
     /// In-memory copy of revoked entries, keyed by hex serial.
     entries: RwLock<HashMap<String, RevokedEntry>>,
-    /// CA issuer for CRL signing.
+    /// Classical (rcgen) CA issuer for CRL signing.
     ///
     /// The key is wrapped in [`ZeroizingKeyPair`] so rcgen's serialized-DER
-    /// copy is wiped on drop (issue #766 / F-39).
-    issuer: Issuer<'static, ZeroizingKeyPair>,
+    /// copy is wiped on drop (issue #766 / F-39). `None` when the store is
+    /// backed by a pure ML-DSA CA (see [`Self::mldsa_ca`]); exactly one of the
+    /// two signing backends is populated.
+    issuer: Option<Issuer<'static, ZeroizingKeyPair>>,
+    /// Pure ML-DSA-87 CA for CRL signing (RFC 9881, #502). When present, CRLs
+    /// are hand-assembled and ML-DSA-signed via `MlDsaCa::issue_crl` instead
+    /// of the classical rcgen path.
+    #[cfg(feature = "post-quantum")]
+    mldsa_ca: Option<MlDsaCa>,
     /// CRL validity period in days.
     crl_validity_days: u32,
     /// Cached CRL PEM (regenerated on revocation).
@@ -194,7 +203,9 @@ impl RevocationStore {
         let store = Self {
             db_path,
             entries: RwLock::new(entries),
-            issuer,
+            issuer: Some(issuer),
+            #[cfg(feature = "post-quantum")]
+            mldsa_ca: None,
             crl_validity_days: DEFAULT_CRL_VALIDITY_DAYS,
             cached_crl: RwLock::new(None),
             crl_serial: AtomicU64::new(initial_serial),
@@ -203,6 +214,49 @@ impl RevocationStore {
         // Issue the initial CRL (bumps `crl_serial` by 1) then persist so a
         // crash between this point and the first revocation does not re-use
         // the same `crlNumber` on the next boot (#765).
+        let crl = store.generate_crl_inner().await?;
+        *store.cached_crl.write().await = Some(crl);
+        store.persist().await?;
+
+        Ok(store)
+    }
+
+    /// Create a revocation store backed by a pure ML-DSA-87 CA (RFC 9881,
+    /// #502).
+    ///
+    /// Generated CRLs are hand-assembled and ML-DSA-signed via
+    /// `MlDsaCa::issue_crl` rather than the classical rcgen path — rcgen
+    /// cannot parse or sign with an ML-DSA key. The `crlNumber` persistence,
+    /// wall-clock fallback, and caching behaviour are identical to
+    /// [`Self::new`].
+    #[cfg(feature = "post-quantum")]
+    pub async fn new_mldsa(db_path: PathBuf, mldsa_ca: MlDsaCa) -> Result<Self, EnrollmentError> {
+        let (entries, stored_serial) = if db_path.exists() {
+            let data = tokio::fs::read_to_string(&db_path).await.map_err(|e| {
+                EnrollmentError::Config(format!("failed to read revocation db: {e}"))
+            })?;
+            let loaded: LoadedDb = serde_json::from_str(&data).map_err(|e| {
+                EnrollmentError::Config(format!("failed to parse revocation db: {e}"))
+            })?;
+            loaded.into_parts()
+        } else {
+            (HashMap::new(), None)
+        };
+
+        let initial_serial = stored_serial
+            .filter(|&n| n > 0)
+            .unwrap_or_else(wall_clock_fallback_serial);
+
+        let store = Self {
+            db_path,
+            entries: RwLock::new(entries),
+            issuer: None,
+            mldsa_ca: Some(mldsa_ca),
+            crl_validity_days: DEFAULT_CRL_VALIDITY_DAYS,
+            cached_crl: RwLock::new(None),
+            crl_serial: AtomicU64::new(initial_serial),
+        };
+
         let crl = store.generate_crl_inner().await?;
         *store.cached_crl.write().await = Some(crl);
         store.persist().await?;
@@ -341,6 +395,21 @@ impl RevocationStore {
 
     /// Generate a CRL PEM from the current revocation entries.
     async fn generate_crl_inner(&self) -> Result<String, EnrollmentError> {
+        // `fetch_add(1)` allocates the next `crlNumber`; the bumped value is
+        // the one we return and sign. The subsequent `persist()` call on the
+        // hot paths captures it so restarts keep the counter monotonic (#765).
+        let serial = self
+            .crl_serial
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+
+        // Route to the ML-DSA backend when configured (#502); otherwise the
+        // classical rcgen path.
+        #[cfg(feature = "post-quantum")]
+        if let Some(mldsa_ca) = &self.mldsa_ca {
+            return self.generate_crl_mldsa(mldsa_ca, serial).await;
+        }
+
         let entries = self.entries.read().await;
 
         let mut revoked_certs = Vec::new();
@@ -364,14 +433,12 @@ impl RevocationStore {
         let revoked_certs_count = revoked_certs.len();
         let now = OffsetDateTime::now_utc();
         let next_update = now + time::Duration::days(i64::from(self.crl_validity_days));
-        // `fetch_add(1)` allocates the next `crlNumber`; the bumped value
-        // is the one we return and sign. The subsequent `persist()` call
-        // on the hot paths captures it so restarts keep the counter
-        // monotonic (#765).
-        let serial = self
-            .crl_serial
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+
+        let issuer = self.issuer.as_ref().ok_or_else(|| {
+            EnrollmentError::Config(
+                "revocation store has no classical CA issuer configured".to_string(),
+            )
+        })?;
 
         let crl_params = CertificateRevocationListParams {
             this_update: now,
@@ -383,7 +450,7 @@ impl RevocationStore {
         };
 
         let crl = crl_params
-            .signed_by(&self.issuer)
+            .signed_by(issuer)
             .map_err(|e| EnrollmentError::Signing(format!("failed to sign CRL: {e}")))?;
 
         let pem = crl
@@ -397,6 +464,79 @@ impl RevocationStore {
         );
 
         Ok(pem)
+    }
+
+    /// Generate an ML-DSA-87-signed CRL PEM (RFC 9881, #502).
+    #[cfg(feature = "post-quantum")]
+    async fn generate_crl_mldsa(
+        &self,
+        mldsa_ca: &MlDsaCa,
+        serial: u64,
+    ) -> Result<String, EnrollmentError> {
+        let entries = self.entries.read().await;
+
+        let mut revoked = Vec::with_capacity(entries.len());
+        for entry in entries.values() {
+            let serial_bytes = hex_to_bytes(&entry.serial).map_err(|e| {
+                EnrollmentError::Config(format!("invalid serial number '{}': {e}", entry.serial))
+            })?;
+            revoked.push(MlDsaRevokedCert {
+                serial: serial_bytes,
+                revocation_time: std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(entry.revoked_at),
+                reason: parse_crl_reason(&entry.reason),
+            });
+        }
+        let revoked_count = revoked.len();
+        drop(entries);
+
+        let now = std::time::SystemTime::now();
+        let next_update =
+            now + std::time::Duration::from_secs(u64::from(self.crl_validity_days) * 24 * 60 * 60);
+
+        let der = mldsa_ca.issue_crl(&revoked, now, next_update, serial)?;
+        let pem = der_to_crl_pem(&der);
+
+        tracing::info!(
+            revoked_count = revoked_count,
+            validity_days = self.crl_validity_days,
+            algorithm = "ml-dsa-87",
+            "CRL generated"
+        );
+
+        Ok(pem)
+    }
+}
+
+/// PEM-encode CRL DER bytes with the `X509 CRL` label (RFC 7468), matching the
+/// classical rcgen path's PEM output shape.
+#[cfg(feature = "post-quantum")]
+fn der_to_crl_pem(der: &[u8]) -> String {
+    let b64 = rustgate_core::b64::encode(der);
+    let wrapped = b64
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("-----BEGIN X509 CRL-----\n{wrapped}\n-----END X509 CRL-----\n")
+}
+
+/// Map a revocation-reason string to an `MlDsaRevokedCert` reason code.
+///
+/// Returns `None` for the unspecified/unknown case, so the CRL entry omits the
+/// reason-code extension rather than emitting `unspecified(0)`.
+#[cfg(feature = "post-quantum")]
+fn parse_crl_reason(reason: &str) -> Option<x509_cert::ext::pkix::CrlReason> {
+    use x509_cert::ext::pkix::CrlReason;
+    match reason.to_lowercase().as_str() {
+        "key_compromise" | "keycompromise" => Some(CrlReason::KeyCompromise),
+        "ca_compromise" | "cacompromise" => Some(CrlReason::CaCompromise),
+        "affiliation_changed" | "affiliationchanged" => Some(CrlReason::AffiliationChanged),
+        "superseded" => Some(CrlReason::Superseded),
+        "cessation_of_operation" | "cessationofoperation" => Some(CrlReason::CessationOfOperation),
+        "privilege_withdrawn" | "privilegewithdrawn" => Some(CrlReason::PrivilegeWithdrawn),
+        _ => None,
     }
 }
 
@@ -786,6 +926,44 @@ mod tests {
             on_disk.contains("\"last_crl_number\""),
             "persist must include last_crl_number; saw: {on_disk}"
         );
+    }
+
+    /// ML-DSA-87-backed store (#502) issues an ML-DSA-signed CRL: the PEM
+    /// carries the `X509 CRL` label, revoked entries survive, and the parsed
+    /// CRL's signatureAlgorithm is id-ml-dsa-87.
+    #[cfg(feature = "post-quantum")]
+    #[tokio::test]
+    async fn mldsa_store_generates_ml_dsa_signed_crl() {
+        let ca = rustgate_test_utils::mldsa::generate_mldsa_ca("Revocation ML-DSA CA");
+        let mldsa_ca = MlDsaCa::from_der(ca.cert_der, ca.secret_key).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("revocations.json");
+        let store = RevocationStore::new_mldsa(db_path, mldsa_ca).await.unwrap();
+
+        // Empty CRL is still valid PEM with the CRL label.
+        let empty = store.crl_pem().await.unwrap();
+        assert!(empty.contains("-----BEGIN X509 CRL-----"));
+        assert!(empty.contains("-----END X509 CRL-----"));
+
+        let _ = store
+            .revoke("aabbcc", "key_compromise", "admin")
+            .await
+            .unwrap();
+        assert!(store.is_revoked("aabbcc").await);
+
+        let pem = store.crl_pem().await.unwrap();
+        let der = {
+            let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+            rustgate_core::b64::decode(body.trim()).unwrap()
+        };
+        let (_, crl) = x509_parser::parse_x509_crl(&der).unwrap();
+        assert_eq!(
+            crl.signature_algorithm.algorithm.to_string(),
+            "2.16.840.1.101.3.4.3.19",
+            "CRL must be ML-DSA-87-signed"
+        );
+        assert_eq!(crl.iter_revoked_certificates().count(), 1);
     }
 
     /// A hand-crafted file with `last_crl_number = 0` (or a corrupted
