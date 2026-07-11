@@ -770,6 +770,15 @@ jobs:
       - name: Run PQ HTTP tests
         run: cargo nextest run --locked -p rustgate-http --features post-quantum
 
+      # rustgate-enrollment's `post-quantum` feature is the pure-Rust fips204
+      # ML-DSA-87 issuance path (#502) — no Go/cmake needed, unlike the aws-lc-rs
+      # `post-quantum` used elsewhere. It shares the `post-quantum` name, so the
+      # check-features powerset excludes it; cover it here on the dedicated PQ job.
+      - name: Clippy + test enrollment ML-DSA-87 issuance (#502)
+        run: |
+          cargo clippy --locked -p rustgate-enrollment --features post-quantum,est --all-targets
+          cargo nextest run --locked -p rustgate-enrollment --features post-quantum,est
+
   binary-size:
     # Release-binary size regression gate (issue #832). Builds the same
     # feature set as .github/workflows/release-binary.yml's default target
