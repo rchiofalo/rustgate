@@ -48,12 +48,12 @@ does.
 | [0016](0016-on-callback-macro-for-typed-aliases.md) | `on_callback!` macro for `Arc<dyn Fn>` callback aliases | Accepted |
 | [0017](0017-workspace-dependency-inheritance.md) | Workspace dependency inheritance for every crate | Accepted |
 | [0018](0018-schema-first-codec-design.md) | Schema-first codec design for tactical wire formats | Accepted |
-| [0019](0019-cnsa2-hybrid-mldsa.md) | CNSA 2.0 with Composite ML-DSA hybrid certificates | Proposed |
+| [0019](0019-cnsa2-hybrid-mldsa.md) | CNSA 2.0 with Composite ML-DSA hybrid certificates | Accepted |
 | [0020](0020-mavlink-pq-rekey.md) | MAVLink integration with ML-KEM-768 rekey channel | Proposed |
 | [0021](0021-clean-room-tak-interop.md) | Clean-room interoperability policy for TAK and third-party protocols | Accepted |
 | [0022](0022-cross-domain-guard-egress-seam.md) | Cross-domain guard egress seam (central `OnEgressGuard` hook) | Accepted |
 | [0023](0023-tactical-codec-ingress-seam.md) | Tactical codec ingress seam (generic UDP/TCP codec-pluggable listeners) | Accepted |
-| [0024](0024-guard-fail-closed.md) | Fail-closed semantics for the cross-domain guard (unparseable markings, audit-chain load failures) | Proposed |
+| [0024](0024-guard-fail-closed.md) | Fail-closed semantics for the cross-domain guard (unparseable markings, audit-chain load failures) | Accepted |
 | [0025](0025-revocation-lifecycle.md) | Live certificate-revocation lifecycle (CRL refresh, fail-closed staleness, active mid-session disconnect) | Proposed |
 | [0026](0026-archive-xchacha-v3.md) | Wider-nonce v3 archive format (XChaCha20-Poly1305) | Proposed |
 | [0027](0027-maskpoint-fail-closed.md) | MaskPoint fails closed for unmaskable position protocols (DIS/Link 16/ASTERIX/…) | Proposed |

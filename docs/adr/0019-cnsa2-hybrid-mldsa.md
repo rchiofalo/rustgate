@@ -121,7 +121,7 @@ The forcing function for THIS ADR is twofold:
 - New PQ-related issues have a written context to reference. #500 / #501 / #502 / #503 do not each need to re-litigate "why Composite ML-DSA and not pure ML-DSA."
 - A future ADR superseding this one (pure ML-DSA migration) has a clear pointer to "this is what we decided in 2026 and why."
 
-**Migration path.** When CNSA 2.0 + rustls + aws-lc-rs converge (expected 2027–2028), the four sub-PRs (#501/#502/#503 plus the wiring) flip the `--cnsa2` flag from "scaffold" to "full enforcement." This ADR's status becomes **Accepted**; if NSA revises the algorithm suite before then, this ADR's body remains the historical record and a new ADR supersedes.
+**Migration path.** This ADR is **Accepted** as the committed CNSA 2.0 direction — real work has already landed under it (pure ML-DSA-87 certificate/CRL issuance, #502; see the Implementation status section above). When CNSA 2.0 + rustls + aws-lc-rs converge (expected 2027–2028), the remaining sub-PRs (#501/#503 plus the wiring) flip the `--cnsa2` flag from "scaffold" to "full enforcement." If NSA revises the algorithm suite before then, this ADR's body remains the historical record and a new ADR supersedes.
 
 ## CNSA 2.0 residual-gap tracker
 
@@ -132,6 +132,16 @@ names the two residual items #873 uniquely owns beyond the #500–#504
 menu. The full mapping table lives in
 [`docs/cnsa2-gap-analysis.md`](../cnsa2-gap-analysis.md); the checklist
 below is the implementation menu.
+
+> **Update (2026-07, post-#502).** `fips204` has since landed as a
+> workspace dependency and is wired for pure ML-DSA-87 certificate/CRL
+> issuance (#502, `rustgate_enrollment::mldsa`). The "no `fips204` in the
+> tree" and "Blocked on `fips204` adoption" notes below predate that
+> milestone: the ML-DSA package-signature verification (#500 residual),
+> PQ federation JWT (#873), and PQ-signed CI artifacts (#873) are now
+> gated on *wiring* the already-available `fips204` signer into their
+> respective sites (`datapackage.rs`, `jwt.rs`, `release.yml`), not on
+> adopting the crate.
 
 **Two corrections to the #873 issue body.** The issue's status table is
 directionally correct but carries two stale claims that this tracker
