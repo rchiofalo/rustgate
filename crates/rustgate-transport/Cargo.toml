@@ -19,6 +19,7 @@ mavlink = ["dep:rustgate-mavlink"]
 # in `rustgate-tls`; transport just forwards the flag.
 fips = ["rustgate-tls/fips"]
 post-quantum = ["rustgate-tls/post-quantum"]
+mldsa-certs = ["rustgate-tls/mldsa-certs"]
 ocsp = ["rustgate-tls/ocsp"]
 spiffe = ["rustgate-tls/spiffe"]
 

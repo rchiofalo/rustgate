@@ -32,14 +32,62 @@ Enable **X25519MLKEM768** (X25519 + ML-KEM 768) hybrid key exchange in rustls. T
 3. The `post-quantum` feature flag will depend on the `aws-lc-rs` backend (same as `fips`), since `ring` does not support PQ. Deployments that want PQ without FIPS compliance will get a separate `aws-lc-rs` dependency path.
 4. Gate behind `#[cfg(feature = "post-quantum")]` to avoid increasing binary size for deployments that don't need it
 
-### Phase 2: PQ Certificate Authentication (Future)
+### Phase 2: PQ Certificate Authentication (Partially shipped)
 
-Once NIST finalizes ML-DSA (FIPS 204) and the X.509 ecosystem supports PQ signature algorithms, migrate server and client certificates to hybrid or pure PQ signatures.
+**Issuance shipped (#502):** the `post-quantum` feature of `rustgate-enrollment`
+issues pure ML-DSA-87 certificates and CRLs (RFC 9881) using the pure-Rust
+`fips204` crate.
 
-**Blockers:**
-- Rustls PQ signature support is not yet available
-- CA tooling (e.g., `openssl`, `rcgen`) needs ML-DSA support
-- Client devices must support PQ certificates
+**Verification shipped (#501):** the `mldsa-certs` feature of `rustgate-tls`
+lets the server *authenticate* peers whose certificate chain is signed with
+ML-DSA-87.
+
+```bash
+cargo build -p rustgate-server --features mldsa-certs
+rustgate --mldsa-client-certs …      # or RUSTGATE_MLDSA_CLIENT_CERTS=1
+```
+
+The build flag alone changes nothing: the runtime flag is required, because
+enabling this widens the set of certificates the process will accept.
+
+#### Recommended deployment: ML-DSA-87 issuer, classical leaves
+
+The migration shape worth adopting first is a **post-quantum root CA signing
+classical (ECDSA P-384) leaves**. This is not a compromise — it targets the
+actual exposure:
+
+- A root CA has a 10–20 year lifetime, so it is the credential genuinely
+  exposed to harvest-now-forge-later. Leaves rotate in days or months.
+- It works with **every existing client, unmodified** — no client-side ML-DSA
+  support is needed, because the client still signs with its classical key.
+- It lets the PKI migrate on its own schedule, independent of endpoint fleets.
+
+A pure ML-DSA-87 *leaf* is also accepted, but note the constraint below.
+
+#### Constraints
+
+| Constraint | Detail |
+|---|---|
+| **Mutually exclusive with FIPS** | ML-DSA is outside the AWS-LC FIPS submission. `--features fips,mldsa-certs` fails to build, and the provider reports `fips() == false`, so `--fips-required` cannot be combined with it. |
+| **TLS 1.3 only in practice** | TLS 1.2's `ClientCertificateType` registry has no ML-DSA entry, so a TLS 1.2 CertificateRequest cannot coherently ask for an ML-DSA credential. |
+| **rustgate-client cannot present a pure ML-DSA leaf** | rustls cannot yet *produce* an ML-DSA signature. The scheme is advertised for interop with stacks that can (OpenSSL 3.5+, BoringSSL). |
+| **Preference order** | ML-DSA-87 is advertised **last**, behind every classical scheme, so dual-credential peers do not send a ~7 KB ML-DSA credential where a ~100-byte ECDSA one suffices. |
+
+#### Wire-size note for constrained links
+
+An ML-DSA-87 public key is 2592 bytes and a signature is 4627 bytes. On
+bandwidth-constrained tactical links, an ML-DSA-signed chain measurably
+increases handshake size — a further reason the issuer-only migration above is
+the sensible default.
+
+**Remaining work:**
+- ML-DSA client-side *signing* (a `rustls::crypto::signer::SigningKey`
+  implementation) — required before `rustgate-client` can present a pure
+  ML-DSA leaf.
+- Composite (hybrid dual-signature) certificates, #503 — blocked on
+  `draft-ietf-lamps-pq-composite-sigs` becoming an RFC.
+- FIPS convergence — blocked on rustls-webpki adopting the AWS-LC FIPS 4.0
+  ML-DSA scope.
 
 ### Phase 3: PQ Federation (Future)
 

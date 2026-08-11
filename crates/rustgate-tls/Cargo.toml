@@ -13,6 +13,12 @@ workspace = true
 [features]
 fips = ["rustls/aws_lc_rs", "rustls/fips"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+# ML-DSA-87 (FIPS 204 / RFC 9881) TLS certificate-chain verification (#501).
+# Augments the aws-lc-rs provider's signature-verification set; see
+# `src/mldsa_certs.rs`. MUTUALLY EXCLUSIVE with `fips` — enforced by a
+# `compile_error!` in that module, because `rustls/fips` turns on
+# `webpki/aws-lc-rs-fips`, which `#[cfg]`-removes the ML-DSA statics.
+mldsa-certs = ["rustls/aws_lc_rs", "dep:rustls-webpki"]
 ocsp = ["dep:ocsp-stapler", "dep:lru", "dep:rasn-ocsp"]
 spiffe = ["dep:spiffe"]
 
@@ -22,6 +28,9 @@ arc-swap = { workspace = true }
 parking_lot = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
+# `aws-lc-rs-unstable` is what exposes `webpki::aws_lc_rs::ML_DSA_87`; rustls's
+# own `aws_lc_rs` feature does not enable it (see the root-manifest comment).
+rustls-webpki = { workspace = true, optional = true, features = ["std", "aws-lc-rs-unstable"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }
@@ -35,8 +44,20 @@ lru = { workspace = true, optional = true }
 spiffe = { workspace = true, optional = true }
 
 [dev-dependencies]
-rustgate-test-utils = { workspace = true }
+# `mldsa` supplies the self-signed ML-DSA-87 test CA used by the `mldsa-certs`
+# tests (#501). Enabled unconditionally because Cargo does not accept
+# `optional` dev-dependencies; the extra deps it pulls (fips204/x509-cert/der)
+# are pure Rust and carry no C-toolchain burden.
+rustgate-test-utils = { workspace = true, features = ["mldsa"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tempfile = { workspace = true }
 futures = { workspace = true }
 socket2 = { workspace = true }
+# Issues the classical ECDSA P-384 leaf that the ML-DSA-87 test CA signs.
+rcgen = { workspace = true }
+# DER -> PEM for feeding ML-DSA-87 test certificates into `TlsConfig::from_pem`.
+base64 = { workspace = true }
+# Produces ML-DSA-87 CertificateVerify signatures for the TLS 1.3
+# signature-scheme test (cross-checks aws-lc-rs verification against the
+# pure-Rust implementation).
+fips204 = { workspace = true }

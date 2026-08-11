@@ -243,7 +243,7 @@ jobs:
             DEPTH=2
           fi
           echo "Running cargo hack check at depth $DEPTH (event=${{ github.event_name }})"
-          cargo hack check --feature-powerset --depth "$DEPTH" --exclude-features jemalloc,fips,otel,post-quantum,mavlink-pq --no-dev-deps
+          cargo hack check --feature-powerset --depth "$DEPTH" --exclude-features jemalloc,fips,otel,post-quantum,mavlink-pq,mldsa-certs --no-dev-deps
 
   check-features-triples:
     # Targeted three-way feature interaction coverage (issue #832 F-147).
@@ -763,6 +763,34 @@ jobs:
         run: |
           cargo clippy --locked -p rustgate-mavlink --features mavlink-pq --all-targets
           cargo nextest run --locked -p rustgate-mavlink --features mavlink-pq
+
+      - name: Clippy + test ML-DSA-87 certificate verification (#501)
+        # `mldsa-certs` pulls aws-lc-rs (needs cmake), so it is excluded from
+        # the cargo-hack feature-powerset lane and exercised here instead.
+        # Also verify it COMPOSES with post-quantum: that build must install a
+        # single provider carrying both PQ key-exchange groups and ML-DSA
+        # signature verification.
+        run: |
+          cargo clippy --locked -p rustgate-tls -p rustgate-server --features mldsa-certs --all-targets
+          cargo clippy --locked -p rustgate-server --features post-quantum,mldsa-certs --all-targets
+          cargo nextest run --locked -p rustgate-tls --features mldsa-certs
+
+      - name: Assert fips + mldsa-certs is rejected at compile time
+        # ML-DSA is outside the AWS-LC FIPS submission and `rustls/fips`
+        # removes the ML-DSA verification algorithms, so the combination must
+        # fail with OUR diagnostic rather than an inscrutable upstream
+        # "cannot find value `ML_DSA_87`".
+        run: |
+          if cargo check --locked -p rustgate-server --features fips,mldsa-certs 2>build.log; then
+            echo "::error::fips + mldsa-certs built successfully but must be rejected"
+            exit 1
+          fi
+          if ! grep -q "mutually exclusive" build.log; then
+            echo "::error::fips + mldsa-certs failed, but not via the intended compile_error!"
+            cat build.log
+            exit 1
+          fi
+          echo "fips + mldsa-certs correctly rejected by compile_error!"
 
       - name: Run PQ transport tests
         run: cargo nextest run --locked -p rustgate-transport --features post-quantum
