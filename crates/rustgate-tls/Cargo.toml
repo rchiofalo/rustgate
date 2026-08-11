@@ -10,6 +10,14 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[package.metadata.cargo-machete]
+# The `rustls-webpki` PACKAGE builds a lib named `webpki` (its `[lib] name`),
+# so `src/mldsa_certs.rs` refers to it as `webpki::aws_lc_rs::ML_DSA_87`.
+# cargo-machete matches the package name textually and never sees
+# `rustls_webpki`, so it reports a false positive. The dependency is real and
+# load-bearing — dropping it fails the `mldsa-certs` build. Refs #501.
+ignored = ["rustls-webpki"]
+
 [features]
 fips = ["rustls/aws_lc_rs", "rustls/fips"]
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
