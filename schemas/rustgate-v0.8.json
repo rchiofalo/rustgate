@@ -1037,6 +1037,13 @@
       ],
       "default": null
     },
+    "mldsa-client-certs": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "mqtt-bind": {
       "type": [
         "string",

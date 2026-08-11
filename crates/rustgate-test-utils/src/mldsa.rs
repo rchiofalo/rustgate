@@ -19,7 +19,7 @@ use fips204::traits::{SerDes, Signer};
 use x509_cert::attr::AttributeTypeAndValue;
 use x509_cert::certificate::{Certificate, TbsCertificate, Version};
 use x509_cert::ext::Extension;
-use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages};
+use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage, KeyUsages};
 use x509_cert::name::{Name, RdnSequence, RelativeDistinguishedName};
 use x509_cert::serial_number::SerialNumber;
 use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
@@ -27,6 +27,8 @@ use x509_cert::time::{Time, Validity};
 
 const OID_ML_DSA_87: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.3.19");
 const OID_COMMON_NAME: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
+const OID_EKU_SERVER_AUTH: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1");
+const OID_EKU_CLIENT_AUTH: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.2");
 
 /// A self-signed ML-DSA-87 test CA: certificate DER and raw `fips204` key
 /// material.
@@ -107,6 +109,104 @@ pub fn generate_mldsa_ca(cn: &str) -> MlDsaTestCa {
         secret_key: sk.into_bytes().to_vec(),
         public_key: pk_bytes.to_vec(),
     }
+}
+
+/// Issue an end-entity certificate signed by an [`MlDsaTestCa`], carrying a
+/// caller-supplied `SubjectPublicKeyInfo`.
+///
+/// The SPKI is passed through verbatim, so the leaf's own key may be *any*
+/// algorithm — in particular a classical ECDSA key. That combination
+/// (ML-DSA-87 issuer, classical leaf) is the one the ML-DSA TLS
+/// certificate-verification path (#501) needs to exercise, and it is the
+/// realistic CNSA 2.0 migration shape: a long-lived post-quantum root signing
+/// short-lived classical leaves.
+///
+/// Deliberately not available on `rustgate_enrollment::mldsa::MlDsaCa`, whose
+/// `issue_leaf` hardcodes an ML-DSA-87 SPKI on purpose — this is a test-only
+/// affordance and must not widen the production issuance API.
+///
+/// `spki_der` must be a DER-encoded `SubjectPublicKeyInfo` (the exact bytes
+/// `rcgen`'s `PublicKeyData::subject_public_key_info` or an X.509 parser
+/// yields).
+///
+/// # Panics
+///
+/// Panics on malformed SPKI DER or any encoding failure — appropriate for a
+/// test helper.
+#[must_use]
+pub fn issue_leaf_with_spki(ca: &MlDsaTestCa, spki_der: &[u8], cn: &str) -> Vec<u8> {
+    use der::Decode;
+
+    let sk = ml_dsa_87::PrivateKey::try_from_bytes(
+        ca.secret_key
+            .clone()
+            .try_into()
+            .expect("CA secret key length"),
+    )
+    .expect("CA secret key");
+
+    let alg = || AlgorithmIdentifierOwned {
+        oid: OID_ML_DSA_87,
+        parameters: None,
+    };
+
+    let spki = SubjectPublicKeyInfoOwned::from_der(spki_der).expect("leaf spki der");
+
+    // Issuer must match the CA's subject byte-for-byte or path building fails.
+    let issuer = Certificate::from_der(&ca.cert_der)
+        .expect("ca cert der")
+        .tbs_certificate
+        .subject;
+
+    let now = std::time::SystemTime::now();
+    let validity = Validity {
+        not_before: to_time(now - std::time::Duration::from_secs(300)),
+        not_after: to_time(now + std::time::Duration::from_secs(365 * 24 * 60 * 60)),
+    };
+
+    let extensions = vec![
+        extension(
+            &BasicConstraints {
+                ca: false,
+                path_len_constraint: None,
+            },
+            true,
+        ),
+        extension(
+            &KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyEncipherment),
+            true,
+        ),
+        extension(
+            &ExtendedKeyUsage(vec![OID_EKU_CLIENT_AUTH, OID_EKU_SERVER_AUTH]),
+            false,
+        ),
+    ];
+
+    let tbs = TbsCertificate {
+        version: Version::V3,
+        serial_number: SerialNumber::new(&[0x02]).expect("serial"),
+        // The algorithm the ISSUER signs with — ML-DSA-87 — independent of the
+        // leaf's own key algorithm carried in `subject_public_key_info`.
+        signature: alg(),
+        issuer,
+        validity,
+        subject: self_signed_name(cn),
+        subject_public_key_info: spki,
+        issuer_unique_id: None,
+        subject_unique_id: None,
+        extensions: Some(extensions),
+    };
+
+    let tbs_der = tbs.to_der().expect("tbs der");
+    let sig = sk.try_sign(&tbs_der, &[]).expect("CA signs leaf");
+
+    let cert = Certificate {
+        tbs_certificate: tbs,
+        signature_algorithm: alg(),
+        signature: BitString::from_bytes(&sig).expect("sig bitstring"),
+    };
+
+    cert.to_der().expect("cert der")
 }
 
 fn self_signed_name(cn: &str) -> Name {

@@ -38,6 +38,8 @@ pub mod verifier;
 
 #[cfg(feature = "ocsp")]
 pub mod client_ocsp;
+#[cfg(feature = "mldsa-certs")]
+pub mod mldsa_certs;
 #[cfg(feature = "ocsp")]
 pub mod ocsp;
 #[cfg(feature = "spiffe")]
@@ -53,10 +55,14 @@ pub use config::{
     is_fips_provider_active, is_pq_provider_active,
 };
 #[cfg(feature = "post-quantum")]
-pub use config::{install_pq_provider, install_provider_with_kx_groups};
+pub use config::{
+    install_pq_provider, install_provider_with_kx_groups, pq_provider, pq_provider_with_kx_groups,
+};
 pub use crl_store::{CrlHealth, CrlHealthObserver, CrlStore};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
+#[cfg(feature = "mldsa-certs")]
+pub use mldsa_certs::{install_mldsa_provider, mldsa_provider, with_mldsa_verification};
 pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 #[cfg(feature = "spiffe")]

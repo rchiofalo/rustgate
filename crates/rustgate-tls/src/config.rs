@@ -541,9 +541,7 @@ pub fn install_pq_provider() -> Result<()> {
 /// is already installed.
 #[cfg(feature = "post-quantum")]
 pub fn install_provider_with_kx_groups(groups: &str) -> Result<()> {
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    let kx_groups = parse_kx_groups(groups)?;
-    provider.kx_groups = kx_groups;
+    let provider = pq_provider_with_kx_groups(groups)?;
 
     rustls::crypto::CryptoProvider::install_default(provider).map_err(|_| {
         RustgateError::from(ConfigError::Other(
@@ -553,6 +551,33 @@ pub fn install_provider_with_kx_groups(groups: &str) -> Result<()> {
 
     tracing::info!(groups = %groups, "crypto provider installed with custom key exchange groups");
     Ok(())
+}
+
+/// Build (but do not install) the post-quantum `aws-lc-rs` provider.
+///
+/// Separate from [`install_pq_provider`] so callers that need to augment the
+/// provider before installing — for example adding ML-DSA certificate
+/// verification (`mldsa-certs`, #501) — can compose one value and call
+/// `install_default` exactly once. Installing twice silently loses the second
+/// provider.
+#[cfg(feature = "post-quantum")]
+#[must_use]
+pub fn pq_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
+
+/// Build (but do not install) a provider with a custom key-exchange group
+/// preference order. See [`pq_provider`] for why the build and install steps
+/// are separable.
+///
+/// # Errors
+///
+/// Returns an error if a group name is unrecognized.
+#[cfg(feature = "post-quantum")]
+pub fn pq_provider_with_kx_groups(groups: &str) -> Result<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = parse_kx_groups(groups)?;
+    Ok(provider)
 }
 
 /// Parse a comma-separated list of key exchange group names into rustls

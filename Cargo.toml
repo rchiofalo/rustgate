@@ -70,6 +70,23 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
+# Direct dependency solely to reach the ML-DSA `SignatureVerificationAlgorithm`
+# statics for the ML-DSA-87 TLS certificate-verification path
+# (`rustgate-tls` `mldsa-certs` feature, #501). rustls already depends on this
+# crate, but its `aws_lc_rs` feature enables only `webpki/aws-lc-rs` — the
+# `webpki::aws_lc_rs::ML_DSA_*` statics additionally require
+# `aws-lc-rs-unstable`, which only a direct dependant can turn on.
+#
+# Pinned to 0.103 (not 0.104) because 0.104 has never had a stable release —
+# only `0.104.0-alpha.*` — and this is a security-load-bearing path.
+#
+# A future webpki major bump is safe for our use: the value we hold is a
+# `&'static dyn rustls_pki_types::SignatureVerificationAlgorithm`, a trait
+# owned by the single-major `rustls-pki-types` crate rather than by webpki, so
+# it cannot produce the two-versions-of-the-same-trait mismatch that a
+# webpki-owned type would. rustls 0.23.40 requires `rustls-webpki ^0.103.5`,
+# so this unifies onto one copy.
+rustls-webpki = { version = "0.103", default-features = false }
 x509-parser = "0.18"
 sha1 = "0.10"
 sha2 = "0.10"

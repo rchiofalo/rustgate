@@ -317,6 +317,37 @@ pub(crate) struct TlsArgs {
     #[arg(long, default_value_t = false, env = "RUSTGATE_CNSA2")]
     pub(crate) cnsa2: bool,
 
+    /// Accept client-certificate chains signed with ML-DSA-87 (FIPS 204 /
+    /// RFC 9881). Requires `--features mldsa-certs` at build time (#501).
+    ///
+    /// This **widens the set of certificates the server will accept** and
+    /// applies process-wide, so it is off by default: a rebuild alone must
+    /// never silently change trust policy. Turning it on adds ML-DSA-87 to
+    /// the signature algorithms used for certificate-chain validation, and
+    /// advertises it (last, behind every classical scheme) in the TLS 1.3
+    /// CertificateRequest.
+    ///
+    /// What this enables today:
+    ///
+    ///   - Client chains anchored at an ML-DSA-87 CA — including one whose
+    ///     leaves carry classical ECDSA/RSA keys. This is the practical
+    ///     CNSA 2.0 migration path: the long-lived root is what carries real
+    ///     harvest-now-forge-later exposure, while short-lived leaves can
+    ///     stay classical.
+    ///   - Forward-compatible interop with peers presenting a pure ML-DSA-87
+    ///     leaf (OpenSSL 3.5+ and similar). `rustgate-client` cannot present
+    ///     one, because rustls cannot yet produce an ML-DSA signature.
+    ///
+    /// Constraints:
+    ///
+    ///   - **Mutually exclusive with FIPS.** ML-DSA is not in the AWS-LC FIPS
+    ///     submission, so this cannot be combined with `--fips-required`, and
+    ///     `--features fips,mldsa-certs` fails to build.
+    ///   - **TLS 1.3 only in practice** — TLS 1.2's ClientCertificateType
+    ///     registry has no ML-DSA entry.
+    #[arg(long, default_value_t = false, env = "RUSTGATE_MLDSA_CLIENT_CERTS")]
+    pub(crate) mldsa_client_certs: bool,
+
     /// Interval in seconds to check for certificate file changes.
     /// When set to a value > 0, the server periodically polls the --cert and
     /// --key files and hot-reloads them on change (zero-downtime rotation).
@@ -2755,6 +2786,7 @@ define_config_file! {
     prefer_post_quantum in tls: bool,
     kx_groups in tls: Option<String>,
     cnsa2 in tls: bool,
+    mldsa_client_certs in tls: bool,
     cert_reload_interval in tls: u64,
     ocsp_stapling in tls: bool,
     spiffe in tls: bool,

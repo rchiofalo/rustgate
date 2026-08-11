@@ -10,9 +10,47 @@
   #504 (`--cnsa2` CLI flag),
   #873 (CNSA 2.0 PQ alignment umbrella),
   #731 (MAVLink PQ umbrella),
-  [aws-lc-rs #964](https://github.com/aws/aws-lc-rs/issues/964) — upstream FIPS/ML-DSA mutual exclusion
+  [aws-lc-rs #964](https://github.com/aws/aws-lc-rs/issues/964) — ML-DSA API
+  stabilization (**closed COMPLETED 2026-08-07**, aws-lc-rs v1.18.0)
 
 ## Implementation status
+
+- **#501 (2026-08, ML-DSA-87 TLS certificate verification delivered).** The new
+  `mldsa-certs` feature on `rustgate-tls` augments the `aws-lc-rs`
+  `CryptoProvider`'s `signature_verification_algorithms` with ML-DSA-87 and is
+  armed at runtime by `--mldsa-client-certs`. The server then accepts
+  client-certificate chains whose issuer signed with ML-DSA-87 — including the
+  practical migration shape of an ML-DSA-87 root over classical ECDSA leaves —
+  and advertises ML-DSA-87 last in the TLS 1.3 CertificateRequest.
+
+  Two corrections to this ADR's earlier assumptions, both verified against
+  vendored sources rather than inferred:
+
+  1. **"Enable a rustls feature flag" was never sufficient.** rustls reserves
+     the `ML_DSA_87` code point (0x0906) but its stock `aws-lc-rs` provider
+     lists no ML-DSA algorithm in `signature_verification_algorithms`. A
+     custom `WebPkiSupportedAlgorithms` is required, which is exactly the
+     `CryptoProvider` extension point this ADR named — so the design holds,
+     but the work was real rather than a flag flip.
+  2. **The FIPS/ML-DSA mutual exclusion is a rustls + rustls-webpki
+     constraint, not an aws-lc-rs one.** aws-lc-rs #964 is closed; the
+     exclusion persists because `rustls/fips` enables
+     `webpki/aws-lc-rs-fips`, and rustls-webpki gates its ML-DSA statics on
+     `not(aws-lc-rs-fips)` (aws-lc-rs independently gates its whole
+     `unstable::signature` module on `not(fips)`). `--features
+     fips,mldsa-certs` is therefore rejected by a `compile_error!`, and the
+     augmented provider always reports `fips() == false`. Waiting on
+     aws-lc-rs will not lift this; rustls-webpki must adopt the AWS-LC
+     FIPS 4.0 ML-DSA scope first.
+
+  **Deferral boundary — do not re-derive.** A peer presenting a *pure*
+  ML-DSA-87 leaf cannot complete a handshake originated by this workspace,
+  because rustls cannot *produce* an ML-DSA signature (`any_supported_type`
+  handles RSA/ECDSA/EdDSA only). The scheme is advertised for forward-compatible
+  interop with stacks that can (OpenSSL 3.5+, BoringSSL), and is covered at the
+  signature level by tests, but no live end-to-end handshake test of that shape
+  is possible until a `rustls::crypto::signer::SigningKey` implementation for
+  ML-DSA exists. That is tracked separately, not by #501.
 
 - **#502 (2026-07, pure ML-DSA-87 issuance delivered — RFC 9881).** The
   `post-quantum` feature now performs **real pure ML-DSA-87 certificate and
@@ -55,7 +93,7 @@ The CNSA 2.0 algorithm suite requires:
 rustgate already ships partial readiness:
 
 - **ML-KEM-768 hybrid key exchange** is available via the `post-quantum` feature (rustls + aws-lc-rs `X25519MLKEM768`, shipped 2025). NIST Level 3 hybrid — not yet Level 5.
-- **No ML-DSA signature support** today: rustls's certificate verifier path does not yet accept ML-DSA signatures (the upstream PR landing is blocked behind the FIPS/ML-DSA mutual exclusion at aws-lc-rs).
+- **No ML-DSA signature support** today (as written 2026-05; **superseded by #501**, see Implementation status): rustls's stock providers still do not list ML-DSA in `signature_verification_algorithms`, but a downstream `CryptoProvider` can supply it, which is what `mldsa-certs` now does.
 - **No CNSA 2.0 mode switch** today: operators wanting CNSA 2.0 would have to set `--kx-groups`, `--tls-min-version`, and a future `--enrollment-ca-algorithm` independently and trust them to converge.
 
 The forcing function for THIS ADR is twofold:
@@ -79,7 +117,7 @@ The forcing function for THIS ADR is twofold:
 
 3. **rustls is the only TLS provider** (per ADR 0xxx / workspace policy). The implementation path for #501/#502/#503 is whatever the upstream rustls roadmap supports — currently Composite ML-DSA via the same `CryptoProvider` extension point that landed X25519MLKEM768. **The workspace will not fork rustls.**
 
-4. **The fips and post-quantum features stay separate compile-time gates.** A future release can require BOTH for `--cnsa2 --enforce`, but the build profile will be permissive (post-quantum without FIPS for early CNSA 2.0 testing) until aws-lc-rs resolves [#964](https://github.com/aws/aws-lc-rs/issues/964).
+4. **The fips and post-quantum features stay separate compile-time gates.** A future release can require BOTH for `--cnsa2 --enforce`, but the build profile will be permissive (post-quantum without FIPS for early CNSA 2.0 testing) until rustls-webpki adopts the AWS-LC FIPS 4.0 ML-DSA scope. (aws-lc-rs [#964](https://github.com/aws/aws-lc-rs/issues/964) closed 2026-08-07; the residual exclusion lives in `rustls/fips` -> `webpki/aws-lc-rs-fips`, not in aws-lc-rs.)
 
 5. **ML-DSA-65/87 package signature verification** ships *independently* of the TLS path (#500). The offline / non-TLS code paths (Zarf package signing, audit log archive signing, release artifact signing) can adopt ML-DSA today via the `fips204` Pure Rust crate — no rustls dependency, no FIPS conflict. This is the lowest-hanging fruit on the CNSA 2.0 migration and lands in K3.
 
@@ -187,7 +225,9 @@ supersedes:
 - [ ] ML-DSA package-signature verification (#500 residual) — extend
       `verify_signature()` in `rustgate-enrollment/src/datapackage.rs`
       once `fips204` is wired. **Blocked** on `fips204` adoption.
-- [ ] ML-DSA TLS certificate verification (#501, open) — via rustls
+- [x] ML-DSA TLS certificate verification (#501, **delivered 2026-08**) — via a
+      custom `WebPkiSupportedAlgorithms` on the aws-lc-rs `CryptoProvider`
+      (`rustgate-tls` `mldsa-certs` feature + `--mldsa-client-certs`)
       `CryptoProvider` extension point; no workspace fork.
 - [x] **Pure** ML-DSA-87 certificate + CRL issuance (#502, delivered) —
       `rustgate_enrollment::mldsa` hand-assembles + `fips204`-signs leaves
