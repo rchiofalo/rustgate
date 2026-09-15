@@ -12,7 +12,14 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
-    if: github.repository_visibility == 'public' || github.event_name == 'schedule'
+    # Public repositories only. On a private repository the default
+    # GITHUB_TOKEN cannot list commits through the GraphQL API the action
+    # uses ("Resource not accessible by integration") and `publish_results`
+    # is refused outright, so the previous `|| schedule` escape hatch just
+    # produced a guaranteed-red run every Monday. To run Scorecard against a
+    # private repository, supply a fine-grained PAT via `repo_token` and set
+    # `publish_results: false` — see the ossf/scorecard-action README.
+    if: github.repository_visibility == 'public'
     runs-on: ubuntu-latest # publish_results requires GitHub-hosted runners
     permissions:
       contents: read # clone the repository
