@@ -42,6 +42,8 @@ pub mod client_ocsp;
 pub mod mldsa_certs;
 #[cfg(feature = "ocsp")]
 pub mod ocsp;
+#[cfg(any(feature = "post-quantum", feature = "mldsa-certs"))]
+pub mod sig_algs;
 #[cfg(feature = "spiffe")]
 pub mod spiffe;
 
@@ -65,6 +67,8 @@ pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
 pub use mldsa_certs::{install_mldsa_provider, mldsa_provider, with_mldsa_verification};
 pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
+#[cfg(any(feature = "post-quantum", feature = "mldsa-certs"))]
+pub use sig_algs::without_mldsa_verification;
 #[cfg(feature = "spiffe")]
 pub use spiffe::{SpiffeConfig, SpiffeHooks, SpiffeIdentity};
 pub use verifier::{

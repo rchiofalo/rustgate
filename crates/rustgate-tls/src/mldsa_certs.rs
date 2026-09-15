@@ -27,11 +27,18 @@
 //!
 //! # Why a custom provider is required
 //!
-//! rustls reserves the `ML_DSA_87` [`SignatureScheme`] code point (0x0906) but
-//! its stock `aws-lc-rs` provider does **not** list any ML-DSA algorithm in
-//! `signature_verification_algorithms`. Enabling a Cargo feature alone
-//! therefore changes nothing; the provider's algorithm set has to be rebuilt.
-//! Everything downstream picks the augmentation up for free, because
+//! rustls reserves the `ML_DSA_87` [`SignatureScheme`] code point (0x0906).
+//! Before rustls 0.23.45 its stock `aws-lc-rs` provider listed no ML-DSA
+//! algorithm in `signature_verification_algorithms`; since 0.23.45 it lists
+//! ML-DSA-44/65/87 unconditionally. Either way the provider's algorithm set
+//! has to be rebuilt here, because the operator decision has to stay a
+//! decision: every `aws-lc-rs` provider rustgate installs is first passed
+//! through [`without_mldsa_verification`](crate::sig_algs::without_mldsa_verification)
+//! (the pre-0.23.45 baseline), and this module adds **ML-DSA-87 only** back on
+//! top of that baseline when `--mldsa-client-certs` is set. ML-DSA-44/65 are
+//! never accepted — CNSA 2.0 specifies the 87 parameter set.
+//!
+//! Everything downstream picks the result up for free, because
 //! `WebPkiClientVerifier::builder` resolves the process-default provider, and
 //! [`DynamicCertVerifier`](crate::verifier::DynamicCertVerifier) already
 //! delegates `verify_tls1{2,3}_signature` and `supported_verify_schemes` to it.
@@ -75,14 +82,16 @@ use rustls_pki_types::SignatureVerificationAlgorithm;
 /// be referenced from [`WebPkiSupportedAlgorithms::mapping`].
 static ML_DSA_87_ALGS: &[&dyn SignatureVerificationAlgorithm] = &[webpki::aws_lc_rs::ML_DSA_87];
 
-/// The stock `aws-lc-rs` verification set plus ML-DSA-87.
+/// The stock `aws-lc-rs` verification set (minus any upstream ML-DSA entries)
+/// plus ML-DSA-87 — so ML-DSA-87 is present exactly once regardless of what
+/// the upstream default ships, and ML-DSA-44/65 are never present.
 ///
 /// Derived from the upstream provider rather than hand-listed so that
-/// algorithms rustls adds in future point releases are picked up
+/// classical algorithms rustls adds in future point releases are picked up
 /// automatically — a hand-copied list would silently drop them, and the only
 /// symptom would be a classical client that mysteriously stops connecting.
 static MLDSA_SIG_ALGS: LazyLock<WebPkiSupportedAlgorithms> = LazyLock::new(|| {
-    let base = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+    let base = crate::sig_algs::stock_without_mldsa();
 
     let mut all = base.all.to_vec();
     all.push(webpki::aws_lc_rs::ML_DSA_87);
@@ -173,12 +182,12 @@ pub fn install_mldsa_provider() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The augmented set must be a strict superset of the stock one: every
-    /// classical algorithm still present, in its original relative order, with
-    /// ML-DSA-87 appended last.
+    /// The augmented set must be exactly the ML-DSA-free baseline plus one
+    /// entry: every classical algorithm still present, in its original
+    /// relative order, with ML-DSA-87 appended last.
     #[test]
     fn augmented_set_is_stock_plus_mldsa_appended_last() {
-        let base = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+        let base = crate::sig_algs::stock_without_mldsa();
         let augmented = *MLDSA_SIG_ALGS;
 
         assert_eq!(
@@ -206,6 +215,66 @@ mod tests {
             augmented_schemes.last(),
             Some(&SignatureScheme::ML_DSA_87),
             "ML-DSA-87 must be last so it is not preferred over classical schemes"
+        );
+    }
+
+    /// ML-DSA-87 must appear exactly once, and the smaller parameter sets the
+    /// upstream default now ships must not leak through: rustgate accepts the
+    /// CNSA 2.0 set only, and a duplicate entry would advertise the scheme
+    /// twice in `signature_algorithms`.
+    #[test]
+    fn augmented_set_has_mldsa_87_once_and_no_44_or_65() {
+        let augmented = *MLDSA_SIG_ALGS;
+        let count = |scheme: SignatureScheme| {
+            augmented
+                .mapping
+                .iter()
+                .filter(|(s, _)| *s == scheme)
+                .count()
+        };
+        assert_eq!(
+            count(SignatureScheme::ML_DSA_87),
+            1,
+            "ML-DSA-87 exactly once"
+        );
+        assert_eq!(
+            count(SignatureScheme::ML_DSA_44),
+            0,
+            "ML-DSA-44 never accepted"
+        );
+        assert_eq!(
+            count(SignatureScheme::ML_DSA_65),
+            0,
+            "ML-DSA-65 never accepted"
+        );
+        assert_eq!(
+            augmented
+                .all
+                .iter()
+                .filter(|a| a.signature_alg_id() == rustls_pki_types::alg_id::ML_DSA_87)
+                .count(),
+            1,
+            "`all` must carry the ML-DSA-87 verifier exactly once"
+        );
+    }
+
+    /// Stripping then augmenting is the on/off pair the server flag drives;
+    /// applying the augmentation to an already-augmented provider must not
+    /// grow the set.
+    #[test]
+    fn augmentation_is_idempotent_over_strip() {
+        let once = mldsa_provider().signature_verification_algorithms;
+        let twice = with_mldsa_verification(mldsa_provider()).signature_verification_algorithms;
+        assert_eq!(once.mapping.len(), twice.mapping.len());
+        assert_eq!(once.all.len(), twice.all.len());
+
+        let off = crate::sig_algs::without_mldsa_verification(mldsa_provider())
+            .signature_verification_algorithms;
+        assert!(
+            !off.mapping
+                .iter()
+                .any(|(s, _)| *s == SignatureScheme::ML_DSA_87),
+            "strip must remove what the augmentation added"
         );
     }
 

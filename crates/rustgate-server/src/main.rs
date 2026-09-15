@@ -647,13 +647,24 @@ fn main() -> anyhow::Result<()> {
     #[cfg(all(feature = "mldsa-certs", not(feature = "post-quantum")))]
     let provider = Some(rustls::crypto::aws_lc_rs::default_provider());
 
+    // rustls >= 0.23.45 ships ML-DSA-44/65/87 in the stock aws-lc-rs set, so
+    // an aws-lc-rs provider accepts ML-DSA issuers out of the box. Strip them
+    // unless the operator opted in — otherwise --mldsa-client-certs gates
+    // nothing and the audit event below is never emitted for a widening that
+    // happened anyway. On a post-quantum-only build there is no opt-in path
+    // at all, so the strip is unconditional there.
+    #[cfg(all(feature = "post-quantum", not(feature = "mldsa-certs")))]
+    let provider = provider.map(rustgate_tls::without_mldsa_verification);
+
     // Augment (never replace) whatever base the build selected, so ML-DSA
-    // verification and PQ key exchange can both be active at once.
+    // verification and PQ key exchange can both be active at once. The
+    // augmentation is itself built on the stripped baseline, so ML-DSA-87 is
+    // present exactly once and 44/65 never.
     #[cfg(feature = "mldsa-certs")]
     let provider = if cli.tls.mldsa_client_certs {
         provider.map(rustgate_tls::with_mldsa_verification)
     } else {
-        provider
+        provider.map(rustgate_tls::without_mldsa_verification)
     };
 
     #[cfg(not(feature = "mldsa-certs"))]

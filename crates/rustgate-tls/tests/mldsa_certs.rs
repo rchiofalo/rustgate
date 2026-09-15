@@ -9,7 +9,7 @@
 //! self-signed ML-DSA CA as both the anchor *and* the end entity passes
 //! happily while executing **zero** ML-DSA verification code. Every test here
 //! therefore uses a chain where the leaf is genuinely *signed by* the anchor,
-//! and [`stock_provider_rejects_mldsa_issued_chain`] is the mandatory negative
+//! and [`flag_off_provider_rejects_mldsa_issued_chain`] is the mandatory negative
 //! control: it runs the identical chain through the unmodified provider and
 //! requires a failure. Without that control, none of the positive results mean
 //! anything.
@@ -34,7 +34,7 @@ use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::mldsa::{MlDsaTestCa, generate_mldsa_ca, issue_leaf_with_spki};
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_tls::{TlsConfig, TlsListener, mldsa_provider};
+use rustgate_tls::{TlsConfig, TlsListener, mldsa_provider, without_mldsa_verification};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
@@ -152,20 +152,27 @@ fn augmented_provider_verifies_mldsa_issued_chain() {
 }
 
 /// **Mandatory negative control.** The identical chain must FAIL against the
-/// unmodified `aws-lc-rs` provider.
+/// provider rustgate installs when `--mldsa-client-certs` is *off* — the
+/// `aws-lc-rs` provider with ML-DSA stripped.
 ///
 /// If this ever passes, the positive test above is proving nothing — it would
 /// mean the chain is being accepted without any ML-DSA signature actually
-/// being checked (for example because the leaf was mistakenly self-signed, or
-/// because upstream started shipping ML-DSA in the default set and the
-/// augmentation became a no-op).
+/// being checked (for example because the leaf was mistakenly self-signed).
+///
+/// This used to run against the *unmodified* `aws-lc-rs` provider, and that
+/// is exactly the case it caught: rustls 0.23.45 started shipping ML-DSA in
+/// the stock set, so the stock provider now accepts this chain and the
+/// opt-in flag would have silently stopped gating anything. The strip is the
+/// fix; this control now pins the flag-off behaviour it restores.
 #[test]
-fn stock_provider_rejects_mldsa_issued_chain() {
+fn flag_off_provider_rejects_mldsa_issued_chain() {
     let chain = mldsa_issued_chain("MLDSA-CLIENT-2");
 
     let verifier =
         WebPkiClientVerifier::builder_with_provider(root_store_with(&chain.ca.cert_der), {
-            Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+            Arc::new(without_mldsa_verification(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
         })
         .build()
         .expect("verifier builds");
@@ -198,9 +205,9 @@ fn stock_provider_rejects_mldsa_issued_chain() {
             );
         }
         other => panic!(
-            "stock provider must reject the chain with UnsupportedSignatureAlgorithm for \
-             ML-DSA-87 — if it accepts, the augmentation is a no-op and the positive test \
-             is vacuous. Got: {other:?}",
+            "flag-off provider must reject the chain with UnsupportedSignatureAlgorithm for \
+             ML-DSA-87 — if it accepts, --mldsa-client-certs gates nothing and the positive \
+             test is vacuous. Got: {other:?}",
         ),
     }
 }
