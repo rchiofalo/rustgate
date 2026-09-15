@@ -124,7 +124,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+      # Pinned, not floating: libFuzzer needs a nightly, but a floating
+      # `nightly` moves under us (2026-08 nightly deprecated
+      # `Atomic::fetch_update`, and `-D warnings` turned that into a build
+      # failure for every fuzz target while stable 1.94 still lacks the
+      # `try_update` replacement). Same date as the rustfmt pin; bump both
+      # together.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly-2026-04-01
+        with:
+          toolchain: nightly-2026-04-01
 
       - name: Install protoc
         # No-op on self-hosted runners where protobuf-compiler is baked into
@@ -139,11 +147,11 @@ jobs:
         # container image; installs via cargo on the GitHub-hosted fallback.
         run: |
           if ! command -v cargo-fuzz >/dev/null 2>&1; then
-            cargo +nightly install cargo-fuzz --locked
+            cargo +nightly-2026-04-01 install cargo-fuzz --locked
           fi
 
       - name: Run fuzzer for 10 minutes
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600
+        run: cargo +nightly-2026-04-01 fuzz run ${{ matrix.target }} -- -max_total_time=600
 
       - name: Upload corpus artifacts
         if: always()
