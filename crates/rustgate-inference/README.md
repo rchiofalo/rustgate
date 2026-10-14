@@ -58,4 +58,4 @@ thresholds, and an empty `models-dir`.
 
 ## License
 
-LicenseRef-Proprietary.
+AGPL-3.0-only, same as the rest of the workspace. See the workspace `LICENSE` and `NOTICE`.

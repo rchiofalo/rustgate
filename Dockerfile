@@ -95,7 +95,7 @@ FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a50
 
 LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
       org.opencontainers.image.description="Secure tactical message router with mTLS and NATS bridge" \
-      org.opencontainers.image.licenses="LicenseRef-Proprietary"
+      org.opencontainers.image.licenses="AGPL-3.0-only"
 
 # Drop SUID/SGID bits from any binaries the base image ships. STIG
 # V-RHEL-08-010040 family requires that no setuid/setgid binaries

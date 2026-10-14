@@ -86,6 +86,5 @@ decode/encode library matching the pattern of `rustgate-asterix` and
 
 ## License
 
-Same as the rest of the workspace: dual-licensed under AGPL-3.0
-(individuals) or a commercial EULA (corporations); see the workspace
-root for details.
+AGPL-3.0-only, same as the rest of the workspace. See the workspace `LICENSE`
+and `NOTICE`.

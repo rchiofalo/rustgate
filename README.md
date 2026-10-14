@@ -8,7 +8,7 @@
   <a href="https://ghcr.io/rchiofalo/rustgate"><img src="https://img.shields.io/badge/docker-ghcr.io-blue?logo=docker" alt="Docker"></a>
   <a href="https://securityscorecards.dev/viewer/?uri=github.com/rchiofalo/rustgate"><img src="https://api.securityscorecards.dev/projects/github.com/rchiofalo/rustgate/badge" alt="OpenSSF Scorecard"></a>
   <img src="https://img.shields.io/badge/rust-1.94%2B-orange.svg?logo=rust" alt="Rust 1.94+">
-  <img src="https://img.shields.io/badge/license-Proprietary-blue.svg" alt="License">
+  <img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg" alt="License: AGPL-3.0-only">
 </p>
 
 <p align="center">
@@ -889,4 +889,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, building, testing, cod
 
 ## License
 
-Proprietary. See [LICENSE](LICENSE) for details.
+Licensed under the GNU Affero General Public License, version 3 only
+(`AGPL-3.0-only`). See [LICENSE](LICENSE) for the license text and
+[NOTICE](NOTICE) for the copyright notice, the grant covering every prior
+revision of this repository, and an additional permission for linking
+AWS-LC in `fips` builds.
+
+In short: you may use, modify, and redistribute rustgate, but if you
+distribute a modified version — or let users interact with one over a
+network — you must make its complete source available under the same
+license.

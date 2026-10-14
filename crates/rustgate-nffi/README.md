@@ -109,5 +109,5 @@ a parallel PR that closes the issue.
 
 ## License
 
-Proprietary. See workspace `LICENSE` for the dual-license terms
-(AGPLv3 for individuals, commercial EULA for corporations).
+AGPL-3.0-only, same as the rest of the workspace. See the workspace `LICENSE`
+and `NOTICE`.

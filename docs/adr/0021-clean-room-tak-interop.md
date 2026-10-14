@@ -10,6 +10,20 @@
   *Lotus Dev. Corp. v. Borland Int'l*, 516 U.S. 233 (1996),
   17 U.S.C. §102(b), 17 U.S.C. §105
 
+> **Update (2026-10, relicensed to AGPL-3.0-only, #1727).** This ADR was
+> written while rustgate was proprietary, and its body says so. The
+> clean-room rule **still stands unchanged**, but its justification has
+> shifted. AGPL-3.0 and GPLv3 may be combined (section 13 of each license
+> permits it), so copying GPLv3 code is no longer an outright license
+> conflict. The rule now rests on three things: (1) copied code would bring
+> in copyright owned by a third party, ending the sole-ownership position
+> that allows rustgate to be relicensed or dual-licensed; (2) EPL-licensed
+> code is generally not GPL-compatible at all, so the FreeTAKServer / taky
+> conflict remains; and (3) the independent-creation record below is
+> still what defends the vendored schemas. Where the body says "the
+> proprietary license", read "rustgate's license and its sole-ownership
+> requirement".
+
 > **This ADR is engineering policy, not legal advice.** It records the
 > rules the project follows to keep interoperability work clean and the
 > reasoning behind them. Nothing here guarantees any litigation outcome.
@@ -35,7 +49,8 @@ The TAK reference implementations are:
 - **FreeTAKServer**, **taky** — third-party OSS reimplementations under
   GPL/EPL-family licenses.
 
-rustgate ships under a **proprietary** license. GPL/EPL source text cannot
+When this ADR was written rustgate shipped under a **proprietary** license
+(it is now AGPL-3.0-only; see the update above). GPL/EPL source text cannot
 live in it. The whole question is therefore: *what may we legitimately use
 to build interoperable code, and what must we never touch?*
 

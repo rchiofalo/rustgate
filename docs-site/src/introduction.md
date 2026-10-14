@@ -30,5 +30,5 @@ This documentation is the canonical reference for operators, integrators, and co
 ## Source
 
 - Repository: <https://github.com/rchiofalo/rustgate>
-- License: Proprietary — see [LICENSE](https://github.com/rchiofalo/rustgate/blob/main/LICENSE)
+- License: AGPL-3.0-only — see [LICENSE](https://github.com/rchiofalo/rustgate/blob/main/LICENSE) and [NOTICE](https://github.com/rchiofalo/rustgate/blob/main/NOTICE)
 - Security policy: [SECURITY.md](https://github.com/rchiofalo/rustgate/blob/main/SECURITY.md)

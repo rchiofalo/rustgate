@@ -163,7 +163,7 @@ FROM registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:9-latest
 
 LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
       org.opencontainers.image.description="Secure tactical message router with mTLS and NATS bridge (Iron Bank build)" \
-      org.opencontainers.image.licenses="LicenseRef-Proprietary" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
       mil.dod.ironbank.build="true"
 
 # Install ca-certificates (UBI minimal does NOT include them by default,

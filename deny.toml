@@ -186,8 +186,11 @@ allow = [
 ]
 
 # aws-lc-sys and aws-lc-fips-sys are licensed ISC + Apache-2.0 + OpenSSL.
-# The OpenSSL license is FSF-approved. These crates provide the crypto
-# primitives for rustls (default) and FIPS 140-3 validated builds.
+# These crates provide the crypto primitives for the aws-lc-rs backend
+# (`fips`, `post-quantum`, `mldsa-certs`, `mavlink-pq`); the default build
+# uses ring. The FSF considers the OpenSSL / SSLeay licenses incompatible with
+# the GPL family, so rustgate's NOTICE carries an AGPL-3.0 section 7
+# additional permission covering the combination with AWS-LC.
 [[licenses.exceptions]]
 allow = ["OpenSSL"]
 crate = "aws-lc-sys"
@@ -197,8 +200,9 @@ crate = "aws-lc-fips-sys"
 
 # ocsp-stapler is MPL-2.0. The MPL-2.0 is a file-level (weak) copyleft: only
 # modifications to MPL-licensed source files must be released under MPL.
-# Linking the unmodified upstream crate into a proprietary binary is
-# explicitly permitted, so this exception is safe for downstream consumers.
+# It is compatible with rustgate's AGPL-3.0-only license: MPL-2.0 names the
+# GNU licenses as "Secondary Licenses" (section 3.3), and ocsp-stapler does
+# not carry the Exhibit B "Incompatible With Secondary Licenses" notice.
 [[licenses.exceptions]]
 allow = ["MPL-2.0"]
 crate = "ocsp-stapler"
@@ -216,122 +220,126 @@ crate = "ocsp-stapler"
 allow = ["Apache-2.0 WITH LLVM-exception"]
 crate = "ar_archive_writer"
 
+# Workspace crates. rustgate is licensed AGPL-3.0-only (see LICENSE and
+# NOTICE). AGPL-3.0 is deliberately NOT in the global `allow` list above:
+# pulling in a third-party AGPL dependency should be a reviewed decision,
+# so the allowance is pinned to our own crates by name.
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-core"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-cot"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-enrollment"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-nats"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-proto"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-transport"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-websocket"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-server"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-federation"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-test-utils"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-client"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-authz"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-mqtt"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-http"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-mavlink"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-resilience"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-stanag4586"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-meshtastic"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-asterix"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-dis"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-guard"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-admin"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-archive"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-metrics"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-tls"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-router"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-sapient"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-nffi"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-vmf"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-link16"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-missions"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-lattice"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-foundry"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-dds"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-ogc-sensorthings"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-correlation"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-operator"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-inference"
 [[licenses.exceptions]]
-allow = ["LicenseRef-Proprietary"]
+allow = ["AGPL-3.0-only"]
 crate = "rustgate-codec-schema"
 
 [bans]
