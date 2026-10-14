@@ -39,7 +39,7 @@ guidance:
    open standard (CoT, MAVLink, MQTT, NATS, gRPC + Protobuf, mTLS,
    SPIFFE, Cedar, JREAP-C/Link 16, VMF, DIS, STANAG 4586, ASTERIX,
    SAPIENT, NFFI, OGC SensorThings, FIPS 140-3, GeoJSON). See §5 for
-   the full standards inventory. rustgate adds no proprietary wire
+   the full standards inventory. rustgate adds no vendor-locked wire
    formats.
 
 4. **Certified Conformance** — every standard implementation has
@@ -180,7 +180,7 @@ as of v0.8.0.
 | **GeoJSON (RFC 7946)** | `rustgate-core::geo`, `rustgate-foundry`, others | Position projection + GeoJSON output |
 | **TAK Data-Packages** | `rustgate-missions` | Lightweight package store + REST API |
 
-The codebase contains **zero proprietary wire formats**. Every
+The codebase contains **zero vendor-locked wire formats**. Every
 serialization surface is either a published standard, a thin
 projection of one (e.g. JSON envelope around CoT), or an explicitly
 internal type whose serialization shape is pinned by integration

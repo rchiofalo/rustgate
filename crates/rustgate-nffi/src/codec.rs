@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! NFFI XML codec — typed [`NffiDocument`] / [`NffiTrack`] decode
 //! plus the `EntityCodec` implementation that participates in the

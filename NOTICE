@@ -1,0 +1,44 @@
+rustgate
+Copyright (C) 2026 Roberto Chiofalo
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, version 3 of the License only.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public
+License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program in the LICENSE file. If not, see
+<https://www.gnu.org/licenses/>.
+
+SPDX-License-Identifier: AGPL-3.0-only
+
+
+Prior revisions
+---------------
+
+Revisions of this repository committed before the license change carry an
+earlier LICENSE file. Its terms are superseded: the copyright holder
+licenses every revision in this repository's history, including those
+earlier revisions, under the GNU Affero General Public License, version 3
+only.
+
+
+Additional permission under GNU AGPL version 3 section 7
+--------------------------------------------------------
+
+If you modify this Program, or any covered work, by linking or combining it
+with AWS-LC (including the aws-lc-sys and aws-lc-fips-sys crates), or a
+modified version of that library, containing parts covered by the terms of
+the OpenSSL License or the original SSLeay License, the licensors of this
+Program grant you additional permission to convey the resulting work.
+Corresponding Source for a non-source form of such a combination shall
+include the source code for the parts of AWS-LC used as well as that of the
+covered work.
+
+(This permission matters for builds using the `fips` feature, which link
+aws-lc-fips-sys. The default build uses ring, licensed Apache-2.0 AND ISC,
+and does not need it.)

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+# SPDX-License-Identifier: AGPL-3.0-only
 # check-playbook-drift.sh — enforce shared-infrastructure patterns mechanically.
 #
 # Run from the repository root. Emits GitHub Actions

@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! ROS 2 wire compatibility on top of [`crate::real::RealDdsBridge`].
 //!

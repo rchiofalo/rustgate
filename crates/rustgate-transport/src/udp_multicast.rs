@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Native IPv4 UDP multicast CoT input + optional rebroadcast egress.
 //!

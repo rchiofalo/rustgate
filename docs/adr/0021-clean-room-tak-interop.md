@@ -10,6 +10,18 @@
   *Lotus Dev. Corp. v. Borland Int'l*, 516 U.S. 233 (1996),
   17 U.S.C. §102(b), 17 U.S.C. §105
 
+> **Update (2026-10, relicensed to AGPL-3.0-only, #1727).** This ADR
+> predates rustgate's relicensing. The clean-room rule **still stands
+> unchanged**, but its justification has shifted. AGPL-3.0 and GPLv3 may be combined (section 13 of each license
+> permits it), so copying GPLv3 code is no longer an outright license
+> conflict. The rule now rests on three things: (1) copied code would bring
+> in copyright owned by a third party, ending the sole-ownership position
+> that allows rustgate to be relicensed or dual-licensed; (2) EPL-licensed
+> code is generally not GPL-compatible at all, so the FreeTAKServer / taky
+> conflict remains; and (3) the independent-creation record below is
+> still what defends the vendored schemas. The body below has been
+> worded in those terms.
+
 > **This ADR is engineering policy, not legal advice.** It records the
 > rules the project follows to keep interoperability work clean and the
 > reasoning behind them. Nothing here guarantees any litigation outcome.
@@ -35,8 +47,9 @@ The TAK reference implementations are:
 - **FreeTAKServer**, **taky** — third-party OSS reimplementations under
   GPL/EPL-family licenses.
 
-rustgate ships under a **proprietary** license. GPL/EPL source text cannot
-live in it. The whole question is therefore: *what may we legitimately use
+rustgate is licensed **AGPL-3.0-only** and must remain entirely its
+copyright holder's own work (see the update above). GPL/EPL source text
+cannot live in it. The whole question is therefore: *what may we legitimately use
 to build interoperable code, and what must we never touch?*
 
 ### The distinction that controls everything
@@ -50,8 +63,8 @@ Two things are routinely conflated and must be kept apart:
 2. **A specific implementation's source code** — the Java/Python/Rust that
    *realizes* the protocol, including its comments, internal structure,
    helper logic, and test fixtures. This is protected expression; copying
-   it from a copyleft project imports obligations the proprietary license
-   cannot satisfy.
+   it from a copyleft project imports third-party copyright and license
+   obligations that rustgate's sole-ownership requirement cannot absorb.
 
 rustgate may freely re-express (1). rustgate must never copy (2).
 
@@ -136,8 +149,10 @@ applied to the bit-level codecs.)
 Every vendored/re-expressed third-party schema or IDL file MUST begin
 with a header of this shape:
 
+<!-- REUSE-IgnoreStart -->
 ```proto
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Independent clean-room implementation of the public <PROTOCOL> wire
 // format for interoperability. The field names, types, and numbers below
@@ -147,6 +162,7 @@ with a header of this shape:
 // Authored from public protocol documentation and observed wire behavior.
 // See docs/adr/0021-clean-room-tak-interop.md.
 ```
+<!-- REUSE-IgnoreEnd -->
 
 The header is the contemporaneous, per-file record of independent
 authorship. It is deliberately **not** a third-party attribution / GPL
@@ -211,8 +227,9 @@ that makes (3) concrete.
   path; couples release cadence to a third-party license and contradicts
   vendor neutrality. Revisit only if a formal partnership is pursued.
 - **Vendor FreeTAKServer/taky logic directly.** Fastest to "working",
-  imports GPL/EPL obligations incompatible with the proprietary license —
-  a non-starter.
+  imports third-party GPL/EPL copyright that rustgate's sole-ownership
+  requirement rules out (and EPL is not GPL-compatible at all) — a
+  non-starter.
 - **Ship a GPLv3 NOTICE for the existing protos.** *Rejected* — it would
   assert the files are GPL-derived, conceding derivative status the audit
   found to be false and undercutting the independent-creation defense. The

@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Closed-form conversion between WGS-84 geodetic (lat / lon / alt)
 //! and ECEF (Earth-Centred-Earth-Fixed Cartesian) coordinates.

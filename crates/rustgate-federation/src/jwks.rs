@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! JSON Web Key Set (JWKS, RFC 7517) representation, key-rotation state
 //! machine, and PEM key loading for federation JWT authentication.

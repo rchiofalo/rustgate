@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Hand-rolled protobuf wire-format primitives and the typed
 //! [`TakPacket`] / [`Pli`] / [`GeoChat`] message structs used by

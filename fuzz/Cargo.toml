@@ -5,6 +5,9 @@ name = "rustgate-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+# Excluded from the main workspace (it has its own [workspace]), so it cannot
+# inherit `license.workspace`; keep in step with the root Cargo.toml.
+license = "AGPL-3.0-only"
 
 [package.metadata]
 cargo-fuzz = true

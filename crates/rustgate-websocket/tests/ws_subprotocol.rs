@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Integration tests for WebSocket subprotocol negotiation (RFC 6455 §4.2.2).
@@ -237,7 +238,7 @@ async fn client_offers_none_leaves_protocol_unset() {
 #[tokio::test]
 async fn subprotocol_no_match_lenient_completes_without_header() {
     let (addr, client_tls, handle) = spawn_listener(vec!["cot.v2".to_string()]);
-    let req = request_for(addr.port(), &["proprietary.only", "also.unsupported"]);
+    let req = request_for(addr.port(), &["vendor.only", "also.unsupported"]);
     let err = connect_expecting_error(addr, &client_tls, req).await;
     let msg = err.to_string();
     // The error must NOT be a server-side 400 — instead tungstenite's
@@ -266,7 +267,7 @@ async fn subprotocol_no_match_lenient_completes_without_header() {
 async fn subprotocol_no_match_strict_rejects_with_400() {
     let (addr, client_tls, handle) =
         spawn_listener_with(strict_config_with(vec!["cot.v2".to_string()]));
-    let req = request_for(addr.port(), &["proprietary.only", "also.unsupported"]);
+    let req = request_for(addr.port(), &["vendor.only", "also.unsupported"]);
     let err = connect_expecting_error(addr, &client_tls, req).await;
     let msg = err.to_string();
     // tungstenite reports a server 400 as `HttpFormat` / `Http` with the

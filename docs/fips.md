@@ -106,6 +106,22 @@ The CI pipeline includes a dedicated `fips` job that:
 
 This requires runners with Go and cmake installed.
 
+## Licensing
+
+A FIPS build links **AWS-LC** through the `aws-lc-fips-sys` crate. Parts of
+AWS-LC are covered by the OpenSSL License and the original SSLeay License,
+which the Free Software Foundation considers incompatible with the GPL family
+of licenses, including rustgate's `AGPL-3.0-only`.
+
+rustgate's [`NOTICE`](https://github.com/rchiofalo/rustgate/blob/main/NOTICE)
+therefore grants an **additional permission under AGPL-3.0 section 7**: you may
+convey a build that combines rustgate with AWS-LC. When you distribute such a
+build in non-source form, the Corresponding Source you provide must include the
+source of the AWS-LC parts used as well as rustgate's own source.
+
+The default build uses `ring` (`Apache-2.0 AND ISC`) and does not rely on this
+permission.
+
 ## Known Limitations
 
 - **Ring is still linked**: When `fips` is enabled, aws-lc-rs is added as the crypto provider but ring remains compiled in as a workspace dependency. The FIPS provider is installed as the process-default, and all TLS code paths (including federation) use `CryptoProvider::get_default()` to ensure the FIPS provider is used at runtime.

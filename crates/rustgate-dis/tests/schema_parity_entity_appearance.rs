@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Schema-parity test for the DIS Entity Appearance bitfield
 //! (IEEE 1278.1 § 5.3.3.1.6 Land Platform variant).

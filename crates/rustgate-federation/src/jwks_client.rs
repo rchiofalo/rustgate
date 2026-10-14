@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Remote JWKS (RFC 7517) URL fetching with periodic refresh and
 //! fail-closed degradation. Refs #952.

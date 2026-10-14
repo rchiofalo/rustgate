@@ -172,8 +172,20 @@ The workspace is organized as independent crates under `crates/`:
 2. Add it to `members` in the root `Cargo.toml`
 3. Inherit workspace fields: `version`, `edition`, `rust-version`, `license`, `repository`
 4. Add `[lints] workspace = true` (unless the crate needs custom lint overrides)
-5. Add a `[[licenses.exceptions]]` entry in `deny.toml` for the proprietary license
+5. Add a `[[licenses.exceptions]]` entry in `deny.toml` allowing `AGPL-3.0-only` for the new crate
 6. Add a `description` field for the crate
+7. Start every new source file (`.rs`, `.proto`, `.py`, `.sh`) with the
+   [REUSE](https://reuse.software) SPDX header — after the shebang, if any:
+
+   <!-- REUSE-IgnoreStart -->
+   ```rust
+   // SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+   // SPDX-License-Identifier: AGPL-3.0-only
+   ```
+   <!-- REUSE-IgnoreEnd -->
+
+   CI runs `reuse lint` and fails on a source file without it. Docs, config
+   and test data are covered by `REUSE.toml` instead.
 
 ## Adding a new protocol schema-parity test
 
@@ -541,10 +553,14 @@ must pass before a PR is mergeable:
 
 ## Clean-room rule for third-party protocols (MANDATORY)
 
-rustgate ships under a **proprietary** license and interoperates with
-protocols whose reference implementations are **copyleft** (the TAK
-ecosystem — ATAK-CIV and TAK Server are GPLv3; FreeTAKServer / taky are
-GPL/EPL). When you write code that speaks one of these protocols, follow
+rustgate is licensed **AGPL-3.0-only** and interoperates with protocols
+whose reference implementations are **copyleft** (the TAK ecosystem —
+ATAK-CIV and TAK Server are GPLv3; FreeTAKServer / taky are GPL/EPL).
+AGPL-3.0 can legally be combined with GPLv3 code, but that does **not**
+relax this rule: copied third-party code would bring in copyright owned by
+someone else, and rustgate must remain entirely its copyright holder's own
+work so it can be relicensed or dual-licensed. EPL-licensed code is
+generally not GPL-compatible at all. When you write code that speaks one of these protocols, follow
 [ADR 0021](docs/adr/0021-clean-room-tak-interop.md) exactly. The short
 version:
 

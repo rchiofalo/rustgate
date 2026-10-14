@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+# SPDX-License-Identifier: AGPL-3.0-only
 # zarf-prebuild-mtls-ca.sh — generate or import a development mTLS CA
 # for the rustgate Zarf bundle.
 #

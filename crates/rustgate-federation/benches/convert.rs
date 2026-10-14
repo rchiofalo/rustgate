@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Gated at the Cargo manifest level via `required-features = ["v2"]`
 // on the matching `[[bench]]` block — when the `v2` feature is off,

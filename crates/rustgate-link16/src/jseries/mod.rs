@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! J-series message bodies carried inside a JREAP-C
 //! [`crate::header::JreapMessageType::JseriesData`] frame.

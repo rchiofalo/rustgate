@@ -77,6 +77,23 @@ jobs:
       - name: Enforce shared-infrastructure patterns
         run: bash scripts/check-playbook-drift.sh
 
+      - name: REUSE licensing compliance
+        # Every tracked file must carry machine-readable copyright and license
+        # information: an SPDX header for source files, or a REUSE.toml
+        # annotation for docs, config and test data. REUSE.toml deliberately
+        # does not match *.rs / *.proto / *.py / *.sh, so a new source file
+        # without an SPDX header fails here. Installed into a venv to avoid
+        # the PEP 668 "externally managed" error on system Python; version
+        # pinned for reproducibility.
+        run: |
+          if ! python3 -c 'import ensurepip' 2>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends python3-venv
+          fi
+          python3 -m venv "$RUNNER_TEMP/reuse-venv"
+          "$RUNNER_TEMP/reuse-venv/bin/pip" install --quiet 'reuse[charset-normalizer]==6.2.0'
+          "$RUNNER_TEMP/reuse-venv/bin/reuse" lint
+
       - name: Install Python YAML dependency
         # PyYAML is preinstalled on ubuntu-latest hosted runners but is absent
         # on the minimal self-hosted Linux runners. Install via apt rather

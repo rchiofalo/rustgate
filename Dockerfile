@@ -95,7 +95,7 @@ FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a50
 
 LABEL org.opencontainers.image.source="https://github.com/rchiofalo/rustgate" \
       org.opencontainers.image.description="Secure tactical message router with mTLS and NATS bridge" \
-      org.opencontainers.image.licenses="LicenseRef-Proprietary"
+      org.opencontainers.image.licenses="AGPL-3.0-only"
 
 # Drop SUID/SGID bits from any binaries the base image ships. STIG
 # V-RHEL-08-010040 family requires that no setuid/setgid binaries
@@ -114,6 +114,14 @@ RUN apk add --no-cache ca-certificates \
 USER 10001:10001
 
 COPY --from=builder --chmod=755 /src/target/release/rustgate /usr/local/bin/rustgate
+# AGPL-3.0 requires a copy of the license to accompany every distributed copy
+# of the program, and a container image is one. NOTICE carries the copyright,
+# the grant covering prior revisions, and the section 7 additional permission
+# for AWS-LC. Deliberately no --chmod: BuildKit applies it to the directory
+# it creates as well, and 444 there left the files unreadable to the
+# non-root runtime user. Plain COPY yields root-owned 0755 / 0644: readable
+# by the runtime user, not writable by it.
+COPY LICENSE NOTICE /usr/share/licenses/rustgate/
 
 EXPOSE 4433 8443 8446 8883 9000 9001 9090
 

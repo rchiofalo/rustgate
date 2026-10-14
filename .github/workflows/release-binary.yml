@@ -147,7 +147,13 @@ jobs:
           else
             ARCHIVE="rustgate-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
           fi
-          tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" rustgate
+          # Ship the license alongside the binary: AGPL-3.0 requires a copy to
+          # accompany every distributed copy of the program, and NOTICE
+          # carries the copyright plus the section 7 permission that FIPS
+          # builds (which link AWS-LC) rely on. The second -C is absolute
+          # because tar resolves each -C relative to the previous one.
+          tar -czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" rustgate \
+            -C "$GITHUB_WORKSPACE" LICENSE NOTICE
           echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
 
       - name: Verify archive name matches build variant

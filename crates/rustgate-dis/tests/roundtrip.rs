@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Integration tests for the rustgate-dis codec — wire-format
 //! round-trip, ECEF↔WGS-84 conversion, malformed-input rejection,

@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Generic codec-pluggable **TCP** ingress for stream-framed tactical
 //! protocols (SAPIENT, NFFI, Link 16 JREAP-C, …) — the connection-oriented
