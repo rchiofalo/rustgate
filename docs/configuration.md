@@ -90,7 +90,7 @@ Per-UID delta encoding reduces outbound bandwidth for CoT workloads where the sa
 | `--authz-policy-format` | `RUSTGATE_AUTHZ_POLICY_FORMAT` | `native` | Policy format: `native` (default JSON ruleset) or `cedar` (requires `--features cedar`). |
 | `--authz-reload-interval` | `RUSTGATE_AUTHZ_RELOAD_INTERVAL` | `5` | Seconds between hot-reload polls of the policy file. Must be >= 1 when `--authz-policy-file` is set. Native backend only. |
 | `--authz-fail-open` | `RUSTGATE_AUTHZ_FAIL_OPEN` | `false` | When the initial load fails, start without an engine instead of aborting. Default is fail-closed. |
-| `--authz-no-policy-allow` | `RUSTGATE_AUTHZ_NO_POLICY_ALLOW` | `false` | Secure-by-default warm-up opt-out ([ADR 0036](adr/0036-secure-by-default-warmup.md)). Acknowledge that no routing policy is configured on purpose (router stays app-layer-open) and silence the no-policy warm-up warning. No behaviour change this release. |
+| `--authz-no-policy-allow` | `RUSTGATE_AUTHZ_NO_POLICY_ALLOW` | `false` | Secure-by-default warm-up opt-out ([ADR 0036](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0036-secure-by-default-warmup.md)). Acknowledge that no routing policy is configured on purpose (router stays app-layer-open) and silence the no-policy warm-up warning. No behaviour change this release. |
 
 See [docs/authorization.md](authorization.md) for the policy format and
 [docs/runbooks/authz.md](runbooks/authz.md) for operational guidance.
@@ -101,7 +101,7 @@ Three convenient-but-unsafe defaults are being tightened over two
 releases. **This release only warns** — it names, at startup, what will
 change and gives each an opt-out flag to pre-pin the current posture and
 silence the warning. See
-[ADR 0036](adr/0036-secure-by-default-warmup.md) for the full staging.
+[ADR 0036](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0036-secure-by-default-warmup.md) for the full staging.
 
 | Warm-up warning fires when… | Opt-out flag | Env Var |
 |---|---|---|

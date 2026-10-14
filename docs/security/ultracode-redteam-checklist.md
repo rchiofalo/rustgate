@@ -314,7 +314,7 @@ A **gap** is a real bug — verify, don't assume:
 - [ ] `std::sync::Mutex` held across `.await` (footgun)
 - [ ] Connection-reject / event-drop paths missing an `audit::*` event (#1500)
 - [ ] New `#[allow(...)]` in production without a `// justification:` (CI: `check-allow-justified.py`)
-- [ ] New `.rs` missing the `// Copyright © 2026 Roberto Chiofalo.` header
+- [ ] New source file (`.rs` / `.proto` / `.py` / `.sh`) missing its two-line SPDX copyright + license header (see CONTRIBUTING; CI: `reuse lint`)
 - [ ] Banned deps (`openssl`, `openssl-sys`, `native-tls`) — `cargo deny check`
 
 ---

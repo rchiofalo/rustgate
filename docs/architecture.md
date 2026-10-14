@@ -330,7 +330,7 @@ stays flat (~51–58 Melem/s), roughly 8x faster at 16 workers. The dedup
 cache and the connection rate limiter keep their single-lock shapes on
 purpose — a raw `DashMap` swap would drop the dedup LRU/eviction
 accounting and fragment the limiter's sliding-window bookkeeping. See
-[ADR 0028](adr/0028-sharded-maps-for-contended-hot-path.md) and the
+[ADR 0028](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0028-sharded-maps-for-contended-hot-path.md) and the
 `crates/rustgate-router/benches/dedup_contention.rs` baseline.
 
 ## NATS Bridge

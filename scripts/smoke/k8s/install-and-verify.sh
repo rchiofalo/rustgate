@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+# SPDX-License-Identifier: AGPL-3.0-only
 # install-and-verify.sh — one-liner sanity test for the rustgate Kubernetes
 # operator (closes #874).
 #

@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Audit-trail regression test for the `/api/v1/*` management endpoints

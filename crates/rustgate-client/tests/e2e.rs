@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! End-to-end tests using `rustgate-client` against a real `TlsListener`.

@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Integration tests for the VMF codec — end-to-end wire round-trips
 //! that exercise [`rustgate_vmf::VmfCodec`] through the full

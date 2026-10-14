@@ -298,7 +298,7 @@ metadata channel — the value flows into `trust_cert_cn`:
 | etcd    | `trust-cn=<CN>` token on the bare `host:port` value, or `trust_cert_cn` in the JSON `PeerConfig` form | `10.0.0.1:9000 trust-cn=fed-prod-east` |
 | DNS-SD  | `trust_cn=<CN>` TXT record | `trust_cn=fed-prod-east` |
 
-See [ADR 0029](adr/0029-discovered-peer-cn-pinning.md) for the full
+See [ADR 0029](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0029-discovered-peer-cn-pinning.md) for the full
 trust-model rationale and the alternatives considered (including why the
 default is chain-only rather than fail-closed).
 

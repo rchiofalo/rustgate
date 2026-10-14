@@ -119,7 +119,7 @@ If NATS itself is lost, all HA coordination stops. Recovery:
 > dependency — there is no NATS-free clustering path yet. The direction for a
 > restart-safe, NATS-optional HA story (durable-store-backed ownership
 > leases) is recorded in
-> [ADR 0031](adr/0031-production-hardening-ha-and-edge.md); native leaderless
+> [ADR 0031](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0031-production-hardening-ha-and-edge.md); native leaderless
 > clustering is deferred to a follow-up issue. Until it lands, keep NATS
 > highly available if you rely on multi-pod HA.
 

@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# REUSE (https://reuse.software) licensing metadata for files that cannot,
+# or should not, carry an inline header. `reuse lint` runs in CI.
+#
+# Source files (*.rs, *.proto, *.py, *.sh) are deliberately NOT matched here:
+# they must carry their own SPDX header, so a new source file added without
+# one fails the lint instead of being silently covered.
+#
+# The AGPL-3.0 section 7 additional permission for AWS-LC lives in NOTICE.
+
+version = 1
+
+# Documentation, the docs site, and brand assets.
+[[annotations]]
+path = ["**/*.md", "docs-site/**", "assets/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Roberto Chiofalo"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# Build, packaging, deployment, CI and dependency metadata.
+[[annotations]]
+path = [
+    "**/*.toml", "**/*.yaml", "**/*.yml", "**/*.json", "**/Cargo.lock",
+    "**/*.example", "**/.gitignore", ".dockerignore", ".env.example",
+    "Dockerfile*", ".github/**", "helm/**", "deploy/**", "bundle/**",
+    "zarf/**", "ops/**", "dashboards/**", "ci/**", "schemas/**", "examples/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Roberto Chiofalo"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# Test data: fuzz seed corpora, binary test fixtures, snapshot fixtures, and
+# proptest regression seeds.
+[[annotations]]
+path = ["fuzz/corpus/**", "**/tests/fixtures/**", "**/*.snap", "**/*.proptest-regressions"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Roberto Chiofalo"
+SPDX-License-Identifier = "AGPL-3.0-only"

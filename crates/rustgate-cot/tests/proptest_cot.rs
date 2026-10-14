@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 #![allow(clippy::panic, clippy::unwrap_used)]
 //! Property-based tests for CoT XML parsing using proptest.

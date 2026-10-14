@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Outbound and inbound wiring between the rustgate router and a
 //! [`crate::bridge::DdsBridge`] implementation.

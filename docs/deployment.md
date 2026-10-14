@@ -124,7 +124,7 @@ curl http://localhost:9090/metrics
 
 For a tactical edge node running the binary directly under systemd (no
 Kubernetes), a hardened unit file and setup guide ship in
-[`deploy/systemd/`](../deploy/systemd/README.md). The unit uses
+[`deploy/systemd/`](https://github.com/rchiofalo/rustgate/blob/main/deploy/systemd/README.md). The unit uses
 `Type=simple` (rustgate emits no `sd_notify` signal today), a `DynamicUser`
 sandbox, `NoNewPrivileges` / `ProtectSystem=strict`, an `EnvironmentFile`
 for secrets, and `Restart=on-failure`.
@@ -133,7 +133,7 @@ for secrets, and `Restart=on-failure`.
 
 For how many clients an instance holds and how the admission-control knobs
 (`--max-queued-bytes`, `--max-connections`, `--max-concurrent-handshakes`)
-bound memory and CPU, see [`docs/capacity-planning.md`](capacity-planning.md)
+bound memory and CPU, see [`docs/capacity-planning.md`](https://github.com/rchiofalo/rustgate/blob/main/docs/capacity-planning.md)
 — including a worked 5,000-client example and a client-count → resource
 table.
 

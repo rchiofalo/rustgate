@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Integration test for the Consul peer-discovery backend's response handling
 //! (#1619): a normal catalog response round-trips through the size-capped,

@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Defense-in-depth wrapper that zeroes the CA private key's serialized DER
 //! bytes when the enrollment subsystem is torn down.

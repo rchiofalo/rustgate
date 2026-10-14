@@ -151,8 +151,10 @@ applied to the bit-level codecs.)
 Every vendored/re-expressed third-party schema or IDL file MUST begin
 with a header of this shape:
 
+<!-- REUSE-IgnoreStart -->
 ```proto
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Independent clean-room implementation of the public <PROTOCOL> wire
 // format for interoperability. The field names, types, and numbers below
@@ -162,6 +164,7 @@ with a header of this shape:
 // Authored from public protocol documentation and observed wire behavior.
 // See docs/adr/0021-clean-room-tak-interop.md.
 ```
+<!-- REUSE-IgnoreEnd -->
 
 The header is the contemporaneous, per-file record of independent
 authorship. It is deliberately **not** a third-party attribution / GPL

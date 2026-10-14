@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 Roberto Chiofalo.
+# SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+# SPDX-License-Identifier: AGPL-3.0-only
 """check-release-artifact-names.py — guard against release artifact filename collisions.
 
 F-21 hardening: the `release-binary.yml` workflow builds six variants from a

@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! `check-cert-expiry` — inspect one or more PEM files and report which
 //! X.509 certificates are near (or past) their `notAfter` time.

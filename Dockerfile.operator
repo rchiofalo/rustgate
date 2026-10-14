@@ -82,6 +82,14 @@ RUN apk add --no-cache ca-certificates \
 USER 10001
 
 COPY --from=builder --chmod=755 /src/target/release/rustgate-operator /usr/local/bin/rustgate-operator
+# AGPL-3.0 requires a copy of the license to accompany every distributed copy
+# of the program, and a container image is one. NOTICE carries the copyright,
+# the grant covering prior revisions, and the section 7 additional permission
+# for AWS-LC. Deliberately no --chmod: BuildKit applies it to the directory
+# it creates as well, and 444 there left the files unreadable to the
+# non-root runtime user. Plain COPY yields root-owned 0755 / 0644: readable
+# by the runtime user, not writable by it.
+COPY LICENSE NOTICE /usr/share/licenses/rustgate-operator/
 
 STOPSIGNAL SIGTERM
 

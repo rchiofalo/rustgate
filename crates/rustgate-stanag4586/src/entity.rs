@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! STANAG-4586 implementation of the canonical
 //! [`rustgate_core::entity::EntityCodec`] trait — refs #847.

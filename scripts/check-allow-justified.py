@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 Roberto Chiofalo.
+# SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+# SPDX-License-Identifier: AGPL-3.0-only
 """check-allow-justified.py — require `// justification:` on production `#[allow]`.
 
 F-156 enforcement: every `#[allow(...)]` annotation in production Rust code

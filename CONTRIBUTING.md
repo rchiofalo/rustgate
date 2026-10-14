@@ -174,6 +174,18 @@ The workspace is organized as independent crates under `crates/`:
 4. Add `[lints] workspace = true` (unless the crate needs custom lint overrides)
 5. Add a `[[licenses.exceptions]]` entry in `deny.toml` allowing `AGPL-3.0-only` for the new crate
 6. Add a `description` field for the crate
+7. Start every new source file (`.rs`, `.proto`, `.py`, `.sh`) with the
+   [REUSE](https://reuse.software) SPDX header — after the shebang, if any:
+
+   <!-- REUSE-IgnoreStart -->
+   ```rust
+   // SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+   // SPDX-License-Identifier: AGPL-3.0-only
+   ```
+   <!-- REUSE-IgnoreEnd -->
+
+   CI runs `reuse lint` and fails on a source file without it. Docs, config
+   and test data are covered by `REUSE.toml` instead.
 
 ## Adding a new protocol schema-parity test
 

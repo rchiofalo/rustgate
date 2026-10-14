@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! VMF (Variable Message Format, MIL-STD-6017) bit-level codec for
 //! rustgate. Closes #868 (MVP scope: K05.1 Position Report).

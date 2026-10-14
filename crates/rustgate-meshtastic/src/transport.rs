@@ -1,4 +1,5 @@
-// Copyright © 2026 Roberto Chiofalo.
+// SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Foundational scaffold for the Meshtastic LoRa / serial ingress
 //! seam (design note `docs/design/meshtastic-serial-ingress.md`,

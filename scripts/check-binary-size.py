@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Copyright © 2026 Roberto Chiofalo.
+# SPDX-FileCopyrightText: 2026 Roberto Chiofalo
+# SPDX-License-Identifier: AGPL-3.0-only
 
 """Verify a release binary's size has not regressed against the checked-in baseline.
 

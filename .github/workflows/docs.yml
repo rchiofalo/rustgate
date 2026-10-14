@@ -5,11 +5,16 @@ on:
     branches: [main]
     paths:
       - 'docs-site/**'
+      # The site {{#include}}s pages from docs/ (FIPS, threat model,
+      # runbooks, ...). Without this path an edit to only those files never
+      # reached the published site.
+      - 'docs/**'
       - 'CHANGELOG.md'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - 'docs-site/**'
+      - 'docs/**'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
