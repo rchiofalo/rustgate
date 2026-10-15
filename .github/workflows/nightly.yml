@@ -14,7 +14,7 @@ env:
 
 jobs:
   security-audit:
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write # required for actions-rust-lang/audit to create issues
@@ -45,7 +45,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   container-scan:
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write
@@ -87,7 +87,7 @@ jobs:
         run: docker rmi rustgate:nightly-scan 2>/dev/null || true
 
   fuzz:
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -127,16 +127,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
 
       - name: Install protoc
-        # No-op on self-hosted runners where protobuf-compiler is baked into
-        # the container image; apt-get install on the GitHub-hosted fallback.
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y protobuf-compiler
           fi
 
       - name: Install cargo-fuzz
-        # No-op on self-hosted runners where cargo-fuzz is baked into the
-        # container image; installs via cargo on the GitHub-hosted fallback.
         run: |
           if ! command -v cargo-fuzz >/dev/null 2>&1; then
             cargo +nightly install cargo-fuzz --locked
