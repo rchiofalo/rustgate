@@ -175,7 +175,7 @@ as of v0.8.0.
 | **STANAG 5527 (NFFI)** Friendly-Force Info | `rustgate-nffi` | Blue-Force-Tracking XML codec; APP-6A SIDC parser |
 | **OGC SensorThings v1.0** | `rustgate-ogc-sensorthings` | REST + JSON polling; MQTT half deferred |
 | **NGVA / VICTORY DDS** | `rustgate-dds` | DDS Pub/Sub trait + mock backend; real SDK partner-gated |
-| **FIPS 140-3** validated cryptography | `rustgate-tls` (`fips` feature) | aws-lc-rs FIPS module; CI gate |
+| **FIPS 140-3** cryptography | `rustgate-tls` (`fips` feature) | aws-lc-rs FIPS module; CI gate |
 | **CNSA 2.0** post-quantum (planned) | `rustgate-tls` (`post-quantum` feature) | Hybrid X25519+ML-KEM key exchange |
 | **GeoJSON (RFC 7946)** | `rustgate-core::geo`, `rustgate-foundry`, others | Position projection + GeoJSON output |
 | **TAK Data-Packages** | `rustgate-missions` | Lightweight package store + REST API |

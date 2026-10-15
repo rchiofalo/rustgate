@@ -204,7 +204,7 @@ and authenticated to the network independently of any human user.
   `clippy::unwrap_used = "deny"` in production code. All failure
   paths propagate `Result<T, E>` or structured error types derived
   via `thiserror`.
-- **FIPS 140-3 validated cryptography** (feature `fips`) — the `aws-lc-rs`
+- **FIPS 140-3 cryptography** (feature `fips`; module certification status in [`fips.md`](fips.md)) — the `aws-lc-rs`
   crypto provider is drop-in replaceable for `ring`; the
   `--fips-required` CLI flag hard-fails startup if FIPS mode is not
   active. See [`fips.md`](fips.md).
@@ -588,7 +588,7 @@ This is a digest of the more detailed inventory in
 | SC-7 | Boundary Protection | Backpressure gate, per-IP rate limiter, plaintext listener allowlist gate |
 | SC-8 | Transmission Confidentiality | mTLS (TLS 1.2+), no plaintext fallback path on the federation/client surface |
 | SC-12 | Cryptographic Key Management | HKDF-SHA256 per-archive subkeys, per-key expiration, rotation via `KeyRing` |
-| SC-13 | Cryptographic Protection | rustls + aws-lc-rs (FIPS-validated under `--fips-required`), ChaCha20-Poly1305 AEAD at rest |
+| SC-13 | Cryptographic Protection | rustls + aws-lc-rs (AWS-LC FIPS module under `--fips-required`; certification status in [`fips.md`](fips.md)), ChaCha20-Poly1305 AEAD at rest |
 | SC-28 | Protection of Information at Rest | Encrypted archive format v2 (per-chunk AAD, sealed terminator) |
 
 For the full per-control inventory, including the controls that are

@@ -14,9 +14,9 @@
 // through one of those. This is the binary every such path converges on.
 #[cfg(all(feature = "mldsa-certs", feature = "fips"))]
 compile_error!(
-    "features `mldsa-certs` and `fips` are mutually exclusive: ML-DSA is not part of the \
-     AWS-LC FIPS submission, and `rustls/fips` removes the ML-DSA verification algorithms \
-     entirely. Choose FIPS 140-3 mode or ML-DSA-87 certificate verification, not both."
+    "features `mldsa-certs` and `fips` are not supported together: ML-DSA verification \
+     under the AWS-LC FIPS module is not validated in rustgate (see #1730). Choose FIPS \
+     140-3 mode or ML-DSA-87 certificate verification, not both."
 );
 
 // `tikv-jemallocator` is POSIX-only and the dependency is target-gated
@@ -646,7 +646,7 @@ fn main() -> anyhow::Result<()> {
     // ML-DSA verification — otherwise the first verifier construction panics
     // inside rustls.
     #[cfg(all(feature = "mldsa-certs", not(feature = "post-quantum")))]
-    let provider = Some(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Some(rustgate_tls::aws_lc_rs_provider());
 
     // Augment (never replace) whatever base the build selected, so ML-DSA
     // verification and PQ key exchange can both be active at once.

@@ -28,10 +28,10 @@
 //!
 //! # Why a custom provider is required
 //!
-//! rustls reserves the `ML_DSA_87` [`SignatureScheme`] code point (0x0906) but
-//! its stock `aws-lc-rs` provider does **not** list any ML-DSA algorithm in
-//! `signature_verification_algorithms`. Enabling a Cargo feature alone
-//! therefore changes nothing; the provider's algorithm set has to be rebuilt.
+//! Since rustls 0.23.46 the stock `aws-lc-rs` provider verifies ML-DSA-44/65/87
+//! by default. rustgate keeps that opt-in: every aws-lc-rs provider it installs
+//! starts from [`crate::config::aws_lc_rs_provider`], which removes ML-DSA, and
+//! this module adds ML-DSA-87 (only) back when `--mldsa-client-certs` is set.
 //! Everything downstream picks the augmentation up for free, because
 //! `WebPkiClientVerifier::builder` resolves the process-default provider, and
 //! [`DynamicCertVerifier`](crate::verifier::DynamicCertVerifier) already
@@ -39,10 +39,9 @@
 //!
 //! # Deliberate constraints
 //!
-//! - **Not FIPS.** [`rustls::crypto::CryptoProvider::fips`] is an AND across
-//!   every algorithm, and webpki marks ML-DSA `in_fips_submission: false`, so
-//!   the augmented provider always reports `fips() == false`. `--fips-required`
-//!   and ML-DSA verification are mutually exclusive by construction.
+//! - **Not FIPS.** `mldsa-certs` and `fips` cannot be built together (see the
+//!   guard below), so this provider never runs the FIPS module and reports
+//!   `fips() == false`. Whether to offer ML-DSA under FIPS is tracked in #1730.
 //! - **TLS 1.3 only, in practice.** TLS 1.2's `ClientCertificateType` registry
 //!   has no ML-DSA entry, so a TLS 1.2 `CertificateRequest` cannot coherently
 //!   ask for one. rustls exposes no per-version hook to suppress the
@@ -52,17 +51,14 @@
 //!   end. Promoting it would make dual-credential peers send a ~7 KB ML-DSA
 //!   credential where a ~100-byte ECDSA one would do.
 
-// `rustls/fips` enables `webpki/aws-lc-rs-fips`, and webpki gates its ML-DSA
-// statics on `not(aws-lc-rs-fips)` (aws-lc-rs independently gates its whole
-// `unstable::signature` module on `not(fips)`). The two feature sets cannot
-// coexist, so fail loudly here rather than with a bare "cannot find value
-// `ML_DSA_87`" from a dependency.
+// ML-DSA verification under the AWS-LC FIPS module has not been validated in
+// rustgate, and that module (AWS-LC-FIPS 4.x) has no CMVP certificate yet.
+// Refuse the combination until #1730 decides it.
 #[cfg(all(feature = "mldsa-certs", feature = "fips"))]
 compile_error!(
-    "features `mldsa-certs` and `fips` are mutually exclusive: `rustls/fips` enables \
-     `webpki/aws-lc-rs-fips`, which removes the `webpki::aws_lc_rs::ML_DSA_*` statics \
-     (ML-DSA is not in the AWS-LC FIPS 3.0 submission). Build ML-DSA certificate \
-     verification without `fips`, or drop `mldsa-certs`."
+    "features `mldsa-certs` and `fips` are not supported together: ML-DSA verification \
+     under the AWS-LC FIPS module is not validated in rustgate (see #1730). Build ML-DSA \
+     certificate verification without `fips`, or drop `mldsa-certs`."
 );
 
 use std::sync::LazyLock;
@@ -76,14 +72,14 @@ use rustls_pki_types::SignatureVerificationAlgorithm;
 /// be referenced from [`WebPkiSupportedAlgorithms::mapping`].
 static ML_DSA_87_ALGS: &[&dyn SignatureVerificationAlgorithm] = &[webpki::aws_lc_rs::ML_DSA_87];
 
-/// The stock `aws-lc-rs` verification set plus ML-DSA-87.
+/// rustgate's classical aws-lc-rs verification set plus ML-DSA-87 only.
 ///
-/// Derived from the upstream provider rather than hand-listed so that
-/// algorithms rustls adds in future point releases are picked up
-/// automatically — a hand-copied list would silently drop them, and the only
-/// symptom would be a classical client that mysteriously stops connecting.
+/// Built on [`crate::config::CLASSICAL_SIG_ALGS`] (the stock set minus
+/// ML-DSA) rather than on the stock set itself: since rustls 0.23.46 the stock
+/// set already contains ML-DSA-44/65/87, and appending to it would advertise
+/// ML-DSA-87 twice and enable ML-DSA-44/65, which this opt-in does not offer.
 static MLDSA_SIG_ALGS: LazyLock<WebPkiSupportedAlgorithms> = LazyLock::new(|| {
-    let base = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+    let base = *crate::config::CLASSICAL_SIG_ALGS;
 
     let mut all = base.all.to_vec();
     all.push(webpki::aws_lc_rs::ML_DSA_87);
@@ -120,7 +116,7 @@ static MLDSA_SIG_ALGS: LazyLock<WebPkiSupportedAlgorithms> = LazyLock::new(|| {
 /// verification.
 #[must_use]
 pub fn mldsa_provider() -> CryptoProvider {
-    with_mldsa_verification(rustls::crypto::aws_lc_rs::default_provider())
+    with_mldsa_verification(crate::config::aws_lc_rs_provider())
 }
 
 /// Add ML-DSA-87 certificate verification to an existing provider, leaving
@@ -178,8 +174,8 @@ mod tests {
     /// classical algorithm still present, in its original relative order, with
     /// ML-DSA-87 appended last.
     #[test]
-    fn augmented_set_is_stock_plus_mldsa_appended_last() {
-        let base = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+    fn augmented_set_is_classical_plus_mldsa_87_appended_last() {
+        let base = *crate::config::CLASSICAL_SIG_ALGS;
         let augmented = *MLDSA_SIG_ALGS;
 
         assert_eq!(
@@ -208,6 +204,23 @@ mod tests {
             Some(&SignatureScheme::ML_DSA_87),
             "ML-DSA-87 must be last so it is not preferred over classical schemes"
         );
+
+        // Since rustls 0.23.46 the stock set already carries ML-DSA; building
+        // on it would advertise ML-DSA-87 twice and enable ML-DSA-44/65.
+        assert_eq!(
+            augmented_schemes
+                .iter()
+                .filter(|s| **s == SignatureScheme::ML_DSA_87)
+                .count(),
+            1,
+            "ML-DSA-87 must be advertised exactly once"
+        );
+        for scheme in [SignatureScheme::ML_DSA_44, SignatureScheme::ML_DSA_65] {
+            assert!(
+                !augmented_schemes.contains(&scheme),
+                "{scheme:?} is not part of the ML-DSA opt-in"
+            );
+        }
     }
 
     /// Pin the on-the-wire code point. rustls takes `ML_DSA_87 => 0x0906` from

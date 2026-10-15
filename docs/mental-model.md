@@ -172,7 +172,7 @@ Pick by deployment. ATAK only? `default`. ATAK + drone fleet? `+mavlink`. NATO c
 ### Security
 `fips`, `post-quantum`, `ocsp`, `spiffe`, `tenant-isolation` (default-on for multi-tenant deployments)
 
-These compose. `fips` swaps to the AWS-LC FIPS-validated crypto provider. `post-quantum` enables hybrid key exchange. `ocsp` enables stapling for revocation. `spiffe` enables SVID workload identity. The compatibility matrix is in [`fips.md`](fips.md) and [`post-quantum.md`](post-quantum.md).
+These compose. `fips` swaps to the AWS-LC FIPS crypto provider. `post-quantum` enables hybrid key exchange. `ocsp` enables stapling for revocation. `spiffe` enables SVID workload identity. The compatibility matrix is in [`fips.md`](fips.md) and [`post-quantum.md`](post-quantum.md).
 
 ### External integrations
 `federation`, `federation-ha`, `http`, `lattice`, `lattice-mock`, `foundry`, `foundry-mock`, `dds`, `dds-mock`, `marti-compat`, `missions`, `cjadc2`, `mesh-routing`, `inference`, `inference-mock`, `inference-onnx`
