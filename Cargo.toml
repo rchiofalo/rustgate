@@ -164,10 +164,10 @@ insta = { version = "1", features = ["yaml"] }
 schemars = "1.2"
 time = { version = "0.3", features = ["formatting"] }
 prometheus = { version = "0.14", default-features = false }
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "grpc-tonic"] }
-tracing-opentelemetry = { version = "0.32", default-features = false }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "grpc-tonic"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 parking_lot = "0.12"
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = "0.6"

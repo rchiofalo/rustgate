@@ -11,6 +11,20 @@ updates:
     commit-message:
       prefix: "deps"
     groups:
+      # opentelemetry, opentelemetry_sdk, opentelemetry-otlp and
+      # tracing-opentelemetry must move together: bumping one alone mixes
+      # two opentelemetry versions and fails to compile. Dependabot assigns
+      # a dependency to the first group it matches, so these come first.
+      opentelemetry-security:
+        applies-to: security-updates
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
+      opentelemetry:
+        applies-to: version-updates
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
       security:
         applies-to: security-updates
         patterns:
