@@ -127,7 +127,7 @@ format and key schedule.
 cargo build --release --features mavlink-pq
 ```
 
-`mavlink-pq` builds aws-lc from source and requires Go + cmake. The
+`mavlink-pq` needs no extra build tooling. The
 rekey envelope and its cryptography are implemented and tested today;
 `--mavlink-pq-bootstrap-file` loads the bootstrap PSK. The receive-socket
 wiring that feeds live envelopes into the running key store is a planned

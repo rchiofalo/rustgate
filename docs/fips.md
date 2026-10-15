@@ -1,6 +1,6 @@
 # FIPS 140-3 Support
 
-rustgate supports FIPS 140-3 cryptography via the `fips` feature flag. When enabled, all TLS operations use the [aws-lc-rs](https://github.com/aws/aws-lc-rs) crypto provider, backed by the AWS-LC FIPS module, instead of the default `ring` backend. Check [the module's NIST certification status](#module-version-and-certification-status) before relying on it for compliance.
+rustgate supports FIPS 140-3 cryptography via the `fips` feature flag. When enabled, all TLS operations use the [aws-lc-rs](https://github.com/aws/aws-lc-rs) crypto provider backed by the AWS-LC FIPS module (`aws-lc-fips-sys`) instead of the default, non-FIPS AWS-LC build (`aws-lc-sys`). Check [the module's NIST certification status](#module-version-and-certification-status) before relying on it for compliance.
 
 ## Module version and certification status
 
@@ -24,7 +24,7 @@ in FIPS mode; it does not check certification.
 
 ## Build Prerequisites
 
-The `fips` feature requires additional build tooling because aws-lc-rs compiles a native C library:
+Every build compiles AWS-LC from C. The FIPS module additionally needs Go and cmake:
 
 - **Go** (1.20+) — required by aws-lc's build system
 - **cmake** (3.12+) — required to compile the C library
@@ -75,11 +75,11 @@ Build with --features fips to enable FIPS 140-3 mode.
 
 ## What FIPS Mode Changes
 
-| Aspect | Default (ring) | FIPS (aws-lc-rs) |
+| Aspect | Default | FIPS |
 |---|---|---|
-| Crypto library | ring | AWS-LC FIPS module (see certification status above) |
-| TLS cipher suites | ring defaults | FIPS-approved only |
-| Key exchange | X25519, ECDHE | FIPS-approved ECDHE |
+| TLS crypto library | AWS-LC (`aws-lc-sys`) | AWS-LC FIPS module (see certification status above) |
+| TLS cipher suites | rustls aws-lc-rs defaults | FIPS-approved only |
+| Key exchange | X25519MLKEM768 first, then X25519, P-256, P-384 | FIPS-approved groups, X25519MLKEM768 first |
 | Hash algorithms | SHA-2 family | SHA-2 family (FIPS) |
 | Certificate signing (enrollment) | rcgen + ring | rcgen + aws-lc-rs (FIPS) |
 | PKCS#12 salt generation | OS CSPRNG (via rustls provider) | FIPS CSPRNG (via aws-lc-rs) |
@@ -139,12 +139,12 @@ convey a build that combines rustgate with AWS-LC. When you distribute such a
 build in non-source form, the Corresponding Source you provide must include the
 source of the AWS-LC parts used as well as rustgate's own source.
 
-The default build uses `ring` (`Apache-2.0 AND ISC`) and does not rely on this
-permission.
+The default build links `aws-lc-sys`, whose license has no OpenSSL or SSLeay
+terms, and does not rely on this permission.
 
 ## Known Limitations
 
-- **Ring is still linked**: When `fips` is enabled, aws-lc-rs is added as the crypto provider but ring remains compiled in as a workspace dependency. The FIPS provider is installed as the process-default, and all TLS code paths (including federation) use `CryptoProvider::get_default()` to ensure the FIPS provider is used at runtime.
+- **Ring is still linked**: TLS uses aws-lc-rs, but `ring` remains compiled in for non-TLS primitives (federation JWT, data-package signing, random numbers, `rcgen` outside `fips`). The FIPS provider is installed as the process-default, and all TLS code paths (including federation) use `CryptoProvider::get_default()` to ensure the FIPS provider is used at runtime.
 - **SHA-1/SHA-2 for PKCS#12**: The PKCS#12 MAC uses `sha1` / `sha2` pure-Rust crates for HMAC-SHA1 and KDF operations. These are outside the FIPS boundary but only protect the P12 bundle integrity with a well-known password — they do not protect data in transit.
 - **No OCSP support**: Revocation checking is CRL-only. OCSP stapling is not supported by rustls.
 - **CRL freshness**: CRL `nextUpdate` timestamps are not validated. Operators should rotate CRL files on a regular schedule.

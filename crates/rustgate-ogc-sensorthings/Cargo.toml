@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-rustgate-core = { workspace = true }
+rustgate-core = { workspace = true, features = ["tls-provider"] }
 rustgate-router = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }

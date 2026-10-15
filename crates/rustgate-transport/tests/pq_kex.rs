@@ -3,50 +3,45 @@
 
 //! Post-quantum key exchange integration tests.
 //!
-//! These tests verify that the aws-lc-rs post-quantum provider installs
-//! correctly, that TLS handshakes negotiate PQ key exchange groups, and
-//! that custom KX group ordering works as expected.
-//!
-//! Only compiled when the `post-quantum` feature is enabled. Run with:
-//! ```sh
-//! cargo test -p rustgate-transport --features post-quantum
-//! ```
-#![cfg(feature = "post-quantum")]
+//! These tests verify that the default aws-lc-rs provider installs
+//! correctly, that TLS handshakes negotiate post-quantum key exchange, and
+//! that custom key-exchange group ordering works as expected. Post-quantum
+//! key exchange is on in every build (ADR 0037).
 
 use std::sync::{Arc, OnceLock};
 
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_tls::{TlsConfig, TlsListener, install_pq_provider, is_pq_provider_active};
+use rustgate_tls::{TlsConfig, TlsListener, install_default_provider, is_pq_provider_active};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── setup ────────────────────────────────────────────────────────────────
 
-/// Install the PQ provider exactly once across all tests in this binary.
+/// Install the default provider exactly once across all tests in this binary.
 ///
 /// Must be called before `TestCa::new()` to ensure aws-lc-rs is the active
-/// provider. The test-utils `ensure_crypto_provider()` will silently skip
-/// installing ring because a provider is already installed.
+/// provider. The test-utils `ensure_crypto_provider()` then finds a provider
+/// already installed and leaves it alone.
 static PQ_INIT: OnceLock<()> = OnceLock::new();
 fn ensure_pq() {
     let _ = PQ_INIT.get_or_init(|| {
-        install_pq_provider().expect("failed to install PQ provider");
+        install_default_provider().expect("failed to install the default provider");
     });
 }
 
 // ── PQ provider tests ──────────────────────────────────────────────────
 
-/// After installing the PQ provider, a second `install_pq_provider()`
+/// After installing the PQ provider, a second `install_default_provider()`
 /// must return an error because `CryptoProvider::install_default` only
 /// permits one installation per process.
 #[test]
 fn pq_double_install_returns_error() {
     ensure_pq();
 
-    let result = install_pq_provider();
+    let result = install_default_provider();
     assert!(
         result.is_err(),
-        "second install_pq_provider() should return Err"
+        "second install_default_provider() should return Err"
     );
 }
 
@@ -57,7 +52,7 @@ fn pq_provider_reports_active() {
     ensure_pq();
     assert!(
         is_pq_provider_active(),
-        "is_pq_provider_active() must return true after install_pq_provider()"
+        "is_pq_provider_active() must return true after install_default_provider()"
     );
 }
 
@@ -282,12 +277,12 @@ async fn pq_with_crl_rejects_revoked() {
     );
 }
 
-/// When a client only supports classical key exchange (ring), the
+/// When a client only offers classical key exchange groups, the
 /// PQ-enabled server must gracefully fall back to *some* classical
 /// group that both sides support.
 ///
 /// In non-FIPS builds the server's PQ provider exposes X25519 and
-/// ring prefers it, so negotiation lands on X25519. In FIPS builds
+/// the client prefers it, so negotiation lands on X25519. In FIPS builds
 /// the server's group list is restricted to FIPS-approved options
 /// (no X25519), so both sides meet on `secp256r1` instead. Either
 /// outcome is a correct graceful fallback; asserting a specific
@@ -316,7 +311,8 @@ async fn pq_classical_client_falls_back_to_x25519() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     });
 
-    // Build a client config using the ring provider (classical groups only)
+    // Build a client config offering classical groups only: the default
+    // provider minus the hybrid group.
     let certs = rustgate_test_utils::tls::parse_certs(&client_cert.cert_pem);
     let key = rustgate_test_utils::tls::parse_key(&client_cert.key_pem);
     let mut root_store = rustls::RootCertStore::empty();
@@ -324,16 +320,18 @@ async fn pq_classical_client_falls_back_to_x25519() {
         root_store.add(cert).expect("add CA");
     }
 
-    let ring_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .expect("tls13")
-    .with_root_certificates(root_store)
-    .with_client_auth_cert(certs, key)
-    .expect("client auth");
+    let mut classical = rustls::crypto::aws_lc_rs::default_provider();
+    classical
+        .kx_groups
+        .retain(|g| g.name() != rustls::NamedGroup::X25519MLKEM768);
+    let classical_config = rustls::ClientConfig::builder_with_provider(Arc::new(classical))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("tls13")
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(certs, key)
+        .expect("client auth");
 
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(ring_config));
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(classical_config));
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
         .expect("tcp connect");

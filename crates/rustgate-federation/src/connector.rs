@@ -1104,7 +1104,7 @@ mod tests {
         Vec<CertificateDer<'static>>,
         Arc<dyn rustls::client::danger::ServerCertVerifier>,
     ) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = TestCa::new("V2 Pin CA");
         let server_cert = ca.issue_server_cert(cert_cn, &["localhost"]);
         let chain = parse_certs(server_cert.cert_pem.as_bytes()).expect("parse server cert");
@@ -1179,7 +1179,7 @@ mod tests {
         // Defense in depth: chain validation still runs. A cert with the
         // right CN but signed by a different CA must fail at the chain step,
         // not slip through on the CN match alone.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let real_ca = TestCa::new("Real CA");
         let rogue_ca = TestCa::new("Rogue CA");
         let rogue_cert = rogue_ca.issue_server_cert("real-v2-peer", &["localhost"]);

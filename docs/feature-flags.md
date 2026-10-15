@@ -28,13 +28,13 @@ build-time and runtime cost of each, see `docs/performance-tuning.md`.
   enrollment, est, proto, full-detail, metrics, federation,
   federation-ha, websocket, mqtt, otel, http`.
 - **Special-build features**: a handful of features change the
-  toolchain or build matrix (Go required for FIPS / PQ; protoc
+  toolchain or build matrix (Go + cmake required for FIPS; protoc
   required for proto / OTel). Marked with **(special build)** below.
 - **CI coverage**: `cargo hack check --feature-powerset --depth 2` runs
   on every PR, excluding `jemalloc, fips, otel, post-quantum,
-  mavlink-pq` (which require special builds). Independent CI jobs cover
-  those — `mavlink-pq` is clippy-checked and tested in the
-  `post-quantum` lane (it shares the aws-lc-rs build dependency).
+  mavlink-pq`. Independent CI jobs cover those: `fips` in the `fips`
+  lane, and `mavlink-pq` plus `rustgate-enrollment`'s `post-quantum`
+  (ML-DSA issuance) in the `post-quantum` lane.
 
 ### Quick-start bundles
 
@@ -43,8 +43,7 @@ build-time and runtime cost of each, see `docs/performance-tuning.md`.
 | **Default release binary** | `nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http` | Canonical operator build — what `docker pull rustgate:latest` ships. |
 | **Tactical edge** | `metrics,websocket,mqtt,proto,full-detail` | Minimal binary for resource-constrained edge nodes (no federation, no NATS). |
 | **Federated hub** | `nats,enrollment,est,metrics,federation,federation-ha,otel,http,management-api,peer-discovery` | Central federation hub with auto-discovery, observability, and a management plane. |
-| **CNSA-2 compliant** | `fips,enrollment,est,metrics,federation,websocket,otel,jemalloc` | NSA CNSA 2.0 alignment; FIPS provider with PQ-ready posture. |
-| **Post-quantum experimental** | `post-quantum,metrics,federation,websocket` | ML-KEM-768 hybrid KEX (ADR 0011 / 0019). Not for production yet. |
+| **FIPS** | `fips,enrollment,est,metrics,federation,websocket,otel,jemalloc` | AWS-LC FIPS module; hybrid PQ key exchange still preferred. |
 
 ---
 
@@ -86,8 +85,8 @@ This is deliberate so consumers can build a minimal binary by setting
 
 | Feature | Adds | Special build? | Notes |
 |---|---|---|---|
-| `fips` | aws-lc-rs FIPS 140-3 provider; PQ-ready posture | **Go + cmake required** | Replaces ring with aws-lc-rs across TLS stack. |
-| `post-quantum` | ML-KEM-768 hybrid KEX (X25519 + Kyber) | **Go + cmake required** | Experimental; co-exists with FIPS or alone. See ADR 0011 / 0019. |
+| `fips` | AWS-LC FIPS module as the TLS provider | **Go + cmake required** | Hybrid PQ key exchange and ML-DSA verification stay on. See [fips.md](fips.md). |
+| `post-quantum`, `mldsa-certs` | Nothing | No | Kept so existing feature lists build; PQ is on in every build (ADR 0037). |
 | `ocsp` | OCSP stapling for served certificates | No | Background fetcher with cached good/revoked. |
 | `spiffe` | SPIFFE Workload API integration | No | Auto-rotating SVIDs; trust-bundle refresh. |
 | `cedar` | Cedar policy backend for authorization | No | Default backend is built-in; Cedar is opt-in. |
@@ -144,8 +143,8 @@ the table below is the source of truth.
 
 | Feature | Pulls in |
 |---|---|
-| `fips` | `rustls/aws_lc_rs`, `rustls/fips` |
-| `post-quantum` | `rustls/aws_lc_rs`, `rustls/prefer-post-quantum` |
+| `fips` | `rustls/fips` |
+| `post-quantum`, `mldsa-certs` | Nothing (compatibility) |
 | `ocsp` | `ocsp-stapler` |
 | `spiffe` | `spiffe` SDK |
 
@@ -167,8 +166,8 @@ the table below is the source of truth.
 | `v2` | gRPC stack (`tonic`, `tonic-prost`, `prost-build`, `rustgate-proto`) |
 | `ha` | `async-nats` for shared HA state |
 | `api` | REST API (`hyper`, `prometheus`, `rustgate-metrics`) |
-| `fips` | `rustls/{aws_lc_rs,fips}`, `tonic?/tls-aws-lc` |
-| `post-quantum` | `rustls/{aws_lc_rs,prefer-post-quantum}`, `tonic?/tls-aws-lc` |
+| `fips` | `rustls/fips` |
+| `post-quantum` | Nothing (compatibility) |
 | `peer-discovery` | All three backends |
 | `peer-discovery-dns-sd` | `mdns-sd`, `async-trait` |
 | `peer-discovery-consul` | `reqwest`, `async-trait` |
@@ -199,14 +198,14 @@ the table below is the source of truth.
 | `metrics` | `prometheus`, `rustgate-metrics`, `rustgate-resilience/metrics` |
 | `proto` | `prost`, `rustgate-proto` |
 | `otel` | `opentelemetry`, `tracing-opentelemetry` |
-| `fips` | `rustls/{aws_lc_rs,fips}` |
-| `post-quantum` | `rustls/{aws_lc_rs,prefer-post-quantum}` |
+| `fips` | `rustls/fips` |
+| `post-quantum` | Nothing (compatibility) |
 
 ### `rustgate-mavlink`
 
 | Feature | Pulls in |
 |---|---|
-| `mavlink-pq` *(special build)* | `aws-lc-rs` (ML-KEM-768), `ciborium`, `hkdf`, `chacha20poly1305`, `serde` — the post-quantum signing-key rekey channel (ADR 0020). Needs Go + cmake; off by default. |
+| `mavlink-pq` *(special build)* | `aws-lc-rs` (ML-KEM-768), `ciborium`, `hkdf`, `chacha20poly1305`, `serde` — the post-quantum signing-key rekey channel (ADR 0020). Off by default. |
 
 ### `rustgate-mqtt`, `rustgate-websocket`, `rustgate-cot`, `rustgate-proto`, `rustgate-guard`
 
@@ -294,8 +293,7 @@ These features change the build toolchain. Plan CI accordingly.
 
 | Feature | Why | Required tools | Linker / sysroot |
 |---|---|---|---|
-| `fips` | aws-lc-rs is partly built from `aws-lc` (C + Go) | Go ≥ 1.21, cmake, gcc | `musl` for static-FIPS images; `glibc` ≥ 2.31 for dynamic. |
-| `post-quantum` | aws-lc-rs's Kyber backend reuses the aws-lc build | Go ≥ 1.21, cmake, gcc | Same as `fips`. |
+| `fips` | The AWS-LC FIPS module build uses Go and cmake | Go ≥ 1.21, cmake, gcc | `musl` for static-FIPS images; `glibc` ≥ 2.31 for dynamic. |
 | `proto` | `prost-build` invokes `protoc` for proto codegen | protoc ≥ 3.20 | Bundled into the Docker build image. |
 | `otel` | Pulls `opentelemetry-proto` via prost | protoc ≥ 3.20 | Same as `proto`. |
 | `jemalloc` | `tikv-jemallocator` is Linux-only (x86_64, aarch64) | None beyond `cargo` | Skipped on macOS / Windows. |
@@ -311,7 +309,6 @@ unwise. The compiler doesn't refuse them — these are advisory:
 
 | Combination | Why it's surprising |
 |---|---|
-| `fips` + `post-quantum` | Both supported; PQ Kyber is FIPS-pending. Use both together for the CNSA-2 bundle. |
 | `default` (none) + every observability flag | Builds the smallest possible binary with full instrumentation hooks; useful for benchmarks where you want the metrics path but no transports. |
 | `federation` without `proto` | Federation V2 needs `proto`. Cargo errors out at link time; pair them. |
 | `est` without `enrollment` | Cargo resolves this automatically (`est` declares `enrollment`), but it's a useful mental model that `est` is "enrollment with EST RFC 7030 on top". |
@@ -335,11 +332,8 @@ cargo build --release --features metrics,websocket,mqtt,proto,full-detail
 # Federated production hub
 cargo build --release --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http,management-api
 
-# CNSA 2.0 compliant (FIPS + PQ-ready)
+# FIPS (hybrid PQ key exchange stays on)
 cargo build --release --features fips,enrollment,est,proto,metrics,federation,websocket,otel,jemalloc
-
-# Post-quantum experimental
-cargo build --release --features post-quantum,metrics,federation,websocket
 ```
 
 The Helm chart's `values.yaml` exposes the canonical operator build

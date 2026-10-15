@@ -194,7 +194,7 @@ impl RotationFixture {
 /// Bring up a TLS listener wired through `CertReloader` and return a
 /// fixture the test can drive rotations against.
 async fn build_fixture() -> RotationFixture {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let ca = TestCa::new("Rotation Integration CA");
     let initial_cert = ca.issue_server_cert("localhost", &["localhost"]);
@@ -563,7 +563,7 @@ fn write_server_cert_files(ca: &TestCa, cn: &str, dir: &std::path::Path) {
 
 #[tokio::test]
 async fn reload_unchanged_returns_false() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let ca = TestCa::new("Unchanged Test CA");
     let dir = tempfile::tempdir().unwrap();
@@ -577,7 +577,7 @@ async fn reload_unchanged_returns_false() {
 
 #[tokio::test]
 async fn reload_corrupted_cert_returns_error() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let ca = TestCa::new("Corrupt Test CA");
     let dir = tempfile::tempdir().unwrap();
@@ -638,7 +638,7 @@ fn root_store_from_cas(cas: &[&TestCa]) -> RootCertStore {
 /// asserts the hint count grows from one to two.
 #[test]
 fn root_hint_subjects_rebuilds_after_ca_rotation() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let ca_one = TestCa::new("Root Hint Rebuild CA One");
     let ca_two = TestCa::new("Root Hint Rebuild CA Two");

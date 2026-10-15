@@ -11,10 +11,8 @@ repository.workspace = true
 workspace = true
 
 [features]
-# Post-quantum signing-key rekey channel (ADR 0020). Pulls in aws-lc-rs
-# for ML-KEM-768, which builds aws-lc from source (cmake + Go) — off by
-# default so the standard build and most CI lanes stay lean. Exercised in
-# the post-quantum CI lane.
+# Post-quantum signing-key rekey channel (ADR 0020). Uses aws-lc-rs for
+# ML-KEM-768. Off by default; exercised in the post-quantum CI lane.
 mavlink-pq = ["dep:aws-lc-rs", "dep:ciborium", "dep:hkdf", "dep:chacha20poly1305", "dep:serde"]
 
 [dependencies]

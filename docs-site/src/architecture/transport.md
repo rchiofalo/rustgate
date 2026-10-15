@@ -8,7 +8,7 @@ For the on-the-wire framing and message format see [Wire Protocol](./protocol.md
 
 ## Responsibilities
 
-- **TLS listener** — accepts mTLS connections via `rustls` (ring backend by default, `aws-lc-rs` under the `fips` feature).
+- **TLS listener** — accepts mTLS connections via `rustls` with the `aws-lc-rs` provider (hybrid post-quantum key exchange preferred; the AWS-LC FIPS module under the `fips` feature).
 - **Identity extraction** — derives the `Identity` (CN + group memberships) from the peer certificate during handshake.
 - **CRL enforcement** — periodically loads CRLs from disk; revoked certificates are rejected on next connection attempt and may also trigger active disconnect of in-flight sessions.
 - **OCSP stapling** — when enabled, validates server-stapled OCSP responses and optionally enforces client OCSP via Tier 1 client checks.
@@ -23,8 +23,7 @@ Features on the `rustgate-transport` crate itself:
 
 | Feature | Effect |
 |---|---|
-| `fips` | Swaps the default `ring` crypto provider for `aws-lc-rs` in FIPS mode. |
-| `post-quantum` | Enables X25519MLKEM768 hybrid key exchange. |
+| `fips` | Uses the AWS-LC FIPS module instead of the default AWS-LC build. |
 | `proto` | Enables protobuf codec support via `rustgate-proto`. |
 | `ocsp` | Enables OCSP stapling validation. |
 | `spiffe` | Enables SPIFFE workload identity extraction from URI SANs. |

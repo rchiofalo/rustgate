@@ -260,7 +260,7 @@ jobs:
             DEPTH=2
           fi
           echo "Running cargo hack check at depth $DEPTH (event=${{ github.event_name }})"
-          cargo hack check --feature-powerset --depth "$DEPTH" --exclude-features jemalloc,fips,otel,post-quantum,mavlink-pq,mldsa-certs --no-dev-deps
+          cargo hack check --feature-powerset --depth "$DEPTH" --exclude-features jemalloc,fips,otel,post-quantum,mavlink-pq --no-dev-deps
 
   check-features-triples:
     # Targeted three-way feature interaction coverage (issue #832 F-147).
@@ -754,13 +754,12 @@ jobs:
           toolchain: "1.99"
           components: clippy
 
-      - name: Install PQ build dependencies
-        # No-op on self-hosted runners where protobuf-compiler, cmake, and
-        # golang-go are baked into the container image; apt-get install on the
-        # GitHub-hosted fallback.
+      - name: Install protoc
+        # Federation v2 needs protoc. Nothing in this job needs Go or cmake
+        # any more: only the FIPS module build does (ADR 0037).
         run: |
-          if ! command -v protoc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 || ! command -v go >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
           fi
 
       - name: Install cargo-nextest
@@ -771,60 +770,23 @@ jobs:
             curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
           fi
 
-      - name: Clippy (post-quantum)
-        run: |
-          cargo clippy --locked -p rustgate-transport -p rustgate-server -p rustgate-http --features post-quantum --all-targets
-          cargo clippy --locked -p rustgate-federation --features post-quantum,v2 --all-targets
-
-      - name: Build server with post-quantum
-        run: cargo build --locked -p rustgate-server --features post-quantum,federation,enrollment,http
+      # Post-quantum key exchange and ML-DSA verification are on in every build
+      # (ADR 0037), so the default clippy/test jobs cover them. This job keeps
+      # the opt-in post-quantum extras: federation v2, the MAVLink ML-KEM rekey
+      # channel, and enrollment's ML-DSA-87 certificate issuance.
+      - name: Clippy federation v2
+        run: cargo clippy --locked -p rustgate-federation --features v2 --all-targets
 
       - name: Clippy + test MAVLink PQ rekey channel
-        # The `mavlink-pq` feature pulls in aws-lc-rs (ML-KEM-768), which
-        # needs cmake + Go — available in this lane but excluded from the
-        # cargo-hack feature-powerset job. Exercise it here.
+        # `mavlink-pq` is excluded from the cargo-hack feature-powerset job;
+        # exercise it here.
         run: |
           cargo clippy --locked -p rustgate-mavlink --features mavlink-pq --all-targets
           cargo nextest run --locked -p rustgate-mavlink --features mavlink-pq
 
-      - name: Clippy + test ML-DSA-87 certificate verification (#501)
-        # `mldsa-certs` pulls aws-lc-rs (needs cmake), so it is excluded from
-        # the cargo-hack feature-powerset lane and exercised here instead.
-        # Also verify it COMPOSES with post-quantum: that build must install a
-        # single provider carrying both PQ key-exchange groups and ML-DSA
-        # signature verification.
-        run: |
-          cargo clippy --locked -p rustgate-tls -p rustgate-server --features mldsa-certs --all-targets
-          cargo clippy --locked -p rustgate-server --features post-quantum,mldsa-certs --all-targets
-          cargo nextest run --locked -p rustgate-tls --features mldsa-certs
-
-      - name: Assert fips + mldsa-certs is rejected at compile time
-        # ML-DSA is outside the AWS-LC FIPS submission and `rustls/fips`
-        # removes the ML-DSA verification algorithms, so the combination must
-        # fail with OUR diagnostic rather than an inscrutable upstream
-        # "cannot find value `ML_DSA_87`".
-        run: |
-          if cargo check --locked -p rustgate-server --features fips,mldsa-certs 2>build.log; then
-            echo "::error::fips + mldsa-certs built successfully but must be rejected"
-            exit 1
-          fi
-          if ! grep -q "not supported together" build.log; then
-            echo "::error::fips + mldsa-certs failed, but not via the intended compile_error!"
-            cat build.log
-            exit 1
-          fi
-          echo "fips + mldsa-certs correctly rejected by compile_error!"
-
-      - name: Run PQ transport tests
-        run: cargo nextest run --locked -p rustgate-transport --features post-quantum
-
-      - name: Run PQ HTTP tests
-        run: cargo nextest run --locked -p rustgate-http --features post-quantum
-
       # rustgate-enrollment's `post-quantum` feature is the pure-Rust fips204
-      # ML-DSA-87 issuance path (#502) — no Go/cmake needed, unlike the aws-lc-rs
-      # `post-quantum` used elsewhere. It shares the `post-quantum` name, so the
-      # check-features powerset excludes it; cover it here on the dedicated PQ job.
+      # ML-DSA-87 issuance path (#502). It shares the `post-quantum` name, which
+      # the check-features powerset excludes, so it is covered here.
       - name: Clippy + test enrollment ML-DSA-87 issuance (#502)
         run: |
           cargo clippy --locked -p rustgate-enrollment --features post-quantum,est --all-targets

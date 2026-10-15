@@ -29,7 +29,7 @@ opted in:
 | Feature | Why we need it |
 |---|---|
 | `json` | The egress publisher serializes payloads via `RequestBuilder::json()` for JSON targets and the Consul backend deserializes the catalog response with `Response::json()` |
-| `rustls-tls` | Aligns with the workspace's rustls-only TLS posture (no `native-tls`, no `openssl`) and makes `aws-lc-rs` / `prefer-post-quantum` swaps feature-gated through the same crate everyone else uses |
+| `rustls-tls-webpki-roots-no-provider` | Aligns with the workspace's rustls-only TLS posture (no `native-tls`, no `openssl`) without pulling in a second crypto provider; reqwest uses the workspace's aws-lc-rs provider |
 | `http2` | TLS-fronted webhook receivers (Splunk HEC, Elastic, generic load balancers) negotiate ALPN `h2`; without this feature reqwest negotiates `http/1.1` only and we lose request multiplexing on long-lived connections |
 
 Any new feature added to this list must come with a justification entry in

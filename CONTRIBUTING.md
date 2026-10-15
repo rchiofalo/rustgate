@@ -30,7 +30,6 @@ cargo build --features ocsp          # OCSP stapling and client checking
 cargo build --features spiffe        # SPIFFE/SPIRE workload identity
 cargo build --features cedar         # Cedar policy language for authz
 cargo build --features fips          # FIPS 140-3 crypto (requires Go + cmake)
-cargo build --features post-quantum  # Post-quantum key exchange (requires Go + cmake)
 cargo build --features otel          # OpenTelemetry tracing (requires protoc)
 cargo build --features jemalloc      # jemalloc allocator (recommended for musl)
 ```
@@ -66,7 +65,7 @@ CI runs as parallel jobs. All checks must pass before merging to `main` (enforce
 | `test` | `cargo nextest run` with all features (except fips/jemalloc/post-quantum) + doc tests |
 | `coverage` | `cargo llvm-cov --nextest` code coverage |
 | `fips` | Clippy, build, and tests with `--features fips` |
-| `post-quantum` | Clippy, build, and tests with `--features post-quantum` |
+| `post-quantum` | ML-DSA issuance (`rustgate-enrollment/post-quantum`), MAVLink ML-KEM rekey (`mavlink-pq`), federation v2 clippy |
 | `audit` | `cargo deny check` + `cargo audit` |
 | `helm` | `helm lint helm/` |
 | `docker` | Dockerfile build validation |

@@ -213,8 +213,9 @@ async fn kid_lifecycle_active_to_retiring_when_dropped_from_upstream() {
 //    validate call rather than just the state machine in isolation.
 #[tokio::test(start_paused = true)]
 async fn kid_lifecycle_retiring_still_verifies_jwts_during_grace() {
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
 
     // Set up an authority + verifier under kid "k-grace".
     let (pkcs8_local, _pub_local) = ed25519_keypair();

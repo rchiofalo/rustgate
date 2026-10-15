@@ -16,6 +16,8 @@ fuzz = ["dep:arbitrary"]
 # this feature in crates that previously rolled their own PEM parsing so
 # they share a single error mapping via `rustgate_core::pem`.
 pem = ["dep:rustls", "dep:rustls-pki-types"]
+# `tls_provider::ensure_default`, for crates that build `reqwest` clients.
+tls-provider = ["dep:rustls"]
 
 [dependencies]
 arbitrary = { workspace = true, optional = true }

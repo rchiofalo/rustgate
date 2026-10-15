@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn new_builds_initial_verifier() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
             .expect("build verifier");
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn generation_change_triggers_rebuild() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let generation = Arc::new(AtomicU64::new(0));
         let store = test_root_store();
 
@@ -535,7 +535,7 @@ mod tests {
         // at runtime left the TLS `CertificateRequest` advertising the
         // stale list. After the fix, each generation advance atomically
         // swaps in the fresh subject set.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca1 = rustgate_test_utils::certs::TestCa::new("Dynamic Test CA One");
         let ca2 = rustgate_test_utils::certs::TestCa::new("Dynamic Test CA Two");
@@ -590,7 +590,7 @@ mod tests {
         // When a rebuild fails, the cached verifier stays in place; the
         // hint list must also stay in lockstep so we never advertise CAs
         // whose keys we cannot actually verify against.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca = rustgate_test_utils::certs::TestCa::new("Dynamic Test CA");
         let mut good = RootCertStore::empty();
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn debug_format() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         let verifier = DynamicCertVerifier::new(Box::new(move || (42, store.clone())), Vec::new())
             .expect("build verifier");
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn supported_verify_schemes_not_empty() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
             .expect("build verifier");
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn survives_panic_in_lock_scope() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
             .expect("build verifier");
@@ -702,7 +702,7 @@ mod tests {
         // with log access). Pin both the numeric count AND the absence
         // of the underlying `CertificateRevocationListDer` type name in
         // the rendered output.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         let verifier = DynamicCertVerifier::new(Box::new(move || (7, store.clone())), Vec::new())
             .expect("build verifier");
@@ -733,7 +733,7 @@ mod tests {
         // surface the new value so `tracing::debug!(?verifier, …)` on
         // the post-rotation path carries the advertised generation,
         // not the construction-time snapshot.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let generation = Arc::new(AtomicU64::new(0));
         let gen_clone = Arc::clone(&generation);
         let store = test_root_store();
@@ -764,7 +764,7 @@ mod tests {
         // the `cached.generation == current_gen` fast path) would cost
         // a fresh WebPkiClientVerifier allocation per handshake and
         // re-leak subject hints, fails here.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         let verifier = DynamicCertVerifier::new(Box::new(move || (42, store.clone())), Vec::new())
             .expect("build verifier");
@@ -788,7 +788,7 @@ mod tests {
         // production a rotation rollback is rare but not unreachable,
         // and the verifier MUST reflect whatever the trust-store source
         // reports, not its idea of linear time.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let generation = Arc::new(AtomicU64::new(5));
         let gen_clone = Arc::clone(&generation);
         let store = test_root_store();
@@ -819,7 +819,7 @@ mod tests {
         // out-of-band trust-store updates between TTL ticks — pin the
         // current contract by counting provider invocations across
         // three reads with a static generation.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let call_count = Arc::new(AtomicU64::new(0));
         let call_count_cb = Arc::clone(&call_count);
         let store = test_root_store();
@@ -854,7 +854,7 @@ mod tests {
         // silently truncated would change what the handshake
         // CertificateRequest advertises and surface as "mystery client
         // cert rejections" rather than a loud failure.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca1 = rustgate_test_utils::certs::TestCa::new("DT CA One");
         let ca2 = rustgate_test_utils::certs::TestCa::new("DT CA Two");
@@ -891,7 +891,7 @@ mod tests {
         // every rebuild, so a regression that dropped it on the second
         // path would silently disable revocation checking after the
         // first CA rotation).
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca = rustgate_test_utils::certs::TestCa::new("CRL Test CA");
         let mut store = RootCertStore::empty();
@@ -952,7 +952,7 @@ mod tests {
         // timeout. A regression that added a `self.cached.lock()` call
         // to the hint accessor would cause the spawned thread to
         // deadlock past the timeout and the test would fail.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
             .expect("build verifier");
@@ -985,7 +985,7 @@ mod tests {
         // refactor that narrowed any of the inner fields to a
         // non-Send/Sync type would fail here rather than at the call
         // site in `rustgate-server::setup`.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
             .expect("build verifier");
@@ -1027,7 +1027,7 @@ mod tests {
     /// wired to a fail-closed gate, so we can prove the gate short-circuits
     /// `verify_client_cert` before the inner verifier ever runs.
     fn verifier_with_gate(gate: Arc<FailClosedGate>) -> Arc<DynamicCertVerifier> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         DynamicCertVerifier::with_crl_provider_and_gate(
             Box::new(move || (0, store.clone())),
@@ -1153,7 +1153,7 @@ mod tests {
     fn no_gate_stays_fail_open() {
         // Without a gate the verifier preserves the original behavior: a valid
         // inner verifier is always consulted; there is no deny-all path.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let store = test_root_store();
         let verifier = DynamicCertVerifier::new(Box::new(move || (0, store.clone())), Vec::new())
             .expect("build verifier");

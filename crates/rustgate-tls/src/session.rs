@@ -170,7 +170,7 @@ mod tests {
         SocketAddr,
         tokio_rustls::client::TlsStream<TcpStream>,
     ) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca = TestCa::new("session-test-ca");
         let server_cert = ca.issue_server_cert("localhost", &["localhost"]);

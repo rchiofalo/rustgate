@@ -287,7 +287,7 @@ mod tests {
     /// `TlsListener`'s bind / local-addr / Debug surface — so the server
     /// cert just has to satisfy `TlsConfig::from_pem`.
     fn test_tls_config() -> TlsConfig {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = TestCa::new("listener-test-ca");
         let server_cert = ca.issue_server_cert("localhost", &["localhost"]);
         TlsConfig::from_pem(&server_cert.cert_pem, &server_cert.key_pem, &ca.cert_pem)

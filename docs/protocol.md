@@ -36,9 +36,8 @@ The crypto provider is `rustls` with one of three backends:
 
 | Backend       | Selected by              | Suites                                                                 |
 |---------------|--------------------------|------------------------------------------------------------------------|
-| `ring`        | default                  | rustls default suites for TLS 1.2/1.3                                  |
+| `aws-lc-rs`   | default                  | rustls default suites for TLS 1.2/1.3; `X25519MLKEM768` preferred      |
 | `aws-lc-rs`   | `--features fips`        | FIPS-approved subset (TLS 1.2 + 1.3, AES-GCM, ECDHE only)             |
-| `aws-lc-rs`   | `--features post-quantum`| Adds `X25519MLKEM768` hybrid key exchange for TLS 1.3                  |
 
 Cipher suite selection is delegated to rustls — clients negotiate normally.
 Under FIPS, only the FIPS-approved subset is offered; clients without an
@@ -95,10 +94,11 @@ validation will be disconnected immediately after the handshake.
   process-wide rustls default. All TLS connections — including federation —
   use the AWS-LC FIPS module. Tests for this mode live in
   `crates/rustgate-transport/tests/fips.rs`.
-- **Post-quantum** (`--features post-quantum`) enables the X25519MLKEM768
-  hybrid key exchange (NIST ML-KEM 768 + X25519) on TLS 1.3 only. Classical
-  X25519 remains available for fallback. Both peers must support the hybrid
-  group for it to be negotiated.
+- **Post-quantum** key exchange is on in every build: X25519MLKEM768 (NIST
+  ML-KEM-768 + X25519) is preferred on TLS 1.3, and classical X25519 remains
+  available for fallback. Both peers must support the hybrid group for it to
+  be negotiated. `--kx-groups` overrides the order (see
+  [post-quantum.md](post-quantum.md)).
 
 ---
 

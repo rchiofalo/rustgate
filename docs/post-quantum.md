@@ -1,97 +1,108 @@
-# Post-Quantum TLS Migration Roadmap
+# Post-Quantum TLS
 
-This document outlines rustgate's path to post-quantum (PQ) cryptographic protection.
+This document describes rustgate's post-quantum (PQ) protection and what is
+still outstanding.
 
 ## Current Status
 
-rustgate uses **rustls** for all TLS operations. The default backend is `ring`, with optional FIPS 140-3 support via `aws-lc-rs` (`--features fips`).
+Every rustgate build uses **rustls** with the **aws-lc-rs** crypto provider
+([ADR 0037](adr/0037-aws-lc-rs-post-quantum-default.md)). With no
+configuration:
 
-- **Key exchange:** X25519 (ECDHE) — vulnerable to future quantum computers capable of running Shor's algorithm.
-- **Authentication:** RSA or ECDSA certificates — also quantum-vulnerable, but requires the attacker to be present at handshake time (no harvest-now-decrypt-later risk for authentication).
-- **Symmetric ciphers:** AES-256-GCM, ChaCha20-Poly1305 — quantum-resistant (Grover's algorithm halves effective key strength; 256-bit keys remain secure).
+- **Key exchange:** X25519MLKEM768 (X25519 + ML-KEM-768) is offered first.
+  Peers that do not support it negotiate X25519, P-256 or P-384.
+- **Certificate verification:** ML-DSA-44, ML-DSA-65 and ML-DSA-87 signatures
+  are verified, alongside the classical ECDSA, Ed25519 and RSA schemes.
+- **Symmetric ciphers:** AES-256-GCM, AES-128-GCM, ChaCha20-Poly1305. Grover's
+  algorithm halves effective key strength; 256-bit keys remain secure.
+
+The provider is process-wide, so the same settings apply to client mTLS
+connections, federation (V1 mTLS and V2 gRPC) and HTTP egress.
 
 ## Why Post-Quantum Matters
 
-The primary risk is **harvest-now-decrypt-later (HNDL)**: an adversary records encrypted traffic today and decrypts it once a cryptographically relevant quantum computer (CRQC) exists. For tactical communication systems, message confidentiality may need to persist for years or decades, making HNDL a relevant concern even before CRQCs are available.
+The primary risk is **harvest-now-decrypt-later (HNDL)**: an adversary records
+encrypted traffic today and decrypts it once a cryptographically relevant
+quantum computer (CRQC) exists. Message confidentiality in tactical systems may
+need to hold for years, so HNDL matters before a CRQC exists. Hybrid key
+exchange closes this gap for traffic negotiated today.
 
-## Migration Plan
+Authentication is different: forging a signature requires a CRQC at the time
+of the handshake, so classical certificates are not exposed to HNDL. The
+long-lived credential worth migrating first is the CA (see below).
 
-### Phase 1: Hybrid Key Exchange (Shipped: v0.7.0)
+## Key Exchange
 
-Enable **X25519MLKEM768** (X25519 + ML-KEM 768) hybrid key exchange in rustls. This provides quantum resistance for key exchange while maintaining classical security as a fallback.
+X25519MLKEM768 is a hybrid: the session is secure if either X25519 or ML-KEM-768
+holds. No client-side changes are required; a client that does not offer the
+hybrid group negotiates classical X25519.
 
-**Requirements:**
-- rustls 0.23.22+ (already supports hybrid PQ key exchange)
-- The `aws-lc-rs` crypto backend — PQ key exchange is **not available** in the `ring` backend. rustgate already uses `aws-lc-rs` for its `fips` feature, so the build tooling (Go, cmake) is already supported.
-- No client-side changes required — clients that don't support PQ will negotiate classical X25519
-- Feature-gated behind a `post-quantum` feature flag initially
+`--kx-groups` (`RUSTGATE_KX_GROUPS`) replaces the offered groups and their
+order. Accepted names: `X25519MLKEM768`, `SECP256R1MLKEM768`, `MLKEM768`,
+`MLKEM1024`, `X25519`, `secp256r1`, `secp384r1` (case-insensitive,
+comma-separated).
 
-**Implementation:**
-1. Add `rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768` to the `CryptoProvider` key exchange group list
-2. Place PQ groups first in preference order so PQ-capable clients negotiate PQ
-3. The `post-quantum` feature flag will depend on the `aws-lc-rs` backend (same as `fips`), since `ring` does not support PQ. Deployments that want PQ without FIPS compliance will get a separate `aws-lc-rs` dependency path.
-4. Gate behind `#[cfg(feature = "post-quantum")]` to avoid increasing binary size for deployments that don't need it
+| Setting | Use |
+|---|---|
+| _(unset)_ | Hybrid PQ preferred, classical fallback. The right default. |
+| `--kx-groups X25519` | Bandwidth-constrained links. An X25519MLKEM768 key share adds about 1.2 KB to each direction of the handshake. |
+| `--kx-groups MLKEM1024` | CNSA 2.0 key establishment. Peers without ML-KEM-1024 cannot connect. |
 
-### Phase 2: PQ Certificate Authentication (Partially shipped)
+`--prefer-post-quantum` is deprecated: hybrid key exchange is already
+preferred. It is still accepted and logs that it changes nothing.
 
-**Issuance shipped (#502):** the `post-quantum` feature of `rustgate-enrollment`
+## Certificate Authentication
+
+**Issuance (#502):** the `post-quantum` feature of `rustgate-enrollment`
 issues pure ML-DSA-87 certificates and CRLs (RFC 9881) using the pure-Rust
 `fips204` crate.
 
-**Verification shipped (#501):** the `mldsa-certs` feature of `rustgate-tls`
-lets the server *authenticate* peers whose certificate chain is signed with
-ML-DSA-87.
+**Verification (#501):** on in every build. A chain is only verified with
+ML-DSA when its issuer key is ML-DSA, which means a trust anchor the operator
+configured with `--ca`. `--mldsa-client-certs` is deprecated and changes
+nothing.
 
-```bash
-cargo build -p rustgate-server --features mldsa-certs
-rustgate --mldsa-client-certs …      # or RUSTGATE_MLDSA_CLIENT_CERTS=1
-```
-
-The build flag alone changes nothing: the runtime flag is required, because
-enabling this widens the set of certificates the process will accept.
-
-#### Recommended deployment: ML-DSA-87 issuer, classical leaves
+### Recommended deployment: ML-DSA-87 issuer, classical leaves
 
 The migration shape worth adopting first is a **post-quantum root CA signing
-classical (ECDSA P-384) leaves**. This is not a compromise — it targets the
-actual exposure:
+classical (ECDSA P-384) leaves**:
 
-- A root CA has a 10–20 year lifetime, so it is the credential genuinely
-  exposed to harvest-now-forge-later. Leaves rotate in days or months.
-- It works with **every existing client, unmodified** — no client-side ML-DSA
-  support is needed, because the client still signs with its classical key.
+- A root CA has a 10–20 year lifetime, so it is the credential exposed to
+  harvest-now-forge-later. Leaves rotate in days or months.
+- It works with **every existing client, unmodified**, because the client
+  still signs with its classical key.
 - It lets the PKI migrate on its own schedule, independent of endpoint fleets.
 
-A pure ML-DSA-87 *leaf* is also accepted, but note the constraint below.
+A pure ML-DSA-87 *leaf* is also accepted, with the constraints below.
 
-#### Constraints
+### Constraints
 
 | Constraint | Detail |
 |---|---|
-| **Mutually exclusive with FIPS** | ML-DSA is outside the AWS-LC FIPS submission. `--features fips,mldsa-certs` fails to build, and the provider reports `fips() == false`, so `--fips-required` cannot be combined with it. |
 | **TLS 1.3 only in practice** | TLS 1.2's `ClientCertificateType` registry has no ML-DSA entry, so a TLS 1.2 CertificateRequest cannot coherently ask for an ML-DSA credential. |
-| **rustgate-client cannot present a pure ML-DSA leaf** | rustls cannot yet *produce* an ML-DSA signature. The scheme is advertised for interop with stacks that can (OpenSSL 3.5+, BoringSSL). |
-| **Preference order** | ML-DSA-87 is advertised **last**, behind every classical scheme, so dual-credential peers do not send a ~7 KB ML-DSA credential where a ~100-byte ECDSA one suffices. |
-
-#### Wire-size note for constrained links
+| **rustgate-client cannot present a pure ML-DSA leaf** | rustls cannot yet *produce* an ML-DSA signature. Peers built on stacks that can (OpenSSL 3.5+, BoringSSL) can. |
+| **Preference order** | ML-DSA schemes are advertised **after** every classical scheme, so dual-credential peers do not send a ~7 KB ML-DSA credential where a ~100-byte ECDSA one suffices. |
 
 An ML-DSA-87 public key is 2592 bytes and a signature is 4627 bytes. On
-bandwidth-constrained tactical links, an ML-DSA-signed chain measurably
-increases handshake size — a further reason the issuer-only migration above is
-the sensible default.
+constrained links an ML-DSA-signed chain measurably increases handshake size,
+which is a further reason to start with the issuer-only migration.
 
-**Remaining work:**
+## FIPS
+
+`--features fips` uses the AWS-LC FIPS module. Hybrid key exchange and ML-DSA
+verification work under it, and the provider still reports FIPS mode. Which
+module version a build links, and its certification status, is in
+[fips.md](fips.md).
+
+## Remaining Work
+
 - ML-DSA client-side *signing* (a `rustls::crypto::signer::SigningKey`
-  implementation) — required before `rustgate-client` can present a pure
+  implementation), required before `rustgate-client` can present a pure
   ML-DSA leaf.
-- Composite (hybrid dual-signature) certificates, #503 — blocked on
+- Composite (hybrid dual-signature) certificates, #503, blocked on
   `draft-ietf-lamps-pq-composite-sigs` becoming an RFC.
-- FIPS convergence — blocked on rustls-webpki adopting the AWS-LC FIPS 4.0
-  ML-DSA scope.
-
-### Phase 3: PQ Federation (Future)
-
-Extend PQ key exchange to federation connections (V1 mTLS and V2 gRPC). This depends on Phase 1 for the TLS layer and on `tonic`/`hyper` supporting PQ-capable TLS configurations.
+- Full CNSA 2.0, tracked in [ADR 0019](adr/0019-cnsa2-hybrid-mldsa.md).
+  `--cnsa2` logs a readiness report at startup.
 
 ## NIST PQ Standards Reference
 

@@ -27,9 +27,8 @@ which supports pluggable `CryptoProvider` backends:
 
 | Feature Flag | Backend | Use Case |
 |---|---|---|
-| _(default)_ | `ring` | Standard deployments, broadest platform support |
-| `fips` | `aws-lc-rs` (FIPS 140-3) | Government and regulated environments |
-| `post-quantum` | `aws-lc-rs` | Post-quantum hybrid key exchange (X25519MLKEM768) |
+| _(default)_ | `aws-lc-rs` | All deployments; hybrid post-quantum key exchange (X25519MLKEM768) and ML-DSA verification |
+| `fips` | `aws-lc-rs` (AWS-LC FIPS module) | Government and regulated environments |
 
 Backend selection is compile-time only — a single binary uses exactly one
 `CryptoProvider`. This avoids runtime complexity and ensures the entire
@@ -37,12 +36,11 @@ binary is auditable against a single cryptographic library.
 
 ### Switching Backends
 
-To migrate from `ring` to `aws-lc-rs` (for FIPS or post-quantum):
+To move to the FIPS module:
 
-1. Rebuild with the appropriate feature flag (`--features fips` or
-   `--features post-quantum`).
-2. Deploy the new binary. No configuration changes are needed — the binary
-   installs its `CryptoProvider` at startup via `install_fips_provider()`.
+1. Rebuild with `--features fips`.
+2. Deploy the new binary. No configuration changes are needed; the binary
+   installs the FIPS `CryptoProvider` at startup.
 3. Existing clients reconnect and negotiate cipher suites with the new
    backend. No client-side changes are required.
 
@@ -51,7 +49,7 @@ To migrate from `ring` to `aws-lc-rs` (for FIPS or post-quantum):
 ### Cipher Suites
 
 rustls selects cipher suites based on the installed `CryptoProvider`.
-Both backends support:
+Both builds support:
 
 - **TLS 1.3:** AES-256-GCM, AES-128-GCM, ChaCha20-Poly1305
 - **TLS 1.2** (when permitted by `--tls-min-version`): ECDHE+AES-GCM,
@@ -66,9 +64,9 @@ the secure baseline.
 
 | Backend | Key Exchange Groups (preference order) |
 |---|---|
-| `ring` | X25519, secp256r1, secp384r1 |
-| `aws-lc-rs` | X25519, secp256r1, secp384r1 |
-| `aws-lc-rs` + PQ | X25519MLKEM768, SECP256R1MLKEM768, MLKEM768, MLKEM1024, X25519, secp256r1, secp384r1 |
+| default | X25519MLKEM768, X25519, secp256r1, secp384r1 |
+| `fips` | The FIPS-approved subset of the default list (X25519MLKEM768 stays first) |
+| `--kx-groups` | Any of X25519MLKEM768, SECP256R1MLKEM768, MLKEM768, MLKEM1024, X25519, secp256r1, secp384r1, in the given order |
 
 When post-quantum support is enabled, the hybrid `X25519MLKEM768` group is
 placed first in preference order. Clients that support ML-KEM negotiate

@@ -281,8 +281,8 @@ rustgate-server \
 - Default rustls provider for non-FIPS environments.
 - `fips` feature for FIPS 140-3 (aws-lc-rs) deployments. See
   [`docs/fips.md`](docs/fips.md).
-- `post-quantum` feature for hybrid PQ key exchange where the
-  threat model includes harvest-now-decrypt-later. See
+- Hybrid post-quantum key exchange (X25519MLKEM768) preferred in every
+  build, against harvest-now-decrypt-later. See
   [`docs/post-quantum.md`](docs/post-quantum.md).
 - All keys held in memory wrapped in `zeroize::Zeroizing<T>`; types
   containing key material implement custom redacted `Debug`.

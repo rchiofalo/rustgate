@@ -466,76 +466,20 @@ pub fn check_crl_freshness(crls: &[CertificateRevocationListDer<'static>]) -> us
     stale_count
 }
 
-/// The stock `aws-lc-rs` provider with every ML-DSA signature algorithm removed.
+/// Install the FIPS 140-3 crypto provider (aws-lc-rs in FIPS mode).
 ///
-/// rustls 0.23.46 added ML-DSA-44/65/87 to the aws-lc-rs provider's default
-/// verification set. rustgate keeps acceptance of ML-DSA-signed certificate
-/// chains opt-in (`--features mldsa-certs` plus `--mldsa-client-certs`, #501),
-/// so every aws-lc-rs provider it installs starts from this one, and the opt-in
-/// adds ML-DSA-87 back. Cipher suites, key-exchange groups and the classical
-/// algorithms (in their original order) are untouched.
-#[cfg(any(feature = "fips", feature = "post-quantum", feature = "mldsa-certs"))]
-#[must_use]
-pub fn aws_lc_rs_provider() -> rustls::crypto::CryptoProvider {
-    rustls::crypto::CryptoProvider {
-        signature_verification_algorithms: *CLASSICAL_SIG_ALGS,
-        ..rustls::crypto::aws_lc_rs::default_provider()
-    }
-}
-
-/// The stock aws-lc-rs verification algorithms without ML-DSA. Derived from the
-/// upstream provider, not hand-listed, so classical algorithms rustls adds
-/// later still carry through.
-#[cfg(any(feature = "fips", feature = "post-quantum", feature = "mldsa-certs"))]
-pub(crate) static CLASSICAL_SIG_ALGS: std::sync::LazyLock<
-    rustls::crypto::WebPkiSupportedAlgorithms,
-> = std::sync::LazyLock::new(|| {
-    use rustls::SignatureScheme;
-    use rustls_pki_types::alg_id;
-
-    let base = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
-    let mldsa = [alg_id::ML_DSA_44, alg_id::ML_DSA_65, alg_id::ML_DSA_87];
-    let all: Vec<_> = base
-        .all
-        .iter()
-        .copied()
-        .filter(|alg| !mldsa.contains(&alg.public_key_alg_id()))
-        .collect();
-    let mapping: Vec<_> = base
-        .mapping
-        .iter()
-        .copied()
-        .filter(|(scheme, _)| {
-            !matches!(
-                scheme,
-                SignatureScheme::ML_DSA_44
-                    | SignatureScheme::ML_DSA_65
-                    | SignatureScheme::ML_DSA_87
-            )
-        })
-        .collect();
-    // `WebPkiSupportedAlgorithms` holds `&'static` slices and this set is
-    // only known at run time, so it is leaked once, here, via `LazyLock`.
-    rustls::crypto::WebPkiSupportedAlgorithms {
-        all: all.leak(),
-        mapping: mapping.leak(),
-    }
-});
-
-/// Install the FIPS 140-3 crypto provider (aws-lc-rs).
-///
-/// Must be called once before any TLS operations. Replaces the default
-/// `ring` backend with `aws-lc-rs` in FIPS mode, restricting cipher
-/// suites and key exchange algorithms to the FIPS-approved set.
+/// Must be called once before any TLS operations. Restricts cipher suites
+/// and key exchange algorithms to the FIPS-approved set.
 ///
 /// Returns an error if a crypto provider is already installed.
 #[cfg(feature = "fips")]
 pub fn install_fips_provider() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(aws_lc_rs_provider()).map_err(|_| {
-        RustgateError::from(ConfigError::Other(
-            "crypto provider already installed".to_string(),
-        ))
-    })?;
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .map_err(|_| {
+            RustgateError::from(ConfigError::Other(
+                "crypto provider already installed".to_string(),
+            ))
+        })?;
 
     // Verify the installed provider actually reports FIPS mode.
     // This catches build misconfigurations where aws-lc-rs was compiled
@@ -564,73 +508,34 @@ pub fn is_fips_provider_active() -> bool {
         .unwrap_or(false)
 }
 
-/// Install the post-quantum crypto provider (aws-lc-rs with ML-KEM key exchange).
+/// Install rustgate's default crypto provider: aws-lc-rs, offering hybrid
+/// post-quantum key exchange (X25519MLKEM768) first with classical fallback,
+/// and verifying ML-DSA certificate signatures (ADR 0037).
 ///
-/// Uses `X25519MLKEM768` as the highest-priority key exchange group when
-/// `prefer-post-quantum` is enabled in rustls. Clients that don't support
-/// ML-KEM fall back to X25519 transparently.
-///
-/// Must be called once before any TLS operations. Replaces the default
-/// `ring` backend with `aws-lc-rs`.
+/// Must be called once before any TLS operations.
 ///
 /// Returns an error if a crypto provider is already installed.
-#[cfg(feature = "post-quantum")]
-pub fn install_pq_provider() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(pq_provider()).map_err(|_| {
-        RustgateError::from(ConfigError::Other(
-            "crypto provider already installed".to_string(),
-        ))
-    })?;
+pub fn install_default_provider() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
+        .map_err(|_| {
+            RustgateError::from(ConfigError::Other(
+                "crypto provider already installed".to_string(),
+            ))
+        })?;
 
-    tracing::info!("post-quantum crypto provider (aws-lc-rs) installed — X25519MLKEM768 preferred");
+    tracing::info!("crypto provider (aws-lc-rs) installed — X25519MLKEM768 preferred");
     Ok(())
 }
 
-/// Install a crypto provider with a custom key exchange group preference order.
-///
-/// Parses group names from a comma-separated string and builds a
-/// `CryptoProvider` with those groups in the specified order.
-/// Requires `--features post-quantum` for PQ groups.
-///
-/// Returns an error if a group name is unrecognized or if a crypto provider
-/// is already installed.
-#[cfg(feature = "post-quantum")]
-pub fn install_provider_with_kx_groups(groups: &str) -> Result<()> {
-    let provider = pq_provider_with_kx_groups(groups)?;
-
-    rustls::crypto::CryptoProvider::install_default(provider).map_err(|_| {
-        RustgateError::from(ConfigError::Other(
-            "crypto provider already installed".to_string(),
-        ))
-    })?;
-
-    tracing::info!(groups = %groups, "crypto provider installed with custom key exchange groups");
-    Ok(())
-}
-
-/// Build (but do not install) the post-quantum `aws-lc-rs` provider.
-///
-/// Separate from [`install_pq_provider`] so callers that need to augment the
-/// provider before installing — for example adding ML-DSA certificate
-/// verification (`mldsa-certs`, #501) — can compose one value and call
-/// `install_default` exactly once. Installing twice silently loses the second
-/// provider.
-#[cfg(feature = "post-quantum")]
-#[must_use]
-pub fn pq_provider() -> rustls::crypto::CryptoProvider {
-    aws_lc_rs_provider()
-}
-
-/// Build (but do not install) a provider with a custom key-exchange group
-/// preference order. See [`pq_provider`] for why the build and install steps
-/// are separable.
+/// Build (but do not install) the aws-lc-rs provider with a custom
+/// key-exchange group preference order — for example `X25519` alone, to keep
+/// handshakes classical on bandwidth-constrained links.
 ///
 /// # Errors
 ///
 /// Returns an error if a group name is unrecognized.
-#[cfg(feature = "post-quantum")]
-pub fn pq_provider_with_kx_groups(groups: &str) -> Result<rustls::crypto::CryptoProvider> {
-    let mut provider = aws_lc_rs_provider();
+pub fn provider_with_kx_groups(groups: &str) -> Result<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     provider.kx_groups = parse_kx_groups(groups)?;
     Ok(provider)
 }
@@ -638,9 +543,7 @@ pub fn pq_provider_with_kx_groups(groups: &str) -> Result<rustls::crypto::Crypto
 /// Parse a comma-separated list of key exchange group names into rustls
 /// `SupportedKxGroup` references.
 ///
-/// Group names are case-insensitive. Available groups depend on the compiled
-/// crypto backend.
-#[cfg(feature = "post-quantum")]
+/// Group names are case-insensitive.
 fn parse_kx_groups(groups: &str) -> Result<Vec<&'static dyn rustls::crypto::SupportedKxGroup>> {
     use rustls::crypto::aws_lc_rs::kx_group;
 
@@ -692,57 +595,6 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
-
-    /// rustls 0.23.46 puts ML-DSA into the stock aws-lc-rs provider; rustgate's
-    /// aws-lc-rs provider must remove exactly those entries and nothing else,
-    /// so ML-DSA acceptance stays behind `--mldsa-client-certs` (#501).
-    #[cfg(any(feature = "fips", feature = "post-quantum", feature = "mldsa-certs"))]
-    #[test]
-    fn aws_lc_rs_provider_removes_only_mldsa() {
-        use rustls::SignatureScheme;
-        use rustls_pki_types::alg_id;
-
-        let is_mldsa_scheme = |s: &SignatureScheme| {
-            matches!(
-                s,
-                SignatureScheme::ML_DSA_44
-                    | SignatureScheme::ML_DSA_65
-                    | SignatureScheme::ML_DSA_87
-            )
-        };
-        let mldsa_ids = [alg_id::ML_DSA_44, alg_id::ML_DSA_65, alg_id::ML_DSA_87];
-
-        let stock = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
-        let ours = aws_lc_rs_provider().signature_verification_algorithms;
-
-        let stock_schemes: Vec<_> = stock.mapping.iter().map(|(s, _)| *s).collect();
-        let our_schemes: Vec<_> = ours.mapping.iter().map(|(s, _)| *s).collect();
-        let expected: Vec<_> = stock_schemes
-            .iter()
-            .copied()
-            .filter(|s| !is_mldsa_scheme(s))
-            .collect();
-        assert_eq!(
-            our_schemes, expected,
-            "classical schemes kept, in order; ML-DSA removed"
-        );
-
-        assert!(
-            ours.all
-                .iter()
-                .all(|alg| !mldsa_ids.contains(&alg.public_key_alg_id())),
-            "no ML-DSA verification algorithm may remain in `all`"
-        );
-        assert_eq!(
-            ours.all.len(),
-            stock
-                .all
-                .iter()
-                .filter(|alg| !mldsa_ids.contains(&alg.public_key_alg_id()))
-                .count(),
-            "every classical verification algorithm is kept"
-        );
-    }
 
     #[test]
     fn parse_tls_min_version_1_2() {
@@ -1251,10 +1103,12 @@ mod tests {
             .expect("build succeeds with TLS 1.3 only");
     }
 
+    // Without `--features fips`, aws-lc-rs runs outside its FIPS module.
+    #[cfg(not(feature = "fips"))]
     #[test]
-    fn is_fips_provider_active_is_false_under_ring_default() {
-        // `TestCa::new` installs `ring` as the default provider (not the
-        // FIPS-validated `aws-lc-rs` with FIPS feature). The FIPS
+    fn is_fips_provider_active_is_false_without_fips_feature() {
+        // `TestCa::new` installs the default aws-lc-rs provider, which is not
+        // in FIPS mode unless built with `--features fips`. The FIPS
         // accessor must report `false` so operators relying on
         // `--fips-required` get a clean fail-closed signal. A regression
         // that returned `true` for non-FIPS providers would silently
@@ -1262,24 +1116,36 @@ mod tests {
         let _ca = rustgate_test_utils::certs::TestCa::new("fips-probe-ca");
         assert!(
             !is_fips_provider_active(),
-            "ring default provider must not report FIPS mode"
+            "a non-FIPS build must not report FIPS mode"
         );
     }
 
     #[test]
-    fn is_pq_provider_active_is_false_under_ring_default() {
-        // Same logic as FIPS: `ring` does not advertise `X25519MLKEM768`,
-        // so the PQ detection accessor must report false. This is what
-        // the `/status` endpoint reads — a false positive would make
-        // operators believe PQ key exchange is live when it isn't.
+    fn is_pq_provider_active_under_default_provider() {
+        // The default aws-lc-rs provider offers X25519MLKEM768 (ADR 0037).
+        // This is what the `/status` endpoint reads, so it must report the
+        // post-quantum key exchange that is actually on offer.
         let _ca = rustgate_test_utils::certs::TestCa::new("pq-probe-ca");
         assert!(
-            !is_pq_provider_active(),
-            "ring default provider must not advertise X25519MLKEM768"
+            is_pq_provider_active(),
+            "the default provider must advertise X25519MLKEM768"
         );
     }
 
-    #[cfg(feature = "post-quantum")]
+    #[test]
+    fn classical_kx_groups_disable_post_quantum() {
+        // `--kx-groups X25519` is the documented setting for constrained
+        // links: the resulting provider must not offer a hybrid group.
+        let provider = provider_with_kx_groups("X25519").unwrap();
+        assert!(
+            provider
+                .kx_groups
+                .iter()
+                .all(|g| g.name() != rustls::NamedGroup::X25519MLKEM768),
+            "X25519-only provider must not offer X25519MLKEM768"
+        );
+    }
+
     mod kx_groups {
         use super::super::parse_kx_groups;
 

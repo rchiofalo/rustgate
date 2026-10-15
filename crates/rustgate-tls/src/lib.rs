@@ -39,8 +39,6 @@ pub mod verifier;
 
 #[cfg(feature = "ocsp")]
 pub mod client_ocsp;
-#[cfg(feature = "mldsa-certs")]
-pub mod mldsa_certs;
 #[cfg(feature = "ocsp")]
 pub mod ocsp;
 #[cfg(feature = "spiffe")]
@@ -49,23 +47,16 @@ pub mod spiffe;
 pub use cert_reloader::CertReloader;
 #[cfg(feature = "ocsp")]
 pub use client_ocsp::{ClientOcspVerifier, FetchFuture, OcspFetcher, OcspStaplerFetcher};
-#[cfg(any(feature = "fips", feature = "post-quantum", feature = "mldsa-certs"))]
-pub use config::aws_lc_rs_provider;
 #[cfg(feature = "fips")]
 pub use config::install_fips_provider;
 pub use config::{
     CrlFileSummary, TlsConfig, TlsMinVersion, check_crl_freshness, crl_max_age_seconds,
-    is_fips_provider_active, is_pq_provider_active,
-};
-#[cfg(feature = "post-quantum")]
-pub use config::{
-    install_pq_provider, install_provider_with_kx_groups, pq_provider, pq_provider_with_kx_groups,
+    install_default_provider, is_fips_provider_active, is_pq_provider_active,
+    provider_with_kx_groups,
 };
 pub use crl_store::{CrlHealth, CrlHealthObserver, CrlStore};
 pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
-#[cfg(feature = "mldsa-certs")]
-pub use mldsa_certs::{install_mldsa_provider, mldsa_provider, with_mldsa_verification};
 pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};
 #[cfg(feature = "spiffe")]

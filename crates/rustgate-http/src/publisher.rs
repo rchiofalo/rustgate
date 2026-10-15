@@ -846,6 +846,7 @@ fn build_standard_client(
     resolver: Arc<SsrfSafeResolver>,
 ) -> Result<reqwest::Client, HttpError> {
     let timeout = Duration::from_secs(tc.effective_timeout_secs());
+    rustgate_core::tls_provider::ensure_default();
     let mut builder = reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(5))
@@ -1015,6 +1016,7 @@ fn build_pinned_client(
     };
 
     let timeout = Duration::from_secs(tc.effective_timeout_secs());
+    rustgate_core::tls_provider::ensure_default();
     reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(5))
@@ -2722,6 +2724,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        rustgate_core::tls_provider::ensure_default();
         let response = reqwest::get(server.uri()).await.unwrap();
         let captured = capture_response_body(response, 4 * 1024, true).await;
         assert_eq!(captured.as_deref(), Some(ack.as_bytes()));
@@ -2742,6 +2745,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        rustgate_core::tls_provider::ensure_default();
         let response = reqwest::get(server.uri()).await.unwrap();
         let captured = capture_response_body(response, 4 * 1024, false).await;
         assert!(captured.is_none());
@@ -2760,6 +2764,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        rustgate_core::tls_provider::ensure_default();
         let response = reqwest::get(server.uri()).await.unwrap();
         let captured = capture_response_body(response, 4 * 1024, true).await;
         assert!(captured.is_none());
@@ -2780,6 +2785,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        rustgate_core::tls_provider::ensure_default();
         let response = reqwest::get(server.uri()).await.unwrap();
         // 512-byte cap — well below the server's 2 KiB payload.
         let captured = capture_response_body(response, 512, true).await;
@@ -2805,6 +2811,7 @@ mod tests {
             .mount(&server)
             .await;
 
+        rustgate_core::tls_provider::ensure_default();
         let response = reqwest::get(server.uri()).await.unwrap();
         // Per-target cap is 1 MiB — without the Content-Length guard
         // the helper would happily allocate 1 MiB+1 into a Bytes.

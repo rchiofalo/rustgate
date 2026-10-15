@@ -96,6 +96,7 @@ impl ConsulDiscovery {
     pub fn new(base_url: impl Into<String>, service: impl Into<String>) -> Result<Self> {
         let base_url = base_url.into();
         let service = service.into();
+        rustgate_core::tls_provider::ensure_default();
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_HTTP_TIMEOUT)
             .build()

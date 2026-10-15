@@ -67,26 +67,13 @@ unused_async = "warn"
 tokio = { version = "1", default-features = false }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# aws-lc-rs is the only TLS crypto provider (ADR 0037): hybrid post-quantum
+# key exchange (X25519MLKEM768 first) and ML-DSA certificate verification by
+# default. Keep `ring` out of rustls's features, including via dependencies
+# below, so rustls can auto-select the single provider.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "logging", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
-# Direct dependency solely to reach the ML-DSA `SignatureVerificationAlgorithm`
-# statics for the ML-DSA-87 TLS certificate-verification path
-# (`rustgate-tls` `mldsa-certs` feature, #501). rustls already depends on this
-# crate, but its `aws_lc_rs` feature enables only `webpki/aws-lc-rs` — the
-# `webpki::aws_lc_rs::ML_DSA_*` statics additionally require
-# `aws-lc-rs-unstable`, which only a direct dependant can turn on.
-#
-# Pinned to 0.103 (not 0.104) because 0.104 has never had a stable release —
-# only `0.104.0-alpha.*` — and this is a security-load-bearing path.
-#
-# A future webpki major bump is safe for our use: the value we hold is a
-# `&'static dyn rustls_pki_types::SignatureVerificationAlgorithm`, a trait
-# owned by the single-major `rustls-pki-types` crate rather than by webpki, so
-# it cannot produce the two-versions-of-the-same-trait mismatch that a
-# webpki-owned type would. rustls 0.23.40 requires `rustls-webpki ^0.103.5`,
-# so this unifies onto one copy.
-rustls-webpki = { version = "0.103", default-features = false }
 x509-parser = "0.18"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -203,7 +190,7 @@ lru = "0.18.0"
 # O(log N) per submit instead of scanning the whole fused-entity map.
 rstar = "0.12"
 zeroize = { version = "1", features = ["derive"] }
-ocsp-stapler = "0.4"
+ocsp-stapler = { version = "0.4", default-features = false, features = ["prometheus", "aws-lc-rs"] }
 # Direct edge on the OCSP ASN.1 crate so the client-OCSP verifier can match
 # `CertStatus` variants directly instead of via a Debug-string comparison.
 # Must stay version-unified with ocsp-stapler's transitive rasn-ocsp (0.28.x).
@@ -231,8 +218,8 @@ cedar-policy = "4"
 spiffe = { version = "0.14", default-features = false, features = ["workload-api-x509"] }
 async-trait = "0.1.89"
 mdns-sd = { version = "0.19", default-features = false, features = ["async"] }
-etcd-client = { version = "0.18", default-features = false, features = ["tls"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+etcd-client = { version = "0.21", default-features = false, features = ["tls-aws-lc"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2"] }
 wiremock = "0.6"
 # Kubernetes client + runtime for the operator's live apply-loop
 # (`rustgate-operator`, feature `controller`). Pulls in the typed API
@@ -243,7 +230,7 @@ wiremock = "0.6"
 # include `openssl-tls`, which would pull `openssl` into the dep tree and
 # trip the deny.toml ban, so the default set is disabled and
 # `rustls-tls` is opted into explicitly.
-kube = { version = "3.1", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
+kube = { version = "3.1", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "aws-lc-rs"] }
 # Typed Kubernetes resource bindings. Pinned to the same minor as `kube`'s
 # tested-against version per the `kube` README. The `latest` feature picks
 # the most recent Kubernetes API surface the bindings ship; the operator

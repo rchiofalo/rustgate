@@ -242,7 +242,8 @@ truth and catch any drift between the two implementations.
 | Rust 1.99+ | Yes | Pinned in `rust-toolchain.toml` (edition 2024) |
 | Rust nightly | Yes | For `cargo +nightly fmt` (CI enforces nightly formatting) |
 | protoc | For `proto` / `federation` features | Protocol Buffers compiler |
-| Go 1.20+, cmake | For `fips` feature | Required by aws-lc-rs build system |
+| C compiler | Yes | aws-lc-rs (the TLS crypto provider) compiles C |
+| Go 1.20+, cmake | For `fips` feature | Required by the AWS-LC FIPS module build |
 | nats-server | For NATS integration tests | Install from [nats.io](https://nats.io/download/) |
 
 Optional tooling:
@@ -270,7 +271,6 @@ cargo build --release --features websocket      # WebSocket listener
 cargo build --release --features metrics        # Prometheus + health endpoints
 cargo build --release --features jemalloc       # jemalloc allocator (musl)
 cargo build --release --features fips           # FIPS 140-3 crypto (needs Go + cmake)
-cargo build --release --features post-quantum  # PQ key exchange (needs Go + cmake)
 cargo build --release --features http            # HTTP/webhook egress
 cargo build --release --features otel           # OpenTelemetry tracing (needs protoc)
 
@@ -294,7 +294,6 @@ cargo build --release --all-features
 | `metrics` | Prometheus metrics | — |
 | `full-detail` | Extended CoT parsing | — |
 | `fips` | FIPS 140-3 crypto (aws-lc-rs) | Go 1.20+, cmake |
-| `post-quantum` | Post-quantum key exchange (X25519MLKEM768) | Go 1.20+, cmake |
 | `otel` | OpenTelemetry distributed tracing | `protoc` |
 | `http` | HTTP/webhook egress bridge | — |
 | `cedar` | Cedar policy backend for authorization | — |
@@ -456,8 +455,7 @@ All flags support environment variables (CLI takes precedence):
 | `--cert-reload-interval` | `RUSTGATE_CERT_RELOAD_INTERVAL` | `0` (disabled) |
 | `--max-concurrent-handshakes` | `RUSTGATE_MAX_HANDSHAKES` | `100` |
 | `--fips-required` | `RUSTGATE_FIPS_REQUIRED` | `false` |
-| `--prefer-post-quantum` | `RUSTGATE_PREFER_POST_QUANTUM` | `false` |
-| `--kx-groups` | `RUSTGATE_KX_GROUPS` | — (provider default) |
+| `--kx-groups` | `RUSTGATE_KX_GROUPS` | — (X25519MLKEM768 first, then X25519, P-256, P-384) |
 | `--framing` | `RUSTGATE_FRAMING` | `xml` |
 | `--encoding` | `RUSTGATE_ENCODING` | `raw` |
 | `--max-connections` | `RUSTGATE_MAX_CONNECTIONS` | `1024` |
@@ -893,7 +891,7 @@ Licensed under the GNU Affero General Public License, version 3 only
 (`AGPL-3.0-only`). See [LICENSE](LICENSE) for the license text and
 [NOTICE](NOTICE) for the copyright notice, the grant covering every prior
 revision of this repository, and an additional permission for linking
-AWS-LC in `fips` builds.
+AWS-LC, which matters for `fips` builds.
 
 In short: you may use, modify, and redistribute rustgate, but if you
 distribute a modified version — or let users interact with one over a

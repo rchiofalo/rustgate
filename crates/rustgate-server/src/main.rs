@@ -7,18 +7,6 @@
 //! graceful shutdown logic. Subsystem initialization is delegated to [`setup`],
 //! session handling to [`session`], and CLI parsing to [`cli`].
 
-// Duplicated from `rustgate-tls` on purpose. Cargo unifies features across the
-// whole build graph, not per crate, and `rustgate-http` / `rustgate-federation`
-// enable `rustls/fips` independently of `rustgate-tls` — so a guard that lived
-// only in `rustgate-tls` could be bypassed by a graph that reaches `fips`
-// through one of those. This is the binary every such path converges on.
-#[cfg(all(feature = "mldsa-certs", feature = "fips"))]
-compile_error!(
-    "features `mldsa-certs` and `fips` are not supported together: ML-DSA verification \
-     under the AWS-LC FIPS module is not validated in rustgate (see #1730). Choose FIPS \
-     140-3 mode or ML-DSA-87 certificate verification, not both."
-);
-
 // `tikv-jemallocator` is POSIX-only and the dependency is target-gated
 // under `cfg(not(target_os = "windows"))` in Cargo.toml. Mirror that
 // gate here so a Windows build that nonetheless enables the `jemalloc`
@@ -594,97 +582,34 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Crypto provider. Exactly one provider is installed, and it is
-    // installed exactly ONCE: `post-quantum` customises `kx_groups` and
-    // `mldsa-certs` customises `signature_verification_algorithms` — two
-    // orthogonal fields of the same aws-lc-rs provider. A build with both
-    // must therefore merge them into a single value; calling
-    // `install_default` twice silently discards the second provider.
-    //
-    // When both `post-quantum` and `fips` are enabled, the PQ provider
-    // includes FIPS validation (same aws-lc-rs backend) plus PQ KX groups.
-    // ------------------------------------------------------------------
-    // `None` means "let rustls select the backend from crate features", which
-    // is correct only on a plain `ring` build. Each arm below is defined once
-    // and later arms shadow it, so there is no dead initial assignment.
-    #[cfg(not(any(feature = "post-quantum", feature = "mldsa-certs")))]
-    let provider: Option<rustls::crypto::CryptoProvider> = None;
-
-    #[cfg(feature = "post-quantum")]
-    let provider = {
-        Some(if let Some(ref groups) = cli.tls.kx_groups {
-            // An explicit group order takes precedence over
-            // --prefer-post-quantum; the operator has spelled out the exact
-            // preference they want.
+    // Crypto provider (ADR 0037): aws-lc-rs in every build, in FIPS mode under
+    // `--features fips`. X25519MLKEM768 is preferred with classical fallback
+    // and ML-DSA certificate verification is on, unless `--kx-groups` sets an
+    // explicit order. Installed once, before any TLS use.
+    let provider = match cli.tls.kx_groups.as_deref() {
+        Some(groups) => {
             if cli.tls.prefer_post_quantum {
                 tracing::info!(
                     groups = %groups,
                     "--prefer-post-quantum superseded by an explicit --kx-groups order"
                 );
             }
-            rustgate_tls::pq_provider_with_kx_groups(groups)?
-        } else {
-            // The default PQ provider already lists X25519MLKEM768 first, so
-            // PQ is preferred whether or not the flag is set. Confirm the
-            // negotiated preference when the operator explicitly opted in, so
-            // the flag is no longer a silent no-op on a --features
-            // post-quantum build.
-            if cli.tls.prefer_post_quantum {
-                tracing::info!(
-                    "--prefer-post-quantum honored: X25519MLKEM768 key exchange preferred"
-                );
-            }
-            rustgate_tls::pq_provider()
-        })
+            rustgate_tls::provider_with_kx_groups(groups)?
+        }
+        None => rustls::crypto::aws_lc_rs::default_provider(),
     };
+    rustls::crypto::CryptoProvider::install_default(provider)
+        .map_err(|_| anyhow::anyhow!("crypto provider already installed"))?;
 
-    // `mldsa-certs` enables `rustls/aws_lc_rs` alongside the workspace's
-    // `ring` default, which leaves rustls unable to choose a backend from
-    // crate features on its own. A provider must therefore be installed
-    // explicitly on such a build even when the operator has NOT opted into
-    // ML-DSA verification — otherwise the first verifier construction panics
-    // inside rustls.
-    #[cfg(all(feature = "mldsa-certs", not(feature = "post-quantum")))]
-    let provider = Some(rustgate_tls::aws_lc_rs_provider());
-
-    // Augment (never replace) whatever base the build selected, so ML-DSA
-    // verification and PQ key exchange can both be active at once.
-    #[cfg(feature = "mldsa-certs")]
-    let provider = if cli.tls.mldsa_client_certs {
-        provider.map(rustgate_tls::with_mldsa_verification)
-    } else {
-        provider
-    };
-
-    #[cfg(not(feature = "mldsa-certs"))]
-    if cli.tls.mldsa_client_certs {
-        tracing::warn!(
-            "--mldsa-client-certs set but the mldsa-certs feature is not compiled in; \
-             rebuild with --features mldsa-certs to accept ML-DSA-87 client-certificate \
-             chains (ML-DSA verification is NOT active)"
+    // A `fips` build that is not running the FIPS module is a build problem
+    // (e.g. aws-lc-fips-sys did not build its module); refuse to start.
+    #[cfg(feature = "fips")]
+    if !rustgate_tls::is_fips_provider_active() {
+        anyhow::bail!(
+            "built with --features fips but the aws-lc-rs provider does not report FIPS \
+             mode; check that aws-lc-fips-sys built correctly"
         );
     }
-
-    if let Some(provider) = provider {
-        rustls::crypto::CryptoProvider::install_default(provider)
-            .map_err(|_| anyhow::anyhow!("crypto provider already installed"))?;
-    }
-
-    #[cfg(feature = "mldsa-certs")]
-    if cli.tls.mldsa_client_certs {
-        // Trust-policy widening — record it in the audit trail, not just the
-        // operational log.
-        rustgate_core::audit::mldsa_client_certs_enabled("ML-DSA-87");
-        tracing::warn!(
-            "--mldsa-client-certs enabled: client-certificate chains signed with ML-DSA-87 \
-             are now accepted. This widens accepted issuers process-wide and the provider \
-             no longer reports FIPS mode."
-        );
-    }
-
-    #[cfg(all(feature = "fips", not(feature = "post-quantum")))]
-    rustgate_tls::install_fips_provider()?;
 
     if cli.tls.fips_required && !rustgate_tls::is_fips_provider_active() {
         anyhow::bail!(
@@ -693,86 +618,35 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    #[cfg(feature = "post-quantum")]
     if rustgate_tls::is_pq_provider_active() {
         tracing::info!("post-quantum key exchange available (X25519MLKEM768)");
     } else {
-        tracing::warn!("post-quantum feature enabled but X25519MLKEM768 not found in provider");
+        tracing::info!("post-quantum key exchange not offered: --kx-groups excludes hybrid groups");
     }
 
-    #[cfg(not(feature = "post-quantum"))]
-    if cli.tls.prefer_post_quantum {
+    // Both flags are also TOML config keys, so they stay accepted; they no
+    // longer change anything (ADR 0037).
+    if cli.tls.prefer_post_quantum && cli.tls.kx_groups.is_none() {
+        tracing::info!("--prefer-post-quantum is the default; the flag is no longer needed");
+    }
+    if cli.tls.mldsa_client_certs {
         tracing::warn!(
-            "--prefer-post-quantum set but the post-quantum feature is not compiled in; \
-             rebuild with --features post-quantum to enable PQ key exchange"
+            "--mldsa-client-certs no longer has any effect: ML-DSA certificate \
+             verification is on in every build (ADR 0037)"
         );
     }
 
-    #[cfg(not(feature = "post-quantum"))]
-    if cli.tls.kx_groups.is_some() {
-        tracing::warn!(
-            "--kx-groups set but the post-quantum feature is not compiled in; \
-             rebuild with --features post-quantum to enable custom key exchange groups"
-        );
-    }
-
-    // CNSA 2.0 scaffolding flag (#504). This flag's runtime behavior
-    // today is limited to (a) validating the build has the
-    // post-quantum feature compiled in, and (b) logging the
-    // phased-readiness state so operators understand what they
-    // actually get versus the full CNSA 2.0 target.
-    //
-    // ML-DSA-87 *certificate verification* is no longer part of the
-    // gap: it ships behind `--features mldsa-certs` +
-    // `--mldsa-client-certs` (#501). What remains outstanding is
-    // ML-KEM-1024 key exchange, ML-DSA client *signing* (rustls cannot
-    // produce an ML-DSA signature yet), and FIPS convergence — ML-DSA
-    // is not in the AWS-LC FIPS submission, so the two cannot be
-    // combined today.
+    // CNSA 2.0 readiness report (#504): what this build delivers against the
+    // NSA CNSA 2.0 suite. It does not change configuration.
     if cli.tls.cnsa2 {
-        #[cfg(not(feature = "post-quantum"))]
-        {
-            tracing::error!(
-                "--cnsa2 requires the post-quantum feature to be compiled in; \
-                 rebuild with --features post-quantum (add --features mldsa-certs \
-                 for ML-DSA-87 certificate verification)"
-            );
-            return Err(anyhow::anyhow!(
-                "--cnsa2 requires --features post-quantum at build time"
-            ));
-        }
-        #[cfg(feature = "post-quantum")]
-        {
-            // Log the gap between "operator asked for CNSA 2.0" and
-            // "this build can actually deliver". The targets come
-            // from the NSA CNSA 2.0 algorithm suite; the "available
-            // today" column is the workspace's current reality.
-            // Report the gap between "operator asked for CNSA 2.0" and "this
-            // build can actually deliver". The targets come from the NSA
-            // CNSA 2.0 algorithm suite; the "available" column is this
-            // build's real state, so it must reflect whether ML-DSA
-            // certificate verification is actually switched on.
-            #[cfg(feature = "mldsa-certs")]
-            let mldsa_certs = if cli.tls.mldsa_client_certs {
-                "ML-DSA-87 certificate verification ACTIVE"
-            } else {
-                "ML-DSA-87 certificate verification compiled in but OFF \
-                 (pass --mldsa-client-certs)"
-            };
-            #[cfg(not(feature = "mldsa-certs"))]
-            let mldsa_certs = "classical certs only (rebuild with --features mldsa-certs \
-                               for ML-DSA-87 certificate verification)";
-
-            tracing::warn!(
-                mldsa_certs,
-                "--cnsa2 enabled (partial). CNSA 2.0 target: ML-KEM-1024 (NIST L5) + \
-                 ML-DSA-87 (NIST L5) + TLS 1.3. Key exchange available today: \
-                 X25519MLKEM768 (NIST L3 hybrid). Still outstanding: ML-KEM-1024, \
-                 ML-DSA client signing (rustls cannot produce ML-DSA signatures), and \
-                 FIPS convergence (ML-DSA is outside the AWS-LC FIPS submission). See \
-                 docs/adr/0019-cnsa2-hybrid-mldsa.md, #504 and #501."
-            );
-        }
+        tracing::warn!(
+            "--cnsa2 enabled (partial). CNSA 2.0 target: ML-KEM-1024 + ML-DSA-87 + TLS 1.3. \
+             Available: X25519MLKEM768 by default, ML-KEM-1024 with --kx-groups MLKEM1024, \
+             and ML-DSA-87 certificate verification. Outstanding: ML-DSA client signing \
+             (rustls cannot produce ML-DSA signatures yet) and a CMVP certificate for the \
+             AWS-LC-FIPS 4.x module. See docs/adr/0019-cnsa2-hybrid-mldsa.md and \
+             docs/adr/0037-aws-lc-rs-post-quantum-default.md."
+        );
     }
 
     tracing::info!(bind = %cli.tls.bind, "rustgate starting");

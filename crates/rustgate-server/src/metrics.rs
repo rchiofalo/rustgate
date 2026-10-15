@@ -295,9 +295,9 @@ pub(crate) fn enabled_features() -> String {
     if cfg!(feature = "fips") {
         features.push("fips");
     }
-    if cfg!(feature = "post-quantum") {
-        features.push("post-quantum");
-    }
+    // Hybrid post-quantum key exchange is on in every build (ADR 0037); keep
+    // reporting it so dashboards keyed on this label stay accurate.
+    features.push("post-quantum");
     if cfg!(feature = "jemalloc") {
         features.push("jemalloc");
     }

@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn new_loads_certificate() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca = rustgate_test_utils::certs::TestCa::new("Reload Test CA");
         let dir = tempfile::tempdir().unwrap();
@@ -474,7 +474,7 @@ mod tests {
     fn rejects_world_readable_key() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca = rustgate_test_utils::certs::TestCa::new("Reload Test CA");
         let dir = tempfile::tempdir().unwrap();
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn reload_detects_changed_files() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca = rustgate_test_utils::certs::TestCa::new("Reload Test CA");
         let dir = tempfile::tempdir().unwrap();
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn reload_rejects_invalid_pem() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca = rustgate_test_utils::certs::TestCa::new("Reload Test CA");
         let dir = tempfile::tempdir().unwrap();
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn new_fails_on_missing_cert() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let result = CertReloader::new("/nonexistent/cert.pem", "/nonexistent/key.pem");
         assert!(result.is_err());
@@ -571,7 +571,7 @@ mod tests {
 
     /// Helper: fresh file-backed reloader in its own tempdir.
     fn fresh_file_backed() -> (Arc<CertReloader>, tempfile::TempDir) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = rustgate_test_utils::certs::TestCa::new("Defensive Test CA");
         let dir = tempfile::tempdir().unwrap();
         write_server_cert(&ca, "server.test", dir.path());
@@ -581,7 +581,7 @@ mod tests {
 
     /// Helper: fresh memory-backed reloader (SPIFFE-style).
     fn fresh_memory_backed() -> Arc<CertReloader> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = rustgate_test_utils::certs::TestCa::new("Defensive Memory CA");
         let cert = ca.issue_server_cert("mem.test", &["mem.test"]);
         let chain = pem_to_der_chain(&cert.cert_pem);
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn from_der_rejects_empty_cert_chain() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let err = CertReloader::from_der(&[], b"ignored").unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn new_missing_key_file_mentions_key_path() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = rustgate_test_utils::certs::TestCa::new("Missing Key CA");
         let dir = tempfile::tempdir().unwrap();
         let cert = ca.issue_server_cert("missing-key.test", &["missing-key.test"]);
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn new_missing_cert_file_mentions_cert_path() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = rustgate_test_utils::certs::TestCa::new("Missing Cert CA");
         let dir = tempfile::tempdir().unwrap();
         let cert = ca.issue_server_cert("missing-cert.test", &["missing-cert.test"]);
@@ -1013,7 +1013,7 @@ mod tests {
 
     #[test]
     fn extract_serial_on_valid_cert_returns_hex_string() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = rustgate_test_utils::certs::TestCa::new("Serial Test CA");
         let cert = ca.issue_server_cert("serial.test", &["serial.test"]);
         let serial = CertReloader::extract_serial(cert.cert_pem.as_bytes());

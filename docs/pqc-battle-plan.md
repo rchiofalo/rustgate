@@ -8,6 +8,12 @@ phased implementation against that decision.
 
 ## Phases
 
+> **Update ([ADR 0037](adr/0037-aws-lc-rs-post-quantum-default.md)).**
+> Hybrid ML-KEM key exchange and ML-DSA verification are now on in every
+> build, so the `post-quantum` feature no longer gates anything below.
+> `--cnsa2` logs a readiness report; `--kx-groups MLKEM1024` and
+> `--tls-min-version 1.3` apply the CNSA 2.0 key-exchange settings.
+
 The `--cnsa2` operator surface (#504) lands in phases, mirroring ADR 0019
 §2:
 

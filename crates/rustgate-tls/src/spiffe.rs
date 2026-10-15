@@ -365,7 +365,7 @@ mod tests {
         // refresh task drives. We build certs via TestCa (DER form) and
         // confirm that update_from_der swaps the active CertifiedKey.
         use rustgate_test_utils::certs::TestCa;
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let ca = TestCa::new("SPIFFE Test CA");
         let cert_a = ca.issue_server_cert("svid-a.spiffe.test", &["svid-a.spiffe.test"]);

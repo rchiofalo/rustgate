@@ -731,6 +731,7 @@ mod tests {
     #[test]
     fn bearer_apply_sets_header() {
         let state = AuthState::Bearer(Zeroizing::new("tok123".to_string()));
+        rustgate_core::tls_provider::ensure_default();
         let client = reqwest::Client::new();
         let builder = client.post("http://localhost/test");
         let result = state.apply(builder, "POST", "/test", b"body").unwrap();
@@ -750,6 +751,7 @@ mod tests {
             username: "user".to_string(),
             password: Zeroizing::new("pass".to_string()),
         };
+        rustgate_core::tls_provider::ensure_default();
         let client = reqwest::Client::new();
         let builder = client.post("http://localhost/test");
         let result = state.apply(builder, "POST", "/test", b"body").unwrap();
@@ -772,6 +774,7 @@ mod tests {
             header_name: "X-Signature-256".to_string(),
         };
         let body = b"request body";
+        rustgate_core::tls_provider::ensure_default();
         let client = reqwest::Client::new();
         let builder = client.post("http://localhost/test");
         let result = state.apply(builder, "POST", "/test", body).unwrap();

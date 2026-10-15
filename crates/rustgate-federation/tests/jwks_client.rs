@@ -510,8 +510,9 @@ async fn mtls_to_jwks_server_uses_federation_trust_bundle() {
     // a tiny TLS server that requires client certs signed by the same
     // CA — the same posture as a federation peer's mTLS endpoint.
 
-    let _ =
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
 
     let ca = TestCa::new("jwks-test-ca");
     let server_cert = ca.issue_server_cert("localhost", &["localhost"]);

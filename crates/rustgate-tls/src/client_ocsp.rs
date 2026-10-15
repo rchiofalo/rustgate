@@ -476,7 +476,7 @@ mod tests {
     }
 
     fn build_inner_and_certs() -> (Arc<dyn ClientCertVerifier>, CertificateDer<'static>) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = rustgate_test_utils::certs::TestCa::new("ClientOCSP Test CA");
         let leaf = ca.issue_client_cert("client-1", &[]);
         let mut roots = rustls::RootCertStore::empty();

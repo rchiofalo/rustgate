@@ -17,8 +17,7 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 /// Install a crypto provider once for the test process.
 ///
-/// Uses `ring` which is always available via the workspace rustls
-/// dependency. When FIPS mode is required, tests should call
+/// Uses `aws-lc-rs`, the workspace's only rustls provider. When FIPS mode is required, tests should call
 /// `install_fips_provider()` from `rustgate-transport` *before*
 /// creating any `TestCa` instances — the `let _ =` here silently
 /// ignores the "already installed" error so FIPS tests work
@@ -31,7 +30,7 @@ static INIT_CRYPTO: Once = Once::new();
 fn ensure_crypto_provider() {
     INIT_CRYPTO.call_once(|| {
         let _ = rustls::crypto::CryptoProvider::install_default(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         );
     });
 }
