@@ -87,8 +87,8 @@ private key, an OCSP responder, or a Workload API SVID lives here.**
 
 | Feature | Description |
 |---|---|
-| `fips` | FIPS 140-3 crypto provider via `aws-lc-rs` + `rustls/fips`. Requires Go + cmake. Adds ~30 MB to the binary. |
-| `post-quantum` | X25519MLKEM768 hybrid PQ key exchange via `aws-lc-rs` + `rustls/prefer-post-quantum`. NIST L3 hybrid; full CNSA 2.0 (NIST L5) tracked in #873 + ADR 0019. Requires Go + cmake. |
+| `fips` | Uses the AWS-LC FIPS module (`rustls/fips`). Requires Go + cmake. |
+| `post-quantum`, `mldsa-certs` | No effect; kept so existing feature lists still build. Hybrid PQ key exchange and ML-DSA verification are on in every build (ADR 0037). |
 | `ocsp` | OCSP stapling (server) + client-side OCSP verification via the `ocsp-stapler` crate. Adds a background fetcher task. |
 | `spiffe` | SPIFFE Workload API integration via the `spiffe` crate. Subscribes to SVID rotation events and feeds them through `CertReloader`. |
 

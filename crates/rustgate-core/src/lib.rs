@@ -47,6 +47,8 @@ pub mod protocol;
 pub mod sanitize;
 pub mod secrets;
 pub mod tasks;
+#[cfg(feature = "tls-provider")]
+pub mod tls_provider;
 pub mod traceparent;
 
 pub use crypto::{HmacError, hmac_sha256_tag, hmac_sha256_verify};

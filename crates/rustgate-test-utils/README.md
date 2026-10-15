@@ -49,8 +49,7 @@ plumbing. Depended on by
 ## Topology / deployment notes
 
 Not for production use — this crate is test-support only. Nothing here
-links into the `rustgate` binary. Crypto-provider installation uses `ring`
-unconditionally; FIPS tests must call
+links into the `rustgate` binary. Crypto-provider installation uses `aws-lc-rs`; FIPS tests must call
 `rustgate_transport::install_fips_provider()` BEFORE constructing any
 `TestCa` instance because the install-default call here silently no-ops
 when a provider is already in place.

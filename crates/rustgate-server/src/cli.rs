@@ -266,86 +266,39 @@ pub(crate) struct TlsArgs {
     #[arg(long, default_value_t = false, env = "RUSTGATE_AIR_GAP")]
     pub(crate) air_gap: bool,
 
-    /// Prefer post-quantum key exchange (X25519MLKEM768). Build with
-    /// --features post-quantum to enable. PQ-capable clients negotiate hybrid
-    /// PQ+classical key exchange; others fall back to X25519 transparently.
+    /// Deprecated: post-quantum key exchange (X25519MLKEM768) is preferred by
+    /// default in every build (ADR 0037). Still accepted, including as a
+    /// config-file key, but it changes nothing.
     #[arg(long, default_value_t = false, env = "RUSTGATE_PREFER_POST_QUANTUM")]
     pub(crate) prefer_post_quantum: bool,
 
-    /// Comma-separated key exchange group preference order. Overrides the
-    /// default group ordering from the crypto provider. Requires
-    /// --features post-quantum for PQ groups.
+    /// Comma-separated key exchange group preference order, overriding the
+    /// default (X25519MLKEM768 first, then classical groups).
     ///
-    /// Available groups (with --features post-quantum):
+    /// Available groups:
     ///   X25519MLKEM768, SECP256R1MLKEM768, MLKEM768, MLKEM1024,
     ///   X25519, secp256r1, secp384r1
+    ///
+    /// On bandwidth-constrained links, `X25519` keeps the handshake classical:
+    /// an X25519MLKEM768 key share adds about 1.2 KB in each direction.
     #[arg(long, env = "RUSTGATE_KX_GROUPS")]
     pub(crate) kx_groups: Option<String>,
 
-    /// Run in CNSA 2.0 compliance mode. **Compile-time scaffolding only —
-    /// no runtime effect yet** beyond requiring `--features post-quantum`
-    /// at build time and logging the phased-readiness gap. It does NOT
-    /// switch key exchange to ML-KEM-1024 or enforce ML-DSA certs today;
-    /// the convergence work tracked in #504 blocks on aws-lc-rs resolving
-    /// the FIPS / ML-DSA mutual exclusion ([aws-lc-rs #964]).
+    /// Log a CNSA 2.0 readiness report at startup: what this build delivers
+    /// against the NSA CNSA 2.0 suite (ML-KEM-1024, ML-DSA-87, TLS 1.3) and
+    /// what is still outstanding. It does not change configuration; use
+    /// `--kx-groups MLKEM1024` and `--tls-min-version 1.3` to apply those
+    /// settings. See [`docs/adr/0019-cnsa2-hybrid-mldsa.md`] and
+    /// [`docs/adr/0037-aws-lc-rs-post-quantum-default.md`].
     ///
-    /// What this flag eventually configures (per NSA CNSA 2.0):
-    ///
-    ///   - ML-KEM-1024 key exchange (NIST Level 5)
-    ///   - ML-DSA-87 digital signatures (NIST Level 5)
-    ///   - TLS 1.3 minimum
-    ///   - AES-256 symmetric (already TLS 1.3 default)
-    ///   - SHA-384+ hashing (already used)
-    ///
-    /// What it does today:
-    ///
-    ///   - Validates that --features post-quantum is compiled in
-    ///     (errors otherwise; clear pointer to the required build
-    ///     profile)
-    ///   - Logs the phased-readiness state at startup so operators
-    ///     understand the gap between "I asked for CNSA 2.0" and
-    ///     "what the build actually delivers"
-    ///   - Does NOT yet override --kx-groups or --tls-min-version —
-    ///     those still come from their dedicated flags. Future work
-    ///     (the sub-issues at #500/#501/#502/#503) will wire those
-    ///     overrides as each phase lands.
-    ///
-    /// See [`docs/adr/0019-cnsa2-hybrid-mldsa.md`] for the design
-    /// rationale and timeline.
-    ///
-    /// [aws-lc-rs #964]: https://github.com/aws/aws-lc-rs/issues/964
     /// [`docs/adr/0019-cnsa2-hybrid-mldsa.md`]: ../../docs/adr/0019-cnsa2-hybrid-mldsa.md
+    /// [`docs/adr/0037-aws-lc-rs-post-quantum-default.md`]: ../../docs/adr/0037-aws-lc-rs-post-quantum-default.md
     #[arg(long, default_value_t = false, env = "RUSTGATE_CNSA2")]
     pub(crate) cnsa2: bool,
 
-    /// Accept client-certificate chains signed with ML-DSA-87 (FIPS 204 /
-    /// RFC 9881). Requires `--features mldsa-certs` at build time (#501).
-    ///
-    /// This **widens the set of certificates the server will accept** and
-    /// applies process-wide, so it is off by default: a rebuild alone must
-    /// never silently change trust policy. Turning it on adds ML-DSA-87 to
-    /// the signature algorithms used for certificate-chain validation, and
-    /// advertises it (last, behind every classical scheme) in the TLS 1.3
-    /// CertificateRequest.
-    ///
-    /// What this enables today:
-    ///
-    ///   - Client chains anchored at an ML-DSA-87 CA — including one whose
-    ///     leaves carry classical ECDSA/RSA keys. This is the practical
-    ///     CNSA 2.0 migration path: the long-lived root is what carries real
-    ///     harvest-now-forge-later exposure, while short-lived leaves can
-    ///     stay classical.
-    ///   - Forward-compatible interop with peers presenting a pure ML-DSA-87
-    ///     leaf (OpenSSL 3.5+ and similar). `rustgate-client` cannot present
-    ///     one, because rustls cannot yet produce an ML-DSA signature.
-    ///
-    /// Constraints:
-    ///
-    ///   - **Mutually exclusive with FIPS.** ML-DSA is not in the AWS-LC FIPS
-    ///     submission, so this cannot be combined with `--fips-required`, and
-    ///     `--features fips,mldsa-certs` fails to build.
-    ///   - **TLS 1.3 only in practice** — TLS 1.2's ClientCertificateType
-    ///     registry has no ML-DSA entry.
+    /// Deprecated: ML-DSA certificate verification is on in every build
+    /// (ADR 0037). Still accepted, including as a config-file key, but it
+    /// changes nothing.
     #[arg(long, default_value_t = false, env = "RUSTGATE_MLDSA_CLIENT_CERTS")]
     pub(crate) mldsa_client_certs: bool,
 

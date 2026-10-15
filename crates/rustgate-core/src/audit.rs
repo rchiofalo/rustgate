@@ -677,29 +677,6 @@ pub fn tls_handshake_failed(peer: &str, reason: &str, stage: &str) {
     );
 }
 
-/// Record that ML-DSA-87 client-certificate verification was enabled at
-/// startup (#501).
-///
-/// This is a **trust-policy widening**: it adds a signature algorithm to the
-/// set the server will accept when validating client-certificate chains, and
-/// it applies process-wide. It belongs in the audit trail rather than only the
-/// operational log so that "which issuer algorithms did this process accept?"
-/// is answerable forensically for any given run.
-///
-/// `fips_mode` is always false when this is enabled — ML-DSA sits outside the
-/// AWS-LC FIPS submission — and is recorded explicitly so the trade-off is
-/// visible in the trail.
-pub fn mldsa_client_certs_enabled(scheme: &str) {
-    let scheme = s(scheme);
-    audit!(
-        "tls.mldsa_client_certs_enabled",
-        scheme = %scheme,
-        fips_mode = false,
-        action = "widen_accepted_issuers",
-        result = "enabled"
-    );
-}
-
 /// Record a successful server certificate rotation.
 ///
 /// Sanitization: `cert_path` and `new_serial` are sanitized at the

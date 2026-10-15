@@ -66,6 +66,7 @@ does.
 | [0034](0034-multi-tenant-at-rest-isolation.md) | Per-tenant at-rest crypto isolation for archives (tenant→key-id resolver) | Proposed |
 | [0035](0035-routablemessage-entity-attach.md) | Attach an optional parsed `Entity` to `RoutableMessage` (additive; inference fast path + Foundry outbound consumer) | Proposed |
 | [0036](0036-secure-by-default-warmup.md) | Secure-by-default warm-up for three insecure startup defaults (no-policy, unauthenticated metrics, unbounded rate limits) | Proposed |
+| [0037](0037-aws-lc-rs-post-quantum-default.md) | aws-lc-rs as the TLS crypto provider, with hybrid post-quantum key exchange and ML-DSA verification by default | Accepted |
 
 ## Authoring a new ADR
 

@@ -10,14 +10,14 @@ cd rustgate
 cargo build --release
 ```
 
-The binary lands at `target/release/rustgate-server`. The default build enables only the core feature set; opt into NATS, federation, WebSocket, metrics, OpenTelemetry, FIPS, or post-quantum via Cargo features. See [Configuration](./configuration.md) and the [feature reference](../reference/configuration.md) for the complete list.
+The binary lands at `target/release/rustgate-server`. The default build enables only the core feature set; opt into NATS, federation, WebSocket, metrics, OpenTelemetry, or FIPS via Cargo features. Hybrid post-quantum key exchange is on in every build. See [Configuration](./configuration.md) and the [feature reference](../reference/configuration.md) for the complete list.
 
 ```bash
 # Production-style build
 cargo build --release --features nats,enrollment,proto,federation,federation-ha,websocket,metrics,full-detail,otel
 ```
 
-The `fips` and `post-quantum` features additionally require **Go** and **cmake** because they pull in `aws-lc-rs`. CI does not exercise them in the default matrix; build them locally only when you need them.
+Every build needs a C compiler, because the `aws-lc-rs` crypto provider compiles AWS-LC. The `fips` feature additionally requires **Go** and **cmake** to build the AWS-LC FIPS module.
 
 ## Container image
 
@@ -47,7 +47,8 @@ The chart wires the differentiated health probes (`/health/live`, `/health/ready
 |---|---|
 | Rust toolchain (pinned in `rust-toolchain.toml`) | Building from source |
 | `protoc` | The `proto` and `federation` features |
-| Go + cmake | The `fips` and `post-quantum` features |
+| C compiler | Every build (`aws-lc-rs`) |
+| Go + cmake | The `fips` feature |
 | `nats-server` | NATS integration tests and the bridge runtime |
 | Helm 3.x | Chart deployment |
 

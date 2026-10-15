@@ -15,6 +15,14 @@
 
 ## Implementation status
 
+- **ADR 0037 (2026-10).** aws-lc-rs is now the provider in every build,
+  with rustls's own defaults: X25519MLKEM768 preferred and ML-DSA-44/65/87
+  verification on. The `mldsa-certs` feature, `--mldsa-client-certs` and the
+  `fips` + `mldsa-certs` exclusion described below are gone (the feature and
+  flag remain as no-ops). Under the AWS-LC-FIPS 4.x module ML-DSA verifies
+  and the provider still reports FIPS mode. ML-KEM-1024 is selectable with
+  `--kx-groups MLKEM1024`. See
+  [ADR 0037](0037-aws-lc-rs-post-quantum-default.md).
 - **#501 (2026-08, ML-DSA-87 TLS certificate verification delivered).** The new
   `mldsa-certs` feature on `rustgate-tls` augments the `aws-lc-rs`
   `CryptoProvider`'s `signature_verification_algorithms` with ML-DSA-87 and is
@@ -218,8 +226,8 @@ supersedes:
 ### Implementation checklist
 
 - [x] PQ TLS key exchange — `X25519MLKEM768` preferred
-      (`rustgate-tls/src/config.rs`, ~line 491 / kx-group match ~line
-      550). NIST L3 hybrid; L5 (`MLKEM1024`) pending upstream.
+      by default (ADR 0037). NIST L3 hybrid; L5 (`MLKEM1024`) selectable
+      via `--kx-groups` (`parse_kx_groups` in `rustgate-tls/src/config.rs`).
 - [x] `--cnsa2` CLI flag scaffold (#504) —
       `rustgate-server/src/cli.rs`, ~line 300 (`pub(crate) cnsa2: bool`).
 - [ ] ML-DSA package-signature verification (#500 residual) — extend
@@ -227,7 +235,7 @@ supersedes:
       once `fips204` is wired. **Blocked** on `fips204` adoption.
 - [x] ML-DSA TLS certificate verification (#501, **delivered 2026-08**) — via a
       custom `WebPkiSupportedAlgorithms` on the aws-lc-rs `CryptoProvider`
-      (`rustgate-tls` `mldsa-certs` feature + `--mldsa-client-certs`)
+      (on by default since ADR 0037; originally the `mldsa-certs` feature)
       `CryptoProvider` extension point; no workspace fork.
 - [x] **Pure** ML-DSA-87 certificate + CRL issuance (#502, delivered) —
       `rustgate_enrollment::mldsa` hand-assembles + `fips204`-signs leaves

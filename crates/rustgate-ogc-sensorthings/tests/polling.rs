@@ -332,6 +332,7 @@ async fn poll_request_timeout_surfaces_as_transient_error() {
     // Build a client with a sub-second timeout via `from_parts` —
     // the config validator's `secs > 0` check would reject the
     // millisecond-grained value the test needs.
+    rustgate_core::tls_provider::ensure_default();
     let inner = reqwest::Client::builder()
         .timeout(Duration::from_millis(100))
         .build()

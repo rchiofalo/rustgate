@@ -459,7 +459,7 @@ mod tests {
     /// Install the default rustls crypto provider so PEM key parsing
     /// can succeed inside the per-test process.
     fn install_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
 
     /// Issue a fresh server certificate + key pair from a

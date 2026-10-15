@@ -75,9 +75,7 @@ mqtt = ["dep:rustgate-mqtt"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "rustgate-http?/otel"]
 fips = ["rustgate-tls/fips", "rustgate-federation?/fips", "rustgate-enrollment?/fips", "rustgate-http?/fips"]
 post-quantum = ["rustgate-tls/post-quantum", "rustgate-federation?/post-quantum", "rustgate-http?/post-quantum"]
-# ML-DSA-87 TLS certificate-chain verification (#501). Composes with
-# `post-quantum` (that augments key-exchange groups, this augments
-# signature-verification algorithms) but is mutually exclusive with `fips`.
+# Compatibility only: ML-DSA certificate verification is on by default (ADR 0037).
 mldsa-certs = ["rustgate-tls/mldsa-certs", "rustgate-transport/mldsa-certs"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 ocsp = ["rustgate-tls/ocsp"]

@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Roberto Chiofalo
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! ML-DSA-87 (FIPS 204 / RFC 9881) TLS certificate-verification tests (#501).
+//! ML-DSA-87 (FIPS 204 / RFC 9881) TLS certificate verification (#501,
+//! ADR 0037). The default aws-lc-rs provider verifies ML-DSA, so these tests
+//! run in every build.
 //!
 //! # What these tests must avoid proving by accident
 //!
@@ -10,23 +12,18 @@
 //! self-signed ML-DSA CA as both the anchor *and* the end entity passes
 //! happily while executing **zero** ML-DSA verification code. Every test here
 //! therefore uses a chain where the leaf is genuinely *signed by* the anchor,
-//! and [`provider_without_opt_in_rejects_mldsa_issued_chain`] is the mandatory negative
-//! control: it runs the identical chain through the unmodified provider and
-//! requires a failure. Without that control, none of the positive results mean
-//! anything.
+//! and [`tampered_mldsa_issuer_signature_is_rejected`] is the negative control:
+//! it corrupts the CA's ML-DSA signature on the leaf and requires
+//! `BadSignature`. If that ever passes, the positive tests prove nothing.
 //!
 //! # Why the leaf key is classical
 //!
-//! The leaf carries an ECDSA P-384 key, not an ML-DSA one. That is the
-//! capability that actually works end-to-end today, and the realistic CNSA 2.0
-//! migration shape: a long-lived post-quantum root signing short-lived
+//! The leaf carries an ECDSA P-384 key, not an ML-DSA one: the realistic CNSA
+//! 2.0 migration shape is a long-lived post-quantum root signing short-lived
 //! classical leaves. A *pure* ML-DSA leaf would have to produce an ML-DSA
-//! `CertificateVerify`, which rustls cannot generate (its `any_supported_type`
-//! handles RSA/ECDSA/EdDSA only) — so no live handshake can exercise it from
-//! this side. That half is covered at the signature level by
-//! [`verify_tls13_signature_accepts_fips204_signature`] instead.
+//! `CertificateVerify`, which rustls cannot generate, so that half is covered
+//! at the signature level by [`verify_tls13_signature_accepts_fips204_signature`].
 
-#![cfg(feature = "mldsa-certs")]
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use std::sync::Arc;
@@ -35,7 +32,7 @@ use rustgate_core::constants::HANDSHAKE_TIMEOUT;
 use rustgate_test_utils::certs::TestCa;
 use rustgate_test_utils::mldsa::{MlDsaTestCa, generate_mldsa_ca, issue_leaf_with_spki};
 use rustgate_test_utils::tls::build_client_tls_config;
-use rustgate_tls::{TlsConfig, TlsListener, mldsa_provider};
+use rustgate_tls::{TlsConfig, TlsListener};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
@@ -45,21 +42,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // Fixtures
 // ------------------------------------------------------------------
 
-/// Install the ML-DSA-augmented provider as this process's default, once.
-///
-/// Required, not merely convenient: with `mldsa-certs` on, rustls has *both*
-/// its `ring` and `aws_lc_rs` features enabled, so
-/// `CryptoProvider::get_default_or_install_from_crate_features()` cannot pick
-/// a backend and panics. Anything that builds a verifier without an explicit
-/// provider — including `TlsConfig::build_server_config` — depends on this
-/// having run first. (Production does the same thing at startup in
-/// `rustgate-server`'s `main`.)
+/// Install the default aws-lc-rs provider for this test process, once, the
+/// same way `rustgate-server` does at startup.
 fn install_default_provider_once() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let _ = rustls::crypto::CryptoProvider::install_default(mldsa_provider());
+        let _ = rustls::crypto::CryptoProvider::install_default(provider());
     });
+}
+
+/// rustgate's default crypto provider (ADR 0037).
+fn provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
 }
 
 fn der_to_pem(der: &[u8], label: &str) -> String {
@@ -126,15 +121,15 @@ fn root_store_with(ca_der: &[u8]) -> Arc<RootCertStore> {
 // Chain verification — positive, and the mandatory negative control
 // ------------------------------------------------------------------
 
-/// The augmented provider must accept a leaf whose issuer signed it with
+/// The default provider must accept a leaf whose issuer signed it with
 /// ML-DSA-87. This is the capability #501 asks for.
 #[test]
-fn augmented_provider_verifies_mldsa_issued_chain() {
+fn default_provider_verifies_mldsa_issued_chain() {
     let chain = mldsa_issued_chain("MLDSA-CLIENT-1");
 
     let verifier =
         WebPkiClientVerifier::builder_with_provider(root_store_with(&chain.ca.cert_der), {
-            Arc::new(mldsa_provider())
+            Arc::new(provider())
         })
         .build()
         .expect("verifier builds");
@@ -147,64 +142,44 @@ fn augmented_provider_verifies_mldsa_issued_chain() {
 
     assert!(
         result.is_ok(),
-        "augmented provider must verify an ML-DSA-87-issued chain, got {:?}",
+        "default provider must verify an ML-DSA-87-issued chain, got {:?}",
         result.err(),
     );
 }
 
-/// **Mandatory negative control.** The identical chain must FAIL against
-/// rustgate's aws-lc-rs provider without the ML-DSA opt-in.
+/// **Mandatory negative control.** Corrupt the CA's ML-DSA-87 signature on
+/// the leaf: verification must now fail with `BadSignature`.
 ///
-/// If this ever passes, the positive test above is proving nothing — it would
-/// mean the chain is being accepted without any ML-DSA signature actually
-/// being checked (for example because the leaf was mistakenly self-signed). It
-/// also pins that ML-DSA acceptance stays opt-in: since rustls 0.23.46 the
-/// *stock* aws-lc-rs provider accepts this chain, and rustgate strips ML-DSA
-/// from it unless `--mldsa-client-certs` is set.
+/// If this ever passes, the positive test above is proving nothing: the chain
+/// would be accepted without the ML-DSA signature actually being checked.
 #[test]
-fn provider_without_opt_in_rejects_mldsa_issued_chain() {
+fn tampered_mldsa_issuer_signature_is_rejected() {
     let chain = mldsa_issued_chain("MLDSA-CLIENT-2");
+
+    // The signature BIT STRING is the last field of the certificate DER, so the
+    // final byte belongs to the ML-DSA-87 signature over the TBS.
+    let mut tampered = chain.leaf_der.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
 
     let verifier =
         WebPkiClientVerifier::builder_with_provider(root_store_with(&chain.ca.cert_der), {
-            Arc::new(rustgate_tls::aws_lc_rs_provider())
+            Arc::new(provider())
         })
         .build()
         .expect("verifier builds");
 
-    let result = verifier.verify_client_cert(
-        &CertificateDer::from(chain.leaf_der.clone()),
-        &[],
-        UnixTime::now(),
-    );
+    let result = verifier.verify_client_cert(&CertificateDer::from(tampered), &[], UnixTime::now());
 
-    // Assert the *reason*, not merely that it failed: the rejection must name
-    // the ML-DSA-87 algorithm identifier (OID 2.16.840.1.101.3.4.3.19, DER
-    // `06 09 60 86 48 01 65 03 04 03 13`) as unsupported. A bare `is_err()`
-    // would also be satisfied by an unrelated failure — a malformed leaf, a
-    // bad issuer name — and would silently stop testing what it claims to.
-    const ML_DSA_87_ALG_ID_DER: &[u8] = &[
-        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13,
-    ];
-
-    match result {
-        Err(rustls::Error::InvalidCertificate(
-            rustls::CertificateError::UnsupportedSignatureAlgorithmContext {
-                signature_algorithm_id,
-                ..
-            },
-        )) => {
-            assert_eq!(
-                signature_algorithm_id, ML_DSA_87_ALG_ID_DER,
-                "rejection must be about ML-DSA-87 specifically",
-            );
-        }
-        other => panic!(
-            "without the opt-in the chain must be rejected with UnsupportedSignatureAlgorithm \
-             for ML-DSA-87 — if it is accepted, ML-DSA is no longer opt-in and the positive \
-             test is vacuous. Got: {other:?}",
+    assert!(
+        matches!(
+            result,
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadSignature
+            ))
         ),
-    }
+        "a corrupted ML-DSA-87 issuer signature must be rejected as BadSignature, got {result:?}",
+    );
 }
 
 // ------------------------------------------------------------------
@@ -307,7 +282,7 @@ fn verify_tls13_signature_accepts_fips204_signature() {
         message,
         &CertificateDer::from(ca.cert_der.clone()),
         &dss,
-        &mldsa_provider().signature_verification_algorithms,
+        &provider().signature_verification_algorithms,
     );
 
     assert!(
@@ -338,7 +313,7 @@ fn verify_tls13_signature_rejects_tampered_signature() {
         message,
         &CertificateDer::from(ca.cert_der.clone()),
         &dss,
-        &mldsa_provider().signature_verification_algorithms,
+        &provider().signature_verification_algorithms,
     );
 
     assert!(result.is_err(), "a tampered ML-DSA-87 signature must fail");
@@ -349,41 +324,38 @@ fn verify_tls13_signature_rejects_tampered_signature() {
 // ------------------------------------------------------------------
 
 /// The server advertises its accepted schemes in the `CertificateRequest`.
-/// ML-DSA-87 must be present but **last**: `mapping` order is preference
-/// order, and promoting it would make dual-credential peers send a ~7 KB
-/// ML-DSA credential where a ~100-byte ECDSA one would do.
+/// ML-DSA must come after every classical scheme: the list is preference
+/// order, and a dual-credential peer should not send a ~7 KB ML-DSA credential
+/// where a ~100-byte ECDSA one would do. ML-DSA-87 must appear exactly once.
 #[test]
-fn advertised_schemes_include_mldsa_last() {
-    let schemes = mldsa_provider()
+fn advertised_schemes_put_mldsa_after_classical() {
+    use rustls::SignatureScheme as S;
+    let schemes = provider()
         .signature_verification_algorithms
         .supported_schemes();
+    let is_mldsa = |s: &S| matches!(s, S::ML_DSA_44 | S::ML_DSA_65 | S::ML_DSA_87);
 
-    assert!(
-        schemes.contains(&rustls::SignatureScheme::ML_DSA_87),
-        "ML-DSA-87 must be advertised in supported_verify_schemes",
-    );
     assert_eq!(
-        schemes.last(),
-        Some(&rustls::SignatureScheme::ML_DSA_87),
-        "ML-DSA-87 must be advertised last, behind every classical scheme",
-    );
-    assert_eq!(
-        schemes
-            .iter()
-            .filter(|s| **s == rustls::SignatureScheme::ML_DSA_87)
-            .count(),
+        schemes.iter().filter(|s| **s == S::ML_DSA_87).count(),
         1,
         "ML-DSA-87 must be advertised exactly once",
     );
-    // The augmentation must not have displaced the classical schemes.
+    let first_mldsa = schemes
+        .iter()
+        .position(is_mldsa)
+        .expect("ML-DSA is advertised");
+    assert!(
+        schemes[first_mldsa..].iter().all(is_mldsa),
+        "every ML-DSA scheme must come after every classical scheme: {schemes:?}",
+    );
     for expected in [
-        rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-        rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-        rustls::SignatureScheme::ED25519,
+        S::ECDSA_NISTP384_SHA384,
+        S::ECDSA_NISTP256_SHA256,
+        S::ED25519,
     ] {
         assert!(
             schemes.contains(&expected),
-            "classical scheme {expected:?} must still be advertised",
+            "classical scheme {expected:?} must still be advertised"
         );
     }
 }

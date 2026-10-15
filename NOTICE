@@ -40,5 +40,6 @@ include the source code for the parts of AWS-LC used as well as that of the
 covered work.
 
 (This permission matters for builds using the `fips` feature, which link
-aws-lc-fips-sys. The default build uses ring, licensed Apache-2.0 AND ISC,
-and does not need it.)
+aws-lc-fips-sys. The default build links aws-lc-sys, whose license
+(ISC, Apache-2.0, MIT and BSD-3-Clause terms) has no OpenSSL or SSLeay
+terms, and does not need it.)

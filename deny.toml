@@ -185,15 +185,11 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 
-# aws-lc-sys and aws-lc-fips-sys are licensed ISC + Apache-2.0 + OpenSSL.
-# These crates provide the crypto primitives for the aws-lc-rs backend
-# (`fips`, `post-quantum`, `mldsa-certs`, `mavlink-pq`); the default build
-# uses ring. The FSF considers the OpenSSL / SSLeay licenses incompatible with
-# the GPL family, so rustgate's NOTICE carries an AGPL-3.0 section 7
-# additional permission covering the combination with AWS-LC.
-[[licenses.exceptions]]
-allow = ["OpenSSL"]
-crate = "aws-lc-sys"
+# aws-lc-fips-sys (the `fips` feature) is licensed ISC + Apache-2.0 + OpenSSL.
+# The FSF considers the OpenSSL / SSLeay licenses incompatible with the GPL
+# family, so rustgate's NOTICE carries an AGPL-3.0 section 7 additional
+# permission covering the combination with AWS-LC. aws-lc-sys, used by every
+# other build, carries no OpenSSL terms and needs no exception.
 [[licenses.exceptions]]
 allow = ["OpenSSL"]
 crate = "aws-lc-fips-sys"

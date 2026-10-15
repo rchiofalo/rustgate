@@ -176,7 +176,7 @@ as of v0.8.0.
 | **OGC SensorThings v1.0** | `rustgate-ogc-sensorthings` | REST + JSON polling; MQTT half deferred |
 | **NGVA / VICTORY DDS** | `rustgate-dds` | DDS Pub/Sub trait + mock backend; real SDK partner-gated |
 | **FIPS 140-3** cryptography | `rustgate-tls` (`fips` feature) | aws-lc-rs FIPS module; CI gate |
-| **CNSA 2.0** post-quantum (planned) | `rustgate-tls` (`post-quantum` feature) | Hybrid X25519+ML-KEM key exchange |
+| **CNSA 2.0** post-quantum (partial) | `rustgate-tls` | Hybrid X25519+ML-KEM key exchange and ML-DSA verification by default; ML-KEM-1024 via `--kx-groups` |
 | **GeoJSON (RFC 7946)** | `rustgate-core::geo`, `rustgate-foundry`, others | Position projection + GeoJSON output |
 | **TAK Data-Packages** | `rustgate-missions` | Lightweight package store + REST API |
 
@@ -202,7 +202,7 @@ in lockstep.
 | `test` | `cargo nextest run` workspace-wide |
 | `coverage` | `cargo tarpaulin` line-coverage gate |
 | `fips` | Build + test under `--features fips` (aws-lc-rs FIPS provider) |
-| `post-quantum` | Build + test under `--features post-quantum` |
+| `post-quantum` | ML-DSA issuance and MAVLink ML-KEM rekey builds + tests |
 | `audit` | `cargo deny check` (advisories, bans, licenses, sources) + `cargo audit` |
 | `helm` | Helm chart lint + template validation |
 | `docker` | Multi-arch container build |
@@ -339,9 +339,9 @@ window:
 - **No `unsafe_code`.** The workspace-wide `unsafe_code = "forbid"`
   removes an entire class of memory-safety vulnerability from the
   attack surface.
-- **FIPS / PQ readiness.** `fips` and `post-quantum` features are
-  built and tested in CI on every PR so a regression in either
-  surface fails the build before merge.
+- **FIPS / PQ readiness.** Post-quantum key exchange is in every
+  build, and the `fips` feature is built and tested in CI on every PR,
+  so a regression in either surface fails the build before merge.
 
 ### 8.4 Release Cadence
 

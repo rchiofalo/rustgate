@@ -22,8 +22,9 @@ default = []
 v2 = ["dep:tonic", "dep:tonic-prost", "dep:tokio-stream", "dep:prost-types", "dep:prost-build", "dep:tonic-prost-build", "dep:rustgate-proto"]
 ha = ["dep:async-nats"]
 api = ["dep:hyper", "dep:http-body-util", "dep:prometheus", "dep:rustgate-metrics"]
-fips = ["rustls/aws_lc_rs", "rustls/fips", "tonic?/tls-aws-lc"]
-post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum", "tonic?/tls-aws-lc"]
+fips = ["rustls/fips"]
+# Compatibility only: post-quantum key exchange is on by default (ADR 0037).
+post-quantum = []
 # Dynamic peer discovery backends (issue #571). Each backend is independently
 # selectable; the `peer-discovery` umbrella enables all three.
 peer-discovery = ["peer-discovery-dns-sd", "peer-discovery-consul", "peer-discovery-etcd"]
@@ -58,7 +59,7 @@ otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 mesh-routing = []
 
 [dependencies]
-rustgate-core = { workspace = true, features = ["pem"] }
+rustgate-core = { workspace = true, features = ["pem", "tls-provider"] }
 rustgate-metrics = { workspace = true, optional = true }
 rustgate-proto = { workspace = true, optional = true }
 rustgate-resilience = { workspace = true }
@@ -73,7 +74,7 @@ futures = { workspace = true }
 bytes = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true, optional = true }
-tonic = { workspace = true, features = ["codegen", "transport", "tls-ring", "tls-webpki-roots", "gzip", "zstd"], optional = true }
+tonic = { workspace = true, features = ["codegen", "transport", "tls-aws-lc", "tls-webpki-roots", "gzip", "zstd"], optional = true }
 tonic-prost = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 tracing = { workspace = true }

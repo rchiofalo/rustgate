@@ -172,7 +172,6 @@ All optional features are compile-time feature gates, keeping the base binary mi
 | `est` | rustgate-enrollment | EST (RFC 7030) enrollment endpoints |
 | `full-detail` | rustgate-nats | Extended CoT parsing for NATS bridge |
 | `fips` | rustgate-transport | FIPS 140-3 crypto via aws-lc-rs (requires Go + cmake) |
-| `post-quantum` | rustgate-transport | Post-quantum key exchange X25519MLKEM768 (requires Go + cmake) |
 | `otel` | opentelemetry | OpenTelemetry distributed tracing (OTLP export, requires protoc) |
 | `ocsp` | rustgate-transport | OCSP stapling and client OCSP checking |
 | `spiffe` | rustgate-transport | SPIFFE/SPIRE workload identity for server TLS |

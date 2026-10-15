@@ -10,7 +10,7 @@ This document maps rustgate's existing security controls to NIST SP 800-53 (Rev.
 |---------|---------------|
 | SC-8 Transmission Confidentiality | mTLS on all client and federation connections. TLS 1.2+ with certificate verification. |
 | SC-12 Cryptographic Key Management | X.509 certificates for identity. PKCS#12 enrollment with CSR signing. CA-signed client and server certificates. |
-| SC-13 Cryptographic Protection | Default: `ring` (rustls). Optional: the AWS-LC FIPS module (`aws-lc-rs`) via `--features fips` and `--fips-required` flag; module certification status in [fips.md](fips.md). |
+| SC-13 Cryptographic Protection | Default: AWS-LC via `aws-lc-rs` (rustls), with hybrid post-quantum X25519MLKEM768 preferred. Optional: the AWS-LC FIPS module via `--features fips` and `--fips-required` flag; module certification status in [fips.md](fips.md). |
 | SC-17 PKI Certificates | Certificate enrollment server with Subject DN enforcement — enrolled certificates carry the authenticated username. |
 | SC-23 Session Authenticity | TLS session resumption disabled. Every connection performs a full handshake with CRL check. |
 

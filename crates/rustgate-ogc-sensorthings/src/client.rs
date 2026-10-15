@@ -100,6 +100,7 @@ impl SensorThingsClient {
         bearer_token: Option<Arc<str>>,
     ) -> Result<Self, SensorThingsError> {
         config.validate()?;
+        rustgate_core::tls_provider::ensure_default();
         let inner = reqwest::Client::builder()
             .timeout(config.effective_request_timeout())
             .connect_timeout(Duration::from_secs(5))
@@ -395,6 +396,7 @@ mod tests {
 
     #[test]
     fn from_parts_normalises_trailing_slash() {
+        rustgate_core::tls_provider::ensure_default();
         let inner = reqwest::Client::new();
         let client = SensorThingsClient::from_parts(
             inner,
