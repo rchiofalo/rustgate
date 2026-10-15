@@ -359,15 +359,13 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                 }
                 _ => {}
             },
-            Event::Text(t) => {
-                if in_detail && pending_text_key.is_some() {
-                    let s = t
-                        .xml10_content()
-                        .map_err(quick_xml::Error::from)?
-                        .into_owned();
-                    if !s.is_empty() {
-                        pending_text_value = Some(s);
-                    }
+            Event::Text(t) if in_detail && pending_text_key.is_some() => {
+                let s = t
+                    .xml10_content()
+                    .map_err(quick_xml::Error::from)?
+                    .into_owned();
+                if !s.is_empty() {
+                    pending_text_value = Some(s);
                 }
             }
             _ => {}

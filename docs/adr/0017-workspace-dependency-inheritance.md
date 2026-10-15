@@ -73,7 +73,7 @@ Concretely:
   `dep = { workspace = true, optional = true }`. The crate's
   feature flags (`[features]`) gate the dep just as they would
   for a per-crate declaration.
-- The MSRV (`rust-version = "1.94"`) is declared once at the
+- The MSRV (`rust-version = "1.99"`) is declared once at the
   workspace root and inherited via `rust-version.workspace =
   true` in each crate. Same for `edition`, `license`, and
   `repository`.

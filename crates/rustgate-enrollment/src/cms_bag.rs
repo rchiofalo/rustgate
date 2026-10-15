@@ -63,7 +63,6 @@ mod tests {
     use cms::cert::CertificateChoices;
     use cms::content_info::CmsVersion;
     use cms::signed_data::SignedData;
-    use der::Decode as _;
 
     use super::*;
 

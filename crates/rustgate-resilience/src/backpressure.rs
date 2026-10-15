@@ -309,10 +309,10 @@ impl BackpressureGate {
     pub fn add(&self, n: usize) {
         let prev = self
             .current_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(n))
             })
-            // Closure always returns Some, so fetch_update never fails.
+            // Closure always returns Some, so try_update never fails.
             .unwrap_or_else(|prev| prev);
         let now = prev.saturating_add(n);
         if let Some(cb) = self.on_bytes_changed.as_ref() {
@@ -340,7 +340,7 @@ impl BackpressureGate {
     pub fn sub(&self, n: usize) {
         let prev = self
             .current_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(n))
             })
             .unwrap_or_else(|prev| prev);

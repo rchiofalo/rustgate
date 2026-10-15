@@ -955,8 +955,6 @@ pub fn check_chain_continuity(audit_path: &Path) -> io::Result<ChainContinuity> 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use std::io::Write as _;
-
     use tempfile::NamedTempFile;
 
     use super::*;

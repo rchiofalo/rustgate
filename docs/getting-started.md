@@ -16,7 +16,7 @@ The 10-minute walkthrough below uses the `rustgate-client` echo example — a re
 
 | Tool | Version | Why |
 |---|---|---|
-| Rust toolchain | **1.94+** (edition 2024) | `rustup install 1.94` if you don't have it |
+| Rust toolchain | **1.99+** (edition 2024) | `rustup install 1.99` if you don't have it |
 | `openssl` | any modern | one-shot CA generation |
 | ~10 GB free disk | | the workspace builds 30+ crates |
 
@@ -164,6 +164,6 @@ You connected an mTLS client to a rustgate server, the server derived an identit
 | `forbidden: identity not in any group` | Client cert has no `O=` field | Add `/O=blue-team` (or any group) to the client cert subject |
 | Echo client connects but receives nothing | You only have one client; nothing to route to | Connect a second client with a different cert |
 | `EADDRINUSE: 8089` | Another rustgate is running | `pkill rustgate` and retry |
-| Build fails with `forbid(unsafe_code)` | You're on an old toolchain | `rustup default 1.94` |
+| Build fails with `forbid(unsafe_code)` | You're on an old toolchain | `rustup default 1.99` |
 
 If something else fails, the structured logs on the server terminal almost always say what went wrong — every TLS rejection, every ACL deny, every rate-limit trip emits a typed `tracing` event with enough context to diagnose without reading source.

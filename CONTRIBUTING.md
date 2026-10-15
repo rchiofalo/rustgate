@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Rust 1.94+** — install via [rustup](https://rustup.rs/). The pinned toolchain is defined in `rust-toolchain.toml`.
+- **Rust 1.99+** — install via [rustup](https://rustup.rs/). The pinned toolchain is defined in `rust-toolchain.toml`.
 - **protoc** — Protocol Buffers compiler, required for the `proto` feature. Install via your package manager (`apt install protobuf-compiler`, `brew install protobuf`, etc.).
 - **nats-server** — required to run NATS integration tests. Install from [nats.io](https://nats.io/download/) or via `go install github.com/nats-io/nats-server/v2@latest`.
 - **cargo-deny** — for license and advisory auditing. Install with `cargo install cargo-deny --locked`.
@@ -522,7 +522,7 @@ must pass before a PR is mergeable:
 - `commit-lint`, `lint`, `clippy`, `check-features`, `test`,
   `coverage`, `fips`, `post-quantum`, `audit`, `helm`, `docker` (the
   eleven jobs listed in the *Code Quality* section above).
-- `msrv` — pins the published minimum supported Rust version (1.94)
+- `msrv` — pins the published minimum supported Rust version (1.99)
   and runs `cargo check` against it. A change that requires a newer
   toolchain must bump `[workspace.package].rust-version` in the root
   `Cargo.toml` and call out the bump in the CHANGELOG.

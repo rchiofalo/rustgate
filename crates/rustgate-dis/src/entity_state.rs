@@ -422,13 +422,9 @@ impl EntityStatePdu {
             });
         }
         let mut articulation_parameters = Vec::with_capacity(num_articulation_parameters);
-        for chunk in tail
-            .chunks_exact(ARTICULATION_PARAMETER_LEN)
-            .take(num_articulation_parameters)
-        {
-            let mut raw = [0u8; ARTICULATION_PARAMETER_LEN];
-            raw.copy_from_slice(chunk);
-            articulation_parameters.push(ArticulationParameter { raw });
+        let (records, _) = tail.as_chunks::<ARTICULATION_PARAMETER_LEN>();
+        for raw in records.iter().take(num_articulation_parameters) {
+            articulation_parameters.push(ArticulationParameter { raw: *raw });
         }
 
         Ok(Self {

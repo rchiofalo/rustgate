@@ -89,7 +89,7 @@ pub async fn handle_simpleenroll(
     .await
     {
         Ok(pair) => pair,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     sign_and_respond(&body, signer, username, &peer, "simpleenroll")
@@ -127,7 +127,7 @@ pub async fn handle_simplereenroll(
     .await
     {
         Ok(pair) => pair,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     // Verify identity continuity: the CSR's subject CN must match the
@@ -209,7 +209,7 @@ async fn validate_and_read_body<'a>(
     sign_limiter: &SlidingWindowLimiter,
     on_rate_limit: Option<&RateLimitCallback>,
     endpoint: &str,
-) -> Result<(Vec<u8>, &'a str), Response<Full<Bytes>>> {
+) -> Result<(Vec<u8>, &'a str), Box<Response<Full<Bytes>>>> {
     // Authentication first — a cheap constant-time credential check. Reject
     // unauthenticated requests before any signing quota is consumed.
     let auth_header = req
@@ -219,11 +219,11 @@ async fn validate_and_read_body<'a>(
     let username = match credentials.validate(auth_header) {
         Some(u) => u,
         None => {
-            return Err(build_response_with_www_auth(
+            return Err(Box::new(build_response_with_www_auth(
                 StatusCode::UNAUTHORIZED,
                 "text/plain",
                 Bytes::from("authentication required"),
-            ));
+            )));
         }
     };
 
@@ -237,13 +237,13 @@ async fn validate_and_read_body<'a>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !content_type.starts_with(CT_PKCS10) {
-        return Err(build_response(
+        return Err(Box::new(build_response(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "text/plain",
             Bytes::from(format!(
                 "expected Content-Type: {CT_PKCS10}, got: {content_type}"
             )),
-        ));
+        )));
     }
 
     // Rate-limit check: the SlidingWindowLimiter records a per-IP slot on the
@@ -255,11 +255,11 @@ async fn validate_and_read_body<'a>(
         if let Some(cb) = on_rate_limit {
             cb();
         }
-        return Err(build_response(
+        return Err(Box::new(build_response(
             StatusCode::TOO_MANY_REQUESTS,
             "text/plain",
             Bytes::from("rate limit exceeded"),
-        ));
+        )));
     }
 
     // Read request body (base64-encoded DER CSR).
@@ -267,11 +267,11 @@ async fn validate_and_read_body<'a>(
         Ok(b) => b,
         Err(e) => {
             tracing::debug!(error = %e, endpoint = %endpoint, "EST: failed to read body");
-            return Err(build_response(
+            return Err(Box::new(build_response(
                 StatusCode::BAD_REQUEST,
                 "text/plain",
                 Bytes::from("failed to read request body"),
-            ));
+            )));
         }
     };
 

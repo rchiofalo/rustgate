@@ -211,10 +211,8 @@ pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
                 _ => {}
             },
 
-            Event::End(ref e) => {
-                if e.name().as_ref() == b"detail" {
-                    in_detail = false;
-                }
+            Event::End(ref e) if e.name().as_ref() == b"detail" => {
+                in_detail = false;
             }
 
             _ => {}

@@ -136,9 +136,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -176,9 +176,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
           components: clippy
 
       # sccache is the primary cache on self-hosted runners (shared volume,
@@ -215,9 +215,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       # sccache is the primary cache on self-hosted runners (shared volume,
       # no per-job upload/download). Swatinem/rust-cache is kept only for
@@ -311,9 +311,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       # sccache is the primary cache on self-hosted runners (shared volume,
       # no per-job upload/download). Swatinem/rust-cache is kept only for
@@ -343,23 +343,23 @@ jobs:
 
   msrv:
     # MSRV verification gate (issue #783). The workspace declares
-    # `rust-version = "1.94"` in the root Cargo.toml, but until this job
+    # `rust-version = "1.99"` in the root Cargo.toml, but until this job
     # landed nothing in CI actually verified the claim — a PR that
-    # introduced a feature requiring rust 1.95 would compile fine on the
-    # current toolchain (every other job pins `1.94` exactly today, but
+    # introduced a feature requiring a newer rustc would compile fine on the
+    # current toolchain (every other job pins `1.99` exactly today, but
     # that is brittle: a future bump of the workspace toolchain pin in
     # `rust-toolchain.toml` to a newer compiler would silently mask MSRV
     # regressions in the rest of CI). This job pins the exact MSRV via
     # `dtolnay/rust-toolchain` and runs `cargo check` against the same
     # production feature set as the `check-features` and `clippy` jobs,
     # so any new feature, syntax, or stdlib API that requires a
-    # toolchain newer than 1.94 fails here loudly.
+    # toolchain newer than 1.99 fails here loudly.
     #
     # Compilation only — no tests, no clippy. Tests would ~3x the wall
     # time without buying additional MSRV coverage (test failures are
     # caught by the `test` job on the workspace toolchain), and clippy
-    # lints evolve between releases so a new clippy warning in 1.94 vs
-    # 1.95 would be a false MSRV positive.
+    # lints evolve between releases so a new clippy warning between releases
+    # would be a false MSRV positive.
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
@@ -373,9 +373,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       # sccache is the primary cache on self-hosted runners (shared volume,
       # no per-job upload/download). Swatinem/rust-cache is kept only for
@@ -396,11 +396,11 @@ jobs:
       - name: Verify rust toolchain version
         # Defensive sanity check: fails the job loudly if `dtolnay/rust-toolchain`
         # ever silently installs a different version. The version string
-        # must contain "1.94" — anything else means MSRV verification is not
+        # must contain "1.99" — anything else means MSRV verification is not
         # actually happening on this runner.
         run: |
           rustc --version
-          rustc --version | grep -F '1.94' >/dev/null
+          rustc --version | grep -F '1.99' >/dev/null
 
       - name: Cargo check at MSRV (production feature set)
         # Feature set must stay in sync with the `clippy`, `check-features`,
@@ -425,9 +425,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       - name: Install protoc
         # No-op on self-hosted runners where protobuf-compiler is baked into
@@ -497,9 +497,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
           # cargo-llvm-cov needs the LLVM profiling runtime and the
           # `llvm-profdata`/`llvm-cov` binaries that ship with this component.
           components: llvm-tools-preview
@@ -673,9 +673,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
           components: clippy
 
       - name: Add Rust target
@@ -749,9 +749,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
           components: clippy
 
       - name: Install PQ build dependencies
@@ -857,9 +857,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
@@ -933,9 +933,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       - uses: taiki-e/install-action@7ea35f098a7369cd23488403f58be9c491a6c55f # v2.77.0
         with:
@@ -993,9 +993,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.94
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       - uses: taiki-e/install-action@7ea35f098a7369cd23488403f58be9c491a6c55f # v2.77.0
         with:

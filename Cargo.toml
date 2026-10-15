@@ -46,7 +46,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.9.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.99"
 license = "AGPL-3.0-only"
 repository = "https://github.com/rchiofalo/rustgate"
 keywords = ["tak", "cot", "mtls", "nats", "tactical"]
@@ -97,6 +97,11 @@ hkdf = "0.12"
 # cmake (and Go for the FIPS module) — gated off by default like the
 # other aws-lc-rs PQ surfaces.
 aws-lc-rs = "1.16"
+# Cargo.lock pins bindgen's `syn` to 2.x. bindgen 0.73 (a required build
+# dependency of aws-lc-fips-sys) accepts syn >=2,<4, so once syn 3 is in the
+# graph cargo picks it, but bindgen's prettyplease 0.2 is built on syn 2 and
+# the `fips` build fails to compile. Keep that edge on syn 2 until bindgen or
+# prettyplease resolves it; the CI `fips` job fails if it regresses.
 # CBOR for the MAVLink rekey envelope payload (ADR 0020 §5).
 ciborium = "0.2"
 # Pure-Rust FIPS 204 (ML-DSA) signatures for the enrollment CA's pure

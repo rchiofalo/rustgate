@@ -11,7 +11,7 @@
 #
 # - **Builder base**: `registry1.dso.mil/ironbank/redhat/ubi/ubi9` (UBI 9
 #   full, since we need cargo + protoc + musl-dev for the build) instead
-#   of `rust:1.95-alpine`. Rust toolchain is installed via rustup inside
+#   of `rust:1.99-alpine`. Rust toolchain is installed via rustup inside
 #   the builder rather than coming from the base image.
 # - **Runtime base**: `registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal`
 #   (UBI 9 minimal, ~30 MiB) instead of `alpine:3.23`. UBI Minimal
@@ -81,7 +81,7 @@ FROM registry1.dso.mil/ironbank/redhat/ubi/ubi9:9-latest AS builder
 # Iron Bank UBI doesn't ship Rust; install via rustup at a pinned
 # version matching `rust-toolchain.toml`. The `--profile minimal`
 # skips rustfmt/clippy (we don't need them for release builds).
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION=1.99
 RUN microdnf install -y --nodocs gcc make protobuf-compiler musl-libc-static \
     && microdnf clean all \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \

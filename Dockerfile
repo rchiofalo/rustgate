@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── Builder stage ────────────────────────────────────────────────────────
-# Pinned to the multi-arch manifest digest for rust:1.94-alpine. Rotated
+# Pinned to the multi-arch manifest digest for rust:1.99-alpine. Rotated
 # by dependabot (see .github/dependabot.yml, ecosystem: docker). The
 # @sha256 digest is mandatory — the CI "Validate Dockerfile FROM digest
 # pinning" step fails any FROM line without it.
@@ -13,9 +13,9 @@
 #
 # Iron Bank pulls require Platform One credentials and a registered
 # robot account; substitute the tag and digest from your IB account at
-# the time of the build. The default `rust:1.95-alpine` base below is
+# the time of the build. The default `rust:1.99-alpine` base below is
 # suitable for non-IB deployments and is what CI publishes today.
-FROM rust:1.95-alpine@sha256:606fd313a0f49743ee2a7bd49a0914bab7deedb12791f3a846a34a4711db7ed2 AS builder
+FROM rust:1.99-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS builder
 
 RUN apk add --no-cache musl-dev protobuf-dev make
 
