@@ -591,6 +591,12 @@ jobs:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
     runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    env:
+      # Fuzzing runs on the latest nightly, where lints and deprecations land
+      # before stable. Denying warnings here would fail the job on nightly-only
+      # deprecations unrelated to fuzzing; the stable `clippy` job enforces
+      # warnings. Matches the nightly and weekly fuzz workflows.
+      RUSTFLAGS: ""
     strategy:
       # Do not cancel every sibling on the first crash — surface all failing
       # framers in one run so a reviewer sees the full blast radius.
