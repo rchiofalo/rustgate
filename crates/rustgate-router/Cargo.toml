@@ -35,7 +35,7 @@ bytes = { workspace = true }
 dashmap = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "time", "macros"] }
 sha2 = { workspace = true }
-ring = { workspace = true }
+aws-lc-rs = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

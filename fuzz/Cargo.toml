@@ -37,7 +37,7 @@ rustgate-link16 = { path = "../crates/rustgate-link16" }
 rustgate-sapient = { path = "../crates/rustgate-sapient" }
 rustgate-nffi = { path = "../crates/rustgate-nffi" }
 rustgate-ogc-sensorthings = { path = "../crates/rustgate-ogc-sensorthings" }
-rcgen = { version = "0.14", features = ["x509-parser"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 serde_json = "1"
 rustls-pki-types = { version = "1", features = ["std"] }
 tokio-tungstenite = "0.29"

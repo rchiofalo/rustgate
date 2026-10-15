@@ -1447,7 +1447,7 @@ fn verify_hmac_envelope<'a>(
 /// this as a fatal startup condition — a broken RNG means all
 /// cryptographic guarantees are void.
 fn fill_random(dest: &mut [u8]) -> Result<(), StoreForwardError> {
-    use ring::rand::{SecureRandom, SystemRandom};
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
     let rng = SystemRandom::new();
     rng.fill(dest).map_err(|_| {

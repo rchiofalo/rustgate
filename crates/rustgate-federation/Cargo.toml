@@ -22,7 +22,7 @@ default = []
 v2 = ["dep:tonic", "dep:tonic-prost", "dep:tokio-stream", "dep:prost-types", "dep:prost-build", "dep:tonic-prost-build", "dep:rustgate-proto"]
 ha = ["dep:async-nats"]
 api = ["dep:hyper", "dep:http-body-util", "dep:prometheus", "dep:rustgate-metrics"]
-fips = ["rustls/fips"]
+fips = ["rustls/fips", "aws-lc-rs/fips"]
 # Compatibility only: post-quantum key exchange is on by default (ADR 0037).
 post-quantum = []
 # Dynamic peer discovery backends (issue #571). Each backend is independently
@@ -81,7 +81,7 @@ tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-ring = { workspace = true }
+aws-lc-rs = { workspace = true }
 time = { workspace = true }
 x509-parser = { workspace = true }
 async-nats = { workspace = true, features = ["kv"], optional = true }

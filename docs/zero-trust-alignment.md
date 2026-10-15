@@ -204,8 +204,8 @@ and authenticated to the network independently of any human user.
   `clippy::unwrap_used = "deny"` in production code. All failure
   paths propagate `Result<T, E>` or structured error types derived
   via `thiserror`.
-- **FIPS 140-3 cryptography** (feature `fips`; module certification status in [`fips.md`](fips.md)) — the `aws-lc-rs`
-  crypto provider is drop-in replaceable for `ring`; the
+- **FIPS 140-3 cryptography** (feature `fips`; module certification status in [`fips.md`](fips.md)) — the build swaps
+  `aws-lc-rs` onto the AWS-LC FIPS module; the
   `--fips-required` CLI flag hard-fails startup if FIPS mode is not
   active. See [`fips.md`](fips.md).
 - **Post-quantum key exchange** (feature `post-quantum`) — ML-KEM /

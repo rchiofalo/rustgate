@@ -440,21 +440,20 @@ fn extract_raw_from_ed25519_spki(spki: &[u8]) -> Result<Vec<u8>, PemKeyError> {
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
-    use ring::signature::{self as ring_sig, KeyPair};
+    use aws_lc_rs::signature::{self as lc_sig, KeyPair};
 
     use super::*;
     use crate::jwt::{FederationClaims, JwtAuthority, JwtError};
 
     fn es256_test_keypair() -> (Vec<u8>, Vec<u8>) {
-        let rng = ring_sig::EcdsaKeyPair::generate_pkcs8(
-            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
-            &ring::rand::SystemRandom::new(),
+        let rng = lc_sig::EcdsaKeyPair::generate_pkcs8(
+            &lc_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &aws_lc_rs::rand::SystemRandom::new(),
         )
         .expect("keygen");
-        let key_pair = ring_sig::EcdsaKeyPair::from_pkcs8(
-            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+        let key_pair = lc_sig::EcdsaKeyPair::from_pkcs8(
+            &lc_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
             rng.as_ref(),
-            &ring::rand::SystemRandom::new(),
         )
         .expect("parse pkcs8");
         let public_key = key_pair.public_key().as_ref().to_vec();
@@ -462,9 +461,9 @@ mod tests {
     }
 
     fn ed25519_test_keypair() -> (Vec<u8>, Vec<u8>) {
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring_sig::Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
-        let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse pkcs8");
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = lc_sig::Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
+        let key_pair = lc_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse pkcs8");
         let public_key = key_pair.public_key().as_ref().to_vec();
         (pkcs8.as_ref().to_vec(), public_key)
     }
@@ -893,12 +892,10 @@ mod tests {
         use std::io::Write;
         // Generate a fresh ES256 key and write it as PEM, then load
         // and use to instantiate a JwtAuthority.
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring_sig::EcdsaKeyPair::generate_pkcs8(
-            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
-            &rng,
-        )
-        .expect("keygen");
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 =
+            lc_sig::EcdsaKeyPair::generate_pkcs8(&lc_sig::ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                .expect("keygen");
         let pem_body = b64::encode(pkcs8.as_ref());
         let pem = format!("-----BEGIN PRIVATE KEY-----\n{pem_body}\n-----END PRIVATE KEY-----\n");
 
@@ -921,8 +918,8 @@ mod tests {
     #[test]
     fn load_ed25519_pkcs8_pem_round_trip() {
         use std::io::Write;
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring_sig::Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = lc_sig::Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
         let pem_body = b64::encode(pkcs8.as_ref());
         let pem = format!("-----BEGIN PRIVATE KEY-----\n{pem_body}\n-----END PRIVATE KEY-----\n");
 
@@ -952,9 +949,9 @@ mod tests {
             use std::io::Write;
             use std::os::unix::fs::PermissionsExt;
 
-            let rng = ring::rand::SystemRandom::new();
-            let pkcs8 = ring_sig::EcdsaKeyPair::generate_pkcs8(
-                &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+            let rng = aws_lc_rs::rand::SystemRandom::new();
+            let pkcs8 = lc_sig::EcdsaKeyPair::generate_pkcs8(
+                &lc_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
                 &rng,
             )
             .expect("keygen");

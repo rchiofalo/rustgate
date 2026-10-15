@@ -117,7 +117,10 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
-rcgen = { version = "0.14", features = ["x509-parser", "zeroize"] }
+# rcgen signs with aws-lc-rs, not its default `ring` backend, so the binary
+# links a single crypto library (ADR 0037). Its `fips` feature only switches
+# aws-lc-rs to the FIPS module; `aws_lc_rs` is what routes rcgen through it.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser", "zeroize"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body = "1"
@@ -176,7 +179,6 @@ tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
 arbitrary = { version = "1", features = ["derive"] }
 proptest = "1"
-ring = "0.17"
 cms = "0.2.3"
 der = "0.7"
 x509-cert = "0.2"

@@ -43,8 +43,8 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ring::rand::SystemRandom;
-use ring::signature::{self as ring_sig};
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{self as lc_sig};
 use rustgate_federation::jwks_rotation::{
     RetainedVerifiers, RotationState, RotationStateMachine, install_on_authority,
 };
@@ -68,9 +68,9 @@ fn observed(kids: &[&str]) -> HashSet<String> {
 /// federation signing algorithm and the constant-size public key keeps
 /// the test fixture wiring tidy.
 fn ed25519_keypair() -> (Vec<u8>, Vec<u8>) {
-    let pkcs8 = ring_sig::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("keygen");
-    let kp = ring_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse");
-    use ring::signature::KeyPair;
+    let pkcs8 = lc_sig::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("keygen");
+    let kp = lc_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse");
+    use aws_lc_rs::signature::KeyPair;
     let pub_key = kp.public_key().as_ref().to_vec();
     (pkcs8.as_ref().to_vec(), pub_key)
 }

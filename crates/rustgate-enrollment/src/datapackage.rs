@@ -297,8 +297,8 @@ fn extract_spki_from_der(cert_der: &[u8]) -> Result<Vec<u8>, EnrollmentError> {
     // we only need it at setup time, and it's lightweight).
     // Fallback: do a minimal ASN.1 walk.
     //
-    // We use ring's built-in X.509 helpers indirectly: ring expects raw
-    // SPKI bytes. For simplicity, parse with the `x509-parser` crate
+    // The signature verifier needs the SPKI bytes on their own.
+    // For simplicity, parse with the `x509-parser` crate
     // which is already available.
     //
     // However x509-parser is only a dev-dependency. Instead we'll use
@@ -426,7 +426,7 @@ fn verify_signature(
     data: &[u8],
     signature: &[u8],
 ) -> Result<(), EnrollmentError> {
-    use ring::signature;
+    use aws_lc_rs::signature;
 
     // Try ECDSA P-256 SHA-256 first
     let ecdsa_result =
@@ -594,25 +594,22 @@ mod tests {
     use super::*;
 
     /// Generate an ECDSA P-256 key pair, return (SPKI DER bytes, key pair) for testing.
-    fn test_ecdsa_keypair() -> (Vec<u8>, ring::signature::EcdsaKeyPair) {
-        use ring::signature::{self, EcdsaKeyPair, KeyPair};
+    fn test_ecdsa_keypair() -> (Vec<u8>, aws_lc_rs::signature::EcdsaKeyPair) {
+        use aws_lc_rs::signature::{self, EcdsaKeyPair, KeyPair};
 
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
             .expect("keygen");
-        let key_pair = EcdsaKeyPair::from_pkcs8(
-            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            pkcs8.as_ref(),
-            &rng,
-        )
-        .expect("parse pkcs8");
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref())
+                .expect("parse pkcs8");
         let spki = key_pair.public_key().as_ref().to_vec();
         (spki, key_pair)
     }
 
     /// Sign data with the test key pair and return base64.
-    fn sign_data(key_pair: &ring::signature::EcdsaKeyPair, data: &[u8]) -> String {
-        let rng = ring::rand::SystemRandom::new();
+    fn sign_data(key_pair: &aws_lc_rs::signature::EcdsaKeyPair, data: &[u8]) -> String {
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let sig = key_pair.sign(&rng, data).expect("sign");
         b64::encode(sig.as_ref())
     }
@@ -1032,7 +1029,7 @@ mod tests {
     fn test_verify_signature_ecdsa() {
         let (spki, key_pair) = test_ecdsa_keypair();
         let data = b"test message for verification";
-        let rng = ring::rand::SystemRandom::new();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
         let sig = key_pair.sign(&rng, data).expect("sign");
 
         // Should succeed

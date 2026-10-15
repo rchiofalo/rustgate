@@ -44,8 +44,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ring::rand::SystemRandom;
-use ring::signature::{self as ring_sig, KeyPair};
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{self as lc_sig, KeyPair};
 use rustgate_core::b64;
 use rustgate_federation::jwks_client::{JwksClient, JwksConfig};
 use rustgate_federation::jwt::{Algorithm, JwtAuthority};
@@ -65,17 +65,14 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 /// Generate a fresh ES256 keypair → (PKCS#8 DER bytes, JWK x/y pair).
 fn fresh_es256_jwk(kid: &str) -> (Vec<u8>, serde_json::Value) {
-    let pkcs8 = ring_sig::EcdsaKeyPair::generate_pkcs8(
-        &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+    let pkcs8 = lc_sig::EcdsaKeyPair::generate_pkcs8(
+        &lc_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
         &SystemRandom::new(),
     )
     .expect("keygen");
-    let key_pair = ring_sig::EcdsaKeyPair::from_pkcs8(
-        &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
-        pkcs8.as_ref(),
-        &SystemRandom::new(),
-    )
-    .expect("parse");
+    let key_pair =
+        lc_sig::EcdsaKeyPair::from_pkcs8(&lc_sig::ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref())
+            .expect("parse");
     let pub_sec1 = key_pair.public_key().as_ref();
     assert_eq!(pub_sec1.len(), 65);
     let x = b64::encode_url_safe(&pub_sec1[1..33]);
@@ -96,8 +93,8 @@ fn fresh_es256_jwk(kid: &str) -> (Vec<u8>, serde_json::Value) {
 
 /// Generate a fresh Ed25519 keypair → (PKCS#8 DER, JWK).
 fn fresh_ed25519_jwk(kid: &str) -> (Vec<u8>, serde_json::Value) {
-    let pkcs8 = ring_sig::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("keygen");
-    let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse");
+    let pkcs8 = lc_sig::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("keygen");
+    let key_pair = lc_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse");
     let raw = key_pair.public_key().as_ref();
     assert_eq!(raw.len(), 32);
     (
