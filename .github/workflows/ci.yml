@@ -435,6 +435,11 @@ jobs:
         # matches byte-for-byte, catching a forgotten regen in CI.
         run: cargo nextest run --locked --workspace --features nats,enrollment,est,proto,full-detail,metrics,federation,federation-ha,websocket,mqtt,otel,http,schema,marti-compat,missions,video,correlation
 
+      - name: Test federation JWKS client
+        # `jwks` is not enabled by any rustgate-server feature, so the
+        # workspace run above never compiles these tests.
+        run: cargo nextest run --locked -p rustgate-federation --features jwks --test jwks_client
+
       - name: Authz P99 budget gate (release)
         run: cargo nextest run --locked --release -p rustgate-authz --run-ignored all perf_budget
 
