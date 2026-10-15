@@ -130,6 +130,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # Reads Cargo.lock only (no toolchain needed), so it runs first. Catches
+      # a lockfile re-resolve (`cargo update`, Dependabot) that moves bindgen
+      # 0.73 onto syn 3, which otherwise surfaces late as an obscure E0277 in
+      # the `fips` job. See the pin comment above `aws-lc-rs` in Cargo.toml.
+      - name: Check hand-maintained Cargo.lock pins
+        run: bash scripts/check-lock-pins.sh
+
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # action pin; toolchain set below
         with:
           toolchain: "1.99"

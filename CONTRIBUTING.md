@@ -59,7 +59,7 @@ CI runs as parallel jobs. All checks must pass before merging to `main` (enforce
 | Job | What it checks |
 |-----|----------------|
 | `commit-lint` | PR title follows Conventional Commits format |
-| `lint` | `cargo +nightly fmt --check` + `cargo machete` |
+| `lint` | `scripts/check-lock-pins.sh` + `cargo +nightly fmt --check` + `cargo machete` |
 | `clippy` | `cargo clippy` with all features + `cargo doc` |
 | `check-features` | `cargo hack` feature powerset (depth 2, excludes fips/jemalloc/post-quantum) |
 | `test` | `cargo nextest run` with all features (except fips/jemalloc/post-quantum) + doc tests |
@@ -69,6 +69,13 @@ CI runs as parallel jobs. All checks must pass before merging to `main` (enforce
 | `audit` | `cargo deny check` + `cargo audit` |
 | `helm` | `helm lint helm/` |
 | `docker` | Dockerfile build validation |
+
+`scripts/check-lock-pins.sh` guards hand-maintained `Cargo.lock` edges that
+Cargo would otherwise undo on a re-resolve. Today that is bindgen 0.73 →
+`syn 2` (see the comment above `aws-lc-rs` in the root `Cargo.toml`): a
+`cargo update -p <crate>` or a Dependabot PR can move it to syn 3, which
+breaks the `fips` build with an obscure E0277. The script reads only the
+lockfile and prints the exact line to edit. Run it after any `cargo update`.
 
 Run locally before pushing:
 
@@ -81,6 +88,9 @@ cargo clippy --all-features --all-targets
 
 # Dependency auditing (licenses, advisories, bans, sources)
 cargo deny check
+
+# Hand-maintained Cargo.lock pins (run after any cargo update)
+bash scripts/check-lock-pins.sh
 
 # Helm chart validation
 helm lint helm/
