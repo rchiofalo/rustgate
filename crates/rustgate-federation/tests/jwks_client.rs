@@ -669,6 +669,7 @@ async fn try_refresh_via_test_client(
         pending_window: Duration::from_secs(60),
         retiring_window: Duration::from_secs(300),
     };
+    rustgate_core::tls_provider::ensure_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -688,6 +689,7 @@ async fn try_refresh_via_test_client(
 }
 
 async fn test_refresh_returning_delay(cfg: &JwksConfig) -> Duration {
+    rustgate_core::tls_provider::ensure_default();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
