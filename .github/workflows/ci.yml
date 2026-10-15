@@ -802,7 +802,7 @@ jobs:
             echo "::error::fips + mldsa-certs built successfully but must be rejected"
             exit 1
           fi
-          if ! grep -q "mutually exclusive" build.log; then
+          if ! grep -q "not supported together" build.log; then
             echo "::error::fips + mldsa-certs failed, but not via the intended compile_error!"
             cat build.log
             exit 1
