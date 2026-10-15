@@ -466,7 +466,63 @@ pub fn check_crl_freshness(crls: &[CertificateRevocationListDer<'static>]) -> us
     stale_count
 }
 
-/// Install the FIPS 140-3 validated crypto provider (aws-lc-rs).
+/// The stock `aws-lc-rs` provider with every ML-DSA signature algorithm removed.
+///
+/// rustls 0.23.46 added ML-DSA-44/65/87 to the aws-lc-rs provider's default
+/// verification set. rustgate keeps acceptance of ML-DSA-signed certificate
+/// chains opt-in (`--features mldsa-certs` plus `--mldsa-client-certs`, #501),
+/// so every aws-lc-rs provider it installs starts from this one, and the opt-in
+/// adds ML-DSA-87 back. Cipher suites, key-exchange groups and the classical
+/// algorithms (in their original order) are untouched.
+#[cfg(any(feature = "fips", feature = "post-quantum", feature = "mldsa-certs"))]
+#[must_use]
+pub fn aws_lc_rs_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::CryptoProvider {
+        signature_verification_algorithms: *CLASSICAL_SIG_ALGS,
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    }
+}
+
+/// The stock aws-lc-rs verification algorithms without ML-DSA. Derived from the
+/// upstream provider, not hand-listed, so classical algorithms rustls adds
+/// later still carry through.
+#[cfg(any(feature = "fips", feature = "post-quantum", feature = "mldsa-certs"))]
+pub(crate) static CLASSICAL_SIG_ALGS: std::sync::LazyLock<
+    rustls::crypto::WebPkiSupportedAlgorithms,
+> = std::sync::LazyLock::new(|| {
+    use rustls::SignatureScheme;
+    use rustls_pki_types::alg_id;
+
+    let base = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+    let mldsa = [alg_id::ML_DSA_44, alg_id::ML_DSA_65, alg_id::ML_DSA_87];
+    let all: Vec<_> = base
+        .all
+        .iter()
+        .copied()
+        .filter(|alg| !mldsa.contains(&alg.public_key_alg_id()))
+        .collect();
+    let mapping: Vec<_> = base
+        .mapping
+        .iter()
+        .copied()
+        .filter(|(scheme, _)| {
+            !matches!(
+                scheme,
+                SignatureScheme::ML_DSA_44
+                    | SignatureScheme::ML_DSA_65
+                    | SignatureScheme::ML_DSA_87
+            )
+        })
+        .collect();
+    // `WebPkiSupportedAlgorithms` holds `&'static` slices and this set is
+    // only known at run time, so it is leaked once, here, via `LazyLock`.
+    rustls::crypto::WebPkiSupportedAlgorithms {
+        all: all.leak(),
+        mapping: mapping.leak(),
+    }
+});
+
+/// Install the FIPS 140-3 crypto provider (aws-lc-rs).
 ///
 /// Must be called once before any TLS operations. Replaces the default
 /// `ring` backend with `aws-lc-rs` in FIPS mode, restricting cipher
@@ -475,12 +531,11 @@ pub fn check_crl_freshness(crls: &[CertificateRevocationListDer<'static>]) -> us
 /// Returns an error if a crypto provider is already installed.
 #[cfg(feature = "fips")]
 pub fn install_fips_provider() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .map_err(|_| {
-            RustgateError::from(ConfigError::Other(
-                "crypto provider already installed".to_string(),
-            ))
-        })?;
+    rustls::crypto::CryptoProvider::install_default(aws_lc_rs_provider()).map_err(|_| {
+        RustgateError::from(ConfigError::Other(
+            "crypto provider already installed".to_string(),
+        ))
+    })?;
 
     // Verify the installed provider actually reports FIPS mode.
     // This catches build misconfigurations where aws-lc-rs was compiled
@@ -521,12 +576,11 @@ pub fn is_fips_provider_active() -> bool {
 /// Returns an error if a crypto provider is already installed.
 #[cfg(feature = "post-quantum")]
 pub fn install_pq_provider() -> Result<()> {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-        .map_err(|_| {
-            RustgateError::from(ConfigError::Other(
-                "crypto provider already installed".to_string(),
-            ))
-        })?;
+    rustls::crypto::CryptoProvider::install_default(pq_provider()).map_err(|_| {
+        RustgateError::from(ConfigError::Other(
+            "crypto provider already installed".to_string(),
+        ))
+    })?;
 
     tracing::info!("post-quantum crypto provider (aws-lc-rs) installed — X25519MLKEM768 preferred");
     Ok(())
@@ -564,7 +618,7 @@ pub fn install_provider_with_kx_groups(groups: &str) -> Result<()> {
 #[cfg(feature = "post-quantum")]
 #[must_use]
 pub fn pq_provider() -> rustls::crypto::CryptoProvider {
-    rustls::crypto::aws_lc_rs::default_provider()
+    aws_lc_rs_provider()
 }
 
 /// Build (but do not install) a provider with a custom key-exchange group
@@ -576,7 +630,7 @@ pub fn pq_provider() -> rustls::crypto::CryptoProvider {
 /// Returns an error if a group name is unrecognized.
 #[cfg(feature = "post-quantum")]
 pub fn pq_provider_with_kx_groups(groups: &str) -> Result<rustls::crypto::CryptoProvider> {
-    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    let mut provider = aws_lc_rs_provider();
     provider.kx_groups = parse_kx_groups(groups)?;
     Ok(provider)
 }
@@ -638,6 +692,57 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    /// rustls 0.23.46 puts ML-DSA into the stock aws-lc-rs provider; rustgate's
+    /// aws-lc-rs provider must remove exactly those entries and nothing else,
+    /// so ML-DSA acceptance stays behind `--mldsa-client-certs` (#501).
+    #[cfg(any(feature = "fips", feature = "post-quantum", feature = "mldsa-certs"))]
+    #[test]
+    fn aws_lc_rs_provider_removes_only_mldsa() {
+        use rustls::SignatureScheme;
+        use rustls_pki_types::alg_id;
+
+        let is_mldsa_scheme = |s: &SignatureScheme| {
+            matches!(
+                s,
+                SignatureScheme::ML_DSA_44
+                    | SignatureScheme::ML_DSA_65
+                    | SignatureScheme::ML_DSA_87
+            )
+        };
+        let mldsa_ids = [alg_id::ML_DSA_44, alg_id::ML_DSA_65, alg_id::ML_DSA_87];
+
+        let stock = rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms;
+        let ours = aws_lc_rs_provider().signature_verification_algorithms;
+
+        let stock_schemes: Vec<_> = stock.mapping.iter().map(|(s, _)| *s).collect();
+        let our_schemes: Vec<_> = ours.mapping.iter().map(|(s, _)| *s).collect();
+        let expected: Vec<_> = stock_schemes
+            .iter()
+            .copied()
+            .filter(|s| !is_mldsa_scheme(s))
+            .collect();
+        assert_eq!(
+            our_schemes, expected,
+            "classical schemes kept, in order; ML-DSA removed"
+        );
+
+        assert!(
+            ours.all
+                .iter()
+                .all(|alg| !mldsa_ids.contains(&alg.public_key_alg_id())),
+            "no ML-DSA verification algorithm may remain in `all`"
+        );
+        assert_eq!(
+            ours.all.len(),
+            stock
+                .all
+                .iter()
+                .filter(|alg| !mldsa_ids.contains(&alg.public_key_alg_id()))
+                .count(),
+            "every classical verification algorithm is kept"
+        );
+    }
 
     #[test]
     fn parse_tls_min_version_1_2() {

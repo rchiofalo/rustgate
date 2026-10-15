@@ -775,7 +775,7 @@ rustgate supports multiple deployment paths — pick the one that matches your e
 - **mTLS everywhere** — all client and federation connections require mutual TLS with certificate verification
 - **CRL revocation** — revoked certificates are rejected at the TLS handshake via `--crl`
 - **OCSP stapling** — optional `ocsp` feature staples OCSP responses to the server certificate (see below)
-- **FIPS 140-3** — optional aws-lc-rs crypto provider for FIPS-validated TLS ([details](docs/fips.md))
+- **FIPS 140-3** — optional aws-lc-rs crypto provider using the AWS-LC FIPS module ([details and certification status](docs/fips.md))
 - **No unsafe code** — `unsafe_code = "forbid"` enforced workspace-wide
 - **No panics** — `clippy::panic = "deny"` and `clippy::unwrap_used = "deny"` in production code
 - **Subject DN enforcement** — enrollment certificates carry the authenticated username to prevent impersonation

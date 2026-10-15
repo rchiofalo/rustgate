@@ -1,6 +1,26 @@
 # FIPS 140-3 Support
 
-rustgate supports FIPS 140-3 validated cryptography via the `fips` feature flag. When enabled, all TLS operations use the [aws-lc-rs](https://github.com/aws/aws-lc-rs) crypto provider (backed by AWS-LC, a FIPS 140-3 validated module) instead of the default `ring` backend.
+rustgate supports FIPS 140-3 cryptography via the `fips` feature flag. When enabled, all TLS operations use the [aws-lc-rs](https://github.com/aws/aws-lc-rs) crypto provider, backed by the AWS-LC FIPS module, instead of the default `ring` backend. Check [the module's NIST certification status](#module-version-and-certification-status) before relying on it for compliance.
+
+## Module version and certification status
+
+NIST certifies a specific version of the AWS-LC FIPS module, not rustgate.
+`--features fips` builds whichever module `aws-lc-fips-sys` (pinned in
+`Cargo.lock`) compiles:
+
+| rustgate | aws-lc-rs | AWS-LC-FIPS module | NIST CMVP status (checked 2026-10-15) |
+|---|---|---|---|
+| before #1729 | 1.16.x | 3.0.x | Certified: [#5298](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/5298) (dynamic), [#5314](https://csrc.nist.gov/projects/cryptographic-module-validation-program/certificate/5314) (static) |
+| from #1729 | 1.18.x | 4.x | Submitted to NIST by AWS; no certificate issued yet |
+
+The move to 4.x was forced: rustls 0.23.44 and later require aws-lc-rs 1.18,
+which only builds the 4.x module, and the rustls fixes it brings (RUSTSEC-2026-0285
+among them) apply to FIPS builds too.
+
+If your deployment requires a module that already holds a CMVP certificate,
+check the [CMVP database](https://csrc.nist.gov/projects/cryptographic-module-validation-program/validated-modules/search)
+for AWS-LC-FIPS 4.x first. `--fips-required` confirms the provider is running
+in FIPS mode; it does not check certification.
 
 ## Build Prerequisites
 
@@ -57,7 +77,7 @@ Build with --features fips to enable FIPS 140-3 mode.
 
 | Aspect | Default (ring) | FIPS (aws-lc-rs) |
 |---|---|---|
-| Crypto library | ring | aws-lc (FIPS validated) |
+| Crypto library | ring | AWS-LC FIPS module (see certification status above) |
 | TLS cipher suites | ring defaults | FIPS-approved only |
 | Key exchange | X25519, ECDHE | FIPS-approved ECDHE |
 | Hash algorithms | SHA-2 family | SHA-2 family (FIPS) |

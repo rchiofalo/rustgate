@@ -10,7 +10,7 @@
 //! self-signed ML-DSA CA as both the anchor *and* the end entity passes
 //! happily while executing **zero** ML-DSA verification code. Every test here
 //! therefore uses a chain where the leaf is genuinely *signed by* the anchor,
-//! and [`stock_provider_rejects_mldsa_issued_chain`] is the mandatory negative
+//! and [`provider_without_opt_in_rejects_mldsa_issued_chain`] is the mandatory negative
 //! control: it runs the identical chain through the unmodified provider and
 //! requires a failure. Without that control, none of the positive results mean
 //! anything.
@@ -152,21 +152,22 @@ fn augmented_provider_verifies_mldsa_issued_chain() {
     );
 }
 
-/// **Mandatory negative control.** The identical chain must FAIL against the
-/// unmodified `aws-lc-rs` provider.
+/// **Mandatory negative control.** The identical chain must FAIL against
+/// rustgate's aws-lc-rs provider without the ML-DSA opt-in.
 ///
 /// If this ever passes, the positive test above is proving nothing — it would
 /// mean the chain is being accepted without any ML-DSA signature actually
-/// being checked (for example because the leaf was mistakenly self-signed, or
-/// because upstream started shipping ML-DSA in the default set and the
-/// augmentation became a no-op).
+/// being checked (for example because the leaf was mistakenly self-signed). It
+/// also pins that ML-DSA acceptance stays opt-in: since rustls 0.23.46 the
+/// *stock* aws-lc-rs provider accepts this chain, and rustgate strips ML-DSA
+/// from it unless `--mldsa-client-certs` is set.
 #[test]
-fn stock_provider_rejects_mldsa_issued_chain() {
+fn provider_without_opt_in_rejects_mldsa_issued_chain() {
     let chain = mldsa_issued_chain("MLDSA-CLIENT-2");
 
     let verifier =
         WebPkiClientVerifier::builder_with_provider(root_store_with(&chain.ca.cert_der), {
-            Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+            Arc::new(rustgate_tls::aws_lc_rs_provider())
         })
         .build()
         .expect("verifier builds");
@@ -199,9 +200,9 @@ fn stock_provider_rejects_mldsa_issued_chain() {
             );
         }
         other => panic!(
-            "stock provider must reject the chain with UnsupportedSignatureAlgorithm for \
-             ML-DSA-87 — if it accepts, the augmentation is a no-op and the positive test \
-             is vacuous. Got: {other:?}",
+            "without the opt-in the chain must be rejected with UnsupportedSignatureAlgorithm \
+             for ML-DSA-87 — if it is accepted, ML-DSA is no longer opt-in and the positive \
+             test is vacuous. Got: {other:?}",
         ),
     }
 }
@@ -365,6 +366,14 @@ fn advertised_schemes_include_mldsa_last() {
         schemes.last(),
         Some(&rustls::SignatureScheme::ML_DSA_87),
         "ML-DSA-87 must be advertised last, behind every classical scheme",
+    );
+    assert_eq!(
+        schemes
+            .iter()
+            .filter(|s| **s == rustls::SignatureScheme::ML_DSA_87)
+            .count(),
+        1,
+        "ML-DSA-87 must be advertised exactly once",
     );
     // The augmentation must not have displaced the classical schemes.
     for expected in [

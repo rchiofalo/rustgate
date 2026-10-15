@@ -68,7 +68,7 @@ tokio = { version = "1", default-features = false }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 # Direct dependency solely to reach the ML-DSA `SignatureVerificationAlgorithm`
 # statics for the ML-DSA-87 TLS certificate-verification path

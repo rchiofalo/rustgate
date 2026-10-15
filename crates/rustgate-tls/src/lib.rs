@@ -49,6 +49,8 @@ pub mod spiffe;
 pub use cert_reloader::CertReloader;
 #[cfg(feature = "ocsp")]
 pub use client_ocsp::{ClientOcspVerifier, FetchFuture, OcspFetcher, OcspStaplerFetcher};
+#[cfg(any(feature = "fips", feature = "post-quantum", feature = "mldsa-certs"))]
+pub use config::aws_lc_rs_provider;
 #[cfg(feature = "fips")]
 pub use config::install_fips_provider;
 pub use config::{
