@@ -19,11 +19,7 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_DEV_DEBUG: 0
   # -Dwarnings is workspace-wide policy (all warnings are errors).
-  # -C link-arg=-fuse-ld=mold wires the mold linker on self-hosted runners
-  # (mold is pre-installed in the github-runner container image); GitHub-hosted
-  # fallback (RUNNER_POOL != self-hosted) keeps the default linker since
-  # ubuntu-latest does not ship mold.
-  RUSTFLAGS: ${{ vars.RUNNER_POOL == 'self-hosted' && '-Dwarnings -C link-arg=-fuse-ld=mold' || '-Dwarnings' }}
+  RUSTFLAGS: -Dwarnings
   # Pinned nats-server release used by the `test` and `coverage` jobs.
   # Bumping the version requires updating NATS_SERVER_SHA256 — check
   # https://github.com/nats-io/nats-server/releases for the tarball checksum.
@@ -33,7 +29,7 @@ env:
 jobs:
   commit-lint:
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -57,7 +53,7 @@ jobs:
 
   playbook-lint:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -95,13 +91,11 @@ jobs:
           "$RUNNER_TEMP/reuse-venv/bin/reuse" lint
 
       - name: Install Python YAML dependency
-        # PyYAML is preinstalled on ubuntu-latest hosted runners but is absent
-        # on the minimal self-hosted Linux runners. Install via apt rather
-        # than pip to avoid the PEP 668 "externally managed" error that
-        # system Python raises on Ubuntu 23.04+ when pip writes to the system
-        # site-packages without --break-system-packages. No-op when already
-        # present. (Same pattern used by the helm job below for the RBAC
-        # scanner.)
+        # Install via apt rather than pip to avoid the PEP 668 "externally
+        # managed" error that system Python raises on Ubuntu 23.04+ when pip
+        # writes to the system site-packages without --break-system-packages.
+        # No-op when already present. (Same pattern used by the helm job below
+        # for the RBAC scanner.)
         run: |
           if ! python3 -c 'import yaml' 2>/dev/null; then
             sudo apt-get update
@@ -125,7 +119,7 @@ jobs:
 
   lint:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -145,11 +139,7 @@ jobs:
           toolchain: nightly-2026-04-01
           components: rustfmt
 
-      # sccache is the primary cache on self-hosted runners (shared volume,
-      # no per-job upload/download). Swatinem/rust-cache is kept only for
-      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Check formatting
         run: cargo +nightly-2026-04-01 fmt --all -- --check
@@ -163,7 +153,7 @@ jobs:
 
   clippy:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
@@ -181,15 +171,9 @@ jobs:
           toolchain: "1.99"
           components: clippy
 
-      # sccache is the primary cache on self-hosted runners (shared volume,
-      # no per-job upload/download). Swatinem/rust-cache is kept only for
-      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Install protoc
-        # No-op on self-hosted runners where protobuf-compiler is baked into
-        # the container image; apt-get install on the GitHub-hosted fallback.
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -204,7 +188,7 @@ jobs:
   check-features:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -219,15 +203,9 @@ jobs:
         with:
           toolchain: "1.99"
 
-      # sccache is the primary cache on self-hosted runners (shared volume,
-      # no per-job upload/download). Swatinem/rust-cache is kept only for
-      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Install protoc
-        # No-op on self-hosted runners where protobuf-compiler is baked into
-        # the container image; apt-get install on the GitHub-hosted fallback.
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -288,7 +266,7 @@ jobs:
     # propagation breakage that pair-coverage misses.
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
@@ -315,17 +293,11 @@ jobs:
         with:
           toolchain: "1.99"
 
-      # sccache is the primary cache on self-hosted runners (shared volume,
-      # no per-job upload/download). Swatinem/rust-cache is kept only for
-      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Install protoc
         # `proto` and `otel` features pull in tonic/prost build scripts that
-        # invoke protoc; some matrix triples (mqtt+otel+full-detail) require
-        # it. No-op on self-hosted runners where protobuf-compiler is baked
-        # into the container image.
+        # invoke protoc; some matrix triples (mqtt+otel+full-detail) require it.
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -362,7 +334,7 @@ jobs:
     # would be a false MSRV positive.
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -377,17 +349,11 @@ jobs:
         with:
           toolchain: "1.99"
 
-      # sccache is the primary cache on self-hosted runners (shared volume,
-      # no per-job upload/download). Swatinem/rust-cache is kept only for
-      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Install protoc
         # Required by the `proto` and `otel` features, which the production
-        # feature set below depends on. No-op on self-hosted runners where
-        # protobuf-compiler is baked into the container image; apt-get
-        # install on the GitHub-hosted fallback.
+        # feature set below depends on.
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -414,7 +380,7 @@ jobs:
   test:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -430,8 +396,6 @@ jobs:
           toolchain: "1.99"
 
       - name: Install protoc
-        # No-op on self-hosted runners where protobuf-compiler is baked into
-        # the container image; apt-get install on the GitHub-hosted fallback.
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -455,15 +419,9 @@ jobs:
       - name: Verify nats-server
         run: nats-server --version
 
-      # sccache is the primary cache on self-hosted runners (shared volume,
-      # no per-job upload/download). Swatinem/rust-cache is kept only for
-      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Install cargo-nextest
-        # No-op on self-hosted runners where cargo-nextest is baked into the
-        # container image; downloads the tarball on the GitHub-hosted fallback.
         run: |
           if ! command -v cargo-nextest >/dev/null 2>&1; then
             curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -486,7 +444,7 @@ jobs:
   coverage:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -505,8 +463,6 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install protoc
-        # No-op on self-hosted runners where protobuf-compiler is baked into
-        # the container image; apt-get install on the GitHub-hosted fallback.
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -527,15 +483,9 @@ jobs:
           tar xzf /tmp/nats.tar.gz -C /tmp
           sudo mv "/tmp/nats-server-v${NATS_SERVER_VERSION}-linux-amd64/nats-server" /usr/local/bin/
 
-      # sccache is the primary cache on self-hosted runners (shared volume,
-      # no per-job upload/download). Swatinem/rust-cache is kept only for
-      # the GitHub-hosted fallback, where sccache is not pre-installed.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: vars.RUNNER_POOL != 'self-hosted'
 
       - name: Install cargo-nextest
-        # No-op on self-hosted runners where cargo-nextest is baked into the
-        # container image; downloads the tarball on the GitHub-hosted fallback.
         run: |
           if ! command -v cargo-nextest >/dev/null 2>&1; then
             curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -590,7 +540,7 @@ jobs:
     # later. Skipped on draft PRs like the other heavyweight jobs.
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     env:
       # Fuzzing runs on the latest nightly, where lints and deprecations land
       # before stable. Denying warnings here would fail the job on nightly-only
@@ -625,16 +575,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
 
       - name: Install protoc
-        # No-op on self-hosted runners where protobuf-compiler is baked into
-        # the container image; apt-get install on the GitHub-hosted fallback.
         run: |
           if ! command -v protoc >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y protobuf-compiler
           fi
 
       - name: Install cargo-fuzz
-        # No-op on self-hosted runners where cargo-fuzz is baked into the
-        # container image; installs via cargo on the GitHub-hosted fallback.
         run: |
           if ! command -v cargo-fuzz >/dev/null 2>&1; then
             cargo +nightly install cargo-fuzz --locked
@@ -649,7 +595,7 @@ jobs:
   fips:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
 
     strategy:
       fail-fast: false
@@ -682,10 +628,6 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Install FIPS build dependencies
-        # No-op on self-hosted runners where protobuf-compiler, cmake, golang-go,
-        # and musl-tools are baked into the container image; apt-get install on
-        # the GitHub-hosted fallback. We check for protoc as a proxy for the
-        # whole package set — the container image provisions them together.
         run: |
           if ! command -v protoc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 || ! command -v go >/dev/null 2>&1 || ! command -v musl-gcc >/dev/null 2>&1; then
             sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go musl-tools
@@ -693,16 +635,12 @@ jobs:
 
       - name: Install aarch64 cross-compiler
         if: contains(matrix.target, 'aarch64')
-        # No-op on self-hosted runners where gcc-aarch64-linux-gnu is baked into
-        # the container image; apt-get install on the GitHub-hosted fallback.
         run: |
           if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
             sudo apt-get install -y gcc-aarch64-linux-gnu
           fi
 
       - name: Install cargo-nextest
-        # No-op on self-hosted runners where cargo-nextest is baked into the
-        # container image; downloads the tarball on the GitHub-hosted fallback.
         run: |
           if ! command -v cargo-nextest >/dev/null 2>&1; then
             curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -719,13 +657,6 @@ jobs:
           CC_${{ matrix.target }}: ${{ matrix.cc }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           C_INCLUDE_PATH: ${{ contains(matrix.target, 'musl') && '/usr/include:/usr/include/x86_64-linux-gnu' || '' }}
-          # Drop mold from RUSTFLAGS for cross-target FIPS builds: the gcc
-          # cross-wrappers (aarch64-linux-gnu-gcc, musl-gcc) invoke collect2
-          # with their own ld-search-path that does not include mold, so
-          # `-fuse-ld=mold` fails with `collect2: cannot find 'ld'`. The mold
-          # speedup still applies to every non-cross-target step (clippy,
-          # test, coverage, check-features, the x86_64 FIPS clippy path).
-          RUSTFLAGS: -Dwarnings
         run: cargo build --locked -p rustgate-server --features fips,federation,enrollment,http --target ${{ matrix.target }}
 
       - name: Run FIPS tests
@@ -737,7 +668,7 @@ jobs:
   post-quantum:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
 
     steps:
       - name: Harden runner
@@ -763,8 +694,6 @@ jobs:
           fi
 
       - name: Install cargo-nextest
-        # No-op on self-hosted runners where cargo-nextest is baked into the
-        # container image; downloads the tarball on the GitHub-hosted fallback.
         run: |
           if ! command -v cargo-nextest >/dev/null 2>&1; then
             curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
@@ -808,7 +737,7 @@ jobs:
     # in review).
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -836,11 +765,9 @@ jobs:
         run: cargo build --locked --release --package rustgate-server --features nats,enrollment,proto,full-detail,metrics,federation,federation-ha,websocket,otel,http
 
       - name: Strip release binary
-        # Release packaging in release-binary.yml ships the stripped binary
-        # (via `tar -czf` of the default cargo output which includes debug
-        # info only when debug=1). Strip here to measure the same shape.
-        # `strip` ships by default on ubuntu-latest (binutils) and on any
-        # self-hosted runner with build-essential installed.
+        # Release packaging in release-binary.yml ships the stripped binary (via
+        # `tar -czf` of the default cargo output which includes debug info only
+        # when debug=1). Strip here to measure the same shape.
         run: strip target/release/rustgate
 
       - name: Check binary size against baseline
@@ -884,7 +811,7 @@ jobs:
   audit:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -939,7 +866,7 @@ jobs:
     # creating false-positive merge blocks. Exit code pinned to 0.
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     # `continue-on-error: true` belt-and-braces against an unexpected
     # `cargo audit` exit code escaping the inline `|| true` in the step
     # body. The intent of this job is "report, never block" — both the
@@ -1011,7 +938,7 @@ jobs:
 
   helm:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
@@ -1038,12 +965,10 @@ jobs:
         run: test -s /tmp/helm-render/rendered.yaml
 
       - name: Install Python YAML dependency
-        # PyYAML is preinstalled on ubuntu-latest hosted runners but is absent
-        # on the minimal self-hosted Linux runners. Install via apt rather
-        # than pip to avoid the PEP 668 "externally managed" error that
-        # system Python raises on Ubuntu 23.04+ when pip writes to the system
-        # site-packages without --break-system-packages. No-op when already
-        # present.
+        # Install via apt rather than pip to avoid the PEP 668 "externally
+        # managed" error that system Python raises on Ubuntu 23.04+ when pip
+        # writes to the system site-packages without --break-system-packages.
+        # No-op when already present.
         run: |
           if ! python3 -c 'import yaml' 2>/dev/null; then
             sudo apt-get update
@@ -1186,7 +1111,7 @@ jobs:
   docker:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [check-features, test]
-    runs-on: ${{ vars.RUNNER_POOL == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     # dorny/paths-filter calls listFiles(pull_number) via the GitHub API on
     # pull_request events; on private repos this requires explicit
     # pull-requests: read (the top-level permissions block only grants
