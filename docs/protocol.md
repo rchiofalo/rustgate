@@ -98,7 +98,7 @@ validation will be disconnected immediately after the handshake.
   ML-KEM-768 + X25519) is preferred on TLS 1.3, and classical X25519 remains
   available for fallback. Both peers must support the hybrid group for it to
   be negotiated. `--kx-groups` overrides the order (see
-  [post-quantum.md](post-quantum.md)).
+  [post-quantum.md](https://github.com/rchiofalo/rustgate/blob/main/docs/post-quantum.md)).
 
 ---
 

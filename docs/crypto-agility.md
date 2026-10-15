@@ -170,7 +170,7 @@ If a vulnerability is discovered in a specific algorithm:
 
 ## Related Documentation
 
-- [Post-Quantum TLS Migration Roadmap](post-quantum.md) — phased PQ
+- [Post-Quantum TLS](post-quantum.md) — phased PQ
   migration plan with timelines and blockers
 - [TLS Certificates](tls-certificates.md) — certificate generation and
   requirements

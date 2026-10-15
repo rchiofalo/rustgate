@@ -6,7 +6,7 @@ still outstanding.
 ## Current Status
 
 Every rustgate build uses **rustls** with the **aws-lc-rs** crypto provider
-([ADR 0037](adr/0037-aws-lc-rs-post-quantum-default.md)). With no
+([ADR 0037](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0037-aws-lc-rs-post-quantum-default.md)). With no
 configuration:
 
 - **Key exchange:** X25519MLKEM768 (X25519 + ML-KEM-768) is offered first.
@@ -101,7 +101,7 @@ module version a build links, and its certification status, is in
   ML-DSA leaf.
 - Composite (hybrid dual-signature) certificates, #503, blocked on
   `draft-ietf-lamps-pq-composite-sigs` becoming an RFC.
-- Full CNSA 2.0, tracked in [ADR 0019](adr/0019-cnsa2-hybrid-mldsa.md).
+- Full CNSA 2.0, tracked in [ADR 0019](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0019-cnsa2-hybrid-mldsa.md).
   `--cnsa2` logs a readiness report at startup.
 
 ## NIST PQ Standards Reference

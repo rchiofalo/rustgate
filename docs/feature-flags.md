@@ -85,7 +85,7 @@ This is deliberate so consumers can build a minimal binary by setting
 
 | Feature | Adds | Special build? | Notes |
 |---|---|---|---|
-| `fips` | AWS-LC FIPS module as the TLS provider | **Go + cmake required** | Hybrid PQ key exchange and ML-DSA verification stay on. See [fips.md](fips.md). |
+| `fips` | AWS-LC FIPS module as the TLS provider | **Go + cmake required** | Hybrid PQ key exchange and ML-DSA verification stay on. See [fips.md](https://github.com/rchiofalo/rustgate/blob/main/docs/fips.md). |
 | `post-quantum`, `mldsa-certs` | Nothing | No | Kept so existing feature lists build; PQ is on in every build (ADR 0037). |
 | `ocsp` | OCSP stapling for served certificates | No | Background fetcher with cached good/revoked. |
 | `spiffe` | SPIFFE Workload API integration | No | Auto-rotating SVIDs; trust-bundle refresh. |
