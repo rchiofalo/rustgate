@@ -569,11 +569,10 @@ fn window_truncated_millis(received_at: SystemTime, window: Duration) -> u64 {
     )
     .unwrap_or(u64::MAX);
     let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
-    if window_ms == 0 {
-        millis
-    } else {
-        (millis / window_ms) * window_ms
-    }
+    // A zero window disables bucketing; otherwise round down to the window.
+    millis
+        .checked_div(window_ms)
+        .map_or(millis, |q| q * window_ms)
 }
 
 #[cfg(test)]

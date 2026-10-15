@@ -723,7 +723,7 @@ mod tests {
 
         let store = ReplayStore::open(dir.path(), 1024 * 1024).unwrap();
         let mut all = store.load_all().unwrap();
-        all.sort_by(|a, b| (a.peer_id.clone(), a.seq).cmp(&(b.peer_id.clone(), b.seq)));
+        all.sort_by_key(|r| (r.peer_id.clone(), r.seq));
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].peer_id, "peer-a");
         assert_eq!(all[0].seq, 1);

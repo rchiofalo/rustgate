@@ -7,7 +7,7 @@
   <a href="https://github.com/rchiofalo/rustgate/releases/latest"><img src="https://img.shields.io/github/v/release/rchiofalo/rustgate?color=green" alt="Release"></a>
   <a href="https://ghcr.io/rchiofalo/rustgate"><img src="https://img.shields.io/badge/docker-ghcr.io-blue?logo=docker" alt="Docker"></a>
   <a href="https://securityscorecards.dev/viewer/?uri=github.com/rchiofalo/rustgate"><img src="https://api.securityscorecards.dev/projects/github.com/rchiofalo/rustgate/badge" alt="OpenSSF Scorecard"></a>
-  <img src="https://img.shields.io/badge/rust-1.94%2B-orange.svg?logo=rust" alt="Rust 1.94+">
+  <img src="https://img.shields.io/badge/rust-1.99%2B-orange.svg?logo=rust" alt="Rust 1.99+">
   <img src="https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg" alt="License: AGPL-3.0-only">
 </p>
 
@@ -239,7 +239,7 @@ truth and catch any drift between the two implementations.
 
 | Dependency | Required | Notes |
 |------------|----------|-------|
-| Rust 1.94+ | Yes | Pinned in `rust-toolchain.toml` (edition 2024) |
+| Rust 1.99+ | Yes | Pinned in `rust-toolchain.toml` (edition 2024) |
 | Rust nightly | Yes | For `cargo +nightly fmt` (CI enforces nightly formatting) |
 | protoc | For `proto` / `federation` features | Protocol Buffers compiler |
 | Go 1.20+, cmake | For `fips` feature | Required by aws-lc-rs build system |

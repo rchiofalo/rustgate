@@ -32,7 +32,7 @@ is the right reference and you can skip the UDS doc entirely.
 
 ### Requirements
 
-- Rust 1.94+ (to build from source) or a pre-built release binary
+- Rust 1.99+ (to build from source) or a pre-built release binary
 - TLS certificates (server cert, private key, CA cert)
 - `protoc` (only if building with `--features proto` or `--features federation`)
 - `nats-server` (optional, for NATS bridge)

@@ -135,10 +135,7 @@ fn extract_xml_attr<'a>(payload: &'a [u8], attr: &[u8]) -> Option<&'a [u8]> {
     while offset + attr_len <= search_limit {
         // Find the next occurrence of the attribute name
         let pos = haystack[offset..].windows(attr_len).position(|w| w == attr);
-        let attr_pos = match pos {
-            Some(p) => offset + p,
-            None => return None,
-        };
+        let attr_pos = offset + pos?;
 
         let value_start = attr_pos + attr_len;
         if value_start >= search_limit {

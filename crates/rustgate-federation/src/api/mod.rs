@@ -241,18 +241,12 @@ mod tests {
     /// waker -- no tokio runtime needed.
     fn body_string(resp: Response<Full<Bytes>>) -> String {
         use std::pin::Pin;
-        use std::task::{Context, Wake};
+        use std::task::{Context, Waker};
 
         use http_body::Body;
 
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: Arc<Self>) {}
-        }
-
         let (_, mut body) = resp.into_parts();
-        let waker = Arc::new(NoopWaker).into();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
 
         let mut buf = bytes::BytesMut::new();
         while let std::task::Poll::Ready(Some(Ok(frame))) = Pin::new(&mut body).poll_frame(&mut cx)

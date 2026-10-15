@@ -532,12 +532,10 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
                     }
                 }
             }
-            Event::Text(t) => {
-                if in_detail {
-                    // Store raw as-is; escapes round-trip through the
-                    // buffer verbatim since we compare by byte equality.
-                    detail_buf.push_str(&String::from_utf8_lossy(t.as_ref()));
-                }
+            Event::Text(t) if in_detail => {
+                // Store raw as-is; escapes round-trip through the
+                // buffer verbatim since we compare by byte equality.
+                detail_buf.push_str(&String::from_utf8_lossy(t.as_ref()));
             }
             _ => {}
         }

@@ -271,11 +271,11 @@ impl TenantQuotaTracker {
             let counters = self.counters.read();
             match counters.get(tenant) {
                 Some(c) => {
-                    // `fetch_update` returns the *previous* value; the closure
+                    // `try_update` returns the *previous* value; the closure
                     // always returns `Some`, so it always succeeds.
                     let prev = c
                         .active_connections
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                             Some(v.saturating_sub(1))
                         })
                         .unwrap_or(0);
@@ -407,7 +407,7 @@ impl TenantQuotaTracker {
                 Some(c) => {
                     let prev = c
                         .queued_bytes
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                             Some(v.saturating_sub(bytes))
                         })
                         .unwrap_or(0);
