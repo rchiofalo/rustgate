@@ -1812,7 +1812,7 @@ mod tests {
     /// regression.
     #[test]
     fn compute_hmac_matches_inlined_construction() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let key = [0xAB; 32];
         let data = b"some encoded envelope bytes";

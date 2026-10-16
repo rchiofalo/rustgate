@@ -278,7 +278,7 @@ impl DataPackageStore {
 fn hex_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Validate that a hash string is a 64-character hex string (SHA-256).

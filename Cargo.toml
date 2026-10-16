@@ -75,10 +75,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "logging", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 x509-parser = "0.18"
-sha1 = "0.10"
-sha2 = "0.10"
-hmac = "0.12"
-hkdf = "0.12"
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+hkdf = "0.13"
 # ML-KEM-768 (FIPS 203) KEM for the MAVLink PQ rekey channel (ADR 0020,
 # rustgate-mavlink `mavlink-pq` feature). Builds aws-lc from source via
 # cmake (and Go for the FIPS module) — gated off by default like the
@@ -137,7 +137,7 @@ tokio-tungstenite = "0.29"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 socket2 = "0.6"
 rustix = { version = "1", default-features = false, features = ["process"] }
-async-nats = { version = "0.47", default-features = false, features = ["jetstream", "nkeys", "server_2_10"] }
+async-nats = { version = "0.50", default-features = false, features = ["jetstream", "nkeys", "server_2_10"] }
 prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
@@ -191,7 +191,7 @@ lru = "0.18.0"
 # (`rustgate-correlation`, closes #848). Used to find fused-entity
 # candidates near an incoming sensor report so the gating ladder runs in
 # O(log N) per submit instead of scanning the whole fused-entity map.
-rstar = "0.12"
+rstar = "0.13"
 zeroize = { version = "1", features = ["derive"] }
 ocsp-stapler = { version = "0.4", default-features = false, features = ["prometheus", "aws-lc-rs"] }
 # Direct edge on the OCSP ASN.1 crate so the client-OCSP verifier can match
@@ -202,7 +202,7 @@ fastrand = "2"
 # CSPRNG for security-sensitive identifiers (e.g. webhook delivery IDs).
 # `fastrand` is non-cryptographic and must not be used for anything an
 # attacker should not be able to predict — see clippy.toml disallowed-methods.
-rand = "0.8"
+rand = "0.10"
 figment = { version = "0.10", features = ["toml"] }
 toml = "1.1"
 # Comment-preserving TOML editor used by the `migrate-config` subcommand
@@ -210,17 +210,17 @@ toml = "1.1"
 # through a syntax tree that preserves blank lines, comments, and key
 # ordering, which keeps an operator's hand-written annotations intact when
 # their config is rewritten across a version boundary.
-toml_edit = "0.22"
-serial_test = "3"
+toml_edit = "0.25"
+serial_test = "4"
 redb = "4"
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"] }
 hex = "0.4"
 ahash = "0.8"
 smol_str = { version = "0.3", features = ["serde"] }
 cedar-policy = "4"
-spiffe = { version = "0.14", default-features = false, features = ["workload-api-x509"] }
+spiffe = { version = "0.18", default-features = false, features = ["workload-api-x509"] }
 async-trait = "0.1.89"
-mdns-sd = { version = "0.19", default-features = false, features = ["async"] }
+mdns-sd = { version = "0.21", default-features = false, features = ["async"] }
 etcd-client = { version = "0.21", default-features = false, features = ["tls-aws-lc"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "http2"] }
 wiremock = "0.6"
@@ -233,13 +233,13 @@ wiremock = "0.6"
 # include `openssl-tls`, which would pull `openssl` into the dep tree and
 # trip the deny.toml ban, so the default set is disabled and
 # `rustls-tls` is opted into explicitly.
-kube = { version = "3.1", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "aws-lc-rs"] }
+kube = { version = "4.2", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "aws-lc-rs"] }
 # Typed Kubernetes resource bindings. Pinned to the same minor as `kube`'s
 # tested-against version per the `kube` README. The `latest` feature picks
 # the most recent Kubernetes API surface the bindings ship; the operator
 # only uses StatefulSet / Service / ConfigMap / Lease / Event types so any
 # 1.28+ cluster works.
-k8s-openapi = { version = "0.27", features = ["latest"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
 # Lightweight HTTP router for the operator's `/healthz`, `/readyz`, and
 # `/metrics` endpoints. Default features are disabled so we don't pull in
 # multipart, ws, or other surface area we don't need.
@@ -261,12 +261,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # compatible, has no native-library install step, and is the
 # foundation `ros2-client` builds on (so the same dependency satisfies
 # both raw-DDS and ROS 2 wire compat).
-rustdds = "0.11"
+rustdds = "0.14"
 # ROS 2 client wrapping rustdds. Exposes the ROS 2 graph (nodes,
 # topics, parameters, rosout) and applies the ROS 2 name-mangling
 # convention (`rt/<topic>`) so a rustgate-published message is
 # visible to `ros2 topic echo`.
-ros2-client = "0.8"
+ros2-client = "0.11"
 
 # Internal crates
 rustgate-core = { path = "crates/rustgate-core" }

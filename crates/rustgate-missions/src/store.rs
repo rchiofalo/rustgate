@@ -482,7 +482,7 @@ impl PackageStore {
 fn hex_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Validate that `s` is exactly 64 lowercase-hex characters.

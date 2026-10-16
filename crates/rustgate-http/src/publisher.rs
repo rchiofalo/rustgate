@@ -2106,15 +2106,15 @@ fn generate_instance_id() -> String {
 
 /// Generate a unique per-request delivery ID for receiver-side idempotency.
 ///
-/// Produces a 32-character hex string from 16 bytes of the OS CSPRNG, giving
-/// 128 bits of collision resistance. Uses [`rand::rngs::OsRng`] (not the
-/// non-cryptographic `fastrand`) so the ID is unpredictable — a receiver may
-/// fence replays on this ID, so a guessable value would let an attacker forge
-/// or suppress deliveries (#1520).
+/// Produces a 32-character hex string from 16 bytes of a CSPRNG, giving
+/// 128 bits of collision resistance. Uses [`rand::rng`], an OS-seeded
+/// cryptographic generator (not the non-cryptographic `fastrand`), so the ID
+/// is unpredictable — a receiver may fence replays on this ID, so a guessable
+/// value would let an attacker forge or suppress deliveries (#1520).
 fn generate_delivery_id() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut buf = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     hex::encode(buf)
 }
 

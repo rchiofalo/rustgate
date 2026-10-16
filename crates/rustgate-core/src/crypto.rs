@@ -34,7 +34,7 @@
 //! `hmac_sha256_verify` for any verification path; never compare
 //! tags with `==`.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;

@@ -272,7 +272,7 @@ pub fn seal(
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     aws_lc_rs::rand::fill(&mut nonce_bytes).map_err(|_| RekeyError::Rng)?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = <&Nonce>::from(&nonce_bytes);
 
     let mut plaintext = Vec::new();
     ciborium::into_writer(payload, &mut plaintext)
@@ -383,7 +383,7 @@ impl RekeyReceiver {
         let wrap_key = derive_wrap_key(self.bootstrap_secret.as_slice(), shared_secret.as_ref())?;
         let cipher = ChaCha20Poly1305::new_from_slice(wrap_key.as_slice())
             .map_err(|_| RekeyError::WrapKeyDerivation)?;
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = <&Nonce>::try_from(nonce_bytes).map_err(|_| RekeyError::AeadOpen)?;
         let aad = rekey_aad(algorithm_id, mlkem_ct);
 
         let mut plaintext = cipher

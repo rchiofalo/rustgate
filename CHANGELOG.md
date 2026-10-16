@@ -144,6 +144,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Major dependency updates.**
+  - RustCrypto moves to its current generation: sha1/sha2 0.11, hmac/hkdf 0.13, chacha20poly1305 0.11, and rand 0.10.
+  - Also updated: async-nats 0.50, kube 4.2, spiffe 0.18, mdns-sd 0.21, rustdds 0.14 with ros2-client 0.11, rstar 0.13, toml_edit 0.25, and serial_test 4.
+  - Code changes:
+    - The deprecated `Array::from_slice`, which panics on a length mismatch, is replaced by panic-free conversions.
+    - The archive's random nonces now come from aws-lc-rs.
+    - HTTP delivery IDs use `rand::rng()`.
+    - The DDS bridge adapts to ros2-client's publisher `Gid` and `ROSTime`. Source GUIDs are unchanged.
+  - Archive encryption formats (v2 and v3) are unchanged and still round-trip.
+  - Not updated yet:
+    - der 0.8 and x509-cert 0.3: cms has no release on them yet.
+    - quick-xml 0.42: its API change touches the CoT parser and gets its own change.
+    - rasn-ocsp: stays matched to ocsp-stapler.
+  - The ros2-client update removes proc-macro-error2, so the RUSTSEC-2026-0173 ignore is dropped. xxhash-rust adds BSL-1.0 to the license allow list.
+
 - **aws-lc-rs is the TLS crypto provider in every build, with hybrid post-quantum key exchange and ML-DSA verification on by default ([ADR 0037](docs/adr/0037-aws-lc-rs-post-quantum-default.md); closes #1730).** The default build previously used `ring`, which has no post-quantum support, so it negotiated classical key exchange only. Every build now uses rustls's aws-lc-rs provider with its own defaults: X25519MLKEM768 is offered first (classical X25519, P-256 and P-384 remain as fallback), and ML-DSA-44/65/87 certificate signatures are verified. The provider is process-wide, so this covers client mTLS, federation (V1 and V2) and HTTP egress. `--kx-groups` now works in every build; `--kx-groups X25519` keeps handshakes classical on constrained links (the hybrid key share adds about 1.2 KB each way), and `--kx-groups MLKEM1024` selects CNSA 2.0 key establishment. The `post-quantum` and `mldsa-certs` features of `rustgate-tls`, `rustgate-transport`, `rustgate-http`, `rustgate-federation` and `rustgate-server` no longer do anything and are kept so existing feature lists build; `--prefer-post-quantum` and `--mldsa-client-certs` are still accepted (also as config keys) and log that they change nothing. The ML-DSA strip, the `mldsa_certs` module, the `tls.mldsa_client_certs_enabled` audit event and the `fips` + `mldsa-certs` build error are removed: under the AWS-LC-FIPS 4.x module ML-DSA verifies and the provider still reports FIPS mode. reqwest now uses the process-wide provider, and a new `rustgate_core::tls_provider::ensure_default()` installs aws-lc-rs before any reqwest client is built when nothing else has, so library callers cannot hit reqwest's "No provider set" panic. Building now needs a C compiler (aws-lc-sys); Go and cmake are needed only for `--features fips`. `rustgate-enrollment`'s `post-quantum` feature (ML-DSA-87 issuance) is unchanged. Release binary size: 14.8 MB to 16.5 MB with the standard operator features (macOS arm64).
 
 - **`ring` is no longer a dependency; aws-lc-rs is the only crypto library in the binary (closes #1735; follow-up to ADR 0037).** Federation JWT signing and verification (ES256, EdDSA), data-package signature checks, and the random numbers for ML-DSA certificate serials and store-and-forward keys now use aws-lc-rs's ring-compatible API instead of `ring`, and `rcgen` uses its aws-lc-rs backend instead of its default `ring` one. In `--features fips` builds these primitives now run in the AWS-LC FIPS module: the `fips` features of `rustgate-enrollment` and `rustgate-federation` also enable `aws-lc-rs/fips`. This also fixes `rcgen` in `fips` builds: its `fips` feature only switched aws-lc-rs to the FIPS module and left rcgen signing with `ring`, which stayed enabled through rcgen's default features. One behavior change: `JwtAuthority::new_ed25519` now also accepts a PKCS#8 v1 Ed25519 key (no embedded public key), as produced by `openssl genpkey -algorithm ED25519`; `ring` accepted only v2. Wire formats, key formats and token formats are unchanged. `cargo tree -i ring` reports nothing.

@@ -1067,7 +1067,7 @@ impl EncryptedWriter {
             });
         }
         let key_bytes = key_ring.key_for_tenant(tenant)?;
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
+        let cipher = XChaCha20Poly1305::new(<&Key>::from(&**key_bytes));
 
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -1155,7 +1155,7 @@ impl EncryptedWriter {
         let ciphertext = self
             .cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                <&XNonce>::from(&nonce),
                 Payload {
                     msg: plaintext,
                     aad: &aad,
@@ -1202,7 +1202,7 @@ impl EncryptedWriter {
         let ciphertext = self
             .cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                <&XNonce>::from(&nonce),
                 Payload {
                     msg: &[][..],
                     aad: &aad,
@@ -1283,28 +1283,28 @@ pub fn decrypt_file(input: &Path, output: &Path, key_ring: &KeyRing) -> Result<(
         FORMAT_VERSION => {
             let mut base = [0u8; BASE_NONCE_LEN_V3];
             reader.read_exact(&mut base)?;
-            let cipher = XChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
+            let cipher = XChaCha20Poly1305::new(<&Key>::from(&**key_bytes));
             decrypt_stream(
                 &mut reader,
                 &mut writer,
                 &key_id_bytes,
                 |counter, aad, ct| {
                     let nonce = chunk_xnonce(&base, counter);
-                    cipher.decrypt(XNonce::from_slice(&nonce), Payload { msg: ct, aad })
+                    cipher.decrypt(<&XNonce>::from(&nonce), Payload { msg: ct, aad })
                 },
             )?;
         }
         FORMAT_VERSION_V2 => {
             let mut base = [0u8; BASE_NONCE_LEN_V2];
             reader.read_exact(&mut base)?;
-            let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes[..]));
+            let cipher = ChaCha20Poly1305::new(<&Key>::from(&**key_bytes));
             decrypt_stream(
                 &mut reader,
                 &mut writer,
                 &key_id_bytes,
                 |counter, aad, ct| {
                     let nonce = chunk_nonce(&base, counter);
-                    cipher.decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad })
+                    cipher.decrypt(<&Nonce>::from(&nonce), Payload { msg: ct, aad })
                 },
             )?;
         }
@@ -1548,11 +1548,7 @@ impl SharedEncryptedWriter {
 
 /// Fill `dest` with cryptographically random bytes via the OS.
 fn getrandom(dest: &mut [u8]) -> Result<(), EncryptError> {
-    use chacha20poly1305::aead::OsRng;
-    use chacha20poly1305::aead::rand_core::RngCore;
-    let mut rng = OsRng;
-    rng.try_fill_bytes(dest)
-        .map_err(|e| EncryptError::Aead(format!("rng: {e}")))
+    aws_lc_rs::rand::fill(dest).map_err(|e| EncryptError::Aead(format!("rng: {e}")))
 }
 
 #[cfg(test)]
@@ -2054,7 +2050,7 @@ mod tests {
         base8: &[u8; 8],
         chunks: &[&[u8]],
     ) -> Vec<u8> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+        let cipher = ChaCha20Poly1305::new(<&Key>::from(key));
         let kid = key_id.as_bytes();
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
@@ -2069,7 +2065,7 @@ mod tests {
             aad.push(kind);
             aad.extend_from_slice(&counter.to_be_bytes());
             cipher
-                .encrypt(Nonce::from_slice(&nonce), Payload { msg, aad: &aad })
+                .encrypt(<&Nonce>::from(&nonce), Payload { msg, aad: &aad })
                 .unwrap()
         };
         let mut counter: u32 = 0;
