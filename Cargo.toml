@@ -88,7 +88,8 @@ aws-lc-rs = "1.16"
 # dependency of aws-lc-fips-sys) accepts syn >=2,<4, so once syn 3 is in the
 # graph cargo picks it, but bindgen's prettyplease 0.2 is built on syn 2 and
 # the `fips` build fails to compile. Keep that edge on syn 2 until bindgen or
-# prettyplease resolves it; the CI `fips` job fails if it regresses.
+# prettyplease resolves it. `scripts/check-lock-pins.sh` (run by the CI `lint`
+# job) fails fast with the fix if a re-resolve moves it to syn 3.
 # CBOR for the MAVLink rekey envelope payload (ADR 0020 §5).
 ciborium = "0.2"
 # Pure-Rust FIPS 204 (ML-DSA) signatures for the enrollment CA's pure
