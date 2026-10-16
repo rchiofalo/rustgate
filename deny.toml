@@ -171,6 +171,32 @@ ignore = [
     # `cargo tree --workspace --all-features --target all -i proc-macro-error2`
     # returns no entries.
     "RUSTSEC-2026-0173",
+    # RUSTSEC-2024-0449 — `unsafe-libyaml` 0.2.11 is unmaintained (repository
+    # archived 2024-03-25). It is a c2rust translation of libyaml, so upstream
+    # bugs will not be fixed.
+    #
+    # Dependency-graph entry points (`cargo tree --workspace --all-features
+    # -i unsafe-libyaml`), all through `serde_yaml` 0.9:
+    #   rustgate-operator -> kube 3.1 -> kube-client -> serde_yaml
+    #   rustgate-operator -> serde_yaml (manifest rendering)
+    #   rustgate-server -> rustgate-stanag4586 / rustgate-vmf
+    #     -> rustgate-codec-schema -> serde_yaml
+    #
+    # Risk surface: the advisory is "unmaintained" (informational), not a
+    # vulnerability, and no CVE is known. None of these paths parse YAML from
+    # the network. rustgate-codec-schema parses only the schema documents
+    # compiled into the binary with `include_str!`. The operator serialises its
+    # own manifests, and kube-client reads the local kubeconfig. The
+    # `audit-soft` CI job continues to surface it as a warning.
+    #
+    # Why we cannot fix this in our tree alone: kube-client depends on
+    # serde_yaml, so the crate stays in the graph even if our own crates move
+    # to a maintained YAML parser.
+    #
+    # Removal trigger: drop this ignore when `cargo tree --workspace
+    # --all-features -i unsafe-libyaml` returns no entries (kube moves off
+    # serde_yaml and rustgate-codec-schema / rustgate-operator migrate).
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]
