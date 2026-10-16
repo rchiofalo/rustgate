@@ -100,9 +100,9 @@ ciborium = "0.2"
 # certificates, so the issuance module hand-assembles the TBS with
 # x509-cert/der and signs the DER with this crate.
 fips204 = "0.4.6"
-argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 bytes = "1"
-quick-xml = "0.41"
+quick-xml = "0.42"
 # OGC SensorThings v1.0 §10 MQTT push subscriber. `default-features =
 # false` with no features enabled keeps the dep tree minimal — the
 # MVP accepts only `mqtt://` URIs (TLS rejected at startup), so the
@@ -125,7 +125,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body = "1"
 http-body-util = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 tokio-tungstenite = "0.29"
 # `permessage-deflate` (RFC 7692) is implemented at the application layer
 # inside `rustgate-websocket::compression` because tokio-tungstenite 0.29
