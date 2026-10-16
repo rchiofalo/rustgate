@@ -294,7 +294,7 @@ impl Ros2Bridge {
                     Ok((msg, info)) => {
                         let sample = DdsSample {
                             topic: topic_name.clone(),
-                            source_guid: guid_to_bytes(info.writer_guid()),
+                            source_guid: guid_to_bytes(rustdds::GUID::from(info.publisher_gid())),
                             timestamp: ros2_timestamp_to_system(info.source_timestamp()),
                             payload: Bytes::from(msg.data),
                         };
@@ -361,27 +361,39 @@ fn guid_to_bytes(guid: rustdds::GUID) -> [u8; 16] {
     guid.to_bytes()
 }
 
-fn ros2_timestamp_to_system(ts: Option<rustdds::Timestamp>) -> SystemTime {
-    match ts {
-        Some(t) => {
-            // rustdds Timestamp stores seconds in the high 32 bits and
-            // an NTP-style fixed-point fraction in the low 32 (where
-            // 2^32 fraction units = 1 second). Reverse via `to_ticks()`
-            // since the fields are private.
-            let ticks = t.to_ticks();
-            let seconds = ticks >> 32;
-            let fraction = ticks & 0xFFFF_FFFF;
-            let nanos = ((fraction * 1_000_000_000) >> 32) as u32;
-            SystemTime::UNIX_EPOCH + std::time::Duration::new(seconds, nanos)
+fn ros2_timestamp_to_system(ts: Option<ros2_client::ROSTime>) -> SystemTime {
+    // ROSTime is signed nanoseconds since the Unix epoch. Out-of-range values
+    // (and a missing source timestamp) fall back to the local clock, as before.
+    ts.and_then(|t| {
+        let nanos = t.to_nanos();
+        let offset = std::time::Duration::from_nanos(nanos.unsigned_abs());
+        if nanos >= 0 {
+            SystemTime::UNIX_EPOCH.checked_add(offset)
+        } else {
+            SystemTime::UNIX_EPOCH.checked_sub(offset)
         }
-        None => SystemTime::now(),
-    }
+    })
+    .unwrap_or_else(SystemTime::now)
 }
 
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ros_time_converts_to_system_time() {
+        let t = ros2_client::ROSTime::from_nanos(1_700_000_000_123_456_789);
+        assert_eq!(
+            ros2_timestamp_to_system(Some(t)),
+            SystemTime::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789)
+        );
+        let before_epoch = ros2_client::ROSTime::from_nanos(-1_500_000_000);
+        assert_eq!(
+            ros2_timestamp_to_system(Some(before_epoch)),
+            SystemTime::UNIX_EPOCH - std::time::Duration::from_millis(1_500)
+        );
+    }
 
     #[test]
     fn chatter_config_has_canonical_shape() {

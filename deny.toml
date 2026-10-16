@@ -132,45 +132,6 @@ ignore = [
     # point `cargo tree --features dds-real -i net2` should return no
     # entries.
     "RUSTSEC-2020-0016",
-    # RUSTSEC-2026-0173 — `proc-macro-error2` 2.0.1 is unmaintained. It is
-    # itself a community fork of the older, also-unmaintained
-    # `proc-macro-error`, so the successor is now flagged too.
-    # First observed 2026-06-19 during a security-review sweep; it surfaces in
-    # the CI `audit` job once the advisory-db pin refreshes past this advisory.
-    #
-    # Dependency-graph entry point: proc-macro-error2 enters ONLY on Linux
-    # targets — `local-ip-address` uses its `neli` netlink backend there, so a
-    # non-Linux host shows nothing under `-e normal` and you need
-    # `cargo tree --workspace --all-features --target all -i proc-macro-error2`
-    # to see it. It enters under the `rustgate-dds` feature via:
-    #   rustgate-server -> rustgate-dds -> ros2-client 0.8 -> rustdds 0.11
-    #     -> local-ip-address 0.6 -> neli 0.7 -> getset 0.1.6 (proc-macro)
-    #     -> proc-macro-error2 2.0.1
-    # (rustdds also pulls local-ip-address directly — same terminal chain.)
-    # rustgate has no direct dependency on proc-macro-error2, getset, or neli,
-    # and no use site in any workspace crate.
-    #
-    # Risk surface: the advisory is "unmaintained" (informational), not a
-    # vulnerability. proc-macro-error2 is a proc-macro helper that `getset`
-    # uses at compile time to emit getter/setter methods; it produces no
-    # runtime code and carries no runtime-exploitable surface. There is no
-    # known CVE. The `audit-soft` CI job continues to surface it as a warning.
-    #
-    # Why we cannot fix this in our tree: the crate is pulled by upstreams we
-    # do not own — `getset` (via `neli`, via `local-ip-address`, via `rustdds`
-    # / `ros2-client`). neli 0.7.4 pins getset 0.1, local-ip-address 0.6 pins
-    # neli 0.7, and rustdds 0.11.8 pins local-ip-address 0.6, so clearing the
-    # advisory needs an upstream release (getset migrating off proc-macro-error2,
-    # or local-ip-address dropping its neli backend), not a change here.
-    # Forking that chain is out of scope.
-    #
-    # Removal trigger: drop this ignore the next release after the upstream
-    # chain stops pulling proc-macro-error2 (getset migrates off it, or
-    # local-ip-address / neli / rustdds update) and we bump our `rustdds` /
-    # `ros2-client` pins past it — i.e. when
-    # `cargo tree --workspace --all-features --target all -i proc-macro-error2`
-    # returns no entries.
-    "RUSTSEC-2026-0173",
     # RUSTSEC-2024-0449 — `unsafe-libyaml` 0.2.11 is unmaintained (repository
     # archived 2024-03-25). It is a c2rust translation of libyaml, so upstream
     # bugs will not be fixed.
@@ -209,6 +170,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CDLA-Permissive-2.0",
+    # Boost Software License 1.0: permissive, OSI-approved and GPL-compatible
+    # per the FSF. Used by xxhash-rust (via ros2-client).
+    "BSL-1.0",
 ]
 
 # aws-lc-fips-sys (the `fips` feature) is licensed ISC + Apache-2.0 + OpenSSL.

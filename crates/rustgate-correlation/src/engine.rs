@@ -225,7 +225,7 @@ impl CorrelationEngine {
         );
         let candidates: Vec<EntityRef> = {
             let guard = self.spatial.read();
-            guard.locate_in_envelope(&envelope).copied().collect()
+            guard.locate_in_envelope(envelope).copied().collect()
         };
         let mut results: Vec<(f64, FusedEntity)> = candidates
             .into_iter()
@@ -383,7 +383,7 @@ impl CorrelationEngine {
         );
         let guard = self.spatial.read();
         guard
-            .locate_in_envelope(&envelope)
+            .locate_in_envelope(envelope)
             .take(MAX_SPATIAL_CANDIDATES)
             .map(|r| r.id)
             .collect()

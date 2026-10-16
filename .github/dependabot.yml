@@ -10,6 +10,17 @@ updates:
     rebase-strategy: auto
     commit-message:
       prefix: "deps"
+    ignore:
+      # rasn-ocsp must stay on the same version as ocsp-stapler's transitive
+      # copy (see the comment in Cargo.toml); bump it with ocsp-stapler.
+      - dependency-name: "rasn-ocsp"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # der 0.8 / x509-cert 0.3 are blocked until cms (enrollment PKCS#12)
+      # ships a release built on them; cms 0.2 requires der 0.7.
+      - dependency-name: "der"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "x509-cert"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       # opentelemetry, opentelemetry_sdk, opentelemetry-otlp and
       # tracing-opentelemetry must move together: bumping one alone mixes
