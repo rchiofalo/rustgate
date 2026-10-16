@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Check which deployment artifacts are present
         id: artifacts
@@ -166,7 +166,7 @@ jobs:
     timeout-minutes: 15
     needs: version-triangle
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Check whether zarf/zarf.yaml exists
         id: check
@@ -190,7 +190,7 @@ jobs:
 
       - name: Upload Zarf package as artifact
         if: steps.check.outputs.exists == '1'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rustgate-zarf-package
           path: zarf-package-rustgate-*.tar.zst
@@ -213,7 +213,7 @@ jobs:
     timeout-minutes: 20
     needs: zarf-create
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Check whether zarf and bundle files both exist
         id: check
@@ -235,7 +235,7 @@ jobs:
 
       - name: Download Zarf package from job 2
         if: steps.check.outputs.exists == '1'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: rustgate-zarf-package
           path: ./
@@ -248,7 +248,7 @@ jobs:
 
       - name: Upload UDS bundle as artifact
         if: steps.check.outputs.exists == '1'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rustgate-uds-bundle
           path: uds-bundle-rustgate-*.tar.zst
@@ -266,7 +266,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Check whether uds-package.yaml exists
         id: check
