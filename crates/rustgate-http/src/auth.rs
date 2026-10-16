@@ -306,7 +306,7 @@ fn verify_hmac_signature(
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use rustgate_core::b64;
     use sha2::Sha256;
 

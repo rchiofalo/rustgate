@@ -1213,7 +1213,7 @@ fn generate_jti(peer_id: &str, timestamp: u64) -> String {
 mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
 
     use super::*;
 

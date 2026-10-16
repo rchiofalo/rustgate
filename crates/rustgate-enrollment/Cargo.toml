@@ -23,6 +23,7 @@ fips = ["rcgen/fips", "aws-lc-rs/fips"]
 post-quantum = ["dep:fips204", "dep:der", "dep:x509-cert"]
 
 [dependencies]
+hex = { workspace = true }
 rustgate-core = { workspace = true, features = ["pem"] }
 rustgate-resilience = { workspace = true }
 rcgen = { workspace = true }
