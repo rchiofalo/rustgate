@@ -41,12 +41,12 @@
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use der::asn1::{BitString, GeneralizedTime, OctetString, SetOfVec, Uint, UtcTime, Utf8StringRef};
 use der::oid::{AssociatedOid, ObjectIdentifier};
 use der::{Any, Decode, Encode};
 use fips204::ml_dsa_87;
 use fips204::traits::{SerDes, Signer, Verifier};
-use ring::rand::{SecureRandom, SystemRandom};
 use x509_cert::attr::AttributeTypeAndValue;
 use x509_cert::certificate::{Certificate, TbsCertificate, Version};
 use x509_cert::crl::{CertificateList, RevokedCert, TbsCertList};

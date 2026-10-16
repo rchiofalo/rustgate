@@ -86,11 +86,11 @@ certificate verification on.
 - The binary grows by the size of aws-lc: the release binary with the standard
   operator features went from 14.8 MB to 16.5 MB (+1.8 MB, +12%; macOS
   arm64, measured when this ADR was written).
-- `ring` is still linked for non-TLS primitives (federation JWT,
-  data-package signing, random numbers, and `rcgen` outside `fips`). Moving
-  those to aws-lc-rs is separate work; it would leave one crypto library in
-  the binary and put those primitives inside the FIPS boundary in `fips`
-  builds.
+- `ring` was still linked for non-TLS primitives (federation JWT,
+  data-package signing, random numbers, and `rcgen` outside `fips`). #1735
+  moved those to aws-lc-rs and switched `rcgen` to its aws-lc-rs backend, so
+  `ring` is no longer in the dependency graph: the binary has one crypto
+  library, and in `fips` builds those primitives run in the FIPS module.
 - Reversing this means restoring `ring` in the dependency features listed
   above and reintroducing provider selection; no data or wire format
   depends on the choice.

@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
+use aws_lc_rs::signature::{self as lc_sig, KeyPair};
 use lru::LruCache;
-use ring::signature::{self as ring_sig, KeyPair};
 use rustgate_core::b64;
 use rustgate_core::crypto::{HmacError, hmac_sha256_tag, hmac_sha256_verify};
 use sha2::{Digest, Sha256};
@@ -167,7 +167,7 @@ impl std::fmt::Display for Algorithm {
 
 /// Active signing key used to issue tokens.
 ///
-/// The `Es256` and `EdDsa` variants box their ring key pairs because
+/// The `Es256` and `EdDsa` variants box their aws-lc-rs key pairs because
 /// they're larger than the HS256 variant (~264 B for `EcdsaKeyPair`,
 /// ~128 B for `Ed25519KeyPair` vs ~48 B for HS256), and we don't want
 /// every `SigningKey` value to pay that cost when the authority is
@@ -178,11 +178,11 @@ enum SigningKey {
         kid: Option<String>,
     },
     Es256 {
-        key_pair: Box<ring_sig::EcdsaKeyPair>,
+        key_pair: Box<lc_sig::EcdsaKeyPair>,
         kid: String,
     },
     EdDsa {
-        key_pair: Box<ring_sig::Ed25519KeyPair>,
+        key_pair: Box<lc_sig::Ed25519KeyPair>,
         kid: String,
     },
 }
@@ -210,9 +210,9 @@ impl SigningKey {
                 hmac_sha256_tag(secret, signing_input).map_err(map_hmac_error)
             }
             SigningKey::Es256 { key_pair, .. } => {
-                // A fresh SystemRandom is effectively free — ring keeps the
-                // per-thread entropy handle internally.
-                let rng = ring::rand::SystemRandom::new();
+                // aws-lc-rs ignores the RNG argument (AWS-LC draws its own
+                // nonce entropy), so a fresh SystemRandom costs nothing.
+                let rng = aws_lc_rs::rand::SystemRandom::new();
                 let sig = key_pair
                     .sign(&rng, signing_input)
                     .map_err(|_| JwtError::InvalidSignature)?;
@@ -220,7 +220,7 @@ impl SigningKey {
             }
             SigningKey::EdDsa { key_pair, .. } => {
                 // Ed25519 is deterministic (RFC 8032 §5.1.6) so no RNG
-                // is required; ring's `sign` never fails for this algo
+                // is required; aws-lc-rs's `sign` never fails for this algo
                 // because the key material was validated at construction.
                 let sig = key_pair.sign(signing_input);
                 Ok(sig.as_ref().to_vec())
@@ -293,12 +293,12 @@ impl VerificationKey {
                 hmac_sha256_verify(secret, signing_input, sig).map_err(map_hmac_error)
             }
             VerificationKey::Es256(pub_key) => {
-                ring_sig::UnparsedPublicKey::new(&ring_sig::ECDSA_P256_SHA256_FIXED, pub_key)
+                lc_sig::UnparsedPublicKey::new(&lc_sig::ECDSA_P256_SHA256_FIXED, pub_key)
                     .verify(signing_input, sig)
                     .map_err(|_| JwtError::InvalidSignature)
             }
             VerificationKey::EdDsa(pub_key) => {
-                ring_sig::UnparsedPublicKey::new(&ring_sig::ED25519, pub_key)
+                lc_sig::UnparsedPublicKey::new(&lc_sig::ED25519, pub_key)
                     .verify(signing_input, sig)
                     .map_err(|_| JwtError::InvalidSignature)
             }
@@ -500,11 +500,9 @@ impl JwtAuthority {
         issuer: impl Into<String>,
     ) -> Result<Self, JwtError> {
         let kid = validate_kid(kid.into())?;
-        let rng = ring::rand::SystemRandom::new();
-        let key_pair = ring_sig::EcdsaKeyPair::from_pkcs8(
-            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+        let key_pair = lc_sig::EcdsaKeyPair::from_pkcs8(
+            &lc_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
             pkcs8_der.as_ref(),
-            &rng,
         )
         .map_err(|_| JwtError::InvalidKey)?;
         let local_public_key = key_pair.public_key().as_ref().to_vec();
@@ -534,8 +532,9 @@ impl JwtAuthority {
 
     /// Create a new EdDSA (Ed25519) JWT authority.
     ///
-    /// `pkcs8_der` must be a PKCS#8 v2 DER-encoded Ed25519 private key
-    /// (RFC 5958 / RFC 8410). `kid` uniquely identifies this signing
+    /// `pkcs8_der` must be a PKCS#8 DER-encoded Ed25519 private key
+    /// (RFC 5958 / RFC 8410), v1 or v2. A v2 key's embedded public key
+    /// must match the private key. `kid` uniquely identifies this signing
     /// key; every issued token carries it in the header so remote
     /// verifiers can route to the correct public key.
     ///
@@ -552,7 +551,7 @@ impl JwtAuthority {
         issuer: impl Into<String>,
     ) -> Result<Self, JwtError> {
         let kid = validate_kid(kid.into())?;
-        let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8(pkcs8_der.as_ref())
+        let key_pair = lc_sig::Ed25519KeyPair::from_pkcs8(pkcs8_der.as_ref())
             .map_err(|_| JwtError::InvalidKey)?;
         let local_public_key = key_pair.public_key().as_ref().to_vec();
 
@@ -619,7 +618,7 @@ impl JwtAuthority {
     /// `public_key_sec1` must be a raw ECDSA P-256 uncompressed public
     /// key in SEC1 form: `0x04 || x(32) || y(32)`, 65 bytes total.
     /// No PEM or SPKI wrapping — unwrap at the call site. Extract
-    /// directly from a `ring::signature::EcdsaKeyPair::public_key()` or
+    /// directly from a `aws_lc_rs::signature::EcdsaKeyPair::public_key()` or
     /// from the raw `x`/`y` fields of a JWK.
     pub fn with_es256_verifier(
         mut self,
@@ -644,7 +643,7 @@ impl JwtAuthority {
     /// `public_key_raw` must be exactly 32 bytes — the raw Ed25519
     /// public key encoding per RFC 8032 §5.1.5. No PEM, no SPKI, no
     /// JWK — unwrap at the call site. Extract directly from a
-    /// [`ring::signature::Ed25519KeyPair::public_key`] or from the
+    /// [`aws_lc_rs::signature::Ed25519KeyPair::public_key`] or from the
     /// base64url `x` field of a `kty=OKP, crv=Ed25519` JWK.
     pub fn with_ed25519_verifier(
         mut self,
@@ -1671,16 +1670,13 @@ mod tests {
 
     /// Generate a fresh ECDSA P-256 key pair. Returns (pkcs8 DER, SEC1 public key).
     fn es256_test_keypair() -> (Vec<u8>, Vec<u8>) {
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring_sig::EcdsaKeyPair::generate_pkcs8(
-            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
-            &rng,
-        )
-        .expect("keygen");
-        let key_pair = ring_sig::EcdsaKeyPair::from_pkcs8(
-            &ring_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 =
+            lc_sig::EcdsaKeyPair::generate_pkcs8(&lc_sig::ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                .expect("keygen");
+        let key_pair = lc_sig::EcdsaKeyPair::from_pkcs8(
+            &lc_sig::ECDSA_P256_SHA256_FIXED_SIGNING,
             pkcs8.as_ref(),
-            &rng,
         )
         .expect("parse pkcs8");
         let public_key = key_pair.public_key().as_ref().to_vec();
@@ -1926,9 +1922,9 @@ mod tests {
 
     /// Generate a fresh Ed25519 key pair. Returns (pkcs8 DER, raw 32-byte public key).
     fn ed25519_test_keypair() -> (Vec<u8>, Vec<u8>) {
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring_sig::Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
-        let key_pair = ring_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse pkcs8");
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = lc_sig::Ed25519KeyPair::generate_pkcs8(&rng).expect("keygen");
+        let key_pair = lc_sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse pkcs8");
         let public_key = key_pair.public_key().as_ref().to_vec();
         (pkcs8.as_ref().to_vec(), public_key)
     }
@@ -2118,7 +2114,7 @@ mod tests {
     #[test]
     fn new_ed25519_rejects_ecdsa_pkcs8() {
         // An ECDSA P-256 PKCS#8 blob is well-formed DER but the wrong
-        // algorithm — ring must refuse it rather than silently accept.
+        // algorithm — aws-lc-rs must refuse it rather than silently accept.
         let (ecdsa_pkcs8, _) = es256_test_keypair();
         let err = JwtAuthority::new_ed25519(ecdsa_pkcs8, "peer-a", "rustgate-test")
             .expect_err("must reject cross-algorithm PKCS#8");

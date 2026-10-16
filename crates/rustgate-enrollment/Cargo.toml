@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 est = ["dep:cms", "dep:der", "dep:x509-cert"]
-fips = ["rcgen/fips"]
+fips = ["rcgen/fips", "aws-lc-rs/fips"]
 # Pure ML-DSA-87 X.509 cert/CRL issuance (RFC 9881, #502). rcgen cannot emit
 # ML-DSA, so the `mldsa` module hand-assembles the TBS with x509-cert/der and
 # signs the DER with the pure-Rust `fips204` crate. `der`/`x509-cert` are
@@ -43,7 +43,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
-ring = { workspace = true }
+aws-lc-rs = { workspace = true }
 cms = { workspace = true, optional = true }
 der = { workspace = true, optional = true }
 x509-cert = { workspace = true, optional = true }

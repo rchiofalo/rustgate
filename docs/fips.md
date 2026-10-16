@@ -81,7 +81,8 @@ Build with --features fips to enable FIPS 140-3 mode.
 | TLS cipher suites | rustls aws-lc-rs defaults | FIPS-approved only |
 | Key exchange | X25519MLKEM768 first, then X25519, P-256, P-384 | FIPS-approved groups, X25519MLKEM768 first |
 | Hash algorithms | SHA-2 family | SHA-2 family (FIPS) |
-| Certificate signing (enrollment) | rcgen + ring | rcgen + aws-lc-rs (FIPS) |
+| Certificate signing (enrollment) | rcgen + aws-lc-rs | rcgen + aws-lc-rs (FIPS) |
+| Federation JWT (ES256, EdDSA), data-package signature checks, random numbers | aws-lc-rs | aws-lc-rs (FIPS) |
 | PKCS#12 salt generation | OS CSPRNG (via rustls provider) | FIPS CSPRNG (via aws-lc-rs) |
 
 The FIPS provider restricts cipher suites to the FIPS-approved set automatically via rustls. No manual cipher suite configuration is needed.
@@ -144,7 +145,7 @@ terms, and does not rely on this permission.
 
 ## Known Limitations
 
-- **Ring is still linked**: TLS uses aws-lc-rs, but `ring` remains compiled in for non-TLS primitives (federation JWT, data-package signing, random numbers, `rcgen` outside `fips`). The FIPS provider is installed as the process-default, and all TLS code paths (including federation) use `CryptoProvider::get_default()` to ensure the FIPS provider is used at runtime.
+- **Pure-Rust primitives outside the module**: AWS-LC is the only native crypto library in the binary (`ring` is not linked). TLS, federation JWT signing and verification, data-package signature checks, `rcgen` certificate signing and the random numbers for serials and store-and-forward keys all run in AWS-LC, so a `fips` build runs them in the FIPS module. Some primitives still come from RustCrypto crates and are outside the module: SHA-2 digests (`sha2`), HMAC-SHA256 (`hmac`: federation HS256 JWT, store-and-forward tags, HTTP signing), the archive and MAVLink rekey AEAD (`chacha20poly1305`, `hkdf`), and ML-DSA-87 certificate issuance (`fips204`). The FIPS provider is installed as the process default, and all TLS code paths (including federation) use `CryptoProvider::get_default()` so the FIPS provider is used at runtime.
 - **SHA-1/SHA-2 for PKCS#12**: The PKCS#12 MAC uses `sha1` / `sha2` pure-Rust crates for HMAC-SHA1 and KDF operations. These are outside the FIPS boundary but only protect the P12 bundle integrity with a well-known password — they do not protect data in transit.
 - **No OCSP support**: Revocation checking is CRL-only. OCSP stapling is not supported by rustls.
 - **CRL freshness**: CRL `nextUpdate` timestamps are not validated. Operators should rotate CRL files on a regular schedule.

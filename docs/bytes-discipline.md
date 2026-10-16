@@ -47,7 +47,7 @@ Bytes`) on the message path:
   any other "build a fresh buffer from scratch" serializer. Wrap in
   `Bytes::from(vec)` once at the boundary.
 - Cryptographic / certificate material handled by `rustls`, `rcgen`,
-  `ring`, `aws-lc-rs`, etc. Those APIs predate `Bytes` and round-trip
+  `aws-lc-rs`, etc. Those APIs predate `Bytes` and round-trip
   through `Vec<u8>` is not a hot loop.
 - Temporary scratch buffers inside a single function (e.g.
   `String::with_capacity(...).into_bytes()` for splice operations) —
