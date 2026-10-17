@@ -1047,12 +1047,10 @@ fn extract_marking(payload: &[u8]) -> Option<String> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if local_name(e.name().as_ref()).eq_ignore_ascii_case(b"marking") {
+                if local_name(e.name().as_ref().as_bytes()).eq_ignore_ascii_case(b"marking") {
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref().eq_ignore_ascii_case(b"value")
-                            && let Ok(s) = std::str::from_utf8(attr.value.as_ref())
-                        {
-                            return Some(s.to_string());
+                        if attr.key.as_ref().eq_ignore_ascii_case("value") {
+                            return Some(attr.value.to_string());
                         }
                     }
                 }
@@ -1119,7 +1117,7 @@ fn count_markings(payload: &[u8]) -> usize {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if local_name(e.name().as_ref()).eq_ignore_ascii_case(b"marking") {
+                if local_name(e.name().as_ref().as_bytes()).eq_ignore_ascii_case(b"marking") {
                     count += 1;
                 }
             }
@@ -1147,12 +1145,10 @@ fn extract_msg_uid(payload: &[u8]) -> Option<String> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if local_name(e.name().as_ref()).eq_ignore_ascii_case(b"event") {
+                if local_name(e.name().as_ref().as_bytes()).eq_ignore_ascii_case(b"event") {
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref().eq_ignore_ascii_case(b"uid")
-                            && let Ok(s) = std::str::from_utf8(attr.value.as_ref())
-                        {
-                            return Some(s.to_string());
+                        if attr.key.as_ref().eq_ignore_ascii_case("uid") {
+                            return Some(attr.value.to_string());
                         }
                     }
                     return None;
@@ -1327,6 +1323,45 @@ mod tests {
         );
         assert_eq!(err.reason_token(), "multiple_markings");
         assert_eq!(g.audit_records_written(), 1, "exactly one deny record");
+    }
+
+    #[test]
+    fn guard_rejects_second_marking_hidden_behind_invalid_utf8_high_to_low() {
+        // quick-xml validates UTF-8 while reading, so invalid bytes stop
+        // the reader. `count_markings` then sees only the first marking;
+        // the payload must still be denied on the release boundary (by the
+        // uninspectable-envelope check) rather than released on the lower
+        // first marking. Covers text, attribute-value and element-name
+        // positions.
+        let tail = &b"<marking value=\"//TOP SECRET//\"/></detail></event>"[..];
+        let head = &b"<event uid=\"u1\" type=\"a-f-G-U-C\" start=\"2026-05-04T12:00:00Z\" stale=\"2026-05-04T12:05:00Z\"><detail><marking value=\"//UNCLASSIFIED//\"/>"[..];
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("text", [head, &[0xff, 0xfe][..], tail].concat()),
+            (
+                "attr",
+                [head, &b"<x a=\""[..], &[0xff][..], &b"\"/>"[..], tail].concat(),
+            ),
+            (
+                "name",
+                [head, &b"<x"[..], &[0xff][..], &b"/>"[..], tail].concat(),
+            ),
+        ];
+        for (position, payload) in cases {
+            let tmp = TempDir::new().unwrap();
+            let cfg = test_config(&tmp, 64 * 1024, 64 * 1024, true);
+            let mut g = CrossDomainGuard::new(cfg).unwrap();
+            let msg = make_message(Bytes::from(payload));
+            let err = g
+                .evaluate(&msg, GuardDirection::HighToLow)
+                .expect_err("hidden second marking must not cross HighToLow");
+            assert!(
+                matches!(
+                    err,
+                    GuardError::MultipleMarkings { .. } | GuardError::UnparseableMarking { .. }
+                ),
+                "{position}: got {err:?}"
+            );
+        }
     }
 
     #[test]

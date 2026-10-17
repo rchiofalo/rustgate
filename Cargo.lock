@@ -3737,7 +3737,7 @@ checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.14.0",
- "quick-xml",
+ "quick-xml 0.41.0",
  "serde",
  "time",
 ]
@@ -3916,7 +3916,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -3937,7 +3937,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -4013,6 +4013,15 @@ name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
 ]
@@ -4474,7 +4483,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "prometheus",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rcgen",
  "rustgate-archive",
  "rustgate-core",
@@ -4642,7 +4651,7 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "proptest",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rustgate-core",
  "rustgate-metrics",
  "thiserror 2.0.21",
@@ -4801,7 +4810,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "prometheus",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rustgate-archive",
  "rustgate-core",
  "rustgate-cot",
@@ -4949,7 +4958,7 @@ name = "rustgate-missions"
 version = "0.9.0"
 dependencies = [
  "hex",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rustgate-core",
  "serde",
  "serde_json",
@@ -5013,7 +5022,7 @@ name = "rustgate-nffi"
 version = "0.9.0"
 dependencies = [
  "bytes",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rustgate-core",
  "thiserror 2.0.21",
 ]
@@ -5070,7 +5079,7 @@ dependencies = [
  "proptest",
  "prost",
  "prost-build",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rustgate-core",
  "rustgate-metrics",
  "thiserror 2.0.21",

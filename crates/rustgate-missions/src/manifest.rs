@@ -148,17 +148,11 @@ pub fn parse_manifest_xml(bytes: &[u8]) -> Result<MissionPackageManifest> {
         let mut handle_open =
             |start: &quick_xml::events::BytesStart<'_>, is_empty: bool| -> Result<()> {
                 let name_bytes = start.name();
-                let name = std::str::from_utf8(name_bytes.as_ref())
-                    .map_err(|e| MissionsError::Manifest(format!("non-utf8 element name: {e}")))?
-                    .to_string();
+                let name = name_bytes.as_ref().to_string();
                 let attrs = start
                     .attributes()
                     .filter_map(std::result::Result::ok)
-                    .filter_map(|attr| {
-                        let key = std::str::from_utf8(attr.key.as_ref()).ok()?.to_string();
-                        let value = std::str::from_utf8(attr.value.as_ref()).ok()?.to_string();
-                        Some((key, value))
-                    })
+                    .map(|attr| (attr.key.as_ref().to_string(), attr.value.to_string()))
                     .collect::<BTreeMap<String, String>>();
 
                 match name.as_str() {
@@ -226,9 +220,7 @@ pub fn parse_manifest_xml(bytes: &[u8]) -> Result<MissionPackageManifest> {
             }
             Event::End(end) => {
                 let name_bytes = end.name();
-                let name = std::str::from_utf8(name_bytes.as_ref())
-                    .map_err(|e| MissionsError::Manifest(format!("non-utf8 element name: {e}")))?
-                    .to_string();
+                let name = name_bytes.as_ref().to_string();
                 match name.as_str() {
                     "Configuration" => in_configuration = false,
                     "Contents" => in_contents = false,

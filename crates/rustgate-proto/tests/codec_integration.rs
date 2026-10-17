@@ -335,7 +335,7 @@ fn build_protocol_support_xml_is_parseable() {
     loop {
         let event = reader.read_event_into(&mut buf).unwrap();
         match event {
-            quick_xml::events::Event::Start(e) if e.name().as_ref() == b"TakControl" => {
+            quick_xml::events::Event::Start(e) if e.name().as_ref() == "TakControl" => {
                 found_tak_control = true;
             }
             quick_xml::events::Event::Eof => break,

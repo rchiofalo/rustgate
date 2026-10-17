@@ -569,40 +569,34 @@ fn parse_inner(xml: &[u8]) -> Result<CotEvent, ParseError> {
         match reader.read_event_into(&mut buf)? {
             Event::Eof => break,
             Event::Start(e) | Event::Empty(e) => match e.name().as_ref() {
-                b"event" => {
+                "event" => {
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"uid" => uid = Some(String::from_utf8_lossy(&attr.value).into_owned()),
-                            b"type" => {
-                                event_type = Some(String::from_utf8_lossy(&attr.value).into_owned())
-                            }
-                            b"stale" => {
-                                stale_time = Some(String::from_utf8_lossy(&attr.value).into_owned())
-                            }
-                            b"start" => {
-                                start_time = Some(String::from_utf8_lossy(&attr.value).into_owned())
-                            }
+                            "uid" => uid = Some(attr.value.to_string()),
+                            "type" => event_type = Some(attr.value.to_string()),
+                            "stale" => stale_time = Some(attr.value.to_string()),
+                            "start" => start_time = Some(attr.value.to_string()),
                             _ => {}
                         }
                     }
                 }
-                b"point" => {
+                "point" => {
                     let mut lat = None;
                     let mut lon = None;
                     let mut hae = None;
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"lat" => {
+                            "lat" => {
                                 let v = parse_f64(&attr.value, "lat")?;
                                 check_range("lat", v, -90.0, 90.0)?;
                                 lat = Some(v);
                             }
-                            b"lon" => {
+                            "lon" => {
                                 let v = parse_f64(&attr.value, "lon")?;
                                 check_range("lon", v, -180.0, 180.0)?;
                                 lon = Some(v);
                             }
-                            b"hae" => hae = Some(parse_f64(&attr.value, "hae")?),
+                            "hae" => hae = Some(parse_f64(&attr.value, "hae")?),
                             _ => {}
                         }
                     }
@@ -610,24 +604,19 @@ fn parse_inner(xml: &[u8]) -> Result<CotEvent, ParseError> {
                         position = Some(Position { lat, lon, hae });
                     }
                 }
-                b"dest" => {
+                "dest" => {
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"callsign" => {
-                                dest_callsign =
-                                    Some(String::from_utf8_lossy(&attr.value).into_owned())
-                            }
-                            b"group" => {
-                                dest_group = Some(String::from_utf8_lossy(&attr.value).into_owned())
-                            }
+                            "callsign" => dest_callsign = Some(attr.value.to_string()),
+                            "group" => dest_group = Some(attr.value.to_string()),
                             _ => {}
                         }
                     }
                 }
-                b"__group" => {
+                "__group" => {
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"name" {
-                            source_group = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                        if attr.key.as_ref() == "name" {
+                            source_group = Some(attr.value.to_string());
                         }
                     }
                 }
@@ -661,11 +650,8 @@ fn parse_inner(xml: &[u8]) -> Result<CotEvent, ParseError> {
     })
 }
 
-fn parse_f64(value: &[u8], field: &'static str) -> Result<f64, ParseError> {
-    std::str::from_utf8(value)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(ParseError::InvalidFloat(field))
+fn parse_f64(value: &str, field: &'static str) -> Result<f64, ParseError> {
+    value.parse().ok().ok_or(ParseError::InvalidFloat(field))
 }
 
 /// Reject values outside `[min, max]` (inclusive).

@@ -180,37 +180,37 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
         match reader.read_event_into(&mut buf)? {
             Event::Eof => break,
             Event::Start(e) => match e.name().as_ref() {
-                b"event" => {
+                "event" => {
                     for attr in e.attributes().flatten() {
                         let key = attr.key.as_ref();
-                        let val = String::from_utf8_lossy(&attr.value).into_owned();
+                        let val = attr.value.to_string();
                         match key {
-                            b"uid" => uid = Some(val),
-                            b"type" => {
+                            "uid" => uid = Some(val),
+                            "type" => {
                                 event_type = Some(val.clone());
                                 let _ = attributes.insert(
                                     format!("{COT_PREFIX}event_type"),
                                     AttributeValue::Str(val),
                                 );
                             }
-                            b"time" => {
+                            "time" => {
                                 event_time_attr = Some(val.clone());
                                 let _ = attributes
                                     .insert(format!("{COT_PREFIX}time"), AttributeValue::Str(val));
                             }
-                            b"start" => {
+                            "start" => {
                                 let _ = attributes
                                     .insert(format!("{COT_PREFIX}start"), AttributeValue::Str(val));
                             }
-                            b"stale" => {
+                            "stale" => {
                                 let _ = attributes
                                     .insert(format!("{COT_PREFIX}stale"), AttributeValue::Str(val));
                             }
-                            b"how" => {
+                            "how" => {
                                 let _ = attributes
                                     .insert(format!("{COT_PREFIX}how"), AttributeValue::Str(val));
                             }
-                            b"version" => {
+                            "version" => {
                                 let _ = attributes.insert(
                                     format!("{COT_PREFIX}version"),
                                     AttributeValue::Str(val),
@@ -220,12 +220,12 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                         }
                     }
                 }
-                b"detail" => in_detail = true,
+                "detail" => in_detail = true,
                 name if in_detail => {
                     // Push the local name onto the detail path; consume
                     // attributes; capture velocity/callsign/sidc from
                     // recognized children.
-                    let local = String::from_utf8_lossy(name).into_owned();
+                    let local = name.to_owned();
                     detail_path.push(local.clone());
                     if detail_path.len() > MAX_DETAIL_DEPTH {
                         return Err(ParseError::DetailTooDeep {
@@ -248,8 +248,8 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                         }
                     } else if local == "contact" {
                         for attr in e.attributes().flatten() {
-                            let k = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-                            let v = String::from_utf8_lossy(&attr.value).into_owned();
+                            let k = attr.key.as_ref().to_owned();
+                            let v = attr.value.to_string();
                             if k == "callsign" && callsign.is_none() {
                                 callsign = Some(v.clone());
                             }
@@ -262,8 +262,8 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                         }
                     } else {
                         for attr in e.attributes().flatten() {
-                            let k = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-                            let v = String::from_utf8_lossy(&attr.value).into_owned();
+                            let k = attr.key.as_ref().to_owned();
+                            let v = attr.value.to_string();
                             if local == "usericon" && k == "iconsetpath" && sidc.is_none() {
                                 sidc = Some(v.clone());
                             }
@@ -281,14 +281,14 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                 _ => {}
             },
             Event::Empty(e) => match e.name().as_ref() {
-                b"point" => {
+                "point" => {
                     let p = read_point_attrs(&e, &mut attributes)?;
                     if position.is_none() {
                         position = p;
                     }
                 }
                 name if in_detail => {
-                    let local = String::from_utf8_lossy(name).into_owned();
+                    let local = name.to_owned();
                     detail_path.push(local.clone());
                     if detail_path.len() > MAX_DETAIL_DEPTH {
                         return Err(ParseError::DetailTooDeep {
@@ -311,8 +311,8 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                         }
                     } else if local == "contact" {
                         for attr in e.attributes().flatten() {
-                            let k = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-                            let v = String::from_utf8_lossy(&attr.value).into_owned();
+                            let k = attr.key.as_ref().to_owned();
+                            let v = attr.value.to_string();
                             if k == "callsign" && callsign.is_none() {
                                 callsign = Some(v.clone());
                             }
@@ -325,8 +325,8 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                         }
                     } else {
                         for attr in e.attributes().flatten() {
-                            let k = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-                            let v = String::from_utf8_lossy(&attr.value).into_owned();
+                            let k = attr.key.as_ref().to_owned();
+                            let v = attr.value.to_string();
                             if local == "usericon" && k == "iconsetpath" && sidc.is_none() {
                                 sidc = Some(v.clone());
                             }
@@ -343,7 +343,7 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                 _ => {}
             },
             Event::End(e) => match e.name().as_ref() {
-                b"detail" => in_detail = false,
+                "detail" => in_detail = false,
                 _ if in_detail => {
                     if let (Some(key), Some(val)) =
                         (pending_text_key.take(), pending_text_value.take())
@@ -360,10 +360,7 @@ fn decode_cot(payload: &[u8]) -> Result<Entity, ParseError> {
                 _ => {}
             },
             Event::Text(t) if in_detail && pending_text_key.is_some() => {
-                let s = t
-                    .xml10_content()
-                    .map_err(quick_xml::Error::from)?
-                    .into_owned();
+                let s = t.xml10_content().into_owned();
                 if !s.is_empty() {
                     pending_text_value = Some(s);
                 }
@@ -457,28 +454,28 @@ fn read_point_attrs(
     let mut hae = None;
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"lat" => {
+            "lat" => {
                 let v = parse_f64(&attr.value, "lat")?;
                 check_range("lat", v, -90.0, 90.0)?;
                 lat = Some(v);
             }
-            b"lon" => {
+            "lon" => {
                 let v = parse_f64(&attr.value, "lon")?;
                 check_range("lon", v, -180.0, 180.0)?;
                 lon = Some(v);
             }
-            b"hae" => {
+            "hae" => {
                 let v = parse_f64(&attr.value, "hae")?;
                 hae = Some(v);
                 let _ =
                     attributes.insert(format!("{COT_PREFIX}point.hae"), AttributeValue::Float(v));
             }
-            b"ce" => {
+            "ce" => {
                 let v = parse_f64(&attr.value, "ce")?;
                 let _ =
                     attributes.insert(format!("{COT_PREFIX}point.ce"), AttributeValue::Float(v));
             }
-            b"le" => {
+            "le" => {
                 let v = parse_f64(&attr.value, "le")?;
                 let _ =
                     attributes.insert(format!("{COT_PREFIX}point.le"), AttributeValue::Float(v));
@@ -513,15 +510,15 @@ fn read_track_attrs(e: &BytesStart<'_>) -> Result<(Option<Velocity>, TrackAttrPa
     let mut course: Option<f64> = None;
     let mut other: Vec<(String, AttributeValue)> = Vec::new();
     for attr in e.attributes().flatten() {
-        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-        let raw = String::from_utf8_lossy(&attr.value).into_owned();
+        let key = attr.key.as_ref().to_owned();
+        let raw = attr.value.to_string();
         match attr.key.as_ref() {
-            b"speed" => {
+            "speed" => {
                 let v = parse_f64(&attr.value, "speed")?;
                 speed = Some(v);
                 other.push((key, AttributeValue::Float(v)));
             }
-            b"course" => {
+            "course" => {
                 let v = parse_f64(&attr.value, "course")?;
                 course = Some(v);
                 other.push((key, AttributeValue::Float(v)));
@@ -539,11 +536,8 @@ fn read_track_attrs(e: &BytesStart<'_>) -> Result<(Option<Velocity>, TrackAttrPa
     Ok((velocity, other))
 }
 
-fn parse_f64(value: &[u8], field: &'static str) -> Result<f64, ParseError> {
-    std::str::from_utf8(value)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(ParseError::InvalidFloat(field))
+fn parse_f64(value: &str, field: &'static str) -> Result<f64, ParseError> {
+    value.parse().ok().ok_or(ParseError::InvalidFloat(field))
 }
 
 fn check_range(field: &'static str, value: f64, min: f64, max: f64) -> Result<(), ParseError> {

@@ -102,7 +102,7 @@ ciborium = "0.2"
 fips204 = "0.4.6"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 bytes = "1"
-quick-xml = "0.41"
+quick-xml = "0.42"
 # OGC SensorThings v1.0 §10 MQTT push subscriber. `default-features =
 # false` with no features enabled keeps the dep tree minimal — the
 # MVP accepts only `mqtt://` URIs (TLS rejected at startup), so the
