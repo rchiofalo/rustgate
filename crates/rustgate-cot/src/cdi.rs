@@ -43,6 +43,7 @@
 
 use bytes::Bytes;
 use quick_xml::Writer;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
@@ -53,7 +54,7 @@ use crate::mask::{MAX_DETAIL_ATTRIBUTES, MaskError};
 /// `<contact>` (or peer) shape, but every identifying attribute has its
 /// value blanked. The brackets are inert in CoT XML (no entity
 /// expansion, no element nesting) so schema validity survives.
-const STRIPPED_VALUE: &[u8] = b"";
+const STRIPPED_VALUE: &str = "";
 
 /// Attribute names on `<contact>` (and similar elements) that MUST be
 /// stripped at the cross-domain boundary. Matched case-insensitively
@@ -94,35 +95,36 @@ fn local_name(name: &[u8]) -> &[u8] {
 /// and namespace-tolerant — `<cot:Contact/>` matches just as `<contact/>`
 /// does. Mirrors `mask::is_contact_tag`; duplicated here so the CDI
 /// helpers do not depend on a `pub(crate)` mask-internal symbol.
-fn is_contact_element(name: &[u8]) -> bool {
-    local_name(name).eq_ignore_ascii_case(b"contact")
+fn is_contact_element(name: &str) -> bool {
+    local_name(name.as_bytes()).eq_ignore_ascii_case(b"contact")
 }
 
 /// Return `true` when `name` is a `<detail>` element. The CDI marking
 /// injector targets this element so the banner travels alongside the
 /// other CoT detail children.
-fn is_detail_element(name: &[u8]) -> bool {
-    local_name(name).eq_ignore_ascii_case(b"detail")
+fn is_detail_element(name: &str) -> bool {
+    local_name(name.as_bytes()).eq_ignore_ascii_case(b"detail")
 }
 
 /// Return `true` when `name` is a `<point>` element. Mirrors
 /// `mask::is_point_tag`; duplicated for the same module-isolation
 /// reason as [`is_contact_element`].
-fn is_point_element(name: &[u8]) -> bool {
-    local_name(name).eq_ignore_ascii_case(b"point")
+fn is_point_element(name: &str) -> bool {
+    local_name(name.as_bytes()).eq_ignore_ascii_case(b"point")
 }
 
 /// Return `true` when `name` is a `<marking>` element — the wrapper the
 /// CDI marking injector uses to deposit the CAPCO banner.
-fn is_marking_element(name: &[u8]) -> bool {
-    local_name(name).eq_ignore_ascii_case(b"marking")
+fn is_marking_element(name: &str) -> bool {
+    local_name(name.as_bytes()).eq_ignore_ascii_case(b"marking")
 }
 
 /// Return `true` when `attr_name` matches any token in
 /// `PII_CONTACT_ATTR_TOKENS` as a case-insensitive substring. The
 /// substring scan is intentional — vendor extensions like
 /// `xmppUsername` should also trip the matcher.
-fn attr_name_is_pii(attr_name: &[u8]) -> bool {
+fn attr_name_is_pii(attr_name: &str) -> bool {
+    let attr_name = attr_name.as_bytes();
     if attr_name.is_empty() {
         return false;
     }
@@ -245,8 +247,7 @@ fn strip_pii_attrs(src: &BytesStart<'_>) -> Result<Option<BytesStart<'static>>, 
     if !needs_rewrite {
         return Ok(None);
     }
-    let name_str = std::str::from_utf8(name_bytes.as_ref())
-        .map_err(|e| MaskError::Xml(quick_xml::Error::Encoding(e.into())))?;
+    let name_str = name_bytes.as_ref();
     let mut out = BytesStart::new(name_str.to_owned());
     let mut count = 0usize;
     for attr in src.attributes() {
@@ -260,7 +261,7 @@ fn strip_pii_attrs(src: &BytesStart<'_>) -> Result<Option<BytesStart<'static>>, 
             out.push_attribute((key_bytes, STRIPPED_VALUE));
         } else {
             // Preserve non-PII attributes verbatim.
-            out.push_attribute((key_bytes, attr.value.as_ref()));
+            out.push_attribute(attr.clone());
         }
     }
     Ok(Some(out))
@@ -342,8 +343,7 @@ fn degrade_point_attrs(
     precision_meters: u32,
 ) -> Result<BytesStart<'static>, MaskError> {
     let name_bytes = src.name();
-    let name_str = std::str::from_utf8(name_bytes.as_ref())
-        .map_err(|e| MaskError::Xml(quick_xml::Error::Encoding(e.into())))?;
+    let name_str = name_bytes.as_ref();
     let mut out = BytesStart::new(name_str.to_owned());
     let mut count = 0usize;
     for attr in src.attributes() {
@@ -353,16 +353,16 @@ fn degrade_point_attrs(
             return Err(MaskError::AttrBudgetExceeded { limit: ATTR_BUDGET });
         }
         let key_bytes = attr.key.as_ref();
-        if key_bytes.eq_ignore_ascii_case(b"lat") {
+        if key_bytes.eq_ignore_ascii_case("lat") {
             let new_value = degrade_coordinate(attr.value.as_ref(), precision_meters);
-            out.push_attribute((key_bytes, new_value.as_bytes()));
-        } else if key_bytes.eq_ignore_ascii_case(b"lon") {
+            out.push_attribute(raw_attribute(attr.key, new_value));
+        } else if key_bytes.eq_ignore_ascii_case("lon") {
             // Same equator-step as latitude — see the docstring above
             // for the idempotence rationale.
             let new_value = degrade_coordinate(attr.value.as_ref(), precision_meters);
-            out.push_attribute((key_bytes, new_value.as_bytes()));
+            out.push_attribute(raw_attribute(attr.key, new_value));
         } else {
-            out.push_attribute((key_bytes, attr.value.as_ref()));
+            out.push_attribute(attr.clone());
         }
     }
     Ok(out)
@@ -372,6 +372,19 @@ fn degrade_point_attrs(
 /// enough for the CDI use case (km-scale degradation), avoids the cost
 /// of an ellipsoidal model the scaffold does not need.
 const METRES_PER_DEG_LAT: f64 = 111_320.0;
+
+/// Build an attribute whose value is already XML-escaped text.
+///
+/// quick-xml's `(&str, &str)` conversion escapes the value, which would
+/// double-escape text taken from the source document (`&apos;` becoming
+/// `&amp;apos;`). Values here are either formatted numbers or the original
+/// raw attribute text, so they are emitted as-is.
+fn raw_attribute(key: quick_xml::name::QName<'_>, value: String) -> Attribute<'_> {
+    Attribute {
+        key,
+        value: std::borrow::Cow::Owned(value),
+    }
+}
 
 /// Round a coordinate attribute value (raw bytes from the CoT element)
 /// to the configured grid step in metres. Used for BOTH latitude and
@@ -386,10 +399,7 @@ const METRES_PER_DEG_LAT: f64 = 111_320.0;
 /// successive applications converge to the same cell index even when
 /// f64 round-tripping introduces sub-bit drift in the formatted
 /// representation.
-fn degrade_coordinate(value_bytes: &[u8], precision_meters: u32) -> String {
-    let Ok(s) = std::str::from_utf8(value_bytes) else {
-        return String::from_utf8_lossy(value_bytes).into_owned();
-    };
+fn degrade_coordinate(s: &str, precision_meters: u32) -> String {
     let trimmed = s.trim();
     let Ok(value) = trimmed.parse::<f64>() else {
         return s.to_string();
@@ -565,6 +575,26 @@ mod tests {
     //! per-helper invariants documented in the module-level docstring.
 
     use super::*;
+
+    #[test]
+    fn preserved_attribute_entities_are_not_double_escaped() {
+        // Raw attribute text (and an unparseable coordinate echoed back by
+        // degrade_coordinate) must be re-emitted without escaping `&` again.
+        let pii = br#"<event uid="u1"><detail><contact callsign="A&amp;B" email="x@y"/></detail></event>"#;
+        let out = String::from_utf8(strip_pii(pii).unwrap().to_vec()).unwrap();
+        assert!(!out.contains("&amp;amp;"), "{out}");
+        let pos =
+            br#"<event uid="u1"><point lat="n&amp;a" lon="-77.0365" note="it&apos;s"/></event>"#;
+        let first = degrade_position(pos, 1000).unwrap();
+        let text = String::from_utf8(first.to_vec()).unwrap();
+        assert!(text.contains(r#"lat="n&amp;a""#), "{text}");
+        assert!(text.contains(r#"note="it&apos;s""#), "{text}");
+        assert_eq!(
+            degrade_position(&first, 1000).unwrap(),
+            first,
+            "not idempotent"
+        );
+    }
 
     const COT_WITH_CONTACT: &[u8] = br#"<event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/><detail><contact callsign="ALPHA-1" phone="+1-555-0100" email="alpha@example.test"/></detail></event>"#;
 

@@ -166,35 +166,35 @@ fn parse_video_detail(msg: &RoutableMessage, event_type: &str) -> Option<VideoEn
         match reader.read_event_into(&mut buf).ok()? {
             Event::Eof => break,
             Event::Start(e) | Event::Empty(e) => match e.name().as_ref() {
-                b"event" => {
+                "event" => {
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"uid" {
-                            uid = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                        if attr.key.as_ref() == "uid" {
+                            uid = Some(attr.value.to_string());
                         }
                     }
                 }
-                b"point" => {
+                "point" => {
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"lat" => lat = parse_attr_f64(&attr.value),
-                            b"lon" => lon = parse_attr_f64(&attr.value),
+                            "lat" => lat = parse_attr_f64(&attr.value),
+                            "lon" => lon = parse_attr_f64(&attr.value),
                             _ => {}
                         }
                     }
                 }
-                b"__video" | b"video" => {
+                "__video" | "video" => {
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"url" {
-                            stream_url = Some(String::from_utf8_lossy(&attr.value).into_owned());
+                        if attr.key.as_ref() == "url" {
+                            stream_url = Some(attr.value.to_string());
                         }
                     }
                 }
-                b"sensor" => {
+                "sensor" => {
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"fov" => sensor_fov = parse_attr_f64(&attr.value),
-                            b"azimuth" => sensor_azimuth = parse_attr_f64(&attr.value),
-                            b"elevation" => sensor_elevation = parse_attr_f64(&attr.value),
+                            "fov" => sensor_fov = parse_attr_f64(&attr.value),
+                            "azimuth" => sensor_azimuth = parse_attr_f64(&attr.value),
+                            "elevation" => sensor_elevation = parse_attr_f64(&attr.value),
                             _ => {}
                         }
                     }
@@ -226,8 +226,8 @@ fn parse_video_detail(msg: &RoutableMessage, event_type: &str) -> Option<VideoEn
     })
 }
 
-fn parse_attr_f64(value: &[u8]) -> Option<f64> {
-    std::str::from_utf8(value).ok()?.parse().ok()
+fn parse_attr_f64(value: &str) -> Option<f64> {
+    value.parse().ok()
 }
 
 /// Build a hyper response handler closure for `GET /api/video/streams`.

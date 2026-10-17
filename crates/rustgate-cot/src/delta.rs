@@ -452,7 +452,7 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
     // reject unbalanced or mismatched closing tags, which would otherwise
     // reconstruct as malformed XML (#1610). Moves in lockstep with
     // `detail_depth`: push on a non-empty child open, pop on its close.
-    let mut detail_tags: Vec<Vec<u8>> = Vec::new();
+    let mut detail_tags: Vec<String> = Vec::new();
     let mut seen_event = false;
     let mut buf = Vec::new();
 
@@ -492,13 +492,13 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
                 }
             }
             Event::End(e) => {
-                let name = e.name().as_ref().to_vec();
-                match name.as_slice() {
-                    b"event" => {
+                let name = e.name().as_ref().to_owned();
+                match name.as_str() {
+                    "event" => {
                         break;
                     }
-                    b"delta" => {}
-                    b"detail" if detail_depth == 1 => {
+                    "delta" => {}
+                    "detail" if detail_depth == 1 => {
                         // Every child tag opened inside <detail> must have been
                         // matched and popped; a non-empty stack means an opening
                         // tag was never closed, which would reconstruct as
@@ -522,7 +522,7 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
                             match detail_tags.pop() {
                                 Some(opened) if opened == name => {
                                     detail_buf.push_str("</");
-                                    detail_buf.push_str(&String::from_utf8_lossy(&name));
+                                    detail_buf.push_str(&name);
                                     detail_buf.push('>');
                                     detail_depth = detail_depth.saturating_sub(1);
                                 }
@@ -535,7 +535,7 @@ pub fn parse_snapshot(raw: &Bytes) -> Option<CotSnapshot> {
             Event::Text(t) if in_detail => {
                 // Store raw as-is; escapes round-trip through the
                 // buffer verbatim since we compare by byte equality.
-                detail_buf.push_str(&String::from_utf8_lossy(t.as_ref()));
+                detail_buf.push_str(t.as_ref());
             }
             _ => {}
         }
@@ -567,11 +567,11 @@ fn handle_open(
     in_detail: &mut bool,
     detail_depth: &mut usize,
     detail_buf: &mut String,
-    detail_tags: &mut Vec<Vec<u8>>,
+    detail_tags: &mut Vec<String>,
 ) -> bool {
-    let name = e.name().as_ref().to_vec();
-    match name.as_slice() {
-        b"event" => {
+    let name = e.name().as_ref().to_owned();
+    match name.as_str() {
+        "event" => {
             if *seen_event {
                 if *in_detail {
                     append_tag_start(detail_buf, e, is_empty);
@@ -585,34 +585,34 @@ fn handle_open(
             *seen_event = true;
             for attr in e.attributes().flatten() {
                 match attr.key.as_ref() {
-                    b"version" => snap.version = attr_to_string(&attr.value),
-                    b"uid" => snap.uid = attr_to_string(&attr.value),
-                    b"type" => snap.event_type = attr_to_string(&attr.value),
-                    b"how" => snap.how = Some(attr_to_string(&attr.value)),
-                    b"time" => snap.time = attr_to_string(&attr.value),
-                    b"start" => snap.start = attr_to_string(&attr.value),
-                    b"stale" => snap.stale = attr_to_string(&attr.value),
+                    "version" => snap.version = attr_to_string(&attr.value),
+                    "uid" => snap.uid = attr_to_string(&attr.value),
+                    "type" => snap.event_type = attr_to_string(&attr.value),
+                    "how" => snap.how = Some(attr_to_string(&attr.value)),
+                    "time" => snap.time = attr_to_string(&attr.value),
+                    "start" => snap.start = attr_to_string(&attr.value),
+                    "stale" => snap.stale = attr_to_string(&attr.value),
                     _ => {}
                 }
             }
             // Self-closing <event/> is degenerate but valid — we're done.
             is_empty
         }
-        b"delta" => {
+        "delta" => {
             // Unwrap delta timestamp attributes onto the event so a
             // received delta parses as a normal snapshot. Enables
             // decoder round-trip via the same parser.
             for attr in e.attributes().flatten() {
                 match attr.key.as_ref() {
-                    b"time" => snap.time = attr_to_string(&attr.value),
-                    b"start" => snap.start = attr_to_string(&attr.value),
-                    b"stale" => snap.stale = attr_to_string(&attr.value),
+                    "time" => snap.time = attr_to_string(&attr.value),
+                    "start" => snap.start = attr_to_string(&attr.value),
+                    "stale" => snap.stale = attr_to_string(&attr.value),
                     _ => {}
                 }
             }
             false
         }
-        b"point" if !*in_detail => {
+        "point" if !*in_detail => {
             let mut p = CotPoint {
                 lat: 0.0,
                 lon: 0.0,
@@ -622,27 +622,27 @@ fn handle_open(
             };
             for attr in e.attributes().flatten() {
                 match attr.key.as_ref() {
-                    b"lat" => {
+                    "lat" => {
                         if let Some(v) = attr_to_f64(&attr.value) {
                             p.lat = v;
                         }
                     }
-                    b"lon" => {
+                    "lon" => {
                         if let Some(v) = attr_to_f64(&attr.value) {
                             p.lon = v;
                         }
                     }
-                    b"hae" => {
+                    "hae" => {
                         if let Some(v) = attr_to_f64(&attr.value) {
                             p.hae = v;
                         }
                     }
-                    b"ce" => {
+                    "ce" => {
                         if let Some(v) = attr_to_f64(&attr.value) {
                             p.ce = v;
                         }
                     }
-                    b"le" => {
+                    "le" => {
                         if let Some(v) = attr_to_f64(&attr.value) {
                             p.le = v;
                         }
@@ -653,7 +653,7 @@ fn handle_open(
             snap.point = Some(p);
             false
         }
-        b"detail" if !*in_detail => {
+        "detail" if !*in_detail => {
             *in_detail = true;
             *detail_depth = 1;
             if is_empty {
@@ -682,12 +682,12 @@ fn handle_open(
 /// cached detail fingerprint is stable across re-parses.
 fn append_tag_start(buf: &mut String, e: &quick_xml::events::BytesStart<'_>, is_empty: bool) {
     buf.push('<');
-    buf.push_str(&String::from_utf8_lossy(e.name().as_ref()));
+    buf.push_str(e.name().as_ref());
     for attr in e.attributes().flatten() {
         buf.push(' ');
-        buf.push_str(&String::from_utf8_lossy(attr.key.as_ref()));
+        buf.push_str(attr.key.as_ref());
         buf.push_str("=\"");
-        let val = String::from_utf8_lossy(&attr.value);
+        let val = &attr.value;
         for ch in val.chars() {
             match ch {
                 '&' => buf.push_str("&amp;"),
@@ -706,12 +706,12 @@ fn append_tag_start(buf: &mut String, e: &quick_xml::events::BytesStart<'_>, is_
     }
 }
 
-fn attr_to_string(raw: &[u8]) -> String {
-    String::from_utf8_lossy(raw).into_owned()
+fn attr_to_string(raw: &str) -> String {
+    raw.to_owned()
 }
 
-fn attr_to_f64(raw: &[u8]) -> Option<f64> {
-    std::str::from_utf8(raw).ok().and_then(|s| s.parse().ok())
+fn attr_to_f64(raw: &str) -> Option<f64> {
+    raw.parse().ok()
 }
 
 /// Whether the raw bytes contain a `<delta` child under `<event>`.

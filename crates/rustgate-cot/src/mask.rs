@@ -85,7 +85,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 
 /// Attribute value written in place of real coordinates.
-const MASKED_VALUE: &[u8] = b"0.0";
+const MASKED_VALUE: &str = "0.0";
 
 /// Attribute value written in place of secondary position-bearing
 /// fields (callsign, group affiliation, takv platform, custom lat/lon
@@ -97,7 +97,7 @@ const MASKED_VALUE: &[u8] = b"0.0";
 /// attribute values does not silently lose the masking signal. The
 /// brackets are inert in CoT XML (no entity expansion, no element
 /// nesting) — schema validity is preserved.
-const REDACTED_VALUE: &[u8] = b"[REDACTED]";
+const REDACTED_VALUE: &str = "[REDACTED]";
 
 /// Upper bound on `<point>` attribute count.
 ///
@@ -298,8 +298,8 @@ impl From<io::Error> for MaskError {
 /// the target literal `"point"` is pure ASCII and XML element names
 /// cannot begin with a character whose case fold escapes ASCII in a
 /// way that would collide with "point".
-fn is_point_tag(name: &[u8]) -> bool {
-    local_name(name).eq_ignore_ascii_case(b"point")
+fn is_point_tag(name: &str) -> bool {
+    local_name(name.as_bytes()).eq_ignore_ascii_case(b"point")
 }
 
 /// Strip the namespace prefix from a qualified XML name and return the
@@ -315,30 +315,30 @@ fn local_name(name: &[u8]) -> &[u8] {
 /// Return `true` when `name` is a `<contact>` element (case-insensitive,
 /// namespace-tolerant). Used by [`MaskDetailLevel::Medium`] and stricter
 /// to redact `<contact callsign="…">` attributes.
-fn is_contact_tag(name: &[u8]) -> bool {
-    local_name(name).eq_ignore_ascii_case(b"contact")
+fn is_contact_tag(name: &str) -> bool {
+    local_name(name.as_bytes()).eq_ignore_ascii_case(b"contact")
 }
 
 /// Return `true` when `name` is a `<__group>` element (case-insensitive,
 /// namespace-tolerant). The double underscore prefix is part of the
 /// element name in spec CoT — it does NOT denote a namespace.
-fn is_group_affiliation_tag(name: &[u8]) -> bool {
-    local_name(name).eq_ignore_ascii_case(b"__group")
+fn is_group_affiliation_tag(name: &str) -> bool {
+    local_name(name.as_bytes()).eq_ignore_ascii_case(b"__group")
 }
 
 /// Return `true` when `name` is a `<takv>` element (case-insensitive,
 /// namespace-tolerant). Used by [`MaskDetailLevel::Strict`] to redact
 /// platform / version metadata that identifies the operator's TAK
 /// device family.
-fn is_takv_tag(name: &[u8]) -> bool {
-    local_name(name).eq_ignore_ascii_case(b"takv")
+fn is_takv_tag(name: &str) -> bool {
+    local_name(name.as_bytes()).eq_ignore_ascii_case(b"takv")
 }
 
 /// Return `true` when `name` is a `<status>` element (case-insensitive,
 /// namespace-tolerant). Used by [`MaskDetailLevel::Strict`] to redact
 /// the `battery` attribute, which can correlate with patrol duration.
-fn is_status_tag(name: &[u8]) -> bool {
-    local_name(name).eq_ignore_ascii_case(b"status")
+fn is_status_tag(name: &str) -> bool {
+    local_name(name.as_bytes()).eq_ignore_ascii_case(b"status")
 }
 
 /// Substrings that identify a position-bearing attribute *name* (not
@@ -359,7 +359,8 @@ const POSITION_ATTR_TOKENS: &[&[u8]] = &[b"lat", b"lon", b"alt", b"pos", b"loc"]
 /// motivating concern for #882's Strict tier is that operator-defined
 /// custom fields might re-introduce position data the masker did not
 /// know to look for.
-fn attr_name_is_position_like(attr_name: &[u8]) -> bool {
+fn attr_name_is_position_like(attr_name: &str) -> bool {
+    let attr_name = attr_name.as_bytes();
     if attr_name.is_empty() {
         return false;
     }
@@ -679,8 +680,7 @@ fn mask_point_attrs(
     // prefix and casing) so receivers that round-trip the event see
     // the same element shape they would have seen pre-mask.
     let name_bytes = src.name();
-    let name_str = std::str::from_utf8(name_bytes.as_ref())
-        .map_err(|e| MaskError::Xml(quick_xml::Error::Encoding(e.into())))?;
+    let name_str = name_bytes.as_ref();
     let mut masked = BytesStart::new(name_str.to_owned());
     let mut count = 0usize;
     for attr in src.attributes() {
@@ -693,7 +693,7 @@ fn mask_point_attrs(
         }
         let key_bytes = attr.key.as_ref();
         match key_bytes {
-            b"lat" | b"lon" | b"hae" => {
+            "lat" | "lon" | "hae" => {
                 masked.push_attribute((key_bytes, MASKED_VALUE));
             }
             _ if level.redacts_takv_and_custom() && attr_name_is_position_like(key_bytes) => {
@@ -704,7 +704,7 @@ fn mask_point_attrs(
                 masked.push_attribute((key_bytes, REDACTED_VALUE));
             }
             _ => {
-                masked.push_attribute((key_bytes, attr.value.as_ref()));
+                masked.push_attribute(attr.clone());
             }
         }
     }
@@ -725,9 +725,8 @@ fn mask_detail_attrs(
     level: MaskDetailLevel,
 ) -> Result<BytesStart<'static>, MaskError> {
     let name_bytes = src.name();
-    let name_str = std::str::from_utf8(name_bytes.as_ref())
-        .map_err(|e| MaskError::Xml(quick_xml::Error::Encoding(e.into())))?;
-    let element_name = name_bytes.as_ref().to_vec();
+    let name_str = name_bytes.as_ref();
+    let element_name = name_bytes.as_ref().to_owned();
     let mut masked = BytesStart::new(name_str.to_owned());
     let mut count = 0usize;
     for attr in src.attributes() {
@@ -742,7 +741,7 @@ fn mask_detail_attrs(
         if attr_should_be_redacted_on_element(&element_name, key_bytes, level) {
             masked.push_attribute((key_bytes, REDACTED_VALUE));
         } else {
-            masked.push_attribute((key_bytes, attr.value.as_ref()));
+            masked.push_attribute(attr.clone());
         }
     }
     Ok(masked)
@@ -753,8 +752,8 @@ fn mask_detail_attrs(
 /// per-element / per-attribute decision table is documented in one
 /// place rather than scattered across the dispatcher arms.
 fn attr_should_be_redacted_on_element(
-    element_name: &[u8],
-    attr_name: &[u8],
+    element_name: &str,
+    attr_name: &str,
     level: MaskDetailLevel,
 ) -> bool {
     // Strict's custom-attribute scan applies on every element.
@@ -763,11 +762,11 @@ fn attr_should_be_redacted_on_element(
     }
     // Medium / Strict: spec-element attributes get specific names redacted.
     if level.redacts_callsign_and_group() {
-        if is_contact_tag(element_name) && attr_name.eq_ignore_ascii_case(b"callsign") {
+        if is_contact_tag(element_name) && attr_name.eq_ignore_ascii_case("callsign") {
             return true;
         }
         if is_group_affiliation_tag(element_name)
-            && (attr_name.eq_ignore_ascii_case(b"name") || attr_name.eq_ignore_ascii_case(b"role"))
+            && (attr_name.eq_ignore_ascii_case("name") || attr_name.eq_ignore_ascii_case("role"))
         {
             return true;
         }
@@ -775,12 +774,12 @@ fn attr_should_be_redacted_on_element(
     // Strict-only: takv platform/version, status battery.
     if level.redacts_takv_and_custom() {
         if is_takv_tag(element_name)
-            && (attr_name.eq_ignore_ascii_case(b"platform")
-                || attr_name.eq_ignore_ascii_case(b"version"))
+            && (attr_name.eq_ignore_ascii_case("platform")
+                || attr_name.eq_ignore_ascii_case("version"))
         {
             return true;
         }
-        if is_status_tag(element_name) && attr_name.eq_ignore_ascii_case(b"battery") {
+        if is_status_tag(element_name) && attr_name.eq_ignore_ascii_case("battery") {
             return true;
         }
     }
@@ -829,7 +828,7 @@ fn any_attr_name_is_position_like(e: &BytesStart<'_>) -> Result<bool, MaskError>
 fn check_attrs_round_trip_safe(e: &BytesStart<'_>) -> Result<(), MaskError> {
     for attr in e.attributes() {
         let attr = attr?;
-        if attr.value.as_ref().contains(&b'"') {
+        if attr.value.contains('"') {
             return Err(MaskError::UnsafeAttrValue);
         }
     }
@@ -841,6 +840,18 @@ mod tests {
     #![allow(clippy::panic, clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn preserved_attribute_entities_are_not_double_escaped() {
+        // Attribute values are kept as raw, already-escaped text; re-emitting
+        // them must not escape `&` again (found by the
+        // cot_mask_strip_coordinates fuzz target's idempotence check).
+        let xml = br#"<event uid="u1"><point lat="38.9" lon="-77.0" hae="1" note="it&apos;s &amp; ok"/></event>"#;
+        let first = strip_coordinates(xml).unwrap();
+        let text = String::from_utf8(first.to_vec()).unwrap();
+        assert!(text.contains(r#"note="it&apos;s &amp; ok""#), "{text}");
+        assert_eq!(strip_coordinates(&first).unwrap(), first, "not idempotent");
+    }
 
     const SAMPLE_COT: &str = r#"<?xml version="1.0"?><event uid="u1" type="a-f-G-U-C" start="2024-01-01T00:00:00Z" stale="2024-01-01T00:05:00Z"><point lat="38.8977" lon="-77.0365" hae="125.4"/><detail><__group name="Cyan"/></detail></event>"#;
 

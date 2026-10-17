@@ -286,7 +286,7 @@ pub fn decode_document(payload: &[u8]) -> Result<NffiDocument, NffiError> {
             Event::Start(ref e_ref) | Event::Empty(ref e_ref) => {
                 let is_empty = matches!(event, Event::Empty(_));
                 let e = e_ref;
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let name = e.name().as_ref().to_owned();
                 // Inside an unknown sub-tree — swallow nested
                 // children rather than confusing the typed
                 // dispatch. The text contents arrive as
@@ -302,9 +302,8 @@ pub fn decode_document(payload: &[u8]) -> Result<NffiDocument, NffiError> {
                         "nffi" => {
                             // Capture xmlns once at the root.
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"xmlns" {
-                                    namespace =
-                                        Some(String::from_utf8_lossy(&attr.value).into_owned());
+                                if attr.key.as_ref() == "xmlns" {
+                                    namespace = Some(attr.value.to_string());
                                 }
                             }
                         }
@@ -343,12 +342,7 @@ pub fn decode_document(payload: &[u8]) -> Result<NffiDocument, NffiError> {
                             let attributes: Vec<(String, String)> = e
                                 .attributes()
                                 .flatten()
-                                .map(|a| {
-                                    (
-                                        String::from_utf8_lossy(a.key.as_ref()).into_owned(),
-                                        String::from_utf8_lossy(&a.value).into_owned(),
-                                    )
-                                })
+                                .map(|a| (a.key.as_ref().to_owned(), a.value.to_string()))
                                 .collect();
                             let element = UnknownElement {
                                 name: name.clone(),
@@ -379,7 +373,7 @@ pub fn decode_document(payload: &[u8]) -> Result<NffiDocument, NffiError> {
                 }
             }
             Event::End(e) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                let name = e.name().as_ref().to_owned();
                 // Consume any pending text body for the just-closed
                 // element. The body may belong to one of the typed
                 // scalar children (datetime / sidc / unitName /
@@ -433,10 +427,7 @@ pub fn decode_document(payload: &[u8]) -> Result<NffiDocument, NffiError> {
                 let _ = stack.pop();
             }
             Event::Text(t) => {
-                let s = t
-                    .xml10_content()
-                    .map_err(quick_xml::Error::from)?
-                    .into_owned();
+                let s = t.xml10_content().into_owned();
                 if !s.is_empty() {
                     pending_text = Some(s);
                 }
@@ -635,17 +626,17 @@ fn read_wgs84(e: &BytesStart<'_>) -> Result<Position, NffiError> {
     let mut alt: Option<f64> = None;
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"lat" => {
+            "lat" => {
                 let v = parse_f64(&attr.value, "wgs84Position", "lat")?;
                 check_range("lat", v, -90.0, 90.0)?;
                 lat = Some(v);
             }
-            b"lon" => {
+            "lon" => {
                 let v = parse_f64(&attr.value, "wgs84Position", "lon")?;
                 check_range("lon", v, -180.0, 180.0)?;
                 lon = Some(v);
             }
-            b"alt" => alt = Some(parse_f64(&attr.value, "wgs84Position", "alt")?),
+            "alt" => alt = Some(parse_f64(&attr.value, "wgs84Position", "alt")?),
             _ => {}
         }
     }
@@ -670,8 +661,8 @@ fn read_kinematics(e: &BytesStart<'_>) -> Result<Kinematics, NffiError> {
     let mut accuracy: Option<f64> = None;
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"speed" => speed = Some(parse_f64(&attr.value, "kinematics", "speed")?),
-            b"course" => {
+            "speed" => speed = Some(parse_f64(&attr.value, "kinematics", "speed")?),
+            "course" => {
                 let v = parse_f64(&attr.value, "kinematics", "course")?;
                 // `[0, 360)` per APP-6A conventions. Reject values
                 // outside the envelope rather than silently
@@ -685,7 +676,7 @@ fn read_kinematics(e: &BytesStart<'_>) -> Result<Kinematics, NffiError> {
                 }
                 course = Some(v);
             }
-            b"accuracy" => accuracy = Some(parse_f64(&attr.value, "kinematics", "accuracy")?),
+            "accuracy" => accuracy = Some(parse_f64(&attr.value, "kinematics", "accuracy")?),
             _ => {}
         }
     }
@@ -705,13 +696,13 @@ fn read_kinematics(e: &BytesStart<'_>) -> Result<Kinematics, NffiError> {
 }
 
 fn parse_f64(
-    value: &[u8],
+    value: &str,
     element: &'static str,
     attribute: &'static str,
 ) -> Result<f64, NffiError> {
-    std::str::from_utf8(value)
+    value
+        .parse()
         .ok()
-        .and_then(|s| s.parse().ok())
         .ok_or(NffiError::InvalidFloat { element, attribute })
 }
 

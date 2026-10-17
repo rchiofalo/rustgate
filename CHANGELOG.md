@@ -144,6 +144,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **quick-xml 0.42 and argon2 0.6.**
+  - quick-xml now types XML names and attribute values as `&str` and validates UTF-8 while reading. The CoT, proto, NFFI, missions, guard and admin parsers are migrated; attribute values are still handled as raw, escaped text.
+  - The masking paths keep re-emitted attribute values escaped exactly once.
+  - New regression tests cover two things: a second classification marking hidden behind invalid UTF-8 is still denied on the HighToLow boundary, and re-emitted attributes are not double-escaped.
+  - argon2 0.6 derives byte-identical archive keys. A new known-answer test pins the derived key so passphrase-encrypted archives stay decryptable across upgrades.
+
 - **Major dependency updates.**
   - RustCrypto moves to its current generation: sha1/sha2 0.11, hmac/hkdf 0.13, chacha20poly1305 0.11, and rand 0.10.
   - Also updated: async-nats 0.50, kube 4.2, spiffe 0.18, mdns-sd 0.21, rustdds 0.14 with ros2-client 0.11, rstar 0.13, toml_edit 0.25, and serial_test 4.

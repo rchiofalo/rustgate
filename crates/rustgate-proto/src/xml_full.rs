@@ -173,9 +173,9 @@ pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
             Event::Eof => break,
 
             Event::Start(ref e) => match e.name().as_ref() {
-                b"event" => parse_event_attrs(e, &mut event)?,
-                b"point" => parse_point_attrs(e, &mut event)?,
-                b"detail" => in_detail = true,
+                "event" => parse_event_attrs(e, &mut event)?,
+                "point" => parse_point_attrs(e, &mut event)?,
+                "detail" => in_detail = true,
                 tag if in_detail => {
                     if is_known_detail(tag) {
                         parse_known_start(tag, e, &mut reader, &mut event)?;
@@ -195,8 +195,8 @@ pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
             },
 
             Event::Empty(ref e) => match e.name().as_ref() {
-                b"event" => parse_event_attrs(e, &mut event)?,
-                b"point" => parse_point_attrs(e, &mut event)?,
+                "event" => parse_event_attrs(e, &mut event)?,
+                "point" => parse_point_attrs(e, &mut event)?,
                 tag if in_detail => {
                     if is_known_detail(tag) {
                         parse_known_empty(tag, e, &mut event);
@@ -211,7 +211,7 @@ pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
                 _ => {}
             },
 
-            Event::End(ref e) if e.name().as_ref() == b"detail" => {
+            Event::End(ref e) if e.name().as_ref() == "detail" => {
                 in_detail = false;
             }
 
@@ -233,21 +233,21 @@ pub fn parse_full(xml: &[u8]) -> Result<FullCotEvent, ProtoError> {
     Ok(event)
 }
 
-fn is_known_detail(tag: &[u8]) -> bool {
+fn is_known_detail(tag: &str) -> bool {
     matches!(
         tag,
-        b"contact"
-            | b"__group"
-            | b"precisionlocation"
-            | b"status"
-            | b"takv"
-            | b"track"
-            | b"link"
-            | b"remarks"
-            | b"color"
-            | b"labels"
-            | b"usericon"
-            | b"marti"
+        "contact"
+            | "__group"
+            | "precisionlocation"
+            | "status"
+            | "takv"
+            | "track"
+            | "link"
+            | "remarks"
+            | "color"
+            | "labels"
+            | "usericon"
+            | "marti"
     )
 }
 
@@ -256,27 +256,27 @@ fn parse_event_attrs(
     event: &mut FullCotEvent,
 ) -> Result<(), ProtoError> {
     for attr in e.attributes().flatten() {
-        let value = String::from_utf8_lossy(&attr.value).into_owned();
+        let value = attr.value.to_string();
         match attr.key.as_ref() {
-            b"version" => event.version = value,
-            b"uid" => event.uid = value,
-            b"type" => event.event_type = value,
-            b"how" => event.how = value,
-            b"time" => {
+            "version" => event.version = value,
+            "uid" => event.uid = value,
+            "type" => event.event_type = value,
+            "how" => event.how = value,
+            "time" => {
                 validate_timestamp("time", &value)?;
                 event.time = value;
             }
-            b"start" => {
+            "start" => {
                 validate_timestamp("start", &value)?;
                 event.start = value;
             }
-            b"stale" => {
+            "stale" => {
                 validate_timestamp("stale", &value)?;
                 event.stale = value;
             }
-            b"access" => event.access = value,
-            b"qos" => event.qos = value,
-            b"opex" => event.opex = value,
+            "access" => event.access = value,
+            "qos" => event.qos = value,
+            "opex" => event.opex = value,
             _ => {}
         }
     }
@@ -312,21 +312,21 @@ fn parse_point_attrs(
     event: &mut FullCotEvent,
 ) -> Result<(), ProtoError> {
     for attr in e.attributes().flatten() {
-        let value_str = String::from_utf8_lossy(&attr.value);
+        let value_str = attr.value.clone();
         match attr.key.as_ref() {
-            b"lat" => {
+            "lat" => {
                 let v = parse_f64(&value_str)?;
                 check_range("lat", v, -90.0, 90.0)?;
                 event.lat = v;
             }
-            b"lon" => {
+            "lon" => {
                 let v = parse_f64(&value_str)?;
                 check_range("lon", v, -180.0, 180.0)?;
                 event.lon = v;
             }
-            b"hae" => event.hae = parse_f64(&value_str)?,
-            b"ce" => event.ce = parse_f64(&value_str)?,
-            b"le" => event.le = parse_f64(&value_str)?,
+            "hae" => event.hae = parse_f64(&value_str)?,
+            "ce" => event.ce = parse_f64(&value_str)?,
+            "le" => event.le = parse_f64(&value_str)?,
             _ => {}
         }
     }
@@ -350,66 +350,66 @@ fn check_range(field: &'static str, value: f64, min: f64, max: f64) -> Result<()
 
 /// Parse a known detail child element that was a Start event (has children).
 fn parse_known_start(
-    tag: &[u8],
+    tag: &str,
     e: &quick_xml::events::BytesStart<'_>,
     reader: &mut Reader<&[u8]>,
     event: &mut FullCotEvent,
 ) -> Result<(), ProtoError> {
     match tag {
-        b"contact" => {
+        "contact" => {
             event.contact = Some(parse_contact(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"__group" => {
+        "__group" => {
             event.group = Some(parse_group(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"precisionlocation" => {
+        "precisionlocation" => {
             event.precision_location = Some(parse_precision_location(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"status" => {
+        "status" => {
             event.status = Some(parse_status(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"takv" => {
+        "takv" => {
             event.takv = Some(parse_takv(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"track" => {
+        "track" => {
             event.track = Some(parse_track(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"link" => {
+        "link" => {
             event.link.push(parse_link(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"remarks" => {
+        "remarks" => {
             event.remarks = Some(parse_remarks_start(e, reader)?);
         }
-        b"color" => {
+        "color" => {
             event.color = Some(parse_color(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"labels" => {
+        "labels" => {
             event.labels = Some(parse_labels(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"usericon" => {
+        "usericon" => {
             event.usericon = Some(parse_usericon(e));
             let mut skip_buf = Vec::new();
             let _ = reader.read_to_end_into(e.to_end().name(), &mut skip_buf)?;
         }
-        b"marti" => {
+        "marti" => {
             event.marti = Some(parse_marti_start(e, reader)?);
         }
         _ => {
@@ -421,22 +421,22 @@ fn parse_known_start(
 }
 
 /// Parse a known detail child element that was an Empty event (self-closing).
-fn parse_known_empty(tag: &[u8], e: &quick_xml::events::BytesStart<'_>, event: &mut FullCotEvent) {
+fn parse_known_empty(tag: &str, e: &quick_xml::events::BytesStart<'_>, event: &mut FullCotEvent) {
     match tag {
-        b"contact" => event.contact = Some(parse_contact(e)),
-        b"__group" => event.group = Some(parse_group(e)),
-        b"precisionlocation" => event.precision_location = Some(parse_precision_location(e)),
-        b"status" => event.status = Some(parse_status(e)),
-        b"takv" => event.takv = Some(parse_takv(e)),
-        b"track" => event.track = Some(parse_track(e)),
-        b"link" => event.link.push(parse_link(e)),
-        b"remarks" => {
+        "contact" => event.contact = Some(parse_contact(e)),
+        "__group" => event.group = Some(parse_group(e)),
+        "precisionlocation" => event.precision_location = Some(parse_precision_location(e)),
+        "status" => event.status = Some(parse_status(e)),
+        "takv" => event.takv = Some(parse_takv(e)),
+        "track" => event.track = Some(parse_track(e)),
+        "link" => event.link.push(parse_link(e)),
+        "remarks" => {
             event.remarks = Some(parse_remarks_empty(e));
         }
-        b"color" => event.color = Some(parse_color(e)),
-        b"labels" => event.labels = Some(parse_labels(e)),
-        b"usericon" => event.usericon = Some(parse_usericon(e)),
-        b"marti" => {
+        "color" => event.color = Some(parse_color(e)),
+        "labels" => event.labels = Some(parse_labels(e)),
+        "usericon" => event.usericon = Some(parse_usericon(e)),
+        "marti" => {
             event.marti = Some(MartiDetail {
                 dest_callsigns: Vec::new(),
             });
@@ -448,10 +448,10 @@ fn parse_known_empty(tag: &[u8], e: &quick_xml::events::BytesStart<'_>, event: &
 fn parse_contact(e: &quick_xml::events::BytesStart<'_>) -> ContactDetail {
     let mut detail = ContactDetail::default();
     for attr in e.attributes().flatten() {
-        let value = String::from_utf8_lossy(&attr.value).into_owned();
+        let value = attr.value.to_string();
         match attr.key.as_ref() {
-            b"endpoint" => detail.endpoint = value,
-            b"callsign" => detail.callsign = value,
+            "endpoint" => detail.endpoint = value,
+            "callsign" => detail.callsign = value,
             _ => {}
         }
     }
@@ -461,10 +461,10 @@ fn parse_contact(e: &quick_xml::events::BytesStart<'_>) -> ContactDetail {
 fn parse_group(e: &quick_xml::events::BytesStart<'_>) -> GroupDetail {
     let mut detail = GroupDetail::default();
     for attr in e.attributes().flatten() {
-        let value = String::from_utf8_lossy(&attr.value).into_owned();
+        let value = attr.value.to_string();
         match attr.key.as_ref() {
-            b"name" => detail.name = value,
-            b"role" => detail.role = value,
+            "name" => detail.name = value,
+            "role" => detail.role = value,
             _ => {}
         }
     }
@@ -474,10 +474,10 @@ fn parse_group(e: &quick_xml::events::BytesStart<'_>) -> GroupDetail {
 fn parse_precision_location(e: &quick_xml::events::BytesStart<'_>) -> PrecisionLocationDetail {
     let mut detail = PrecisionLocationDetail::default();
     for attr in e.attributes().flatten() {
-        let value = String::from_utf8_lossy(&attr.value).into_owned();
+        let value = attr.value.to_string();
         match attr.key.as_ref() {
-            b"geopointsrc" => detail.geopointsrc = value,
-            b"altsrc" => detail.altsrc = value,
+            "geopointsrc" => detail.geopointsrc = value,
+            "altsrc" => detail.altsrc = value,
             _ => {}
         }
     }
@@ -487,8 +487,8 @@ fn parse_precision_location(e: &quick_xml::events::BytesStart<'_>) -> PrecisionL
 fn parse_status(e: &quick_xml::events::BytesStart<'_>) -> StatusDetail {
     let mut detail = StatusDetail::default();
     for attr in e.attributes().flatten() {
-        let value_str = String::from_utf8_lossy(&attr.value);
-        if attr.key.as_ref() == b"battery" {
+        let value_str = attr.value.clone();
+        if attr.key.as_ref() == "battery" {
             detail.battery = value_str.parse().unwrap_or(0);
         }
     }
@@ -498,12 +498,12 @@ fn parse_status(e: &quick_xml::events::BytesStart<'_>) -> StatusDetail {
 fn parse_takv(e: &quick_xml::events::BytesStart<'_>) -> TakvDetail {
     let mut detail = TakvDetail::default();
     for attr in e.attributes().flatten() {
-        let value = String::from_utf8_lossy(&attr.value).into_owned();
+        let value = attr.value.to_string();
         match attr.key.as_ref() {
-            b"device" => detail.device = value,
-            b"platform" => detail.platform = value,
-            b"os" => detail.os = value,
-            b"version" => detail.version = value,
+            "device" => detail.device = value,
+            "platform" => detail.platform = value,
+            "os" => detail.os = value,
+            "version" => detail.version = value,
             _ => {}
         }
     }
@@ -513,10 +513,10 @@ fn parse_takv(e: &quick_xml::events::BytesStart<'_>) -> TakvDetail {
 fn parse_track(e: &quick_xml::events::BytesStart<'_>) -> TrackDetail {
     let mut detail = TrackDetail::default();
     for attr in e.attributes().flatten() {
-        let value_str = String::from_utf8_lossy(&attr.value);
+        let value_str = attr.value.clone();
         match attr.key.as_ref() {
-            b"speed" => detail.speed = value_str.parse().unwrap_or(0.0),
-            b"course" => detail.course = value_str.parse().unwrap_or(0.0),
+            "speed" => detail.speed = value_str.parse().unwrap_or(0.0),
+            "course" => detail.course = value_str.parse().unwrap_or(0.0),
             _ => {}
         }
     }
@@ -530,13 +530,13 @@ fn parse_link(e: &quick_xml::events::BytesStart<'_>) -> LinkDetail {
     let mut parent_callsign = None;
     let mut production_time = None;
     for attr in e.attributes().flatten() {
-        let value = String::from_utf8_lossy(&attr.value).into_owned();
+        let value = attr.value.to_string();
         match attr.key.as_ref() {
-            b"relation" => relation = value,
-            b"type" => link_type = value,
-            b"uid" => uid = value,
-            b"parent_callsign" => parent_callsign = Some(value),
-            b"production_time" => production_time = Some(value),
+            "relation" => relation = value,
+            "type" => link_type = value,
+            "uid" => uid = value,
+            "parent_callsign" => parent_callsign = Some(value),
+            "production_time" => production_time = Some(value),
             _ => {}
         }
     }
@@ -557,10 +557,10 @@ fn parse_remarks_start(
     let mut source = None;
     let mut timestamp = None;
     for attr in e.attributes().flatten() {
-        let value = String::from_utf8_lossy(&attr.value).into_owned();
+        let value = attr.value.to_string();
         match attr.key.as_ref() {
-            b"source" => source = Some(value),
-            b"time" => timestamp = Some(value),
+            "source" => source = Some(value),
+            "time" => timestamp = Some(value),
             _ => {}
         }
     }
@@ -578,9 +578,9 @@ fn parse_remarks_start(
                         max: MAX_XML_DETAIL_BYTES,
                     });
                 }
-                text_buf.extend_from_slice(t.as_ref());
+                text_buf.extend_from_slice(t.as_ref().as_bytes());
             }
-            Event::End(ref end) if end.name().as_ref() == b"remarks" => break,
+            Event::End(ref end) if end.name().as_ref() == "remarks" => break,
             Event::Eof => break,
             _ => {}
         }
@@ -599,10 +599,10 @@ fn parse_remarks_empty(e: &quick_xml::events::BytesStart<'_>) -> RemarksDetail {
     let mut source = None;
     let mut timestamp = None;
     for attr in e.attributes().flatten() {
-        let value = String::from_utf8_lossy(&attr.value).into_owned();
+        let value = attr.value.to_string();
         match attr.key.as_ref() {
-            b"source" => source = Some(value),
-            b"time" => timestamp = Some(value),
+            "source" => source = Some(value),
+            "time" => timestamp = Some(value),
             _ => {}
         }
     }
@@ -616,8 +616,8 @@ fn parse_remarks_empty(e: &quick_xml::events::BytesStart<'_>) -> RemarksDetail {
 fn parse_color(e: &quick_xml::events::BytesStart<'_>) -> ColorDetail {
     let mut argb = None;
     for attr in e.attributes().flatten() {
-        if attr.key.as_ref() == b"argb" {
-            let value_str = String::from_utf8_lossy(&attr.value);
+        if attr.key.as_ref() == "argb" {
+            let value_str = attr.value.clone();
             argb = value_str.parse().ok();
         }
     }
@@ -627,8 +627,8 @@ fn parse_color(e: &quick_xml::events::BytesStart<'_>) -> ColorDetail {
 fn parse_labels(e: &quick_xml::events::BytesStart<'_>) -> LabelsDetail {
     let mut value = String::new();
     for attr in e.attributes().flatten() {
-        if attr.key.as_ref() == b"value" {
-            value = String::from_utf8_lossy(&attr.value).into_owned();
+        if attr.key.as_ref() == "value" {
+            value = attr.value.to_string();
         }
     }
     LabelsDetail { value }
@@ -637,8 +637,8 @@ fn parse_labels(e: &quick_xml::events::BytesStart<'_>) -> LabelsDetail {
 fn parse_usericon(e: &quick_xml::events::BytesStart<'_>) -> UserIconDetail {
     let mut iconsetpath = String::new();
     for attr in e.attributes().flatten() {
-        if attr.key.as_ref() == b"iconsetpath" {
-            iconsetpath = String::from_utf8_lossy(&attr.value).into_owned();
+        if attr.key.as_ref() == "iconsetpath" {
+            iconsetpath = attr.value.to_string();
         }
     }
     UserIconDetail { iconsetpath }
@@ -655,17 +655,17 @@ fn parse_marti_start(
     loop {
         inner_buf.clear();
         match reader.read_event_into(&mut inner_buf)? {
-            Event::Empty(ref child) if child.name().as_ref() == b"dest" => {
+            Event::Empty(ref child) if child.name().as_ref() == "dest" => {
                 if dest_callsigns.len() >= MAX_MARTI_DESTINATIONS {
                     continue;
                 }
                 for attr in child.attributes().flatten() {
-                    if attr.key.as_ref() == b"callsign" {
-                        dest_callsigns.push(String::from_utf8_lossy(&attr.value).into_owned());
+                    if attr.key.as_ref() == "callsign" {
+                        dest_callsigns.push(attr.value.to_string());
                     }
                 }
             }
-            Event::End(ref end) if end.name().as_ref() == b"marti" => break,
+            Event::End(ref end) if end.name().as_ref() == "marti" => break,
             Event::Eof => break,
             _ => {}
         }
@@ -684,15 +684,15 @@ fn capture_unknown_start(
     xml_detail_buf.push(b'>');
 
     // Read inner content until matching end tag
-    let end_name = e.to_end().name().into_inner().to_vec();
+    let end_name = e.to_end().name().into_inner().to_owned();
     let mut inner_buf = Vec::new();
     loop {
         inner_buf.clear();
         let ev = reader.read_event_into(&mut inner_buf)?;
         match &ev {
-            Event::End(end) if end.name().as_ref() == end_name.as_slice() => {
+            Event::End(end) if end.name().as_ref() == end_name.as_str() => {
                 xml_detail_buf.extend_from_slice(b"</");
-                xml_detail_buf.extend_from_slice(&end_name);
+                xml_detail_buf.extend_from_slice(end_name.as_bytes());
                 xml_detail_buf.push(b'>');
                 break;
             }
@@ -712,12 +712,12 @@ fn capture_unknown_empty(e: &quick_xml::events::BytesStart<'_>, xml_detail_buf: 
 /// Write the opening tag name and attributes (without > or />).
 fn write_opening_tag(e: &quick_xml::events::BytesStart<'_>, buf: &mut Vec<u8>) {
     buf.push(b'<');
-    buf.extend_from_slice(e.name().as_ref());
+    buf.extend_from_slice(e.name().as_ref().as_bytes());
     for attr in e.attributes().flatten() {
         buf.push(b' ');
-        buf.extend_from_slice(attr.key.as_ref());
+        buf.extend_from_slice(attr.key.as_ref().as_bytes());
         buf.extend_from_slice(b"=\"");
-        buf.extend_from_slice(&attr.value);
+        buf.extend_from_slice(attr.value.as_bytes());
         buf.push(b'"');
     }
 }
@@ -731,7 +731,7 @@ fn write_event_to_buf(ev: &Event<'_>, buf: &mut Vec<u8>) {
         }
         Event::End(e) => {
             buf.extend_from_slice(b"</");
-            buf.extend_from_slice(e.name().as_ref());
+            buf.extend_from_slice(e.name().as_ref().as_bytes());
             buf.push(b'>');
         }
         Event::Empty(e) => {
@@ -739,16 +739,16 @@ fn write_event_to_buf(ev: &Event<'_>, buf: &mut Vec<u8>) {
             buf.extend_from_slice(b"/>");
         }
         Event::Text(e) => {
-            buf.extend_from_slice(e.as_ref());
+            buf.extend_from_slice(e.as_ref().as_bytes());
         }
         Event::CData(e) => {
             buf.extend_from_slice(b"<![CDATA[");
-            buf.extend_from_slice(e.as_ref());
+            buf.extend_from_slice(e.as_ref().as_bytes());
             buf.extend_from_slice(b"]]>");
         }
         Event::Comment(e) => {
             buf.extend_from_slice(b"<!--");
-            buf.extend_from_slice(e.as_ref());
+            buf.extend_from_slice(e.as_ref().as_bytes());
             buf.extend_from_slice(b"-->");
         }
         _ => {}

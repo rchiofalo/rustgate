@@ -346,7 +346,7 @@ mod tests {
         loop {
             let event = reader.read_event_into(&mut buf).expect("valid XML");
             match event {
-                quick_xml::events::Event::Start(e) if e.name().as_ref() == b"event" => {
+                quick_xml::events::Event::Start(e) if e.name().as_ref() == "event" => {
                     found_event = true;
                 }
                 quick_xml::events::Event::Eof => break,

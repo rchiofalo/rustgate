@@ -2918,6 +2918,34 @@ mod tests {
             assert_eq!(key_a.len(), 32);
         }
 
+        // 1b. Argon2id known-answer test. Archives encrypted under a
+        //     passphrase must stay decryptable across argon2 crate
+        //     upgrades, so the derived key is pinned to a fixed value
+        //     (computed with argon2 0.5.3 and unchanged in 0.6).
+        #[test]
+        fn argon2id_derivation_matches_known_answer() {
+            let json = format!(
+                r#"{{
+                    "active_key_id": "k1",
+                    "key_derivations": {{
+                        "k1": {{
+                            "kdf": "argon2id",
+                            "ikm": "{TEST_IKM_HEX}",
+                            "salt": "{TEST_SALT_HEX}",
+                            "params": {{ "m_cost_kib": 64, "t_cost": 1, "p_cost": 1 }}
+                        }}
+                    }}
+                }}"#
+            );
+            let ring = KeyRing::from_bytes(json.as_bytes()).expect("ring");
+            let key = ring.active_key().expect("key");
+            let got = hex::encode(**key);
+            assert_eq!(
+                got,
+                "74890da11d72273538e38e6cadff2d6d220ba32235530bdf16cd0928842e5da1"
+            );
+        }
+
         // 2. HKDF-SHA256 — known-answer test.
         //    The pre-existing `hkdf_sha256_matches_rfc_5869_test_case_3`
         //    test in `key_derivation::tests` already pins the RFC 5869
