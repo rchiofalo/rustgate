@@ -221,9 +221,18 @@ impl WireEvent {
             None => format_rfc3339(now + Duration::from_secs(300)),
         };
 
-        let (lat, lon, hae) = match &cot.position {
-            Some(pos) => (pos.lat, pos.lon, pos.hae),
-            None => (0.0, 0.0, 0.0),
+        // Carry the sender's ce/le so `is_position_unknown` can see the
+        // unknown-position sentinel. When a report omits them, keep the
+        // historical defaults (50 m / 30 m).
+        let (lat, lon, hae, ce, le) = match &cot.position {
+            Some(pos) => (
+                pos.lat,
+                pos.lon,
+                pos.hae,
+                pos.ce.unwrap_or(DEFAULT_CE),
+                pos.le.unwrap_or(DEFAULT_LE),
+            ),
+            None => (0.0, 0.0, 0.0, DEFAULT_CE, DEFAULT_LE),
         };
 
         Self {
@@ -241,8 +250,8 @@ impl WireEvent {
                 lat,
                 lon,
                 hae,
-                ce: 50.0,
-                le: 30.0,
+                ce,
+                le,
             },
             detail: None,
         }
@@ -408,6 +417,11 @@ impl WireEvent {
         self.point.ce >= UNKNOWN_POSITION_ERROR && self.point.le >= UNKNOWN_POSITION_ERROR
     }
 }
+
+/// `ce` (metres) emitted by [`WireEvent::from_cot`] when the report carries none.
+const DEFAULT_CE: f64 = 50.0;
+/// `le` (metres) emitted by [`WireEvent::from_cot`] when the report carries none.
+const DEFAULT_LE: f64 = 30.0;
 
 /// Threshold (meters) above which `ce`/`le` are treated as "position unknown".
 ///
@@ -895,6 +909,8 @@ mod tests {
                 lat: 1.0,
                 lon: 2.0,
                 hae: 3.0,
+                ce: None,
+                le: None,
             }),
             ttl: None,
             source_group: None,
@@ -909,6 +925,26 @@ mod tests {
         assert!((wire.point.lon - 2.0).abs() < f64::EPSILON);
         assert!((wire.point.hae - 3.0).abs() < f64::EPSILON);
         assert!(wire.detail.is_none(), "from_cot must not invent details");
+    }
+
+    #[test]
+    fn from_cot_carries_parsed_ce_le_so_unknown_positions_are_detected() {
+        // The basic parser path used to hard-code ce/le, so a report marked
+        // "position unknown" (ce/le sentinel) was published with 50 m / 30 m
+        // accuracy instead of being filtered.
+        let xml = br#"<event version="2.0" uid="u1" type="a-f-G-U-C" time="2026-01-01T00:00:00Z" start="2026-01-01T00:00:00Z" stale="2026-01-01T00:05:00Z" how="m-g"><point lat="37.0" lon="-122.0" hae="0" ce="9999999" le="9999999"/><detail/></event>"#;
+        let cot = rustgate_cot::parse(xml).expect("parse unknown-position CoT");
+        let wire = WireEvent::from_cot(&cot);
+        assert!((wire.point.ce - 9_999_999.0).abs() < f64::EPSILON);
+        assert!((wire.point.le - 9_999_999.0).abs() < f64::EPSILON);
+        assert!(wire.is_position_unknown());
+
+        let known = br#"<event version="2.0" uid="u2" type="a-f-G-U-C" time="2026-01-01T00:00:00Z" start="2026-01-01T00:00:00Z" stale="2026-01-01T00:05:00Z" how="m-g"><point lat="37.0" lon="-122.0" hae="0" ce="12.5" le="4"/><detail/></event>"#;
+        let wire =
+            WireEvent::from_cot(&rustgate_cot::parse(known).expect("parse known-position CoT"));
+        assert!((wire.point.ce - 12.5).abs() < f64::EPSILON);
+        assert!((wire.point.le - 4.0).abs() < f64::EPSILON);
+        assert!(!wire.is_position_unknown());
     }
 
     #[test]
