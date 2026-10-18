@@ -105,10 +105,12 @@ liveness.
   among those the client presented that is on some issuer path from the leaf
   (`chain_revocation_keys`, at most 32), so revoking an intermediate evicts
   the leaves under it. A certificate counts only when its key verifies the
-  signature of one already on a path; the search follows every branch, so
-  neither same-named padding nor a self-signed twin minted with the
-  intermediate's key can hide the copy that chains to the anchor. Signature
-  verifications are capped at 100, webpki's per-handshake budget. Recording
+  signature of one already on a path, and the search follows every branch.
+  It is capped at 100 signature verifications (webpki's per-handshake
+  budget) and 32 recorded certificates; a chain that hits either cap is
+  rejected at connect rather than recorded partially, so same-named padding
+  or self-signed twins minted with the intermediate's key cannot hide the
+  copy that chains to the anchor. Byte-identical repeats are ignored. Recording
   every branch is fail-closed: a session with a valid alternate path through
   a revoked certificate (e.g. a cross-signed intermediate) is evicted too.
   Intermediates configured as trust anchors in `--ca` rather than sent by the

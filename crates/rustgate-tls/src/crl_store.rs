@@ -513,6 +513,43 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_beyond_the_search_limits_is_rejected_not_recorded_partially() {
+        let ca = TestCa::new("Sweep CA");
+        let leaf = ca.issue_client_cert_with_serial("alice", &[0x51]);
+        let leaf_der = rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0);
+        let real = rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0);
+
+        // Too many certificates that really verify (twins minted with the
+        // CA key) to record them all.
+        let mut twins = vec![leaf_der.clone()];
+        for i in 0..40u8 {
+            twins.push(
+                rustgate_test_utils::tls::parse_certs(&ca.self_signed_twin("Sweep CA", &[0x60, i]))
+                    .remove(0),
+            );
+        }
+        twins.push(real.clone());
+        assert!(crate::extract::extract_identity_with_chain(&twins).is_err());
+
+        // Too many same-named impostors to verify within the budget.
+        let mut impostors = vec![leaf_der.clone()];
+        for _ in 0..120 {
+            impostors.push(
+                rustgate_test_utils::tls::parse_certs(&TestCa::new("Sweep CA").cert_pem).remove(0),
+            );
+        }
+        impostors.push(real.clone());
+        assert!(crate::extract::extract_identity_with_chain(&impostors).is_err());
+
+        // Repeating the real chain many times costs nothing extra.
+        let mut repeated = vec![leaf_der];
+        repeated.extend(std::iter::repeat_n(real, 50));
+        let identity = crate::extract::extract_identity_with_chain(&repeated).unwrap();
+        let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
+        assert!(store.revoked_set().is_revoked(&identity));
+    }
+
+    #[test]
     fn revoked_set_is_issuer_scoped_and_follows_reloads() {
         let ca = TestCa::new("Sweep CA");
         let other = TestCa::new("Other CA");

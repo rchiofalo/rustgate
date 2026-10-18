@@ -52,15 +52,27 @@ const MAX_PATH_SIGNATURE_CHECKS: usize = 100;
 ///
 /// The client controls which extra certificates it sends and in what order,
 /// so a certificate is recorded only when its key verifies the signature of a
-/// certificate already on a path. Every such branch is followed, so neither
-/// padding nor a self-signed twin of an intermediate can hide the copy that
-/// chains to the trust anchor. A session with a valid alternate path through
-/// a revoked certificate is evicted too (fail-closed).
+/// certificate already on a path, and every such branch is followed. The
+/// search is complete within its limits (100 signature verifications, 32
+/// recorded certificates); a chain that exceeds them is rejected
+/// rather than recorded partially, so padding or self-signed twins cannot
+/// hide the copy of an intermediate that chains to the trust anchor. A
+/// session with a valid alternate path through a revoked certificate is
+/// evicted too (fail-closed).
+///
+/// # Errors
+///
+/// Fails like [`extract_identity`], and when the chain exceeds the search
+/// limits.
 pub fn extract_identity_with_chain(chain: &[CertificateDer<'_>]) -> Result<Identity> {
     let leaf = chain.first().ok_or(TransportError::EmptyCertChain)?;
     let identity = extract_identity(leaf)?;
 
-    let keys = issuer_path_keys(chain);
+    let keys = issuer_path_keys(chain).ok_or_else(|| {
+        RustgateError::from(TransportError::Other(
+            "client certificate chain is too large to check for revocation".to_string(),
+        ))
+    })?;
     if keys.is_empty() {
         return Ok(identity);
     }
@@ -75,18 +87,23 @@ pub fn extract_identity_with_chain(chain: &[CertificateDer<'_>]) -> Result<Ident
 /// Breadth-first search up from the leaf through the presented
 /// certificates. A certificate joins the search when its subject is the
 /// issuer of a certificate already found and its key verifies that
-/// certificate's signature. Returns the revocation key of each one found.
-fn issuer_path_keys(chain: &[CertificateDer<'_>]) -> Vec<String> {
+/// certificate's signature. Returns the revocation key of each one found, or
+/// `None` when the search hit a limit before it finished.
+fn issuer_path_keys(chain: &[CertificateDer<'_>]) -> Option<Vec<String>> {
     let Some(provider) = rustls::crypto::CryptoProvider::get_default() else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let algs = provider.signature_verification_algorithms.all;
     let Some(Ok((_, leaf))) = chain.first().map(|d| X509Certificate::from_der(d.as_ref())) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
+    // Byte-identical copies add nothing; drop them so a client that repeats
+    // a certificate is not charged for it.
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
     let pool: Vec<X509Certificate<'_>> = chain
         .iter()
         .skip(1)
+        .filter(|&d| seen.insert(d.as_ref()))
         .filter_map(|d| X509Certificate::from_der(d.as_ref()).ok().map(|(_, c)| c))
         .collect();
 
@@ -102,7 +119,7 @@ fn issuer_path_keys(chain: &[CertificateDer<'_>]) -> Vec<String> {
             match signed_by(current, candidate, algs, &mut budget) {
                 Some(true) => {}
                 Some(false) => continue,
-                None => return keys,
+                None => return None,
             }
             found[i] = true;
             if let Some(issuer) = first_issuer_cn(candidate) {
@@ -110,14 +127,14 @@ fn issuer_path_keys(chain: &[CertificateDer<'_>]) -> Vec<String> {
                     &revocation::canonical_issuer(&issuer),
                     &revocation::serial_hex(&candidate.tbs_certificate.serial.to_bytes_be()),
                 ));
-                if keys.len() >= MAX_CHAIN_REVOCATION_KEYS {
-                    return keys;
+                if keys.len() > MAX_CHAIN_REVOCATION_KEYS {
+                    return None;
                 }
             }
             queue.push_back(candidate);
         }
     }
-    keys
+    Some(keys)
 }
 
 /// Whether `issuer`'s key verifies `child`'s signature, trying the installed
