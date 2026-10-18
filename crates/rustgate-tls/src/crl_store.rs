@@ -494,6 +494,25 @@ mod tests {
     }
 
     #[test]
+    fn a_self_signed_twin_does_not_hide_the_real_issuer() {
+        // Someone holding the CA key mints a self-signed twin with the same
+        // name and key and sends it before the real CA certificate. The twin
+        // verifies the leaf, but the search must keep going and record the
+        // real certificate too, so revoking it still evicts the session.
+        let ca = TestCa::new("Sweep CA");
+        let leaf = ca.issue_client_cert_with_serial("alice", &[0x41]);
+        let chain = [
+            rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0),
+            rustgate_test_utils::tls::parse_certs(&ca.self_signed_twin("Sweep CA", &[0x7e]))
+                .remove(0),
+            rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
+        ];
+        let identity = crate::extract::extract_identity_with_chain(&chain).unwrap();
+        let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
+        assert!(store.revoked_set().is_revoked(&identity));
+    }
+
+    #[test]
     fn revoked_set_is_issuer_scoped_and_follows_reloads() {
         let ca = TestCa::new("Sweep CA");
         let other = TestCa::new("Other CA");

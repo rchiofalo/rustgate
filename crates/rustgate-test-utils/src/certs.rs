@@ -90,6 +90,24 @@ impl TestCa {
         }
     }
 
+    /// A self-signed certificate with this CA's name and key but a different
+    /// serial: what someone holding the CA's private key could mint. Used by
+    /// revocation tests where a client inserts such a twin into its chain.
+    pub fn self_signed_twin(&self, cn: &str, serial: &[u8]) -> String {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        params.distinguished_name = dn;
+        params.serial_number = Some(SerialNumber::from_slice(serial));
+        let key_pair = KeyPair::from_pem(&self.key_pem).expect("failed to load CA key");
+        params
+            .self_signed(&key_pair)
+            .expect("failed to self-sign twin")
+            .pem()
+    }
+
     /// Issue a server certificate with the given common name and SANs.
     pub fn issue_server_cert(&self, cn: &str, san_dns: &[&str]) -> TestCert {
         let key_pair = KeyPair::generate().expect("failed to generate key pair");

@@ -101,14 +101,18 @@ liveness.
   with the same certificate displaces an older one that stays connected. The
   router also keeps every live session by id, and the sweep reads that set, so
   displaced sessions are evicted too.
-- Each session also records the `(issuer, serial)` of each CA certificate on
-  the leaf's issuer path among those the client presented
-  (`chain_revocation_keys`), so revoking an intermediate evicts the leaves
-  under it. The path is rebuilt by checking that each certificate's key
-  verifies the previous one's signature (at most 100 checks, webpki's own
-  budget), so a client cannot hide its real intermediate by padding the chain
-  with same-named certificates. Intermediates configured as trust anchors in
-  `--ca` rather than sent by the client are not covered.
+- Each session also records the `(issuer, serial)` of every CA certificate
+  among those the client presented that is on some issuer path from the leaf
+  (`chain_revocation_keys`, at most 32), so revoking an intermediate evicts
+  the leaves under it. A certificate counts only when its key verifies the
+  signature of one already on a path; the search follows every branch, so
+  neither same-named padding nor a self-signed twin minted with the
+  intermediate's key can hide the copy that chains to the anchor. Signature
+  verifications are capped at 100, webpki's per-handshake budget. Recording
+  every branch is fail-closed: a session with a valid alternate path through
+  a revoked certificate (e.g. a cross-signed intermediate) is evicted too.
+  Intermediates configured as trust anchors in `--ca` rather than sent by the
+  client are not covered.
 - Matching uses the issuer CN, not the full issuer name or key identifier, so
   two CAs with the same CN and overlapping serials are not told apart. An
   issuer CN that is not a plain string type (e.g. BMPString) yields no key and
