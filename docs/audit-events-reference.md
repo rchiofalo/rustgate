@@ -183,7 +183,7 @@ group memberships they should not have.
 | `federation.event_rejected` | `rpc`, `peer_cn`, `reason`, `action`, `result` | Inbound V2 unary RPC rejected — security signal. |
 | `federation.group_claim_rejected` | `peer_cn`, `origin_cn`, `claimed_count`, `claimed_groups`, `action`, `result` | Peer claimed `federate_groups` memberships it was not authorised to forward. |
 | `federation.traceparent_invalid` | `peer`, `reason`, `action`, `result` | Malformed W3C `traceparent` header on an inbound gRPC RPC. |
-| `federation.discovered_peer_unpinned` | `peer_id`, `address`, `action="pin_skipped"`, `result="unpinned"` | A peer found by discovery has no trusted CN while strict CN matching is on, so it is validated by chain only. Attach a CN through backend metadata ([ADR 0029](adr/0029-discovered-peer-cn-pinning.md)). |
+| `federation.discovered_peer_unpinned` | `peer_id`, `address`, `action="pin_skipped"`, `result="unpinned"` | A peer found by discovery has no trusted CN while strict CN matching is on, so it is validated by chain only. Attach a CN through backend metadata ([ADR 0029](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0029-discovered-peer-cn-pinning.md)). |
 
 See the [federation-reconnect runbook](runbooks/federation-reconnect.md).
 
@@ -327,7 +327,7 @@ chain.
 | Event | Fields | Purpose |
 |---|---|---|
 | `guard.activated` | `sink`, `direction`, `mandatory_marking`, `action="guard_activate"`, `result="active"` | A cross-domain guard was wired onto an egress leg at startup. |
-| `guard.chain_reset` | `path`, `reason`, `prior_max_seq`, `action="guard_chain_reset"`, `result="chain_break"` | Only with the `audit-chain-fail-open` opt-out: the guard could not read its prior chain tip and restarted the hash chain from genesis, carrying the sequence number forward from `prior_max_seq` ([ADR 0024](adr/0024-guard-fail-closed.md)). |
+| `guard.chain_reset` | `path`, `reason`, `prior_max_seq`, `action="guard_chain_reset"`, `result="chain_break"` | Only with the `audit-chain-fail-open` opt-out: the guard could not read its prior chain tip and restarted the hash chain from genesis, carrying the sequence number forward from `prior_max_seq` ([ADR 0024](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0024-guard-fail-closed.md)). |
 | `guard.rejected` | `cn`, `sink`, `direction`, `reason`, `action="guard_evaluate"`, `result="rejected"` | A message was dropped at the boundary (`reason = rate_limit \| missing_marking \| unauthorized_classification \| audit_error`). |
 
 ## `store_forward` — offline queue
