@@ -46,7 +46,8 @@ const MAX_CHAIN_REVOCATION_KEYS: usize = 32;
 const MAX_PATH_SIGNATURE_CHECKS: usize = 100;
 
 /// Extract identity from a presented chain: the leaf ([`extract_identity`])
-/// plus the `(issuer, serial)` revocation key of every CA certificate that is
+/// plus, once [`enable_chain_revocation_keys`] has been called, the
+/// `(issuer, serial)` revocation key of every CA certificate that is
 /// on some issuer path from the leaf, so the revocation sweep can evict
 /// sessions whose intermediate is revoked (ADR 0025).
 ///
@@ -65,6 +66,29 @@ const MAX_PATH_SIGNATURE_CHECKS: usize = 100;
 /// Fails like [`extract_identity`], and when the chain exceeds the search
 /// limits.
 pub fn extract_identity_with_chain(chain: &[CertificateDer<'_>]) -> Result<Identity> {
+    let leaf = chain.first().ok_or(TransportError::EmptyCertChain)?;
+    if !CHAIN_REVOCATION_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return extract_identity(leaf);
+    }
+    identity_with_chain_keys(chain)
+}
+
+/// Whether [`extract_identity_with_chain`] records chain revocation keys.
+/// Off by default, so the issuer search and its chain-size limits cost
+/// nothing unless the revocation sweep is enabled.
+static CHAIN_REVOCATION_KEYS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Make [`extract_identity_with_chain`] record the issuer-path revocation
+/// keys (and enforce its chain-size limits). The server calls this at
+/// startup when `--revocation-sweep-interval` is set, before any listener
+/// accepts a connection.
+pub fn enable_chain_revocation_keys() {
+    CHAIN_REVOCATION_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`extract_identity_with_chain`] with chain revocation keys always on.
+pub(crate) fn identity_with_chain_keys(chain: &[CertificateDer<'_>]) -> Result<Identity> {
     let leaf = chain.first().ok_or(TransportError::EmptyCertChain)?;
     let identity = extract_identity(leaf)?;
 

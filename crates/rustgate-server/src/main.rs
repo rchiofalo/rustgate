@@ -601,6 +601,12 @@ fn main() -> anyhow::Result<()> {
     rustls::crypto::CryptoProvider::install_default(provider)
         .map_err(|_| anyhow::anyhow!("crypto provider already installed"))?;
 
+    // The revocation sweep matches intermediates too, so sessions must record
+    // their issuer path from the first connection on (ADR 0025).
+    if cli.tls.revocation_sweep_interval > 0 {
+        rustgate_tls::enable_chain_revocation_keys();
+    }
+
     // A `fips` build that is not running the FIPS module is a build problem
     // (e.g. aws-lc-fips-sys did not build its module); refuse to start.
     #[cfg(feature = "fips")]

@@ -458,7 +458,7 @@ mod tests {
             rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0),
             rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
         ];
-        let with_chain = crate::extract::extract_identity_with_chain(&chain).unwrap();
+        let with_chain = crate::extract::identity_with_chain_keys(&chain).unwrap();
         let leaf_only = identity_of(&leaf.cert_pem);
 
         let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
@@ -482,7 +482,7 @@ mod tests {
         }
         chain.push(rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0));
 
-        let identity = crate::extract::extract_identity_with_chain(&chain).unwrap();
+        let identity = crate::extract::identity_with_chain_keys(&chain).unwrap();
         match identity.attributes.get("chain_revocation_keys") {
             Some(rustgate_core::identity::AttrValue::Set(keys)) => {
                 assert_eq!(keys.len(), 1, "only the real issuer is recorded: {keys:?}");
@@ -507,7 +507,7 @@ mod tests {
                 .remove(0),
             rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
         ];
-        let identity = crate::extract::extract_identity_with_chain(&chain).unwrap();
+        let identity = crate::extract::identity_with_chain_keys(&chain).unwrap();
         let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
         assert!(store.revoked_set().is_revoked(&identity));
     }
@@ -529,7 +529,7 @@ mod tests {
             );
         }
         twins.push(real.clone());
-        assert!(crate::extract::extract_identity_with_chain(&twins).is_err());
+        assert!(crate::extract::identity_with_chain_keys(&twins).is_err());
 
         // Too many same-named impostors to verify within the budget.
         let mut impostors = vec![leaf_der.clone()];
@@ -539,14 +539,28 @@ mod tests {
             );
         }
         impostors.push(real.clone());
-        assert!(crate::extract::extract_identity_with_chain(&impostors).is_err());
+        assert!(crate::extract::identity_with_chain_keys(&impostors).is_err());
 
         // Repeating the real chain many times costs nothing extra.
         let mut repeated = vec![leaf_der];
         repeated.extend(std::iter::repeat_n(real, 50));
-        let identity = crate::extract::extract_identity_with_chain(&repeated).unwrap();
+        let identity = crate::extract::identity_with_chain_keys(&repeated).unwrap();
         let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
         assert!(store.revoked_set().is_revoked(&identity));
+    }
+
+    #[test]
+    fn chain_keys_are_off_unless_enabled() {
+        // No test enables the process-wide switch, so the public entry point
+        // must behave exactly like leaf-only extraction.
+        let ca = TestCa::new("Sweep CA");
+        let leaf = ca.issue_client_cert_with_serial("alice", &[0x71]);
+        let chain = [
+            rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0),
+            rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
+        ];
+        let identity = crate::extract::extract_identity_with_chain(&chain).unwrap();
+        assert!(!identity.attributes.contains_key("chain_revocation_keys"));
     }
 
     #[test]

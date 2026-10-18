@@ -56,7 +56,8 @@ pub use config::{
 };
 pub use crl_store::{CrlHealth, CrlHealthObserver, CrlStore};
 pub use extract::{
-    ExpectedKeyUsage, extract_identity, extract_identity_with_chain, validate_key_usage,
+    ExpectedKeyUsage, enable_chain_revocation_keys, extract_identity, extract_identity_with_chain,
+    validate_key_usage,
 };
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
 pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};

@@ -241,6 +241,10 @@ impl TlsListener {
                 Ok(id) => id,
                 Err(e) => {
                     warn!(peer_addr = %peer_addr, error = %e, "identity extraction failed");
+                    rustgate_core::audit::connection_rejected(
+                        peer_addr,
+                        "identity extraction failed",
+                    );
                     return Err(e);
                 }
             };

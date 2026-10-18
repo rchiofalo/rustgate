@@ -110,7 +110,9 @@ liveness.
   budget) and 32 recorded certificates; a chain that hits either cap is
   rejected at connect rather than recorded partially, so same-named padding
   or self-signed twins minted with the intermediate's key cannot hide the
-  copy that chains to the anchor. Byte-identical repeats are ignored. Recording
+  copy that chains to the anchor. Byte-identical repeats are ignored. The
+  search and its limits run only when `--revocation-sweep-interval` is set;
+  otherwise identity extraction is leaf-only, as before. Recording
   every branch is fail-closed: a session with a valid alternate path through
   a revoked certificate (e.g. a cross-signed intermediate) is evicted too.
   Intermediates configured as trust anchors in `--ca` rather than sent by the
