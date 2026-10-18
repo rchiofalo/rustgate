@@ -37,33 +37,28 @@ const MAX_SAN_ENTRIES_PER_CATEGORY: usize = 32;
 /// after each insertion, not per-byte.
 const MAX_ATTR_BAG_BYTES: usize = 4 * 1024;
 
-/// Most intermediate CA certificates recorded per session for revocation
-/// matching. Real chains have one or two; the cap bounds the attribute bag.
+/// Most issuer certificates recorded per session for revocation matching.
+/// Real chains have one or two intermediates.
 const MAX_CHAIN_REVOCATION_KEYS: usize = 8;
 
+/// Most signature checks spent rebuilding the issuer path. Matches webpki's
+/// default signature budget, so a padded chain costs at most what the
+/// handshake verifier already allowed.
+const MAX_PATH_SIGNATURE_CHECKS: usize = 100;
+
 /// Extract identity from a presented chain: the leaf ([`extract_identity`])
-/// plus the `(issuer, serial)` revocation key of each intermediate CA
-/// certificate after it, so the revocation sweep can evict sessions whose
-/// intermediate is revoked (ADR 0025). Intermediates that do not parse or
-/// have no issuer CN are skipped; the handshake verifier has already
-/// validated the chain.
+/// plus the `(issuer, serial)` revocation key of each CA certificate on the
+/// leaf's issuer path, so the revocation sweep can evict sessions whose
+/// intermediate is revoked (ADR 0025).
+///
+/// The client controls which extra certificates it sends and in what order,
+/// so only certificates that really signed the previous link are recorded:
+/// padding the chain cannot push the real intermediate out of the record.
 pub fn extract_identity_with_chain(chain: &[CertificateDer<'_>]) -> Result<Identity> {
     let leaf = chain.first().ok_or(TransportError::EmptyCertChain)?;
     let identity = extract_identity(leaf)?;
 
-    let keys: Vec<String> = chain
-        .iter()
-        .skip(1)
-        .take(MAX_CHAIN_REVOCATION_KEYS)
-        .filter_map(|der| {
-            let (_, cert) = X509Certificate::from_der(der.as_ref()).ok()?;
-            let issuer = first_issuer_cn(&cert)?;
-            Some(revocation::chain_key(
-                &revocation::canonical_issuer(&issuer),
-                &revocation::serial_hex(&cert.tbs_certificate.serial.to_bytes_be()),
-            ))
-        })
-        .collect();
+    let keys = issuer_path_keys(chain);
     if keys.is_empty() {
         return Ok(identity);
     }
@@ -73,6 +68,96 @@ pub fn extract_identity_with_chain(chain: &[CertificateDer<'_>]) -> Result<Ident
         AttrValue::Set(keys),
     );
     Ok(identity.with_attributes(attrs))
+}
+
+/// Walk from the leaf up through the presented certificates, at each step
+/// taking a certificate whose subject is the current issuer and whose key
+/// verifies the current certificate's signature, and return the revocation
+/// key of each certificate on that path.
+fn issuer_path_keys(chain: &[CertificateDer<'_>]) -> Vec<String> {
+    let Some(provider) = rustls::crypto::CryptoProvider::get_default() else {
+        return Vec::new();
+    };
+    let algs = provider.signature_verification_algorithms.all;
+    let Some(Ok((_, leaf))) = chain.first().map(|d| X509Certificate::from_der(d.as_ref())) else {
+        return Vec::new();
+    };
+    let pool: Vec<X509Certificate<'_>> = chain
+        .iter()
+        .skip(1)
+        .filter_map(|d| X509Certificate::from_der(d.as_ref()).ok().map(|(_, c)| c))
+        .collect();
+
+    let mut used = vec![false; pool.len()];
+    let mut checks = 0usize;
+    let mut keys = Vec::new();
+    let mut current = &leaf;
+    while keys.len() < MAX_CHAIN_REVOCATION_KEYS
+        && current.subject().as_raw() != current.issuer().as_raw()
+    {
+        let mut next = None;
+        for (i, candidate) in pool.iter().enumerate() {
+            if used[i] || candidate.subject().as_raw() != current.issuer().as_raw() {
+                continue;
+            }
+            if checks >= MAX_PATH_SIGNATURE_CHECKS {
+                return keys;
+            }
+            checks += 1;
+            if signed_by(current, candidate, algs) {
+                next = Some(i);
+                break;
+            }
+        }
+        let Some(i) = next else { break };
+        used[i] = true;
+        let issuer_cert = &pool[i];
+        if let Some(issuer) = first_issuer_cn(issuer_cert) {
+            keys.push(revocation::chain_key(
+                &revocation::canonical_issuer(&issuer),
+                &revocation::serial_hex(&issuer_cert.tbs_certificate.serial.to_bytes_be()),
+            ));
+        }
+        current = issuer_cert;
+    }
+    keys
+}
+
+/// Whether `issuer`'s key verifies `child`'s signature, using the installed
+/// provider's algorithms that match both the signature and key algorithm.
+fn signed_by(
+    child: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+    algs: &[&dyn rustls::pki_types::SignatureVerificationAlgorithm],
+) -> bool {
+    let (Some(sig_oid), Some(key_oid)) = (
+        oid_tlv(&child.signature_algorithm.algorithm),
+        oid_tlv(&issuer.public_key().algorithm.algorithm),
+    ) else {
+        return false;
+    };
+    let public_key = &issuer.public_key().subject_public_key.data;
+    let message = child.tbs_certificate.as_ref();
+    let signature = &child.signature_value.data;
+    algs.iter()
+        .filter(|alg| {
+            alg.signature_alg_id().as_ref().starts_with(&sig_oid)
+                && alg.public_key_alg_id().as_ref().starts_with(&key_oid)
+        })
+        .any(|alg| alg.verify_signature(public_key, message, signature).is_ok())
+}
+
+/// DER encoding of an OID (tag, length, value), the prefix of an
+/// AlgorithmIdentifier's contents. `None` for an OID too long for a
+/// short-form length, which no supported algorithm uses.
+fn oid_tlv(oid: &x509_parser::der_parser::oid::Oid<'_>) -> Option<Vec<u8>> {
+    let value = oid.as_bytes();
+    let len = u8::try_from(value.len()).ok().filter(|l| *l < 0x80)?;
+    let mut tlv = Vec::with_capacity(value.len() + 2);
+    tlv.push(0x06);
+    tlv.push(len);
+    tlv.extend_from_slice(value);
+    Some(tlv)
 }
 
 /// The first issuer CN that is a plain string type.

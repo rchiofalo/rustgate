@@ -468,6 +468,32 @@ mod tests {
     }
 
     #[test]
+    fn padding_the_chain_does_not_hide_a_revoked_issuer() {
+        // The client chooses which extra certificates it sends. Impostor CAs
+        // with the same name but a different key come first, beyond the
+        // per-session key cap; only the certificate that really signed the
+        // leaf may be recorded, so the real CA's revocation still matches.
+        let ca = TestCa::new("Sweep CA");
+        let leaf = ca.issue_client_cert_with_serial("alice", &[0x31]);
+        let mut chain = vec![rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0)];
+        for _ in 0..9 {
+            let impostor = TestCa::new("Sweep CA");
+            chain.push(rustgate_test_utils::tls::parse_certs(&impostor.cert_pem).remove(0));
+        }
+        chain.push(rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0));
+
+        let identity = crate::extract::extract_identity_with_chain(&chain).unwrap();
+        match identity.attributes.get("chain_revocation_keys") {
+            Some(rustgate_core::identity::AttrValue::Set(keys)) => {
+                assert_eq!(keys.len(), 1, "only the real issuer is recorded: {keys:?}");
+            }
+            other => panic!("expected chain_revocation_keys, got {other:?}"),
+        }
+        let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
+        assert!(store.revoked_set().is_revoked(&identity));
+    }
+
+    #[test]
     fn revoked_set_is_issuer_scoped_and_follows_reloads() {
         let ca = TestCa::new("Sweep CA");
         let other = TestCa::new("Other CA");
