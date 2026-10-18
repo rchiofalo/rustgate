@@ -77,6 +77,12 @@ pub struct Position {
     pub le: Option<f64>,
 }
 
+/// Parse a `ce`/`le` attribute. Non-numeric and non-finite values (`NaN`,
+/// `inf`) yield `None`: downstream JSON encoders cannot represent them.
+fn parse_accuracy(value: &str) -> Option<f64> {
+    value.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
 /// Errors that can occur when parsing CoT XML.
 ///
 /// Closes #847 — the `Display` and `std::error::Error` impls below
@@ -609,8 +615,8 @@ fn parse_inner(xml: &[u8]) -> Result<CotEvent, ParseError> {
                             // ce/le are optional accuracy hints: a missing or
                             // malformed value is ignored rather than rejecting
                             // the event, as before they were parsed at all.
-                            "ce" => ce = attr.value.trim().parse::<f64>().ok(),
-                            "le" => le = attr.value.trim().parse::<f64>().ok(),
+                            "ce" => ce = parse_accuracy(&attr.value),
+                            "le" => le = parse_accuracy(&attr.value),
                             _ => {}
                         }
                     }
@@ -959,6 +965,11 @@ mod tests {
         // validated before this field existed).
         let bad = br#"<event version="2.0" uid="u" type="a-f-G" time="2026-01-01T00:00:00Z" start="2026-01-01T00:00:00Z" stale="2026-01-01T00:05:00Z" how="m-g"><point lat="1" lon="2" hae="3" ce="n/a"/></event>"#;
         let pos = parse(bad).unwrap().position.unwrap();
+        assert_eq!(pos.ce, None);
+        assert_eq!(pos.le, None);
+
+        let non_finite = br#"<event version="2.0" uid="u" type="a-f-G" time="2026-01-01T00:00:00Z" start="2026-01-01T00:00:00Z" stale="2026-01-01T00:05:00Z" how="m-g"><point lat="1" lon="2" hae="3" ce="NaN" le="inf"/></event>"#;
+        let pos = parse(non_finite).unwrap().position.unwrap();
         assert_eq!(pos.ce, None);
         assert_eq!(pos.le, None);
     }
