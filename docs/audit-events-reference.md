@@ -67,9 +67,9 @@ For trace spans, see [observability.md](observability.md).
 1. [`client` — TLS client lifecycle](#client--tls-client-lifecycle) (7)
 2. [`tls` — handshake failures](#tls--handshake-failures) (1)
 3. [`cert` — server certificate rotation](#cert--server-certificate-rotation) (2)
-4. [`crl` — CRL reload outcomes](#crl--crl-reload-outcomes) (3)
+4. [`crl` — CRL reload outcomes](#crl--crl-reload-outcomes) (5)
 5. [`enrollment` — CSR signing / EST](#enrollment--csr-signing--est) (5)
-6. [`federation` — peer connectivity](#federation--peer-connectivity) (11)
+6. [`federation` — peer connectivity](#federation--peer-connectivity) (12)
 7. [`authz` — policy enforcement & reload](#authz--policy-enforcement--reload) (7)
 8. [`egress` — outbound obligation actuation](#egress--outbound-obligation-actuation) (1)
 9. [`classification` — CAPCO marking checks](#classification--capco-marking-checks) (2)
@@ -79,21 +79,22 @@ For trace spans, see [observability.md](observability.md).
 13. [`mqtt` — MQTT broker events](#mqtt--mqtt-broker-events) (1)
 14. [`nats` — NATS bridge](#nats--nats-bridge) (1)
 15. [`udp_multicast` — UDP multicast bridge](#udp_multicast--udp-multicast-bridge) (2)
-16. [`mavlink` — MAVLink framing](#mavlink--mavlink-framing) (2)
-17. [`store_forward` — offline queue](#store_forward--offline-queue) (4)
-18. [`position_replay` — replay rate limits](#position_replay--replay-rate-limits) (1)
-19. [`security` & `quota` — rate limits & tenant throughput](#security--quota--rate-limits--tenant-throughput) (2)
-20. [`tenant` — label-cardinality protection](#tenant--label-cardinality-protection) (1)
-21. [`jwks` — JWKS rotation](#jwks--jwks-rotation) (4)
-22. [`jwt` — token verification](#jwt--token-verification) (1)
-23. [`spiffe` — SPIFFE X.509-SVID refresh](#spiffe--spiffe-x509-svid-refresh) (2)
-24. [`hw_identity` — hardware identity backends](#hw_identity--hardware-identity-backends) (3)
-25. [`verifier` — TLS verifier rebuild](#verifier--tls-verifier-rebuild) (1)
-26. [`archive` — encrypted archive key rotation](#archive--encrypted-archive-key-rotation) (1)
-27. [`audit` — hash-chain integrity](#audit--hash-chain-integrity) (3)
-28. [`admin` & `mgmt` — operator control plane](#admin--mgmt--operator-control-plane) (2)
-29. [`server` — process lifecycle](#server--process-lifecycle) (1)
-30. [`air_gap` — air-gap mode rejections](#air_gap--air-gap-mode-rejections) (1)
+16. [`mavlink` — MAVLink framing](#mavlink--mavlink-framing) (4)
+17. [`guard` — cross-domain boundary](#guard--cross-domain-boundary) (3)
+18. [`store_forward` — offline queue](#store_forward--offline-queue) (4)
+19. [`position_replay` — replay rate limits](#position_replay--replay-rate-limits) (1)
+20. [`security` & `quota` — rate limits & tenant throughput](#security--quota--rate-limits--tenant-throughput) (3)
+21. [`tenant` — label-cardinality protection](#tenant--label-cardinality-protection) (1)
+22. [`jwks` — JWKS rotation](#jwks--jwks-rotation) (4)
+23. [`jwt` — token verification](#jwt--token-verification) (1)
+24. [`spiffe` — SPIFFE X.509-SVID refresh](#spiffe--spiffe-x509-svid-refresh) (2)
+25. [`hw_identity` — hardware identity backends](#hw_identity--hardware-identity-backends) (3)
+26. [`verifier` — TLS verifier rebuild](#verifier--tls-verifier-rebuild) (1)
+27. [`archive` — encrypted archive key rotation](#archive--encrypted-archive-key-rotation) (2)
+28. [`audit` — hash-chain integrity](#audit--hash-chain-integrity) (3)
+29. [`admin` & `mgmt` — operator control plane](#admin--mgmt--operator-control-plane) (2)
+30. [`server` — process lifecycle](#server--process-lifecycle) (1)
+31. [`air_gap` — air-gap mode rejections](#air_gap--air-gap-mode-rejections) (1)
 
 ---
 
@@ -144,6 +145,8 @@ for stale-CRL alerting.
 |---|---|---|
 | `crl.reloaded` | `count`, `source`, `action`, `result` | Successful CRL reload. `count` is revoked-serial count. |
 | `crl.reload_failed` | `source`, `error`, `action`, `result` | Failed CRL reload — investigate against the `rustgate_crl_age_seconds` gauge. |
+| `crl.fail_closed_engaged` | `grace_secs`, `action="deny_all_client_certs"`, `result="engaged"` | With `--crl-fail-closed`, every loaded CRL went stale past the grace window, so all client-certificate handshakes are now rejected until a fresh CRL loads (ADR 0025). |
+| `crl.fail_closed_cleared` | `action="deny_all_client_certs"`, `result="cleared"` | A fresh CRL loaded and the fail-closed gate released; client-certificate handshakes resume. |
 | `revocation.sweep_clock_skew` | `drift_secs`, `action="skip_expiry_check"`, `result="warning"` | The revocation sweep skipped certificate-expiry eviction for one sweep because the wall clock stepped relative to monotonic time. Revocation checks still ran. |
 
 ## `enrollment` — CSR signing / EST
@@ -180,6 +183,7 @@ group memberships they should not have.
 | `federation.event_rejected` | `rpc`, `peer_cn`, `reason`, `action`, `result` | Inbound V2 unary RPC rejected — security signal. |
 | `federation.group_claim_rejected` | `peer_cn`, `origin_cn`, `claimed_count`, `claimed_groups`, `action`, `result` | Peer claimed `federate_groups` memberships it was not authorised to forward. |
 | `federation.traceparent_invalid` | `peer`, `reason`, `action`, `result` | Malformed W3C `traceparent` header on an inbound gRPC RPC. |
+| `federation.discovered_peer_unpinned` | `peer_id`, `address`, `action="pin_skipped"`, `result="unpinned"` | A peer found by discovery has no trusted CN while strict CN matching is on, so it is validated by chain only. Attach a CN through backend metadata ([ADR 0029](adr/0029-discovered-peer-cn-pinning.md)). |
 
 See the [federation-reconnect runbook](runbooks/federation-reconnect.md).
 
@@ -307,20 +311,23 @@ identity, autopilot, frame metadata).
 | Event | Fields | Purpose |
 |---|---|---|
 | `mavlink.unsigned_rejected` | `peer`, `reason`, `action`, `result` | Unsigned MAVLink v2 frame rejected by a signature-requiring codec. |
+| `mavlink.signature_rejected` | `peer`, `reason`, `action="mavlink_verify"`, `result="rejected"` | MAVLink v2 frame whose signature failed verification (wrong key, unknown link, malformed, or unsigned where signing is required). |
+| `mavlink.replay_rejected` | `peer`, `link_id`, `timestamp`, `last_accepted`, `reason="replayed_timestamp"`, `action="mavlink_verify"`, `result="rejected"` | Signed frame whose timestamp did not advance past the last accepted one for its `(system_id, component_id, link_id)` stream (replay defence). |
 | `mavlink.heartbeat_received` | `system_id`, `component_id`, `autopilot`, `vehicle_type`, `action`, `result` | MAVLink HEARTBEAT decoded — useful for vehicle inventory. |
 
 ## `guard` — cross-domain boundary
 
 Cross-domain inspection guard (`rustgate-guard`). The guard writes its
 own tamper-evident `boundary.evaluate` record to a **dedicated**
-hash-chained log on every evaluation; these two events mirror activation
-and the *deny* outcome into the main audit stream so a SIEM watching the
+hash-chained log on every evaluation; these events mirror activation,
+the *deny* outcome and chain resets into the main audit stream so a SIEM watching the
 operational log sees boundary gating without tailing the separate guard
 chain.
 
 | Event | Fields | Purpose |
 |---|---|---|
 | `guard.activated` | `sink`, `direction`, `mandatory_marking`, `action="guard_activate"`, `result="active"` | A cross-domain guard was wired onto an egress leg at startup. |
+| `guard.chain_reset` | `path`, `reason`, `prior_max_seq`, `action="guard_chain_reset"`, `result="chain_break"` | Only with the `audit-chain-fail-open` opt-out: the guard could not read its prior chain tip and restarted the hash chain from genesis, carrying the sequence number forward from `prior_max_seq` ([ADR 0024](adr/0024-guard-fail-closed.md)). |
 | `guard.rejected` | `cn`, `sink`, `direction`, `reason`, `action="guard_evaluate"`, `result="rejected"` | A message was dropped at the boundary (`reason = rate_limit \| missing_marking \| unauthorized_classification \| audit_error`). |
 
 ## `store_forward` — offline queue
@@ -524,6 +531,6 @@ for e in events:
 PY
 ```
 
-— diff against the row count above (91). When you add a new
+— diff against the row count above (98). When you add a new
 `audit::*` function in the same PR, add a row in the appropriate
 domain section here.
