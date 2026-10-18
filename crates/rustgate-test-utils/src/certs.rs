@@ -433,11 +433,6 @@ impl TestCa {
         }
     }
 
-    /// Issue a client certificate with the given CN and OU fields.
-    ///
-    /// CN becomes the user identity, OU fields become group memberships.
-    /// Groups are stored as comma-separated values in a single OU field
-    /// due to rcgen limitations with multiple OU entries.
     /// Issue a client certificate with an explicit serial number.
     ///
     /// Used by revocation tests that need a specific serial, e.g. one with
@@ -463,6 +458,11 @@ impl TestCa {
         }
     }
 
+    /// Issue a client certificate with the given CN and OU fields.
+    ///
+    /// CN becomes the user identity, OU fields become group memberships.
+    /// Groups are stored as comma-separated values in a single OU field
+    /// due to rcgen limitations with multiple OU entries.
     pub fn issue_client_cert(&self, cn: &str, groups: &[&str]) -> TestCert {
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::NoCa;

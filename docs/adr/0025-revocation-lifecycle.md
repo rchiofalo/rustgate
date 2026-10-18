@@ -97,11 +97,26 @@ liveness.
   so signalling a snapshot handle can never reach a replacement session for the
   same CN. This is why the sweeper does not reuse `Router::disconnect_client`,
   which works by CN and only closes the writer side.
+- The router's session map holds one session per CN, so a newer connection
+  with the same certificate displaces an older one that stays connected. The
+  router also keeps every live session by id, and the sweep reads that set, so
+  displaced sessions are evicted too.
+- Each session also records the `(issuer, serial)` of every intermediate CA
+  certificate the client presented (`chain_revocation_keys`), so revoking an
+  intermediate evicts the leaves under it. Intermediates configured as trust
+  anchors in `--ca` rather than sent by the client are not covered.
+- Matching uses the issuer CN, not the full issuer name or key identifier, so
+  two CAs with the same CN and overlapping serials are not told apart. An
+  issuer CN that is not a plain string type (e.g. BMPString) yields no key and
+  never matches.
 - Expiry eviction is skipped for a sweep when the wall clock has moved more
   than 30 s away from monotonic time since the previous sweep
   (`revocation.sweep_clock_skew`). Revocation checks still run, because they do
-  not depend on the clock.
-- Without `--crl`, the sweep runs in expiry-only mode and logs a warning.
+  not depend on the clock. The next sweep takes the new time as its baseline,
+  so a lasting clock change delays expiry eviction by one interval rather than
+  blocking it; new handshakes are judged by the same clock.
+- Without `--crl` and a non-zero `--crl-refresh-interval` there is no CRL
+  store, so the sweep runs in expiry-only mode and logs a warning.
 - MQTT sessions skip the will message on eviction and, on MQTT 5, send
   DISCONNECT with reason `0x98` (administrative action). WebSocket and TLS
   sessions close.

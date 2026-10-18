@@ -448,6 +448,26 @@ mod tests {
     }
 
     #[test]
+    fn revoked_set_matches_a_revoked_certificate_further_up_the_chain() {
+        // The CA certificate stands in for an intermediate: the chain is
+        // [leaf, CA], and the CRL revokes the CA certificate's serial. The
+        // leaf itself is not revoked, but its session must still match.
+        let ca = TestCa::new("Sweep CA");
+        let leaf = ca.issue_client_cert_with_serial("alice", &[0x21]);
+        let chain = [
+            rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0),
+            rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
+        ];
+        let with_chain = crate::extract::extract_identity_with_chain(&chain).unwrap();
+        let leaf_only = identity_of(&leaf.cert_pem);
+
+        let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
+        let set = store.revoked_set();
+        assert!(set.is_revoked(&with_chain));
+        assert!(!set.is_revoked(&leaf_only));
+    }
+
+    #[test]
     fn revoked_set_is_issuer_scoped_and_follows_reloads() {
         let ca = TestCa::new("Sweep CA");
         let other = TestCa::new("Other CA");

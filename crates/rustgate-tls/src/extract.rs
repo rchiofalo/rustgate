@@ -37,6 +37,55 @@ const MAX_SAN_ENTRIES_PER_CATEGORY: usize = 32;
 /// after each insertion, not per-byte.
 const MAX_ATTR_BAG_BYTES: usize = 4 * 1024;
 
+/// Most intermediate CA certificates recorded per session for revocation
+/// matching. Real chains have one or two; the cap bounds the attribute bag.
+const MAX_CHAIN_REVOCATION_KEYS: usize = 8;
+
+/// Extract identity from a presented chain: the leaf ([`extract_identity`])
+/// plus the `(issuer, serial)` revocation key of each intermediate CA
+/// certificate after it, so the revocation sweep can evict sessions whose
+/// intermediate is revoked (ADR 0025). Intermediates that do not parse or
+/// have no issuer CN are skipped; the handshake verifier has already
+/// validated the chain.
+pub fn extract_identity_with_chain(chain: &[CertificateDer<'_>]) -> Result<Identity> {
+    let leaf = chain.first().ok_or(TransportError::EmptyCertChain)?;
+    let identity = extract_identity(leaf)?;
+
+    let keys: Vec<String> = chain
+        .iter()
+        .skip(1)
+        .take(MAX_CHAIN_REVOCATION_KEYS)
+        .filter_map(|der| {
+            let (_, cert) = X509Certificate::from_der(der.as_ref()).ok()?;
+            let issuer = first_issuer_cn(&cert)?;
+            Some(revocation::chain_key(
+                &revocation::canonical_issuer(&issuer),
+                &revocation::serial_hex(&cert.tbs_certificate.serial.to_bytes_be()),
+            ))
+        })
+        .collect();
+    if keys.is_empty() {
+        return Ok(identity);
+    }
+    let mut attrs = (*identity.attributes).clone();
+    let _ = attrs.insert(
+        revocation::ATTR_CHAIN_REVOCATION_KEYS.to_string(),
+        AttrValue::Set(keys),
+    );
+    Ok(identity.with_attributes(attrs))
+}
+
+/// The first issuer CN that is a plain string type.
+fn first_issuer_cn(cert: &X509Certificate<'_>) -> Option<String> {
+    cert.issuer().iter_rdn().find_map(|rdn| {
+        rdn.iter().find_map(|attr| {
+            (attr.attr_type() == &OID_X509_COMMON_NAME)
+                .then(|| attr.attr_value().as_str().ok().map(str::to_string))
+                .flatten()
+        })
+    })
+}
+
 /// Extract identity from an X.509 certificate.
 ///
 /// Parses the certificate DER and extracts:
@@ -113,24 +162,9 @@ fn extract_attributes(
             AttrValue::Str(sanitize_for_log(&country)),
         );
     }
-    // Issuer CN.
-    let mut issuer_cn: Option<String> = None;
-    for rdn in cert.issuer().iter_rdn() {
-        for attr in rdn.iter() {
-            if attr.attr_type() == &OID_X509_COMMON_NAME
-                && let Ok(v) = attr.attr_value().as_str()
-            {
-                issuer_cn = Some(v.to_string());
-                break;
-            }
-        }
-        if issuer_cn.is_some() {
-            break;
-        }
-    }
     // Issuer CN and serial use the shared revocation encoding so the
     // revocation sweep can match them against CRL entries (ADR 0025).
-    if let Some(cn) = issuer_cn {
+    if let Some(cn) = first_issuer_cn(cert) {
         let _ = attrs.insert(
             revocation::ATTR_ISSUER_CN.to_string(),
             AttrValue::Str(revocation::canonical_issuer(&cn)),

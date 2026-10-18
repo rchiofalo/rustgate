@@ -23,6 +23,22 @@ pub const ATTR_ISSUER_CN: &str = "issuer_cn";
 pub const ATTR_CERT_SERIAL: &str = "cert_serial";
 /// Identity attribute holding the certificate `notAfter` as Unix seconds.
 pub const ATTR_CERT_NOT_AFTER: &str = "cert_not_after";
+/// Identity attribute (a set) holding one [`chain_key`] per intermediate CA
+/// certificate the client presented, so revoking an intermediate also
+/// matches the sessions of the leaves it issued.
+pub const ATTR_CHAIN_REVOCATION_KEYS: &str = "chain_revocation_keys";
+
+/// Separates issuer and serial in a [`chain_key`]. A control character, so
+/// it can never appear in a [`canonical_issuer`] string.
+const CHAIN_KEY_SEP: char = '\u{1f}';
+
+/// Encode one `(issuer, serial)` pair for [`ATTR_CHAIN_REVOCATION_KEYS`].
+/// Both arguments must already be canonical ([`canonical_issuer`],
+/// [`serial_hex`]).
+#[must_use]
+pub fn chain_key(issuer_canonical: &str, serial_hex: &str) -> String {
+    format!("{issuer_canonical}{CHAIN_KEY_SEP}{serial_hex}")
+}
 
 /// Encode a certificate serial as lowercase hex, two characters per byte of
 /// its big-endian representation, with no `0x` prefix and no trimming.
@@ -82,16 +98,24 @@ impl RevokedSet {
             .contains(&(issuer_cn.to_owned(), serial_hex.to_owned()))
     }
 
-    /// Whether the certificate behind `identity` is revoked. Returns `false`
-    /// when the identity carries no issuer or serial (e.g. plaintext or
-    /// anonymous sessions), which never match a CRL.
+    /// Whether the certificate behind `identity`, or any intermediate CA
+    /// certificate in the chain the client presented, is revoked. Returns
+    /// `false` when the identity carries no issuer or serial (e.g. plaintext
+    /// or anonymous sessions), which never match a CRL.
     #[must_use]
     pub fn is_revoked(&self, identity: &Identity) -> bool {
-        match (
+        if let (Some(issuer), Some(serial)) = (
             str_attr(identity, ATTR_ISSUER_CN),
             str_attr(identity, ATTR_CERT_SERIAL),
-        ) {
-            (Some(issuer), Some(serial)) => self.contains_canonical(issuer, serial),
+        ) && self.contains_canonical(issuer, serial)
+        {
+            return true;
+        }
+        match identity.attributes.get(ATTR_CHAIN_REVOCATION_KEYS) {
+            Some(AttrValue::Set(keys)) => keys.iter().any(|key| {
+                key.split_once(CHAIN_KEY_SEP)
+                    .is_some_and(|(issuer, serial)| self.contains_canonical(issuer, serial))
+            }),
             _ => false,
         }
     }
@@ -178,6 +202,33 @@ mod tests {
         set.insert("Bad\nCA", &[0x02]);
         let stored = canonical_issuer("Bad\nCA");
         assert!(set.is_revoked(&identity_with(Some(&stored), Some("02"))));
+    }
+
+    #[test]
+    fn a_revoked_intermediate_matches_its_leaves() {
+        let mut set = RevokedSet::new();
+        set.insert("Root CA", &[0x07]);
+        let mut attrs = std::collections::BTreeMap::new();
+        let _ = attrs.insert(ATTR_ISSUER_CN.into(), AttrValue::Str("Issuing CA".into()));
+        let _ = attrs.insert(ATTR_CERT_SERIAL.into(), AttrValue::Str("01".into()));
+        let _ = attrs.insert(
+            ATTR_CHAIN_REVOCATION_KEYS.into(),
+            AttrValue::Set(vec![chain_key("Root CA", "07")]),
+        );
+        let leaf = Identity::new("client".into(), "fp".into(), BTreeSet::new())
+            .expect("valid identity")
+            .with_attributes(attrs.clone());
+        assert!(set.is_revoked(&leaf));
+
+        // A different intermediate serial under the same root does not match.
+        let _ = attrs.insert(
+            ATTR_CHAIN_REVOCATION_KEYS.into(),
+            AttrValue::Set(vec![chain_key("Root CA", "08")]),
+        );
+        let other = Identity::new("client".into(), "fp".into(), BTreeSet::new())
+            .expect("valid identity")
+            .with_attributes(attrs);
+        assert!(!set.is_revoked(&other));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::config::TlsConfig;
-use crate::extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
+use crate::extract::{ExpectedKeyUsage, extract_identity_with_chain, validate_key_usage};
 use crate::session::AuthenticatedSession;
 
 rustgate_core::on_callback!(
@@ -269,7 +269,7 @@ impl TlsListener {
 
         validate_key_usage(client_cert, ExpectedKeyUsage::ClientAuth)?;
 
-        extract_identity(client_cert)
+        extract_identity_with_chain(certs)
     }
 }
 

@@ -37,7 +37,7 @@ By default the CRL is loaded once at startup. The revocation lifecycle flags (al
 
 - `--crl-refresh-interval` re-reads the CRL file and applies it to new handshakes without a restart.
 - `--crl-fail-closed` (with `--crl-grace-secs`) rejects all client-certificate handshakes once every loaded CRL has been stale for longer than the grace window.
-- `--revocation-sweep-interval` disconnects **established** sessions whose certificate has since been revoked or has expired. Revocation matching is by issuer and serial and needs `--crl-refresh-interval`; without it only expiry is enforced. A sweep skips expiry eviction when the wall clock steps by more than 30 seconds relative to monotonic time, so a clock correction cannot mass-disconnect valid sessions. TLS, WebSocket and MQTT sessions are covered; an evicted MQTT session does not publish its Last Will.
+- `--revocation-sweep-interval` disconnects **established** sessions whose certificate has since been revoked or has expired. Revocation matching is by issuer CN and serial, covers intermediate CA certificates the client presented, and needs `--crl-refresh-interval`; without it only expiry is enforced. Two CAs with the same CN are not told apart. A sweep skips expiry eviction when the wall clock steps by more than 30 seconds relative to monotonic time; the next sweep uses the new time, so a step only delays expiry eviction by one interval. TLS, WebSocket and MQTT sessions are covered; an evicted MQTT session does not publish its Last Will.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|

@@ -55,7 +55,9 @@ pub use config::{
     provider_with_kx_groups,
 };
 pub use crl_store::{CrlHealth, CrlHealthObserver, CrlStore};
-pub use extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
+pub use extract::{
+    ExpectedKeyUsage, extract_identity, extract_identity_with_chain, validate_key_usage,
+};
 pub use listener::{DEFAULT_MAX_HANDSHAKES, OnHandshakeError, TlsListener};
 pub use plaintext::{PlaintextIdentityConfig, PlaintextListener, PlaintextSession};
 pub use session::{AuthenticatedSession, SessionReader, SessionWriter};

@@ -544,9 +544,13 @@ pub(crate) async fn handle_mqtt_session(
                 reason_code: mqttbytes::v5::DisconnectReasonCode::AdministrativeAction,
                 properties: None,
             };
-            let _ = writer
-                .write_v5(&mqttbytes::v5::Packet::Disconnect(disconnect))
-                .await;
+            // Bounded: a client that has stopped reading must not keep a
+            // revoked session registered by stalling this write.
+            let _ = tokio::time::timeout(
+                WRITE_TIMEOUT,
+                writer.write_v5(&mqttbytes::v5::Packet::Disconnect(disconnect)),
+            )
+            .await;
         }
     } else if let SessionEnd::Read(Err(e)) = &session_end {
         debug!(cn = %hash_cn(&cn), error = %e, "MQTT session ended with error");

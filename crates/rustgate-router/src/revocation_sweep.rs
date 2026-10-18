@@ -141,9 +141,9 @@ pub struct RevocationSweeper {
     revoked: Option<RevokedSetFn>,
     clock: ClockGuard,
     /// Sessions already asked to disconnect. A session stays registered
-    /// until its teardown finishes (an MQTT DISCONNECT write can take up to
-    /// the write timeout), so without this every tick would signal and
-    /// audit it again.
+    /// until its teardown finishes (an MQTT 5 DISCONNECT write is bounded by
+    /// `WRITE_TIMEOUT`), so without this every tick would signal and audit it
+    /// again.
     signalled: HashSet<u64>,
 }
 
@@ -409,6 +409,32 @@ mod tests {
         assert!(signalled(&revoked_h).await);
         assert!(signalled(&expired_h).await);
         assert!(!signalled(&valid_h).await);
+    }
+
+    #[tokio::test]
+    async fn a_displaced_session_for_the_same_cn_is_still_swept() {
+        // A second connection with the same certificate replaces the first in
+        // the CN-keyed session map, but the first stays connected. Both must
+        // be evicted once the certificate is revoked.
+        let router = Arc::new(Router::new());
+        let far = 4_000_000_000;
+        let first = handle_for(identity("alice", "CA", "01", Some(far)));
+        let second = handle_for(identity("alice", "CA", "01", Some(far)));
+        assert!(router.register(first.clone()).await);
+        assert!(router.register(second.clone()).await);
+
+        let set = Arc::new(revoked(&[("CA", &[0x01])]));
+        let source: RevokedSetFn = Arc::new(move || Arc::clone(&set));
+        let mut sweeper = RevocationSweeper::new(Arc::clone(&router), Some(source));
+        assert_eq!(sweeper.sweep_once().await.len(), 2);
+        assert!(signalled(&first).await);
+        assert!(signalled(&second).await);
+
+        // The displaced session leaving does not drop the current one.
+        router.unregister("alice", first.id).await;
+        assert_eq!(router.session_handles().await.len(), 1);
+        router.unregister("alice", second.id).await;
+        assert!(router.session_handles().await.is_empty());
     }
 
     #[tokio::test]
