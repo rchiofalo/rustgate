@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rustgate_core::error::{Result, RustgateError, TransportError};
 use rustgate_core::identity::{AttrValue, Identity};
+use rustgate_core::revocation;
 use rustgate_core::sanitize::sanitize_for_log;
 use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
@@ -87,11 +88,13 @@ pub fn extract_identity(cert_der: &CertificateDer<'_>) -> Result<Identity> {
 /// - `country` (Str) — first subject C (countryName) value
 /// - `issuer_cn` (Str) — first issuer CN value
 /// - `cert_serial` (Str) — certificate serial number as lowercase hex,
-///   formatted as two hex chars per byte of the DER big-endian
-///   representation with no `0x` prefix and no leading-zero trimming.
-///   A one-byte serial `0x01` formats as `"01"`, not `"1"`; a
-///   leading-zero byte is preserved, so a policy rule comparing
-///   `cert_serial` with string equality must use the same format.
+///   two hex chars per byte of its minimal big-endian magnitude, with no
+///   `0x` prefix (see [`rustgate_core::revocation::serial_hex`]). A
+///   one-byte serial `0x01` formats as `"01"`, not `"1"`. The `0x00` that
+///   DER prepends to a serial with its high bit set is not included, so a
+///   policy rule comparing `cert_serial` with string equality must use the
+///   same format. CRL entries are encoded identically for revocation.
+/// - `cert_not_after` (Int) — certificate `notAfter` as Unix seconds
 fn extract_attributes(
     cert: &X509Certificate<'_>,
     cert_der: &CertificateDer<'_>,
@@ -125,17 +128,30 @@ fn extract_attributes(
             break;
         }
     }
+    // Issuer CN and serial use the shared revocation encoding so the
+    // revocation sweep can match them against CRL entries (ADR 0025).
     if let Some(cn) = issuer_cn {
         let _ = attrs.insert(
-            "issuer_cn".to_string(),
-            AttrValue::Str(sanitize_for_log(&cn)),
+            revocation::ATTR_ISSUER_CN.to_string(),
+            AttrValue::Str(revocation::canonical_issuer(&cn)),
         );
     }
 
-    // Certificate serial (lowercase hex of DER bytes).
-    let serial_bytes = cert.tbs_certificate.serial.to_bytes_be();
-    let serial_hex: String = serial_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let _ = attrs.insert("cert_serial".to_string(), AttrValue::Str(serial_hex));
+    // Certificate serial (lowercase hex of the big-endian magnitude).
+    let serial_hex = revocation::serial_hex(&cert.tbs_certificate.serial.to_bytes_be());
+    let _ = attrs.insert(
+        revocation::ATTR_CERT_SERIAL.to_string(),
+        AttrValue::Str(serial_hex),
+    );
+
+    // Certificate notAfter as Unix seconds, for expiry-based eviction.
+    // `timestamp()` is already an i64 for any representable ASN.1 time
+    // (pre-1970 and post-2050 GeneralizedTime included), so no clamp or
+    // fallible conversion is needed.
+    let _ = attrs.insert(
+        revocation::ATTR_CERT_NOT_AFTER.to_string(),
+        AttrValue::Int(cert.validity().not_after.timestamp()),
+    );
 
     // SAN extension — URI / DNS / email.
     //

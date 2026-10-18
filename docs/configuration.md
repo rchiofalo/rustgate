@@ -33,10 +33,20 @@ When `--cert-reload-interval` is set to a value greater than 0, the server perio
 
 The `--crl` flag loads a PEM-encoded Certificate Revocation List. Revoked certificates are rejected at the TLS handshake before any application-layer processing. CRL freshness is checked at startup — stale CRLs produce a warning by default (`--crl-warn-stale`).
 
+By default the CRL is loaded once at startup. The revocation lifecycle flags (all off by default, [ADR 0025](https://github.com/rchiofalo/rustgate/blob/main/docs/adr/0025-revocation-lifecycle.md)) make revocation live:
+
+- `--crl-refresh-interval` re-reads the CRL file and applies it to new handshakes without a restart.
+- `--crl-fail-closed` (with `--crl-grace-secs`) rejects all client-certificate handshakes once every loaded CRL has been stale for longer than the grace window.
+- `--revocation-sweep-interval` disconnects **established** sessions whose certificate has since been revoked or has expired. Revocation matching is by issuer and serial and needs `--crl-refresh-interval`; without it only expiry is enforced. A sweep skips expiry eviction when the wall clock steps by more than 30 seconds relative to monotonic time, so a clock correction cannot mass-disconnect valid sessions. TLS, WebSocket and MQTT sessions are covered; an evicted MQTT session does not publish its Last Will.
+
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
 | `--crl` | `RUSTGATE_CRL` | — | Path to PEM-encoded CRL file |
 | `--crl-warn-stale` | `RUSTGATE_CRL_WARN_STALE` | `true` | Warn if the CRL's `nextUpdate` is in the past |
+| `--crl-refresh-interval` | `RUSTGATE_CRL_REFRESH_INTERVAL` | `0` | Seconds between CRL file re-reads (0 = load once at startup) |
+| `--crl-fail-closed` | `RUSTGATE_CRL_FAIL_CLOSED` | `false` | Reject client-certificate handshakes when every CRL is stale past the grace window |
+| `--crl-grace-secs` | `RUSTGATE_CRL_GRACE_SECS` | `0` | How long the CRL set may stay stale before `--crl-fail-closed` engages |
+| `--revocation-sweep-interval` | `RUSTGATE_REVOCATION_SWEEP_INTERVAL` | `0` | Seconds between sweeps that disconnect sessions whose certificate is revoked or expired (0 = disabled) |
 
 ### Plaintext Transport
 

@@ -35,6 +35,10 @@ use tracing::{debug, info, warn};
 use crate::health::{HealthCheckConfig, LastPong, new_last_pong};
 use crate::{TRANSPORT_LABEL, WsListener, WsSession, WsStream};
 
+/// Session-end reason when the revocation sweep disconnects a session
+/// (ADR 0025, piece 3).
+const SESSION_EVICTED: &str = "session evicted: certificate revoked or expired";
+
 rustgate_core::on_callback!(
     /// Fired once per successful WebSocket session registration (post-mTLS,
     /// post-upgrade, post-tenant-quota). Used by `rustgate-server` to increment
@@ -406,14 +410,22 @@ async fn handle_ws_session(
     let read_result = {
         let router = Arc::clone(&router);
         let read_last_pong = Arc::clone(&last_pong);
+        let evict = handle.evict_signal();
         tokio::select! {
+            // Checked first so a pending eviction is never starved by traffic.
+            biased;
+            () = evict.notified() => Err(SESSION_EVICTED.to_string()),
             r = ws_read_loop(ws_read, &identity, &router, nats_publish.as_ref(), fed_forward.as_ref(), http_forward.as_ref(), &throttle, &replay_filter, &mut ws_rate_limiter, read_last_pong, sa_upgrade_observer.as_ref()) => r,
             r = ws_write_loop(ws_write, &mut priority_rx, &mut normal_rx, &*codec, max_write_buffer_bytes, health_check, Arc::clone(&last_pong)) => r,
         }
     };
 
-    if let Err(ref e) = read_result {
-        debug!(cn = %hash_cn(&cn), error = %e, "WebSocket session ended with error");
+    match read_result {
+        Err(ref e) if e == SESSION_EVICTED => {
+            info!(cn = %hash_cn(&cn), "WebSocket session evicted by revocation sweep");
+        }
+        Err(ref e) => debug!(cn = %hash_cn(&cn), error = %e, "WebSocket session ended with error"),
+        Ok(()) => {}
     }
 
     router.unregister(&cn, session_id).await;

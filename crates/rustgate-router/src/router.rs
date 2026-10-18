@@ -433,7 +433,7 @@ use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use rustgate_resilience::token_bucket::TokenBucket;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tracing::{debug, warn};
 
 use crate::acl::GroupAclPolicy;
@@ -832,6 +832,10 @@ pub struct SessionHandle {
     normal_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
     consecutive_drops: Arc<AtomicU32>,
     max_consecutive_drops: u32,
+    /// Wakes the session's I/O loop to disconnect it (revocation sweep,
+    /// ADR 0025 piece 3). Per session: a replacement session for the same
+    /// CN has its own signal, so evicting a stale snapshot is harmless.
+    evict: Arc<Notify>,
 }
 
 impl SessionHandle {
@@ -852,8 +856,20 @@ impl SessionHandle {
             priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
             normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
+            evict: Arc::new(Notify::new()),
             max_consecutive_drops: DEFAULT_MAX_CONSECUTIVE_DROPS,
         }
+    }
+
+    /// Ask this session's I/O loop to disconnect. Safe to call at any time:
+    /// the signal is stored if the loop is not yet waiting on it.
+    pub fn request_evict(&self) {
+        self.evict.notify_one();
+    }
+
+    /// The eviction signal the session's I/O loop waits on.
+    pub fn evict_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.evict)
     }
 
     /// Precomputed authz subject hash suitable for
@@ -880,6 +896,7 @@ impl SessionHandle {
             priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
             normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
+            evict: Arc::new(Notify::new()),
             max_consecutive_drops: threshold,
         }
     }
@@ -2589,6 +2606,12 @@ impl Router {
     /// Snapshot the current quota tracker, if any.
     pub fn quota_tracker(&self) -> Option<Arc<crate::quota::TenantQuotaTracker>> {
         self.quota_tracker.load_full().as_ref().clone()
+    }
+
+    /// Snapshot the registered sessions (cloned handles). Used by the
+    /// revocation sweep; the handles keep working after the lock is released.
+    pub async fn session_handles(&self) -> Vec<SessionHandle> {
+        self.state.read().await.sessions.values().cloned().collect()
     }
 
     /// Register a session with the router.

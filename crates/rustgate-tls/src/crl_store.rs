@@ -26,6 +26,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rustgate_core::error::{ConfigError, Result, RustgateError};
+use rustgate_core::revocation::RevokedSet;
 use rustgate_core::tasks::spawn_background;
 use rustls::pki_types::CertificateRevocationListDer;
 use rustls::pki_types::pem::PemObject;
@@ -55,6 +56,9 @@ struct CrlState {
     generation: u64,
     hash: [u8; 32],
     health: CrlHealth,
+    /// `(issuer, serial)` pairs revoked by this generation, for the
+    /// mid-session revocation sweep (ADR 0025, piece 3).
+    revoked: Arc<RevokedSet>,
 }
 
 /// A file-backed CRL set that can be reloaded at runtime without a restart.
@@ -73,6 +77,7 @@ impl CrlStore {
     pub fn from_path(path: &Path) -> Result<Arc<Self>> {
         let bytes = read_crl_file(path)?;
         let (crls, hash, health) = parse_and_summarize(&bytes, path)?;
+        let revoked = Arc::new(revoked_set(&crls, path));
         info!(
             path = %path.display(),
             count = crls.len(),
@@ -86,6 +91,7 @@ impl CrlStore {
                 generation: 1,
                 hash,
                 health,
+                revoked,
             }),
         }))
     }
@@ -112,6 +118,7 @@ impl CrlStore {
         }
 
         let (crls, hash, health) = parse_and_summarize(&bytes, &self.path)?;
+        let revoked = Arc::new(revoked_set(&crls, &self.path));
         let count = crls.len();
         {
             let mut guard = self
@@ -122,6 +129,7 @@ impl CrlStore {
             guard.generation = guard.generation.wrapping_add(1);
             guard.hash = hash;
             guard.health = health.clone();
+            guard.revoked = revoked;
         }
         info!(
             path = %self.path.display(),
@@ -144,6 +152,16 @@ impl CrlStore {
             // verifier rebuilds into a no-CRL state rather than panicking on the
             // handshake thread.
             Err(_) => (0, Arc::new(Vec::new())),
+        }
+    }
+
+    /// The revoked `(issuer, serial)` set of the current generation. Cheap — a
+    /// read-lock and an `Arc` clone; the set is built once per reload.
+    pub fn revoked_set(&self) -> Arc<RevokedSet> {
+        match self.state.read() {
+            Ok(guard) => Arc::clone(&guard.revoked),
+            // Fail safe (no panics under the lock): an empty set evicts nothing.
+            Err(_) => Arc::new(RevokedSet::new()),
         }
     }
 
@@ -297,6 +315,40 @@ fn parse_and_summarize(
     Ok((crls, hash, health))
 }
 
+/// Collect every revoked `(issuer CN, serial)` pair across `crls`.
+///
+/// Serials come from x509-parser's `BigUint::to_bytes_be`, the same form the
+/// session identity's `cert_serial` uses, so a high-bit serial (DER-padded
+/// with `0x00` on the wire) matches on both sides. A CRL that does not parse,
+/// or whose issuer has no CN, contributes nothing: webpki still enforces it at
+/// the handshake, and a session can only be issuer-matched by CN.
+fn revoked_set(crls: &[CertificateRevocationListDer<'static>], path: &Path) -> RevokedSet {
+    let mut set = RevokedSet::new();
+    for (i, der) in crls.iter().enumerate() {
+        let crl = match parse_x509_crl(der.as_ref()) {
+            Ok((_, crl)) => crl,
+            Err(e) => {
+                warn!(path = %path.display(), crl_index = i, error = %e,
+                    "CRL could not be parsed for the revocation sweep");
+                continue;
+            }
+        };
+        let Some(issuer_cn) = crl
+            .issuer()
+            .iter_common_name()
+            .find_map(|cn| cn.as_str().ok())
+        else {
+            warn!(path = %path.display(), crl_index = i,
+                "CRL issuer has no CN; its entries are not used by the revocation sweep");
+            continue;
+        };
+        for revoked in crl.iter_revoked_certificates() {
+            set.insert(issuer_cn, &revoked.user_certificate.to_bytes_be());
+        }
+    }
+    set
+}
+
 /// Compute the all-stale freshness summary by parsing each CRL's `nextUpdate`.
 fn summarize_health(crls: &[CertificateRevocationListDer<'static>], path: &Path) -> CrlHealth {
     let now = x509_parser::time::ASN1Time::now();
@@ -362,6 +414,58 @@ mod tests {
         let p = dir.join("crl.pem");
         std::fs::write(&p, pem).unwrap();
         p
+    }
+
+    fn identity_of(pem: &str) -> rustgate_core::identity::Identity {
+        let der = rustgate_test_utils::tls::parse_certs(pem).remove(0);
+        crate::extract::extract_identity(&der).unwrap()
+    }
+
+    #[test]
+    fn revoked_set_matches_a_high_bit_serial_on_both_sides() {
+        // ADR 0025 revision 3: a serial with its high bit set is DER-encoded
+        // with a leading 0x00 in both the certificate and the CRL. The session
+        // identity and the CRL entry must still produce the same key.
+        let ca = TestCa::new("Sweep CA");
+        let revoked = ca.issue_client_cert_with_serial("alice", &[0x80, 0x01, 0x02]);
+        let kept = ca.issue_client_cert_with_serial("bob", &[0x80, 0x01, 0x03]);
+        // Prove the fixture really carries the DER sign pad on the wire.
+        let der = rustgate_test_utils::tls::parse_certs(&revoked.cert_pem).remove(0);
+        let (_, parsed) = x509_parser::parse_x509_certificate(der.as_ref()).unwrap();
+        assert_eq!(parsed.raw_serial(), &[0x00, 0x80, 0x01, 0x02]);
+        let alice = identity_of(&revoked.cert_pem);
+        assert_eq!(
+            alice.attributes.get("cert_serial"),
+            Some(&rustgate_core::identity::AttrValue::Str("800102".into()))
+        );
+
+        let store =
+            CrlStore::from_path(&write_temp(&ca.generate_crl(&[&revoked.cert_pem]))).unwrap();
+        let set = store.revoked_set();
+        assert_eq!(set.len(), 1);
+        assert!(set.is_revoked(&alice));
+        assert!(!set.is_revoked(&identity_of(&kept.cert_pem)));
+    }
+
+    #[test]
+    fn revoked_set_is_issuer_scoped_and_follows_reloads() {
+        let ca = TestCa::new("Sweep CA");
+        let other = TestCa::new("Other CA");
+        let a = ca.issue_client_cert_with_serial("alice", &[0x11]);
+        // Same serial, different issuer: must never match CA's CRL.
+        let b = other.issue_client_cert_with_serial("bob", &[0x11]);
+
+        let path = write_temp(&ca.generate_crl(&[]));
+        let store = CrlStore::from_path(&path).unwrap();
+        // Empty-but-fresh CRL: nothing revoked and healthy.
+        assert!(store.revoked_set().is_empty());
+        assert!(!store.health().all_stale);
+
+        std::fs::write(&path, ca.generate_crl(&[&a.cert_pem])).unwrap();
+        assert!(store.reload().unwrap());
+        let set = store.revoked_set();
+        assert!(set.is_revoked(&identity_of(&a.cert_pem)));
+        assert!(!set.is_revoked(&identity_of(&b.cert_pem)));
     }
 
     #[test]

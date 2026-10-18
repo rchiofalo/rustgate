@@ -531,6 +531,7 @@ pub(crate) async fn bind_tls_listener(
     Ok(TlsListenerHandle {
         listener,
         cert_reloader,
+        crl_store,
         #[cfg(feature = "ocsp")]
         ocsp_stapler,
     })
@@ -542,6 +543,9 @@ pub(crate) async fn bind_tls_listener(
 pub(crate) struct TlsListenerHandle {
     pub(crate) listener: TlsListener,
     pub(crate) cert_reloader: Option<Arc<CertReloader>>,
+    /// The refreshable CRL store, when `--crl` and `--crl-refresh-interval`
+    /// are set. Feeds the revocation sweep (`--revocation-sweep-interval`).
+    pub(crate) crl_store: Option<Arc<rustgate_tls::CrlStore>>,
     #[cfg(feature = "ocsp")]
     pub(crate) ocsp_stapler: Option<Arc<rustgate_tls::ocsp::Stapler>>,
 }

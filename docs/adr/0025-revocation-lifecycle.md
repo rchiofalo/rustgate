@@ -1,6 +1,6 @@
 # ADR 0025: Live certificate-revocation lifecycle
 
-- **Status:** Proposed
+- **Status:** Accepted (all three pieces implemented)
 - **Date:** 2026-06-25
 - **Deciders:** rchiofalo
 - **Related:** #1496 (revocation restart-gated), `rustgate-tls`
@@ -83,6 +83,28 @@ id-match stale-guard so it never evicts a replacement session.
 **Defaults: all OFF** (`--crl-refresh-interval=0`, `--crl-fail-closed=false`,
 `--revocation-sweep-interval=0`) — strict back-compat; operators opt into
 liveness.
+
+### Implementation notes (Piece 3)
+
+- The sweeper lives in `rustgate-router` (`revocation_sweep.rs`), not
+  `rustgate-server`, because it only needs the session registry. The server
+  supplies the revoked set as a callback over `CrlStore::revoked_set()`.
+- The revoked `(issuer, serial)` encoding is defined once, in
+  `rustgate-core::revocation`, and used by both the CRL side and the identity
+  extractor. Both serials go through `BigUint::to_bytes_be`, so a high-bit
+  serial matches (revision 3).
+- The stale-guard is structural: each `SessionHandle` owns its own `Notify`,
+  so signalling a snapshot handle can never reach a replacement session for the
+  same CN. This is why the sweeper does not reuse `Router::disconnect_client`,
+  which works by CN and only closes the writer side.
+- Expiry eviction is skipped for a sweep when the wall clock has moved more
+  than 30 s away from monotonic time since the previous sweep
+  (`revocation.sweep_clock_skew`). Revocation checks still run, because they do
+  not depend on the clock.
+- Without `--crl`, the sweep runs in expiry-only mode and logs a warning.
+- MQTT sessions skip the will message on eviction and, on MQTT 5, send
+  DISCONNECT with reason `0x98` (administrative action). WebSocket and TLS
+  sessions close.
 
 ## Alternatives considered
 

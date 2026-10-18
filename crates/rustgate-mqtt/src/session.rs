@@ -480,9 +480,15 @@ pub(crate) async fn handle_mqtt_session(
     enum SessionEnd {
         Read(Result<ReadLoopOutcome, MqttError>),
         Write(Result<(), MqttError>),
+        /// Disconnected by the revocation sweep (ADR 0025, piece 3).
+        Evicted,
     }
 
+    let evict = handle.evict_signal();
     let session_end = tokio::select! {
+        // Checked first so a pending eviction is never starved by traffic.
+        biased;
+        () = evict.notified() => SessionEnd::Evicted,
         r = mqtt_read_loop(&mut read_params) => SessionEnd::Read(r),
         r = mqtt_write_loop(
             &mut writer,
@@ -506,6 +512,10 @@ pub(crate) async fn handle_mqtt_session(
         SessionEnd::Read(Ok(ReadLoopOutcome::DisconnectWithWill)) => true,
         SessionEnd::Read(Err(_)) => true,
         SessionEnd::Write(_) => true,
+        // The will was set under a credential that is now revoked or
+        // expired; publishing it would send a message on that identity's
+        // behalf after its access was withdrawn.
+        SessionEnd::Evicted => false,
     };
 
     let read_ok = matches!(
@@ -527,7 +537,18 @@ pub(crate) async fn handle_mqtt_session(
         .await;
     }
 
-    if let SessionEnd::Read(Err(e)) = &session_end {
+    if matches!(session_end, SessionEnd::Evicted) {
+        info!(cn = %hash_cn(&cn), "MQTT session evicted by revocation sweep");
+        if protocol == ProtocolLevel::V50 {
+            let disconnect = mqttbytes::v5::Disconnect {
+                reason_code: mqttbytes::v5::DisconnectReasonCode::AdministrativeAction,
+                properties: None,
+            };
+            let _ = writer
+                .write_v5(&mqttbytes::v5::Packet::Disconnect(disconnect))
+                .await;
+        }
+    } else if let SessionEnd::Read(Err(e)) = &session_end {
         debug!(cn = %hash_cn(&cn), error = %e, "MQTT session ended with error");
     } else if let SessionEnd::Write(Err(e)) = &session_end {
         debug!(cn = %hash_cn(&cn), error = %e, "MQTT session ended with write error");

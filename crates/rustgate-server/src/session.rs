@@ -127,6 +127,8 @@ pub(crate) struct SessionDeps<P: NatsPublish> {
 struct SessionContext<'a, P: NatsPublish> {
     identity: &'a Identity,
     router: &'a Router,
+    /// Fired by the revocation sweep to disconnect this session.
+    evict: Arc<tokio::sync::Notify>,
     codec: &'a dyn Codec,
     nats_publisher: &'a Option<P>,
     fed_forward: &'a Option<FedForwardFn>,
@@ -316,6 +318,7 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     let ctx = SessionContext {
         identity: &identity,
         router: &deps.router,
+        evict: handle.evict_signal(),
         codec: final_codec.as_ref(),
         nats_publisher: &deps.nats_publisher,
         fed_forward: &deps.fed_forward,
@@ -342,8 +345,16 @@ pub(crate) async fn handle_session<P: NatsPublish + Send + Sync + 'static>(
     )
     .await;
 
-    if let Err(e) = result {
-        tracing::debug!(cn = %hash_cn(&cn), error = %e, "session error");
+    match result {
+        // The revocation sweep already emitted `session.evicted` with the reason.
+        Err(e)
+            if e.get_ref()
+                .is_some_and(|inner| inner.is::<SessionEvicted>()) =>
+        {
+            tracing::info!(cn = %hash_cn(&cn), "session evicted by revocation sweep");
+        }
+        Err(e) => tracing::debug!(cn = %hash_cn(&cn), error = %e, "session error"),
+        Ok(()) => {}
     }
 
     deps.router.unregister(&cn, session_id).await;
@@ -470,6 +481,9 @@ async fn run_session_loops(
         None
     };
     tokio::select! {
+        // Checked first so a pending eviction is never starved by traffic.
+        biased;
+        () = ctx.evict.notified() => Err(std::io::Error::other(SessionEvicted)),
         r = read_loop(reader, ctx, read_buf) => r,
         r = write_loop(
             writer,
@@ -482,6 +496,12 @@ async fn run_session_loops(
         ) => r,
     }
 }
+
+/// Marker error: the session was asked to disconnect by the revocation sweep
+/// (ADR 0025, piece 3).
+#[derive(Debug, thiserror::Error)]
+#[error("session evicted: certificate revoked or expired")]
+struct SessionEvicted;
 
 /// Whether the active codec speaks XML on the wire. The delta encoder
 /// only operates on XML-framed sessions — protobuf and raw length-prefixed
