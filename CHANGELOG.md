@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Federation trust store no longer logs raw certificate CNs.** Four warning paths in `rustgate-federation`'s trust store (persist failure, file-removal failure, and two root-store add failures) logged the certificate common name in clear, while the success paths already used `hash_cn`. They now log `hash_cn(cn)`. The file-removal warning logs the trust store directory instead of the file path, because the file name is derived from the CN. Found while triaging CodeQL's `rust/cleartext-logging` alerts.
+
 - **OpenTelemetry 0.33 (GHSA-w9wp-h8wv-79jx).** `opentelemetry_sdk` up to 0.32.0 allocates without bound when parsing W3C Baggage headers. `opentelemetry`, `opentelemetry_sdk` and `opentelemetry-otlp` move from 0.31 to 0.33.1, and `tracing-opentelemetry` from 0.32 to 0.34, together, because bumping one alone mixes two opentelemetry versions. No code changes were needed. Dependabot now groups this family so it is bumped as one.
 
 - **event-listener 5.4.2 for RUSTSEC-2026-0221, and replacements for two yanked crates (closes #1720).** event-listener before 5.4.2 implements `Send`/`Sync` for `StackSlot` unconditionally, so a non-`Send` tag set with `Event::with_tag` can cross threads (unsound). rustgate does not call event-listener directly; it arrives through `kube` (rustgate-operator) and `ros2-client` (rustgate-dds). `spin` 0.9.8 and `chacha20` 0.10.0 were yanked upstream and move to 0.9.9 and 0.10.2. Lockfile only.

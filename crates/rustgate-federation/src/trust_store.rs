@@ -241,7 +241,7 @@ impl TrustStore {
         if let Some(ref dir) = self.data_dir
             && let Err(e) = persist_cert_to_disk(dir, &cn, pem_data)
         {
-            warn!(cn = %cn, error = %e, "failed to persist certificate to disk");
+            warn!(cn = %hash_cn(&cn), error = %e, "failed to persist certificate to disk");
         }
 
         info!(cn = %hash_cn(&cn), "added certificate to trust store");
@@ -269,9 +269,11 @@ impl TrustStore {
                 if path.exists()
                     && let Err(e) = fs::remove_file(&path)
                 {
+                    // The file name is derived from the CN, so log the
+                    // directory rather than the full path.
                     warn!(
-                        cn = %cn,
-                        path = %path.display(),
+                        cn = %hash_cn(cn),
+                        dir = %dir.display(),
                         error = %e,
                         "failed to remove certificate file"
                     );
@@ -358,7 +360,7 @@ impl TrustStore {
 
         for (cn, cert) in certs.iter() {
             if let Err(e) = store.add(cert.der.clone()) {
-                warn!(cn = %cn, error = %e, "failed to add certificate to root store");
+                warn!(cn = %hash_cn(cn), error = %e, "failed to add certificate to root store");
             }
         }
 
@@ -380,7 +382,7 @@ impl TrustStore {
 
         for (cn, cert) in certs.iter() {
             if let Err(e) = store.add(cert.der.clone()) {
-                warn!(cn = %cn, error = %e, "failed to add trust store cert to root store");
+                warn!(cn = %hash_cn(cn), error = %e, "failed to add trust store cert to root store");
             }
         }
 
