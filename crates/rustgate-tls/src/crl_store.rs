@@ -418,7 +418,7 @@ mod tests {
 
     fn identity_of(pem: &str) -> rustgate_core::identity::Identity {
         let der = rustgate_test_utils::tls::parse_certs(pem).remove(0);
-        crate::extract::extract_identity(&der).unwrap()
+        crate::extract::extract_identity(&der).unwrap_or_else(|_| panic!("leaf identity"))
     }
 
     #[test]
@@ -431,18 +431,23 @@ mod tests {
         let kept = ca.issue_client_cert_with_serial("bob", &[0x80, 0x01, 0x03]);
         // Prove the fixture really carries the DER sign pad on the wire.
         let der = rustgate_test_utils::tls::parse_certs(&revoked.cert_pem).remove(0);
-        let (_, parsed) = x509_parser::parse_x509_certificate(der.as_ref()).unwrap();
-        assert_eq!(parsed.raw_serial(), &[0x00, 0x80, 0x01, 0x02]);
+        let (_, parsed) = x509_parser::parse_x509_certificate(der.as_ref())
+            .unwrap_or_else(|_| panic!("parse certificate"));
+        assert!(
+            parsed.raw_serial() == [0x00, 0x80, 0x01, 0x02],
+            "serial must carry the DER sign pad"
+        );
         let alice = identity_of(&revoked.cert_pem);
-        assert_eq!(
-            alice.attributes.get("cert_serial"),
-            Some(&rustgate_core::identity::AttrValue::Str("800102".into()))
+        assert!(
+            alice.attributes.get("cert_serial")
+                == Some(&rustgate_core::identity::AttrValue::Str("800102".into())),
+            "cert_serial must be the unpadded magnitude"
         );
 
         let store =
             CrlStore::from_path(&write_temp(&ca.generate_crl(&[&revoked.cert_pem]))).unwrap();
         let set = store.revoked_set();
-        assert_eq!(set.len(), 1);
+        assert!(set.len() == 1, "one revoked entry");
         assert!(set.is_revoked(&alice));
         assert!(!set.is_revoked(&identity_of(&kept.cert_pem)));
     }
@@ -458,7 +463,8 @@ mod tests {
             rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0),
             rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
         ];
-        let with_chain = crate::extract::identity_with_chain_keys(&chain).unwrap();
+        let with_chain = crate::extract::identity_with_chain_keys(&chain)
+            .unwrap_or_else(|_| panic!("chain identity"));
         let leaf_only = identity_of(&leaf.cert_pem);
 
         let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
@@ -482,13 +488,15 @@ mod tests {
         }
         chain.push(rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0));
 
-        let identity = crate::extract::identity_with_chain_keys(&chain).unwrap();
-        match identity.attributes.get("chain_revocation_keys") {
-            Some(rustgate_core::identity::AttrValue::Set(keys)) => {
-                assert_eq!(keys.len(), 1, "only the real issuer is recorded: {keys:?}");
-            }
-            other => panic!("expected chain_revocation_keys, got {other:?}"),
-        }
+        let identity = crate::extract::identity_with_chain_keys(&chain)
+            .unwrap_or_else(|_| panic!("chain identity"));
+        assert!(
+            matches!(
+                identity.attributes.get("chain_revocation_keys"),
+                Some(rustgate_core::identity::AttrValue::Set(keys)) if keys.len() == 1
+            ),
+            "only the real issuer is recorded"
+        );
         let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
         assert!(store.revoked_set().is_revoked(&identity));
     }
@@ -507,7 +515,8 @@ mod tests {
                 .remove(0),
             rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
         ];
-        let identity = crate::extract::identity_with_chain_keys(&chain).unwrap();
+        let identity = crate::extract::identity_with_chain_keys(&chain)
+            .unwrap_or_else(|_| panic!("chain identity"));
         let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
         assert!(store.revoked_set().is_revoked(&identity));
     }
@@ -544,7 +553,8 @@ mod tests {
         // Repeating the real chain many times costs nothing extra.
         let mut repeated = vec![leaf_der];
         repeated.extend(std::iter::repeat_n(real, 50));
-        let identity = crate::extract::identity_with_chain_keys(&repeated).unwrap();
+        let identity = crate::extract::identity_with_chain_keys(&repeated)
+            .unwrap_or_else(|_| panic!("chain identity"));
         let store = CrlStore::from_path(&write_temp(&ca.generate_crl(&[&ca.cert_pem]))).unwrap();
         assert!(store.revoked_set().is_revoked(&identity));
     }
@@ -559,7 +569,8 @@ mod tests {
             rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0),
             rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
         ];
-        let identity = crate::extract::extract_identity_with_chain(&chain).unwrap();
+        let identity = crate::extract::extract_identity_with_chain(&chain)
+            .unwrap_or_else(|_| panic!("chain identity"));
         assert!(!identity.attributes.contains_key("chain_revocation_keys"));
     }
 
