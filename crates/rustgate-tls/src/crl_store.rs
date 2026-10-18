@@ -416,8 +416,18 @@ mod tests {
         p
     }
 
+    /// The first certificate in `pem`. Panics with a fixed message, so a
+    /// failing test never prints certificate bytes.
+    fn der(pem: &str) -> rustls::pki_types::CertificateDer<'static> {
+        use rustls::pki_types::pem::PemObject as _;
+        rustls::pki_types::CertificateDer::pem_slice_iter(pem.as_bytes())
+            .next()
+            .and_then(std::result::Result::ok)
+            .unwrap_or_else(|| panic!("expected a PEM certificate"))
+    }
+
     fn identity_of(pem: &str) -> rustgate_core::identity::Identity {
-        let der = rustgate_test_utils::tls::parse_certs(pem).remove(0);
+        let der = der(pem);
         crate::extract::extract_identity(&der).unwrap_or_else(|_| panic!("leaf identity"))
     }
 
@@ -430,7 +440,7 @@ mod tests {
         let revoked = ca.issue_client_cert_with_serial("alice", &[0x80, 0x01, 0x02]);
         let kept = ca.issue_client_cert_with_serial("bob", &[0x80, 0x01, 0x03]);
         // Prove the fixture really carries the DER sign pad on the wire.
-        let der = rustgate_test_utils::tls::parse_certs(&revoked.cert_pem).remove(0);
+        let der = der(&revoked.cert_pem);
         let (_, parsed) = x509_parser::parse_x509_certificate(der.as_ref())
             .unwrap_or_else(|_| panic!("parse certificate"));
         assert!(
@@ -459,10 +469,7 @@ mod tests {
         // leaf itself is not revoked, but its session must still match.
         let ca = TestCa::new("Sweep CA");
         let leaf = ca.issue_client_cert_with_serial("alice", &[0x21]);
-        let chain = [
-            rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0),
-            rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
-        ];
+        let chain = [der(&leaf.cert_pem), der(&ca.cert_pem)];
         let with_chain = crate::extract::identity_with_chain_keys(&chain)
             .unwrap_or_else(|_| panic!("chain identity"));
         let leaf_only = identity_of(&leaf.cert_pem);
@@ -481,12 +488,12 @@ mod tests {
         // leaf may be recorded, so the real CA's revocation still matches.
         let ca = TestCa::new("Sweep CA");
         let leaf = ca.issue_client_cert_with_serial("alice", &[0x31]);
-        let mut chain = vec![rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0)];
+        let mut chain = vec![der(&leaf.cert_pem)];
         for _ in 0..9 {
             let impostor = TestCa::new("Sweep CA");
-            chain.push(rustgate_test_utils::tls::parse_certs(&impostor.cert_pem).remove(0));
+            chain.push(der(&impostor.cert_pem));
         }
-        chain.push(rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0));
+        chain.push(der(&ca.cert_pem));
 
         let identity = crate::extract::identity_with_chain_keys(&chain)
             .unwrap_or_else(|_| panic!("chain identity"));
@@ -510,10 +517,9 @@ mod tests {
         let ca = TestCa::new("Sweep CA");
         let leaf = ca.issue_client_cert_with_serial("alice", &[0x41]);
         let chain = [
-            rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0),
-            rustgate_test_utils::tls::parse_certs(&ca.self_signed_twin("Sweep CA", &[0x7e]))
-                .remove(0),
-            rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
+            der(&leaf.cert_pem),
+            der(&ca.self_signed_twin("Sweep CA", &[0x7e])),
+            der(&ca.cert_pem),
         ];
         let identity = crate::extract::identity_with_chain_keys(&chain)
             .unwrap_or_else(|_| panic!("chain identity"));
@@ -525,17 +531,14 @@ mod tests {
     fn a_chain_beyond_the_search_limits_is_rejected_not_recorded_partially() {
         let ca = TestCa::new("Sweep CA");
         let leaf = ca.issue_client_cert_with_serial("alice", &[0x51]);
-        let leaf_der = rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0);
-        let real = rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0);
+        let leaf_der = der(&leaf.cert_pem);
+        let real = der(&ca.cert_pem);
 
         // Too many certificates that really verify (twins minted with the
         // CA key) to record them all.
         let mut twins = vec![leaf_der.clone()];
         for i in 0..40u8 {
-            twins.push(
-                rustgate_test_utils::tls::parse_certs(&ca.self_signed_twin("Sweep CA", &[0x60, i]))
-                    .remove(0),
-            );
+            twins.push(der(&ca.self_signed_twin("Sweep CA", &[0x60, i])));
         }
         twins.push(real.clone());
         assert!(crate::extract::identity_with_chain_keys(&twins).is_err());
@@ -543,9 +546,7 @@ mod tests {
         // Too many same-named impostors to verify within the budget.
         let mut impostors = vec![leaf_der.clone()];
         for _ in 0..120 {
-            impostors.push(
-                rustgate_test_utils::tls::parse_certs(&TestCa::new("Sweep CA").cert_pem).remove(0),
-            );
+            impostors.push(der(&TestCa::new("Sweep CA").cert_pem));
         }
         impostors.push(real.clone());
         assert!(crate::extract::identity_with_chain_keys(&impostors).is_err());
@@ -565,10 +566,7 @@ mod tests {
         // must behave exactly like leaf-only extraction.
         let ca = TestCa::new("Sweep CA");
         let leaf = ca.issue_client_cert_with_serial("alice", &[0x71]);
-        let chain = [
-            rustgate_test_utils::tls::parse_certs(&leaf.cert_pem).remove(0),
-            rustgate_test_utils::tls::parse_certs(&ca.cert_pem).remove(0),
-        ];
+        let chain = [der(&leaf.cert_pem), der(&ca.cert_pem)];
         let identity = crate::extract::extract_identity_with_chain(&chain)
             .unwrap_or_else(|_| panic!("chain identity"));
         assert!(!identity.attributes.contains_key("chain_revocation_keys"));
