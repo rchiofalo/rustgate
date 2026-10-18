@@ -728,7 +728,7 @@ mod tests {
         assert!(rendered.contains("CertReloader"));
         assert!(
             rendered.contains("None"),
-            "Memory-backed reloader must render path fields as None, got: {rendered}"
+            "Memory-backed reloader must render path fields as None"
         );
         // Absence checks: no file-path leak when there isn't one.
         assert!(!rendered.contains(".pem"));
