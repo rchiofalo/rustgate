@@ -606,6 +606,34 @@ pub fn crl_reload_failed(source: &str, error: &str) {
     );
 }
 
+/// Record that an established session was evicted by the revocation sweep
+/// (ADR 0025, piece 3). `reason` is `"revoked"` (certificate listed on a
+/// loaded CRL) or `"expired"` (certificate `notAfter` has passed).
+pub fn session_evicted(cn: &str, session_id: u64, reason: &str) {
+    let cn = s(cn);
+    let reason = s(reason);
+    audit!(
+        "session.evicted",
+        cn = %cn,
+        session_id = session_id,
+        reason = %reason,
+        action = "disconnect",
+        result = "success"
+    );
+}
+
+/// Record that the revocation sweep skipped its expiry check because the
+/// wall clock moved inconsistently with monotonic time (a clock step), which
+/// could otherwise mass-evict valid sessions. Revocation checks still ran.
+pub fn revocation_sweep_clock_skew(drift_secs: i64) {
+    audit!(
+        "revocation.sweep_clock_skew",
+        drift_secs = drift_secs,
+        action = "skip_expiry_check",
+        result = "warning"
+    );
+}
+
 /// Record an enrollment certificate issued event.
 ///
 /// Sanitization: `username`, `client_uid`, and `serial` are sanitized at

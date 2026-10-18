@@ -1,6 +1,6 @@
 # ADR 0025: Live certificate-revocation lifecycle
 
-- **Status:** Proposed
+- **Status:** Accepted (all three pieces implemented)
 - **Date:** 2026-06-25
 - **Deciders:** rchiofalo
 - **Related:** #1496 (revocation restart-gated), `rustgate-tls`
@@ -83,6 +83,55 @@ id-match stale-guard so it never evicts a replacement session.
 **Defaults: all OFF** (`--crl-refresh-interval=0`, `--crl-fail-closed=false`,
 `--revocation-sweep-interval=0`) — strict back-compat; operators opt into
 liveness.
+
+### Implementation notes (Piece 3)
+
+- The sweeper lives in `rustgate-router` (`revocation_sweep.rs`), not
+  `rustgate-server`, because it only needs the session registry. The server
+  supplies the revoked set as a callback over `CrlStore::revoked_set()`.
+- The revoked `(issuer, serial)` encoding is defined once, in
+  `rustgate-core::revocation`, and used by both the CRL side and the identity
+  extractor. Both serials go through `BigUint::to_bytes_be`, so a high-bit
+  serial matches (revision 3).
+- The stale-guard is structural: each `SessionHandle` owns its own `Notify`,
+  so signalling a snapshot handle can never reach a replacement session for the
+  same CN. This is why the sweeper does not reuse `Router::disconnect_client`,
+  which works by CN and only closes the writer side.
+- The router's session map holds one session per CN, so a newer connection
+  with the same certificate displaces an older one that stays connected. The
+  router also keeps every live session by id, and the sweep reads that set, so
+  displaced sessions are evicted too.
+- Each session also records the `(issuer, serial)` of every CA certificate
+  among those the client presented that is on some issuer path from the leaf
+  (`chain_revocation_keys`, at most 32), so revoking an intermediate evicts
+  the leaves under it. A certificate counts only when its key verifies the
+  signature of one already on a path, and the search follows every branch.
+  It is capped at 100 signature verifications (webpki's per-handshake
+  budget) and 32 recorded certificates; a chain that hits either cap is
+  rejected at connect rather than recorded partially, so same-named padding
+  or self-signed twins minted with the intermediate's key cannot hide the
+  copy that chains to the anchor. Byte-identical repeats are ignored. The
+  search and its limits run only when `--revocation-sweep-interval` is set;
+  otherwise identity extraction is leaf-only, as before. Recording
+  every branch is fail-closed: a session with a valid alternate path through
+  a revoked certificate (e.g. a cross-signed intermediate) is evicted too.
+  Intermediates configured as trust anchors in `--ca` rather than sent by the
+  client are not covered.
+- Matching uses the issuer CN, not the full issuer name or key identifier, so
+  two CAs with the same CN and overlapping serials are not told apart. An
+  issuer CN that is not a plain string type (e.g. BMPString) yields no key and
+  never matches.
+- Expiry eviction is skipped for a sweep when the wall clock has moved more
+  than 30 s away from monotonic time since the previous sweep
+  (`revocation.sweep_clock_skew`). Revocation checks still run, because they do
+  not depend on the clock. The next sweep takes the new time as its baseline,
+  so a lasting clock change delays expiry eviction by one interval rather than
+  blocking it; new handshakes are judged by the same clock.
+- Without `--crl` and a non-zero `--crl-refresh-interval` there is no CRL
+  store, so the sweep runs in expiry-only mode and logs a warning.
+- MQTT sessions skip the will message on eviction and, on MQTT 5, send
+  DISCONNECT with reason `0x98` (administrative action). WebSocket and TLS
+  sessions close.
 
 ## Alternatives considered
 

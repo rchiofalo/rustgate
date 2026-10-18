@@ -231,6 +231,16 @@ pub(crate) struct TlsArgs {
     #[arg(long, default_value_t = 0, env = "RUSTGATE_CRL_REFRESH_INTERVAL")]
     pub(crate) crl_refresh_interval: u64,
 
+    /// Seconds between sweeps that disconnect established sessions whose
+    /// client certificate has since been revoked or has expired (0 =
+    /// disabled, the default). Certificates are otherwise checked only at the
+    /// handshake, so a long-lived session survives a later revocation.
+    /// Revocation needs `--crl` with `--crl-refresh-interval > 0`; without
+    /// them only expiry is enforced. Expiry eviction is skipped for a sweep
+    /// when the wall clock steps (#1496, ADR-0025).
+    #[arg(long, default_value_t = 0, env = "RUSTGATE_REVOCATION_SWEEP_INTERVAL")]
+    pub(crate) revocation_sweep_interval: u64,
+
     /// Reject **all** client-certificate handshakes once every loaded CRL has
     /// gone stale (its `nextUpdate` is in the past) past `--crl-grace-secs`.
     /// Opt-in and default `false` — a default deployment stays fail-open,
@@ -2733,6 +2743,7 @@ define_config_file! {
     tls_min_version in tls: String,
     crl_warn_stale in tls: bool,
     crl_refresh_interval in tls: u64,
+    revocation_sweep_interval in tls: u64,
     crl_fail_closed in tls: bool,
     crl_grace_secs in tls: u64,
     fips_required in tls: bool,

@@ -44,6 +44,7 @@ pub mod peer_id;
 #[cfg(feature = "pem")]
 pub mod pem;
 pub mod protocol;
+pub mod revocation;
 pub mod sanitize;
 pub mod secrets;
 pub mod tasks;

@@ -90,6 +90,24 @@ impl TestCa {
         }
     }
 
+    /// A self-signed certificate with this CA's name and key but a different
+    /// serial: what someone holding the CA's private key could mint. Used by
+    /// revocation tests where a client inserts such a twin into its chain.
+    pub fn self_signed_twin(&self, cn: &str, serial: &[u8]) -> String {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        params.distinguished_name = dn;
+        params.serial_number = Some(SerialNumber::from_slice(serial));
+        let key_pair = KeyPair::from_pem(&self.key_pem).expect("failed to load CA key");
+        params
+            .self_signed(&key_pair)
+            .expect("failed to self-sign twin")
+            .pem()
+    }
+
     /// Issue a server certificate with the given common name and SANs.
     pub fn issue_server_cert(&self, cn: &str, san_dns: &[&str]) -> TestCert {
         let key_pair = KeyPair::generate().expect("failed to generate key pair");
@@ -427,6 +445,31 @@ impl TestCa {
             .signed_by(&key_pair, &self.issuer)
             .expect("failed to sign near-expiry client cert");
 
+        TestCert {
+            cert_pem: cert.pem(),
+            key_pem: key_pair.serialize_pem(),
+        }
+    }
+
+    /// Issue a client certificate with an explicit serial number.
+    ///
+    /// Used by revocation tests that need a specific serial, e.g. one with
+    /// its high bit set, which DER encodes with a leading `0x00` pad.
+    pub fn issue_client_cert_with_serial(&self, cn: &str, serial: &[u8]) -> TestCert {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::NoCa;
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::ClientAuth);
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        params.distinguished_name = dn;
+        params.serial_number = Some(SerialNumber::from_slice(serial));
+
+        let key_pair = KeyPair::generate().expect("failed to generate key pair");
+        let cert = params
+            .signed_by(&key_pair, &self.issuer)
+            .expect("failed to sign client cert");
         TestCert {
             cert_pem: cert.pem(),
             key_pem: key_pair.serialize_pem(),

@@ -1433,6 +1433,15 @@
       ],
       "default": null
     },
+    "revocation-sweep-interval": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "default": null,
+      "minimum": 0
+    },
     "sapient-allowed-cidrs": {
       "type": [
         "string",

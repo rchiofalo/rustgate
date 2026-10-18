@@ -451,6 +451,10 @@ All flags support environment variables (CLI takes precedence):
 | `--ca` | `RUSTGATE_CA` | — |
 | `--crl` | `RUSTGATE_CRL` | — |
 | `--crl-warn-stale` | `RUSTGATE_CRL_WARN_STALE` | `true` |
+| `--crl-refresh-interval` | `RUSTGATE_CRL_REFRESH_INTERVAL` | `0` (disabled) |
+| `--crl-fail-closed` | `RUSTGATE_CRL_FAIL_CLOSED` | `false` |
+| `--crl-grace-secs` | `RUSTGATE_CRL_GRACE_SECS` | `0` |
+| `--revocation-sweep-interval` | `RUSTGATE_REVOCATION_SWEEP_INTERVAL` | `0` (disabled) |
 | `--tls-min-version` | `RUSTGATE_TLS_MIN_VERSION` | `1.2` |
 | `--cert-reload-interval` | `RUSTGATE_CERT_RELOAD_INTERVAL` | `0` (disabled) |
 | `--max-concurrent-handshakes` | `RUSTGATE_MAX_HANDSHAKES` | `100` |

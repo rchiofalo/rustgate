@@ -601,6 +601,12 @@ fn main() -> anyhow::Result<()> {
     rustls::crypto::CryptoProvider::install_default(provider)
         .map_err(|_| anyhow::anyhow!("crypto provider already installed"))?;
 
+    // The revocation sweep matches intermediates too, so sessions must record
+    // their issuer path from the first connection on (ADR 0025).
+    if cli.tls.revocation_sweep_interval > 0 {
+        rustgate_tls::enable_chain_revocation_keys();
+    }
+
     // A `fips` build that is not running the FIPS module is a build problem
     // (e.g. aws-lc-fips-sys did not build its module); refuse to start.
     #[cfg(feature = "fips")]
@@ -734,6 +740,7 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     let setup::TlsListenerHandle {
         listener,
         cert_reloader,
+        crl_store,
         #[cfg(feature = "ocsp")]
         ocsp_stapler,
     } = tls_handle;
@@ -1094,6 +1101,30 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
             Some(tracker) => base.with_quota_tracker(tracker),
             None => base,
         }
+    });
+
+    // Revocation sweep (ADR 0025, piece 3): periodically disconnect sessions
+    // whose client certificate was revoked or has expired since the handshake.
+    let revocation_sweep = (cli.tls.revocation_sweep_interval > 0).then(|| {
+        let source = crl_store.as_ref().map(|store| {
+            let store = Arc::clone(store);
+            Arc::new(move || store.revoked_set()) as rustgate_router::revocation_sweep::RevokedSetFn
+        });
+        tracing::info!(
+            interval_secs = cli.tls.revocation_sweep_interval,
+            revocation = source.is_some(),
+            "revocation sweep enabled; revoked or expired sessions are disconnected"
+        );
+        if source.is_none() {
+            tracing::warn!(
+                "--revocation-sweep-interval without --crl and --crl-refresh-interval: \
+                 only certificate expiry is enforced mid-session"
+            );
+        }
+        rustgate_router::revocation_sweep::RevocationSweeper::new(Arc::clone(&router), source)
+            .spawn(std::time::Duration::from_secs(
+                cli.tls.revocation_sweep_interval,
+            ))
     });
 
     // Populate the router slot so the metrics server can serve
@@ -2555,6 +2586,10 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
     if let Some(ref publisher) = _http_publisher {
         publisher.shutdown().await;
         tracing::info!("HTTP egress shut down");
+    }
+
+    if let Some(handle) = revocation_sweep {
+        stop_subsystem("revocation-sweep", handle).await;
     }
 
     #[cfg(feature = "websocket")]

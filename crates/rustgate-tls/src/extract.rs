@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rustgate_core::error::{Result, RustgateError, TransportError};
 use rustgate_core::identity::{AttrValue, Identity};
+use rustgate_core::revocation;
 use rustgate_core::sanitize::sanitize_for_log;
 use rustls::pki_types::CertificateDer;
 use sha2::{Digest, Sha256};
@@ -35,6 +36,184 @@ const MAX_SAN_ENTRIES_PER_CATEGORY: usize = 32;
 /// ceiling: small overshoots are acceptable because the check runs
 /// after each insertion, not per-byte.
 const MAX_ATTR_BAG_BYTES: usize = 4 * 1024;
+
+/// Most issuer certificates recorded per session for revocation matching.
+/// Real chains have one or two intermediates; cross-signed ones a few more.
+const MAX_CHAIN_REVOCATION_KEYS: usize = 32;
+
+/// Most signature verifications spent rebuilding issuer paths, the same as
+/// webpki's default per-handshake signature budget.
+const MAX_PATH_SIGNATURE_CHECKS: usize = 100;
+
+/// Extract identity from a presented chain: the leaf ([`extract_identity`])
+/// plus, once [`enable_chain_revocation_keys`] has been called, the
+/// `(issuer, serial)` revocation key of every CA certificate that is
+/// on some issuer path from the leaf, so the revocation sweep can evict
+/// sessions whose intermediate is revoked (ADR 0025).
+///
+/// The client controls which extra certificates it sends and in what order,
+/// so a certificate is recorded only when its key verifies the signature of a
+/// certificate already on a path, and every such branch is followed. The
+/// search is complete within its limits (100 signature verifications, 32
+/// recorded certificates); a chain that exceeds them is rejected
+/// rather than recorded partially, so padding or self-signed twins cannot
+/// hide the copy of an intermediate that chains to the trust anchor. A
+/// session with a valid alternate path through a revoked certificate is
+/// evicted too (fail-closed).
+///
+/// # Errors
+///
+/// Fails like [`extract_identity`], and when the chain exceeds the search
+/// limits.
+pub fn extract_identity_with_chain(chain: &[CertificateDer<'_>]) -> Result<Identity> {
+    let leaf = chain.first().ok_or(TransportError::EmptyCertChain)?;
+    if !CHAIN_REVOCATION_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return extract_identity(leaf);
+    }
+    identity_with_chain_keys(chain)
+}
+
+/// Whether [`extract_identity_with_chain`] records chain revocation keys.
+/// Off by default, so the issuer search and its chain-size limits cost
+/// nothing unless the revocation sweep is enabled.
+static CHAIN_REVOCATION_KEYS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Make [`extract_identity_with_chain`] record the issuer-path revocation
+/// keys (and enforce its chain-size limits). The server calls this at
+/// startup when `--revocation-sweep-interval` is set, before any listener
+/// accepts a connection.
+pub fn enable_chain_revocation_keys() {
+    CHAIN_REVOCATION_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`extract_identity_with_chain`] with chain revocation keys always on.
+pub(crate) fn identity_with_chain_keys(chain: &[CertificateDer<'_>]) -> Result<Identity> {
+    let leaf = chain.first().ok_or(TransportError::EmptyCertChain)?;
+    let identity = extract_identity(leaf)?;
+
+    let keys = issuer_path_keys(chain).ok_or_else(|| {
+        RustgateError::from(TransportError::Other(
+            "client certificate chain is too large to check for revocation".to_string(),
+        ))
+    })?;
+    if keys.is_empty() {
+        return Ok(identity);
+    }
+    let mut attrs = (*identity.attributes).clone();
+    let _ = attrs.insert(
+        revocation::ATTR_CHAIN_REVOCATION_KEYS.to_string(),
+        AttrValue::Set(keys),
+    );
+    Ok(identity.with_attributes(attrs))
+}
+
+/// Breadth-first search up from the leaf through the presented
+/// certificates. A certificate joins the search when its subject is the
+/// issuer of a certificate already found and its key verifies that
+/// certificate's signature. Returns the revocation key of each one found, or
+/// `None` when the search hit a limit before it finished.
+fn issuer_path_keys(chain: &[CertificateDer<'_>]) -> Option<Vec<String>> {
+    let Some(provider) = rustls::crypto::CryptoProvider::get_default() else {
+        return Some(Vec::new());
+    };
+    let algs = provider.signature_verification_algorithms.all;
+    let Some(Ok((_, leaf))) = chain.first().map(|d| X509Certificate::from_der(d.as_ref())) else {
+        return Some(Vec::new());
+    };
+    // Byte-identical copies add nothing; drop them so a client that repeats
+    // a certificate is not charged for it.
+    let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    let pool: Vec<X509Certificate<'_>> = chain
+        .iter()
+        .skip(1)
+        .filter(|&d| seen.insert(d.as_ref()))
+        .filter_map(|d| X509Certificate::from_der(d.as_ref()).ok().map(|(_, c)| c))
+        .collect();
+
+    let mut found = vec![false; pool.len()];
+    let mut budget = MAX_PATH_SIGNATURE_CHECKS;
+    let mut keys = Vec::new();
+    let mut queue = std::collections::VecDeque::from([&leaf]);
+    while let Some(current) = queue.pop_front() {
+        for (i, candidate) in pool.iter().enumerate() {
+            if found[i] || candidate.subject().as_raw() != current.issuer().as_raw() {
+                continue;
+            }
+            match signed_by(current, candidate, algs, &mut budget) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => return None,
+            }
+            found[i] = true;
+            if let Some(issuer) = first_issuer_cn(candidate) {
+                keys.push(revocation::chain_key(
+                    &revocation::canonical_issuer(&issuer),
+                    &revocation::serial_hex(&candidate.tbs_certificate.serial.to_bytes_be()),
+                ));
+                if keys.len() > MAX_CHAIN_REVOCATION_KEYS {
+                    return None;
+                }
+            }
+            queue.push_back(candidate);
+        }
+    }
+    Some(keys)
+}
+
+/// Whether `issuer`'s key verifies `child`'s signature, trying the installed
+/// provider's algorithms that match both the signature and key algorithm.
+/// Each verification spends one unit of `budget`; `None` once it runs out.
+fn signed_by(
+    child: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+    algs: &[&dyn rustls::pki_types::SignatureVerificationAlgorithm],
+    budget: &mut usize,
+) -> Option<bool> {
+    let (Some(sig_oid), Some(key_oid)) = (
+        oid_tlv(&child.signature_algorithm.algorithm),
+        oid_tlv(&issuer.public_key().algorithm.algorithm),
+    ) else {
+        return Some(false);
+    };
+    let public_key = &issuer.public_key().subject_public_key.data;
+    let message = child.tbs_certificate.as_ref();
+    let signature = &child.signature_value.data;
+    for alg in algs.iter().filter(|alg| {
+        alg.signature_alg_id().as_ref().starts_with(&sig_oid)
+            && alg.public_key_alg_id().as_ref().starts_with(&key_oid)
+    }) {
+        *budget = budget.checked_sub(1)?;
+        if alg.verify_signature(public_key, message, signature).is_ok() {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// DER encoding of an OID (tag, length, value), the prefix of an
+/// AlgorithmIdentifier's contents. `None` for an OID too long for a
+/// short-form length, which no supported algorithm uses.
+fn oid_tlv(oid: &x509_parser::der_parser::oid::Oid<'_>) -> Option<Vec<u8>> {
+    let value = oid.as_bytes();
+    let len = u8::try_from(value.len()).ok().filter(|l| *l < 0x80)?;
+    let mut tlv = Vec::with_capacity(value.len() + 2);
+    tlv.push(0x06);
+    tlv.push(len);
+    tlv.extend_from_slice(value);
+    Some(tlv)
+}
+
+/// The first issuer CN that is a plain string type.
+fn first_issuer_cn(cert: &X509Certificate<'_>) -> Option<String> {
+    cert.issuer().iter_rdn().find_map(|rdn| {
+        rdn.iter().find_map(|attr| {
+            (attr.attr_type() == &OID_X509_COMMON_NAME)
+                .then(|| attr.attr_value().as_str().ok().map(str::to_string))
+                .flatten()
+        })
+    })
+}
 
 /// Extract identity from an X.509 certificate.
 ///
@@ -87,11 +266,13 @@ pub fn extract_identity(cert_der: &CertificateDer<'_>) -> Result<Identity> {
 /// - `country` (Str) — first subject C (countryName) value
 /// - `issuer_cn` (Str) — first issuer CN value
 /// - `cert_serial` (Str) — certificate serial number as lowercase hex,
-///   formatted as two hex chars per byte of the DER big-endian
-///   representation with no `0x` prefix and no leading-zero trimming.
-///   A one-byte serial `0x01` formats as `"01"`, not `"1"`; a
-///   leading-zero byte is preserved, so a policy rule comparing
-///   `cert_serial` with string equality must use the same format.
+///   two hex chars per byte of its minimal big-endian magnitude, with no
+///   `0x` prefix (see [`rustgate_core::revocation::serial_hex`]). A
+///   one-byte serial `0x01` formats as `"01"`, not `"1"`. The `0x00` that
+///   DER prepends to a serial with its high bit set is not included, so a
+///   policy rule comparing `cert_serial` with string equality must use the
+///   same format. CRL entries are encoded identically for revocation.
+/// - `cert_not_after` (Int) — certificate `notAfter` as Unix seconds
 fn extract_attributes(
     cert: &X509Certificate<'_>,
     cert_der: &CertificateDer<'_>,
@@ -110,32 +291,30 @@ fn extract_attributes(
             AttrValue::Str(sanitize_for_log(&country)),
         );
     }
-    // Issuer CN.
-    let mut issuer_cn: Option<String> = None;
-    for rdn in cert.issuer().iter_rdn() {
-        for attr in rdn.iter() {
-            if attr.attr_type() == &OID_X509_COMMON_NAME
-                && let Ok(v) = attr.attr_value().as_str()
-            {
-                issuer_cn = Some(v.to_string());
-                break;
-            }
-        }
-        if issuer_cn.is_some() {
-            break;
-        }
-    }
-    if let Some(cn) = issuer_cn {
+    // Issuer CN and serial use the shared revocation encoding so the
+    // revocation sweep can match them against CRL entries (ADR 0025).
+    if let Some(cn) = first_issuer_cn(cert) {
         let _ = attrs.insert(
-            "issuer_cn".to_string(),
-            AttrValue::Str(sanitize_for_log(&cn)),
+            revocation::ATTR_ISSUER_CN.to_string(),
+            AttrValue::Str(revocation::canonical_issuer(&cn)),
         );
     }
 
-    // Certificate serial (lowercase hex of DER bytes).
-    let serial_bytes = cert.tbs_certificate.serial.to_bytes_be();
-    let serial_hex: String = serial_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let _ = attrs.insert("cert_serial".to_string(), AttrValue::Str(serial_hex));
+    // Certificate serial (lowercase hex of the big-endian magnitude).
+    let serial_hex = revocation::serial_hex(&cert.tbs_certificate.serial.to_bytes_be());
+    let _ = attrs.insert(
+        revocation::ATTR_CERT_SERIAL.to_string(),
+        AttrValue::Str(serial_hex),
+    );
+
+    // Certificate notAfter as Unix seconds, for expiry-based eviction.
+    // `timestamp()` is already an i64 for any representable ASN.1 time
+    // (pre-1970 and post-2050 GeneralizedTime included), so no clamp or
+    // fallible conversion is needed.
+    let _ = attrs.insert(
+        revocation::ATTR_CERT_NOT_AFTER.to_string(),
+        AttrValue::Int(cert.validity().not_after.timestamp()),
+    );
 
     // SAN extension — URI / DNS / email.
     //

@@ -433,7 +433,7 @@ use rustgate_core::masking::hash_cn;
 use rustgate_core::message::{Destination, MessageType, RoutableMessage};
 use rustgate_resilience::backpressure::{BackpressureGate, BackpressurePermit};
 use rustgate_resilience::token_bucket::TokenBucket;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tracing::{debug, warn};
 
 use crate::acl::GroupAclPolicy;
@@ -832,6 +832,10 @@ pub struct SessionHandle {
     normal_sender: Arc<Mutex<Option<mpsc::Sender<RoutedMessage>>>>,
     consecutive_drops: Arc<AtomicU32>,
     max_consecutive_drops: u32,
+    /// Wakes the session's I/O loop to disconnect it (revocation sweep,
+    /// ADR 0025 piece 3). Per session: a replacement session for the same
+    /// CN has its own signal, so evicting a stale snapshot is harmless.
+    evict: Arc<Notify>,
 }
 
 impl SessionHandle {
@@ -852,8 +856,20 @@ impl SessionHandle {
             priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
             normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
+            evict: Arc::new(Notify::new()),
             max_consecutive_drops: DEFAULT_MAX_CONSECUTIVE_DROPS,
         }
+    }
+
+    /// Ask this session's I/O loop to disconnect. Safe to call at any time:
+    /// the signal is stored if the loop is not yet waiting on it.
+    pub fn request_evict(&self) {
+        self.evict.notify_one();
+    }
+
+    /// The eviction signal the session's I/O loop waits on.
+    pub fn evict_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.evict)
     }
 
     /// Precomputed authz subject hash suitable for
@@ -880,6 +896,7 @@ impl SessionHandle {
             priority_sender: Arc::new(Mutex::new(Some(priority_sender))),
             normal_sender: Arc::new(Mutex::new(Some(normal_sender))),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
+            evict: Arc::new(Notify::new()),
             max_consecutive_drops: threshold,
         }
     }
@@ -1050,6 +1067,11 @@ struct State {
     /// allocating a fresh `String`. `HashMap<Arc<str>, _>::get(&str)`
     /// still works through `Arc<str>: Borrow<str>`. Closes #784.
     sessions: HashMap<Arc<str>, SessionHandle>,
+    /// Every registered session that has not unregistered yet, by session
+    /// id. Differs from `sessions` when a newer session for the same CN
+    /// displaced an older one that is still connected; the revocation sweep
+    /// must see both (ADR 0025).
+    live: HashMap<u64, SessionHandle>,
     groups: HashMap<GroupId, HashSet<Arc<str>>>,
     /// Secondary index: number of groups each CN belongs to.
     /// Maintained by `join_group`, `leave_group`, `register`, and `unregister`
@@ -1065,6 +1087,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             sessions: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
+            live: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
             groups: HashMap::with_capacity(DEFAULT_GROUP_CAPACITY),
             cn_group_count: HashMap::with_capacity(DEFAULT_SESSION_CAPACITY),
             max_groups_per_cn: DEFAULT_MAX_GROUPS_PER_CN,
@@ -2591,6 +2614,14 @@ impl Router {
         self.quota_tracker.load_full().as_ref().clone()
     }
 
+    /// Snapshot every live session (cloned handles), including one that a
+    /// newer session for the same CN displaced but that has not disconnected
+    /// yet. Used by the revocation sweep; the handles keep working after the
+    /// lock is released.
+    pub async fn session_handles(&self) -> Vec<SessionHandle> {
+        self.state.read().await.live.values().cloned().collect()
+    }
+
     /// Register a session with the router.
     ///
     /// Returns `true` if the session was accepted, `false` if it was
@@ -2662,6 +2693,7 @@ impl Router {
             }
         }
 
+        let _ = state.live.insert(handle.id, handle.clone());
         let _ = state.sessions.insert(cn.clone(), handle);
 
         let mut joined = 0usize;
@@ -2706,6 +2738,9 @@ impl Router {
     )]
     pub async fn unregister(&self, cn: &str, session_id: u64) {
         let mut state = self.state.write().await;
+        // Always drop this session from the live set, even when a newer
+        // session owns the CN below.
+        let _ = state.live.remove(&session_id);
         if let Some(handle) = state.sessions.get(cn)
             && handle.id != session_id
         {

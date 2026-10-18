@@ -235,8 +235,10 @@ operator to understand the implications.
 
 - mTLS required on every operational listener (TLS 4433, WebSocket
   8443, MQTT 8883, federation 9000/9001).
-- CRL configured with `--crl <path>` and reloaded via SIGHUP or the
-  CRL refresher.
+- CRL configured with `--crl <path>` and refreshed live with
+  `--crl-refresh-interval`. Add `--revocation-sweep-interval` so a
+  certificate revoked (or expired) after the handshake also drops its
+  established session, not only new handshakes (ADR 0025).
 - `ConnRateLimiter` enabled with a per-IP cap appropriate for the
   expected client population.
 - Plaintext listener disabled, or scoped to a synthetic group with no
@@ -244,14 +246,15 @@ operator to understand the implications.
 
 ```bash
 # Representative production invocation
-rustgate-server \
-  --tls-bind 0.0.0.0:4433 \
-  --tls-cert /run/secrets/server.pem --tls-key /run/secrets/server.key \
-  --ca-cert /run/secrets/ca.pem \
-  --crl /run/secrets/ca.crl --crl-refresh-secs 300 \
-  --acl /etc/rustgate/acl.toml --authz-policy /etc/rustgate/policies.cedar \
-  --conn-rate-limit-per-ip 10 \
-  --dedup-cache-size 100000 --dedup-ttl-secs 60 \
+rustgate \
+  --bind 0.0.0.0:4433 \
+  --cert /run/secrets/server.pem --key /run/secrets/server.key \
+  --ca /run/secrets/ca.pem \
+  --crl /run/secrets/ca.crl --crl-refresh-interval 300 \
+  --revocation-sweep-interval 60 \
+  --group-acl-file /etc/rustgate/acl.toml \
+  --authz-policy-file /etc/rustgate/policies.cedar \
+  --dedup-cache-size 100000 --dedup-window-secs 60 \
   --archive-dir /var/lib/rustgate/archive \
   --archive-key-file /run/secrets/archive-keys.json \
   --audit-log /var/log/rustgate/audit.jsonl

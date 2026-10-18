@@ -37,6 +37,7 @@ pub mod obligations;
 pub mod quota;
 pub mod repeater;
 pub mod replay;
+pub mod revocation_sweep;
 pub mod router;
 pub mod store_forward;
 pub mod throttle;

@@ -16,7 +16,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::config::TlsConfig;
-use crate::extract::{ExpectedKeyUsage, extract_identity, validate_key_usage};
+use crate::extract::{ExpectedKeyUsage, extract_identity_with_chain, validate_key_usage};
 use crate::session::AuthenticatedSession;
 
 rustgate_core::on_callback!(
@@ -241,6 +241,10 @@ impl TlsListener {
                 Ok(id) => id,
                 Err(e) => {
                     warn!(peer_addr = %peer_addr, error = %e, "identity extraction failed");
+                    rustgate_core::audit::connection_rejected(
+                        peer_addr,
+                        "identity extraction failed",
+                    );
                     return Err(e);
                 }
             };
@@ -269,7 +273,7 @@ impl TlsListener {
 
         validate_key_usage(client_cert, ExpectedKeyUsage::ClientAuth)?;
 
-        extract_identity(client_cert)
+        extract_identity_with_chain(certs)
     }
 }
 

@@ -64,10 +64,10 @@ For trace spans, see [observability.md](observability.md).
 
 ## Table of contents
 
-1. [`client` — TLS client lifecycle](#client--tls-client-lifecycle) (6)
+1. [`client` — TLS client lifecycle](#client--tls-client-lifecycle) (7)
 2. [`tls` — handshake failures](#tls--handshake-failures) (1)
 3. [`cert` — server certificate rotation](#cert--server-certificate-rotation) (2)
-4. [`crl` — CRL reload outcomes](#crl--crl-reload-outcomes) (2)
+4. [`crl` — CRL reload outcomes](#crl--crl-reload-outcomes) (3)
 5. [`enrollment` — CSR signing / EST](#enrollment--csr-signing--est) (5)
 6. [`federation` — peer connectivity](#federation--peer-connectivity) (11)
 7. [`authz` — policy enforcement & reload](#authz--policy-enforcement--reload) (7)
@@ -114,6 +114,7 @@ management API.
 | `client.tls_error` | `peer`, `error`, `action="tls_handshake"`, `result="failure"` | TLS accept error — may carry attacker-supplied bytes (sanitized). |
 | `client.negotiation` | `cn`, `protocol`, `action="negotiate"`, `result="success"\|"failure"` | Post-handshake protocol negotiation outcome (TAK proto, XML, ...). |
 | `client.force_disconnected` | `cn`, `by_operator`, `sessions_closed`, `action`, `result` | Operator forced one or more sessions to close via `POST /api/v1/clients/{cn}/disconnect` (#902). |
+| `session.evicted` | `cn`, `session_id`, `reason="revoked"\|"expired"`, `action="disconnect"`, `result="success"` | The revocation sweep (`--revocation-sweep-interval`) disconnected an established session whose certificate was revoked or expired after the handshake (ADR 0025). |
 
 ## `tls` — handshake failures
 
@@ -143,6 +144,7 @@ for stale-CRL alerting.
 |---|---|---|
 | `crl.reloaded` | `count`, `source`, `action`, `result` | Successful CRL reload. `count` is revoked-serial count. |
 | `crl.reload_failed` | `source`, `error`, `action`, `result` | Failed CRL reload — investigate against the `rustgate_crl_age_seconds` gauge. |
+| `revocation.sweep_clock_skew` | `drift_secs`, `action="skip_expiry_check"`, `result="warning"` | The revocation sweep skipped certificate-expiry eviction for one sweep because the wall clock stepped relative to monotonic time. Revocation checks still ran. |
 
 ## `enrollment` — CSR signing / EST
 
@@ -522,6 +524,6 @@ for e in events:
 PY
 ```
 
-— diff against the row count above (87). When you add a new
+— diff against the row count above (91). When you add a new
 `audit::*` function in the same PR, add a row in the appropriate
 domain section here.

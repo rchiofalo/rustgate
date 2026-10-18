@@ -51,7 +51,7 @@ use rustgate_core::identity::Identity;
 use rustgate_core::masking::hash_cn;
 use rustgate_core::net::configure_tactical_socket;
 use rustgate_resilience::SlidingWindowLimiter;
-use rustgate_tls::{ExpectedKeyUsage, TlsConfig, extract_identity, validate_key_usage};
+use rustgate_tls::{ExpectedKeyUsage, TlsConfig, extract_identity_with_chain, validate_key_usage};
 pub use server::{
     DEFAULT_MAX_WRITE_BUFFER_BYTES, OnFederationForward, OnHttpForward, OnNatsPublish,
     OnWsAcceptFn, OnWsRejectFn, WebSocketServer, WsServerConfig, WsSessionHooks,
@@ -736,7 +736,7 @@ fn extract_client_identity(tls_stream: &TlsStream) -> Result<Identity> {
     // identically to the primary TLS listener (rustgate-tls).
     validate_key_usage(client_cert, ExpectedKeyUsage::ClientAuth)?;
 
-    extract_identity(client_cert)
+    extract_identity_with_chain(certs)
 }
 
 #[cfg(test)]
