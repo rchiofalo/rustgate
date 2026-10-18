@@ -68,6 +68,13 @@ pub struct Position {
     pub lat: f64,
     pub lon: f64,
     pub hae: f64,
+    /// Circular error (metres) from the `<point ce>` attribute, if present
+    /// and numeric. Senders mark an unknown position with a very large
+    /// value (`9999999` by TAK convention).
+    pub ce: Option<f64>,
+    /// Linear (vertical) error (metres) from `<point le>`, if present and
+    /// numeric.
+    pub le: Option<f64>,
 }
 
 /// Errors that can occur when parsing CoT XML.
@@ -584,6 +591,8 @@ fn parse_inner(xml: &[u8]) -> Result<CotEvent, ParseError> {
                     let mut lat = None;
                     let mut lon = None;
                     let mut hae = None;
+                    let mut ce = None;
+                    let mut le = None;
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
                             "lat" => {
@@ -597,11 +606,22 @@ fn parse_inner(xml: &[u8]) -> Result<CotEvent, ParseError> {
                                 lon = Some(v);
                             }
                             "hae" => hae = Some(parse_f64(&attr.value, "hae")?),
+                            // ce/le are optional accuracy hints: a missing or
+                            // malformed value is ignored rather than rejecting
+                            // the event, as before they were parsed at all.
+                            "ce" => ce = attr.value.trim().parse::<f64>().ok(),
+                            "le" => le = attr.value.trim().parse::<f64>().ok(),
                             _ => {}
                         }
                     }
                     if let (Some(lat), Some(lon), Some(hae)) = (lat, lon, hae) {
-                        position = Some(Position { lat, lon, hae });
+                        position = Some(Position {
+                            lat,
+                            lon,
+                            hae,
+                            ce,
+                            le,
+                        });
                     }
                 }
                 "dest" => {
@@ -927,6 +947,21 @@ impl MessageBuilder {
 #[allow(clippy::panic, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_reads_optional_ce_le_and_ignores_malformed_values() {
+        let with = br#"<event version="2.0" uid="u" type="a-f-G" time="2026-01-01T00:00:00Z" start="2026-01-01T00:00:00Z" stale="2026-01-01T00:05:00Z" how="m-g"><point lat="1" lon="2" hae="3" ce="9999999" le="4.5"/></event>"#;
+        let pos = parse(with).unwrap().position.unwrap();
+        assert_eq!(pos.ce, Some(9_999_999.0));
+        assert_eq!(pos.le, Some(4.5));
+
+        // Malformed ce/le must not reject the event (they were never
+        // validated before this field existed).
+        let bad = br#"<event version="2.0" uid="u" type="a-f-G" time="2026-01-01T00:00:00Z" start="2026-01-01T00:00:00Z" stale="2026-01-01T00:05:00Z" how="m-g"><point lat="1" lon="2" hae="3" ce="n/a"/></event>"#;
+        let pos = parse(bad).unwrap().position.unwrap();
+        assert_eq!(pos.ce, None);
+        assert_eq!(pos.le, None);
+    }
 
     fn test_identity() -> Identity {
         Identity::new("alice".into(), "abc123".into(), BTreeSet::new()).unwrap()
