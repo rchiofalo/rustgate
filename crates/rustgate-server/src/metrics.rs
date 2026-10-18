@@ -142,12 +142,11 @@ static CLIENT_QUEUE_SKIPPED_UNSUPPORTED: OnceLock<IntCounter> = OnceLock::new();
 /// before queueing.
 static STORE_FORWARD_DWELL_SECONDS: OnceLock<Histogram> = OnceLock::new();
 
-#[cfg(feature = "federation")]
-static FEDERATION_PEER_QUEUE_BYTES: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
+// `rustgate_federation_peer_queue_bytes` and `_peer_latency_nanos` are owned
+// and registered by `rustgate_federation::metrics`; registering them here as
+// well made workspace metrics registration fail at startup (#1773).
 #[cfg(feature = "federation")]
 static FEDERATION_PEER_OLDEST_SECONDS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
-#[cfg(feature = "federation")]
-static FEDERATION_PEER_LATENCY_NANOS: OnceLock<prometheus::IntGaugeVec> = OnceLock::new();
 
 static AUTHZ_DECISIONS: OnceLock<IntCounterVec> = OnceLock::new();
 static AUTHZ_EVAL_NANOS: OnceLock<Histogram> = OnceLock::new();
@@ -947,16 +946,6 @@ pub fn init() -> prometheus::Result<()> {
 
     #[cfg(feature = "federation")]
     {
-        let federation_peer_queue_bytes = prometheus::IntGaugeVec::new(
-            Opts::new(
-                "rustgate_federation_peer_queue_bytes",
-                "Bytes currently queued for delivery to a federation peer",
-            ),
-            &["peer"],
-        )?;
-        registry.register(Box::new(federation_peer_queue_bytes.clone()))?;
-        let _ = FEDERATION_PEER_QUEUE_BYTES.set(federation_peer_queue_bytes);
-
         let federation_peer_oldest_seconds = prometheus::IntGaugeVec::new(
             Opts::new(
                 "rustgate_federation_peer_oldest_seconds",
@@ -966,16 +955,6 @@ pub fn init() -> prometheus::Result<()> {
         )?;
         registry.register(Box::new(federation_peer_oldest_seconds.clone()))?;
         let _ = FEDERATION_PEER_OLDEST_SECONDS.set(federation_peer_oldest_seconds);
-
-        let federation_peer_latency_nanos = prometheus::IntGaugeVec::new(
-            Opts::new(
-                "rustgate_federation_peer_latency_nanos",
-                "EWMA round-trip latency to a federation peer in nanoseconds",
-            ),
-            &["peer"],
-        )?;
-        registry.register(Box::new(federation_peer_latency_nanos.clone()))?;
-        let _ = FEDERATION_PEER_LATENCY_NANOS.set(federation_peer_latency_nanos);
     }
 
     let archive_bytes = IntGauge::with_opts(Opts::new(
@@ -1885,7 +1864,7 @@ pub fn record_authz_cache_stats(hits_delta: u64, misses_delta: u64) {
 #[cfg(feature = "federation")]
 #[allow(dead_code)]
 pub fn federation_peer_queue_bytes() -> Option<&'static prometheus::IntGaugeVec> {
-    FEDERATION_PEER_QUEUE_BYTES.get()
+    Some(rustgate_federation::metrics::peer_queue_bytes())
 }
 
 /// Returns the federation per-peer oldest-message-age gauge vector.
@@ -1917,9 +1896,9 @@ pub fn spawn_federation_lag_updater(
                 let guard = manager.read().await;
                 (guard.peer_lag_snapshot(), guard.peer_latency_snapshot())
             };
-            let bytes_vec = FEDERATION_PEER_QUEUE_BYTES.get();
+            let bytes_vec = Some(rustgate_federation::metrics::peer_queue_bytes());
             let oldest_vec = FEDERATION_PEER_OLDEST_SECONDS.get();
-            let latency_vec = FEDERATION_PEER_LATENCY_NANOS.get();
+            let latency_vec = Some(rustgate_federation::metrics::peer_latency_nanos());
             let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
             // Peer ids are hashed before they become metric label *values* so
             // the federation topology (configured peer names) is not disclosed

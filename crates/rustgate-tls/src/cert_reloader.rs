@@ -130,7 +130,7 @@ impl CertReloader {
             )))
         })?;
         let signing_key = Self::load_signing_key(key_der)?;
-        let certified_key = CertifiedKey::new(certs, signing_key);
+        let certified_key = checked_certified_key(certs, signing_key)?;
 
         info!("certificate reloader initialized from in-memory DER material");
 
@@ -293,7 +293,7 @@ impl CertReloader {
 
         let signing_key = Self::load_signing_key(key_der)?;
 
-        Ok(CertifiedKey::new(certs, signing_key))
+        checked_certified_key(certs, signing_key)
     }
 
     /// Convert a [`PrivateKeyDer`] into a rustls [`rustls::sign::SigningKey`] using the
@@ -393,7 +393,7 @@ impl CertReloader {
         })?;
 
         let signing_key = Self::load_signing_key(key_der)?;
-        let certified_key = CertifiedKey::new(certs, signing_key);
+        let certified_key = checked_certified_key(certs, signing_key)?;
 
         {
             let mut guard = self
@@ -425,6 +425,25 @@ impl fmt::Debug for CertReloader {
             .field("cert_path", &self.cert_path)
             .field("key_path", &self.key_path)
             .finish()
+    }
+}
+
+/// Pair a chain with its signing key, rejecting a key that does not belong
+/// to the leaf certificate. Without this a mismatched pair loads fine and
+/// every handshake fails later. A key type that cannot report its public key
+/// is accepted, as rustls's own `CertifiedKey::from_der` does.
+fn checked_certified_key(
+    certs: Vec<CertificateDer<'static>>,
+    signing_key: Arc<dyn rustls::sign::SigningKey>,
+) -> Result<CertifiedKey> {
+    let certified_key = CertifiedKey::new(certs, signing_key);
+    match certified_key.keys_match() {
+        Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {
+            Ok(certified_key)
+        }
+        Err(e) => Err(RustgateError::from(ConfigError::Other(format!(
+            "private key does not match the certificate: {e}"
+        )))),
     }
 }
 
@@ -465,6 +484,52 @@ mod tests {
             !guard.0.cert.is_empty(),
             "should have at least one certificate"
         );
+    }
+
+    #[test]
+    fn rejects_a_key_that_does_not_match_the_certificate() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let ca = rustgate_test_utils::certs::TestCa::new("Reload Test CA");
+        let dir = tempfile::tempdir().unwrap();
+        write_server_cert(&ca, "server.test", dir.path());
+        let other = ca.issue_server_cert("other.test", &["other.test"]);
+
+        // A matching pair loads.
+        let reloader =
+            CertReloader::new(dir.path().join("cert.pem"), dir.path().join("key.pem")).unwrap();
+
+        // Rotating in a key from another certificate is refused, and the
+        // reloader keeps serving the previous pair.
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&key_path, &other.key_pem).unwrap();
+        let err = reloader.reload().unwrap_err();
+        assert!(
+            format!("{err}").contains("does not match"),
+            "mismatched reload must be rejected, got: {err}"
+        );
+        assert!(reloader.certified_key().is_some());
+
+        // Loading a mismatched pair from scratch fails.
+        let err = CertReloader::new(dir.path().join("cert.pem"), &key_path).unwrap_err();
+        assert!(
+            format!("{err}").contains("does not match"),
+            "mismatched pair must be rejected, got: {err}"
+        );
+
+        // Same for the in-memory DER constructor.
+        let cert_der = crate::pem::parse_certs(
+            std::fs::read(dir.path().join("cert.pem"))
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|c| c.to_vec())
+        .collect::<Vec<_>>();
+        let key_der = crate::pem::parse_key(other.key_pem.as_bytes()).unwrap();
+        let err = CertReloader::from_der(&cert_der, key_der.secret_der()).unwrap_err();
+        assert!(format!("{err}").contains("does not match"), "got: {err}");
     }
 
     /// SEC-5: a group/other-readable private key is refused by the shared
