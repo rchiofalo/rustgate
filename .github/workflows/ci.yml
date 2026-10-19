@@ -151,7 +151,7 @@ jobs:
       - name: Check formatting
         run: cargo +nightly-2026-04-01 fmt --all -- --check
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tool: cargo-machete
@@ -218,7 +218,7 @@ jobs:
             sudo apt-get update && sudo apt-get install -y protobuf-compiler
           fi
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tool: cargo-hack
@@ -509,7 +509,7 @@ jobs:
             curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
           fi
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tool: cargo-llvm-cov
@@ -844,7 +844,7 @@ jobs:
         with:
           toolchain: "1.99"
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tool: cargo-deny
@@ -904,7 +904,7 @@ jobs:
         with:
           toolchain: "1.99"
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           tool: cargo-audit
