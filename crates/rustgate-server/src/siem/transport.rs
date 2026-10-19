@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use super::format::{Format, syslog_frame};
 use super::layer::{AuditRecord, Stats};
+use super::redact::Redactor;
 
 /// Delay before the first reconnect; doubles per consecutive failure up to
 /// the shared cap (`rustgate_resilience::reconnect`).
@@ -44,6 +45,9 @@ pub(crate) struct Sender {
     pub(crate) format: Format,
     pub(crate) hostname: String,
     pub(crate) stats: Arc<Stats>,
+    /// Pseudonymizes classification-linked events; `None` with
+    /// `--siem-include-classified`.
+    pub(crate) redactor: Option<Redactor>,
 }
 
 /// How a connection ended.
@@ -212,7 +216,7 @@ impl Sender {
                         close(&mut writer).await;
                         return Ended::QueueClosed;
                     };
-                    let frame = syslog_frame(&record, self.format, &self.hostname, pid);
+                    let frame = self.frame(record, pid);
                     tokio::select! {
                         biased;
                         // A stalled collector must not hold shutdown past its
@@ -254,7 +258,7 @@ impl Sender {
                 // Counted as lost until written, so a timeout mid-write is
                 // still counted.
                 lost = 1;
-                let frame = syslog_frame(&record, self.format, &self.hostname, pid);
+                let frame = self.frame(record, pid);
                 self.write(&mut writer, &frame).await.ok()?;
                 lost = 0;
             }
@@ -269,6 +273,15 @@ impl Sender {
             );
         }
         self.count_undelivered(lost + drain_count(rx));
+    }
+
+    /// Redact (unless `--siem-include-classified`) and frame one record.
+    fn frame(&self, record: AuditRecord, pid: u32) -> Vec<u8> {
+        let record = match &self.redactor {
+            Some(redactor) => redactor.redact(record),
+            None => record,
+        };
+        syslog_frame(&record, self.format, &self.hostname, pid)
     }
 
     async fn connect(&self) -> std::io::Result<TlsStream<TcpStream>> {
@@ -314,7 +327,7 @@ impl Sender {
         let _ = tokio::time::timeout(SHUTDOWN_FLUSH, async {
             while let Ok(record) = rx.try_recv() {
                 in_flight = 1;
-                let frame = syslog_frame(&record, self.format, &self.hostname, pid);
+                let frame = self.frame(record, pid);
                 if self.write(writer, &frame).await.is_err() {
                     return;
                 }

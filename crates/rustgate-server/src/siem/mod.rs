@@ -17,6 +17,7 @@
 
 mod format;
 mod layer;
+mod redact;
 mod transport;
 
 use std::path::PathBuf;
@@ -97,6 +98,9 @@ pub(crate) fn start(pending: Pending) -> anyhow::Result<SubsystemHandle> {
         format: settings.format,
         hostname: format::syslog_hostname(&local_hostname()),
         stats,
+        redactor: (!settings.include_classified)
+            .then(redact::Redactor::new)
+            .transpose()?,
     };
     tracing::info!(
         endpoint = %settings.endpoint,

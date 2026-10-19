@@ -404,3 +404,71 @@ async fn a_collector_that_drops_every_connection_is_not_redialled_in_a_loop() {
     collector.abort();
     rustgate_core::tasks::stop_subsystem("siem", handle).await;
 }
+
+/// Send one `classification.denied` through the forwarder and return the
+/// message the collector receives for it.
+async fn forwarded_classification_denied(include_classified: bool) -> String {
+    ensure_provider();
+    let ca = TestCa::new("SIEM Test CA");
+    let server = ca.issue_server_cert("localhost", &["localhost"]);
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = write(dir.path(), "ca.pem", &ca.cert_pem);
+    let (listener, acceptor) = collector(&server, None).await;
+    let port = listener.local_addr().unwrap().port();
+
+    let mut cfg = settings(format!("localhost:{port}"), ca_path, Format::Json, 64);
+    cfg.include_classified = include_classified;
+    let (layer, pending) = layer(cfg);
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+    let handle = start(pending).unwrap();
+    rustgate_core::audit::classification_denied(
+        "alice",
+        "bob",
+        "msg-42",
+        "SECRET//SI//NOFORN",
+        "blue",
+    );
+
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut tls = acceptor.accept(tcp).await.unwrap();
+    let message = loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut tls))
+            .await
+            .unwrap()
+            .expect("frame");
+        if message.contains("classification.denied") {
+            break message;
+        }
+    };
+    rustgate_core::tasks::stop_subsystem("siem", handle).await;
+    message
+}
+
+#[tokio::test]
+async fn classification_denials_are_pseudonymized_by_default() {
+    let message = forwarded_classification_denied(false).await;
+    let json = message.split_once(" audit - ").expect("RFC 5424 header").1;
+    let value: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert!(
+        value["source"].as_str().unwrap().starts_with("p:"),
+        "{message}"
+    );
+    assert!(
+        value["dest"].as_str().unwrap().starts_with("p:"),
+        "{message}"
+    );
+    assert_eq!(value["marking"], "SECRET");
+    assert!(value.get("uid").is_none());
+    assert_eq!(value["group"], "blue");
+    for raw in ["alice", "bob", "msg-42", "NOFORN"] {
+        assert!(!message.contains(raw), "{raw} leaked: {message}");
+    }
+}
+
+#[tokio::test]
+async fn include_classified_forwards_classification_denials_unchanged() {
+    let message = forwarded_classification_denied(true).await;
+    for raw in ["alice", "bob", "msg-42", "SECRET//SI//NOFORN"] {
+        assert!(message.contains(raw), "{raw} missing: {message}");
+    }
+}
