@@ -1499,6 +1499,61 @@
       "default": null,
       "minimum": 0
     },
+    "siem-ca": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "siem-cert": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "siem-endpoint": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "siem-format": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Format"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "siem-include-classified": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
+    "siem-key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "siem-queue-size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": null,
+      "minimum": 0
+    },
     "spiffe": {
       "type": [
         "boolean",
@@ -1865,6 +1920,21 @@
           "description": "TAK protobuf encoding (proto <-> XML at session edge). Requires --features proto.",
           "type": "string",
           "const": "tak-protobuf"
+        }
+      ]
+    },
+    "Format": {
+      "description": "Payload format inside each syslog message.",
+      "oneOf": [
+        {
+          "description": "ArcSight Common Event Format v0.",
+          "type": "string",
+          "const": "cef"
+        },
+        {
+          "description": "One JSON object per event.",
+          "type": "string",
+          "const": "json"
         }
       ]
     },

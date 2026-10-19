@@ -2874,6 +2874,37 @@ pub fn air_gap_violation(subsystem: &str, endpoint: &str, reason: &str) {
     );
 }
 
+/// Record the SIEM forwarder connecting to its collector.
+///
+/// Sanitization: `endpoint` is sanitized at the audit boundary.
+pub fn siem_connected(endpoint: &str) {
+    let endpoint = s(endpoint);
+    audit!(
+        "siem.connected",
+        endpoint = %endpoint,
+        action = "connect",
+        result = "success"
+    );
+}
+
+/// Record the SIEM forwarder losing its collector connection. Audit
+/// events emitted until it reconnects queue up to the configured limit
+/// and are dropped beyond it.
+///
+/// Sanitization: `endpoint` and `error` are sanitized at the audit
+/// boundary.
+pub fn siem_disconnected(endpoint: &str, error: &str) {
+    let endpoint = s(endpoint);
+    let error = s(error);
+    audit!(
+        "siem.disconnected",
+        endpoint = %endpoint,
+        error = %error,
+        action = "connect",
+        result = "failure"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

@@ -2086,6 +2086,52 @@ pub(crate) struct ObservabilityArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub(crate) otlp_metrics_interval: u64,
+
+    /// Forward every audit event to a SIEM collector at `host:port` over
+    /// syslog-over-TLS (RFC 5425). Off when unset. The `--audit-log` file
+    /// stays the authoritative record: if the collector is slow or
+    /// unreachable, events beyond `--siem-queue-size` are dropped and
+    /// counted rather than slowing the router. Requires `--siem-ca`.
+    #[arg(long, env = "RUSTGATE_SIEM_ENDPOINT")]
+    pub(crate) siem_endpoint: Option<String>,
+
+    /// PEM file of CA certificates the SIEM collector's certificate must
+    /// chain to. Only these are trusted; system roots are not used.
+    #[arg(long, env = "RUSTGATE_SIEM_CA")]
+    pub(crate) siem_ca: Option<std::path::PathBuf>,
+
+    /// Client certificate (PEM) to present to the SIEM collector. Requires
+    /// `--siem-key`.
+    #[arg(long, env = "RUSTGATE_SIEM_CERT", requires = "siem_key")]
+    pub(crate) siem_cert: Option<std::path::PathBuf>,
+
+    /// Private key (PEM) for `--siem-cert`. Must be readable only by its
+    /// owner (mode 0600).
+    #[arg(long, env = "RUSTGATE_SIEM_KEY", requires = "siem_cert")]
+    pub(crate) siem_key: Option<std::path::PathBuf>,
+
+    /// Payload format inside each syslog message: `cef` (ArcSight Common
+    /// Event Format) or `json`.
+    #[arg(long, value_enum, default_value_t = crate::siem::Format::Cef, env = "RUSTGATE_SIEM_FORMAT")]
+    pub(crate) siem_format: crate::siem::Format,
+
+    /// Audit events held in memory while the SIEM collector is slow or
+    /// unreachable. Events beyond this are dropped and counted in
+    /// `rustgate_siem_events_dropped_total{reason="queue_full"}`.
+    #[arg(long, default_value_t = 10_000, env = "RUSTGATE_SIEM_QUEUE_SIZE")]
+    pub(crate) siem_queue_size: usize,
+
+    /// Also forward `authz.classified_delivery`, which records the
+    /// plaintext CNs of classified-artefact recipients. Off by default:
+    /// set it only when the SIEM is cleared for the traffic's
+    /// classification, since sending it to a lower-cleared SIEM is a
+    /// cross-domain leak.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "RUSTGATE_SIEM_INCLUDE_CLASSIFIED"
+    )]
+    pub(crate) siem_include_classified: bool,
 }
 
 #[derive(Args, Serialize)]
@@ -2962,6 +3008,13 @@ define_config_file! {
     otel_service_name in observability: String,
     otlp_metrics in observability: bool,
     otlp_metrics_interval in observability: u64,
+    siem_endpoint in observability: Option<String>,
+    siem_ca in observability: Option<std::path::PathBuf>,
+    siem_cert in observability: Option<std::path::PathBuf>,
+    siem_key in observability: Option<std::path::PathBuf>,
+    siem_format in observability: crate::siem::Format,
+    siem_queue_size in observability: usize,
+    siem_include_classified in observability: bool,
     dedup_window_secs in dedup: u64,
     dedup_cache_size in dedup: usize,
     dedup_cross_tenant in dedup: bool,
@@ -2971,6 +3024,67 @@ define_config_file! {
 }
 
 impl Cli {
+    /// Check the `--siem-*` flags; see [`Self::siem_settings`].
+    fn validate_siem(&self) -> anyhow::Result<()> {
+        let obs = &self.observability;
+        let Some(endpoint) = obs.siem_endpoint.as_deref() else {
+            if obs.siem_ca.is_some() || obs.siem_cert.is_some() || obs.siem_key.is_some() {
+                anyhow::bail!("--siem-ca/--siem-cert/--siem-key require --siem-endpoint");
+            }
+            return Ok(());
+        };
+        // Plain `host:port` (or `[v6]:port`): no scheme, path or userinfo,
+        // which `TcpStream::connect` would reject on every attempt.
+        let host_ok = |host: &str| match host.strip_prefix('[') {
+            // A bracketed host must be an IPv6 literal.
+            Some(rest) => rest
+                .strip_suffix(']')
+                .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok()),
+            None => !host.is_empty() && !host.contains([':', '[', ']']),
+        };
+        let valid = !endpoint.contains(['/', '@', '?', '#'])
+            && endpoint.rsplit_once(':').is_some_and(|(host, port)| {
+                host_ok(host) && port.parse::<u16>().is_ok_and(|p| p != 0)
+            });
+        if !valid {
+            anyhow::bail!("--siem-endpoint must be host:port, got `{endpoint}`");
+        }
+        let Some(ca) = obs.siem_ca.as_deref() else {
+            anyhow::bail!("--siem-endpoint requires --siem-ca");
+        };
+        for (flag, path) in [
+            ("--siem-ca", Some(ca)),
+            ("--siem-cert", obs.siem_cert.as_deref()),
+            ("--siem-key", obs.siem_key.as_deref()),
+        ] {
+            if let Some(path) = path
+                && !path.is_file()
+            {
+                anyhow::bail!("{flag} file not found: {}", path.display());
+            }
+        }
+        if obs.siem_cert.is_some() != obs.siem_key.is_some() {
+            anyhow::bail!("--siem-cert and --siem-key must be set together");
+        }
+        if obs.siem_queue_size == 0 {
+            anyhow::bail!("--siem-queue-size must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// The SIEM forwarder settings, when `--siem-endpoint` is set.
+    pub(crate) fn siem_settings(&self) -> Option<crate::siem::SiemSettings> {
+        let obs = &self.observability;
+        Some(crate::siem::SiemSettings {
+            endpoint: obs.siem_endpoint.clone()?,
+            ca: obs.siem_ca.clone()?,
+            client_auth: obs.siem_cert.clone().zip(obs.siem_key.clone()),
+            format: obs.siem_format,
+            queue_size: obs.siem_queue_size,
+            include_classified: obs.siem_include_classified,
+        })
+    }
+
     /// Parse command-line arguments, then layer in any TOML configuration
     /// file specified via `--config` / `RUSTGATE_CONFIG`. CLI flags and
     /// environment variables always override file values.
@@ -2994,6 +3108,7 @@ impl Cli {
     /// ACL reload interval bounds. All errors are actionable messages
     /// so operators can fix configuration before the server starts.
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.validate_siem()?;
         // SPIFFE mode obtains cert/key/ca from the Workload API, so
         // file-based TLS checks do not apply.
         if !self.tls.spiffe {
@@ -3716,6 +3831,108 @@ mod tests {
             cli.observability.audit_log.as_deref(),
             Some("/var/log/rustgate/audit.jsonl")
         );
+    }
+
+    fn siem_cli(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut args = vec![
+            "rustgate", "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+        ];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn siem_is_off_by_default() {
+        let cli = siem_cli(&[]).expect("should parse");
+        assert!(cli.siem_settings().is_none());
+        assert!(cli.validate_siem().is_ok());
+        assert_eq!(cli.observability.siem_format, crate::siem::Format::Cef);
+        assert_eq!(cli.observability.siem_queue_size, 10_000);
+        assert!(!cli.observability.siem_include_classified);
+    }
+
+    #[test]
+    fn siem_endpoint_requires_a_ca_and_a_host_port() {
+        let err = siem_cli(&["--siem-endpoint", "siem.example:6514"])
+            .expect("should parse")
+            .validate_siem()
+            .expect_err("missing --siem-ca");
+        assert!(err.to_string().contains("--siem-ca"), "{err}");
+
+        let ca = tempfile::NamedTempFile::new().expect("temp file");
+        let ca_path = ca.path().to_str().expect("utf-8 path");
+        for bad in [
+            "siem.example",
+            ":6514",
+            "siem.example:notaport",
+            "siem.example:0",
+            "tls://siem.example:6514",
+            "siem.example:6514/x",
+            "user@siem.example:6514",
+            "::1:6514",
+            "[siem.example]:6514",
+            "[::1]x:6514",
+        ] {
+            let err = siem_cli(&["--siem-endpoint", bad, "--siem-ca", ca_path])
+                .expect("should parse")
+                .validate_siem()
+                .expect_err("bad endpoint");
+            assert!(err.to_string().contains("host:port"), "{bad}: {err}");
+        }
+        let cli = siem_cli(&["--siem-endpoint", "siem.example:6514", "--siem-ca", ca_path])
+            .expect("should parse");
+        assert!(cli.validate_siem().is_ok());
+        for good in ["[::1]:6514", "10.0.0.5:6514"] {
+            let ok = siem_cli(&["--siem-endpoint", good, "--siem-ca", ca_path])
+                .expect("should parse")
+                .validate_siem();
+            assert!(ok.is_ok(), "{good}");
+        }
+        let settings = cli.siem_settings().expect("settings");
+        assert_eq!(settings.endpoint, "siem.example:6514");
+        assert!(settings.client_auth.is_none());
+    }
+
+    #[test]
+    fn siem_rejects_a_missing_ca_file_and_a_zero_queue() {
+        let err = siem_cli(&[
+            "--siem-endpoint",
+            "siem.example:6514",
+            "--siem-ca",
+            "/no/such/ca.pem",
+        ])
+        .expect("should parse")
+        .validate_siem()
+        .expect_err("missing file");
+        assert!(
+            err.to_string().contains("--siem-ca file not found"),
+            "{err}"
+        );
+
+        let ca = tempfile::NamedTempFile::new().expect("temp file");
+        let err = siem_cli(&[
+            "--siem-endpoint",
+            "siem.example:6514",
+            "--siem-ca",
+            ca.path().to_str().expect("utf-8 path"),
+            "--siem-queue-size",
+            "0",
+        ])
+        .expect("should parse")
+        .validate_siem()
+        .expect_err("zero queue");
+        assert!(err.to_string().contains("--siem-queue-size"), "{err}");
+    }
+
+    #[test]
+    fn siem_cert_and_key_go_together() {
+        assert!(siem_cli(&["--siem-cert", "c.pem"]).is_err());
+        assert!(siem_cli(&["--siem-key", "k.pem"]).is_err());
+        let err = siem_cli(&["--siem-ca", "ca.pem"])
+            .expect("should parse")
+            .validate_siem()
+            .expect_err("ca without endpoint");
+        assert!(err.to_string().contains("require --siem-endpoint"), "{err}");
     }
 
     #[test]

@@ -45,6 +45,7 @@ mod otel;
 mod otel_metrics;
 mod session;
 mod setup;
+mod siem;
 mod tactical_ingress;
 
 use cli::{Cli, Command};
@@ -526,6 +527,33 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // SIEM forwarder (ADR 0038): a second consumer of target="audit"
+    // events. The layer only queues; the TLS sender starts inside `run`
+    // once the runtime and crypto provider exist.
+    let (siem_layer, siem_pending) = match cli.siem_settings() {
+        Some(settings) => {
+            if cli.tls.air_gap {
+                let host = rustgate_core::air_gap::extract_host(&settings.endpoint);
+                if !host.is_some_and(rustgate_core::air_gap::is_private_host) {
+                    rustgate_core::audit::air_gap_violation(
+                        "siem_forwarder",
+                        &settings.endpoint,
+                        "non-private host",
+                    );
+                    anyhow::bail!(
+                        "--air-gap rejects --siem-endpoint `{}`: host is not in the private/loopback/link-local set",
+                        settings.endpoint
+                    );
+                }
+            }
+            let (layer, pending) = siem::layer(settings);
+            let filter = tracing_subscriber::filter::Targets::new()
+                .with_target(siem::AUDIT_TARGET, tracing::Level::INFO);
+            (Some(layer.with_filter(filter)), Some(pending))
+        }
+        None => (None, None),
+    };
+
     #[cfg(feature = "otel")]
     let otel_layer = if let Some(ref endpoint) = cli.observability.otel_endpoint {
         // Air-gap enforcement: refuse OTEL endpoints that resolve to
@@ -566,6 +594,7 @@ fn main() -> anyhow::Result<()> {
         .with(fmt_layer)
         .with(audit_layer)
         .with(access_layer)
+        .with(siem_layer)
         .with(otel_layer)
         .init();
 
@@ -679,7 +708,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    tokio::runtime::Runtime::new()?.block_on(run(cli, audit_anchor_handle))
+    tokio::runtime::Runtime::new()?.block_on(run(cli, audit_anchor_handle, siem_pending))
 }
 
 /// Build the canonical [`rustgate_core::entity::EntityCodecRegistry`] wired
@@ -726,7 +755,15 @@ fn build_entity_codec_registry() -> rustgate_core::entity::EntityCodecRegistry {
     registry
 }
 
-async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow::Result<()> {
+async fn run(
+    cli: Cli,
+    audit_anchor_handle: Option<AuditAnchorHandle>,
+    siem_pending: Option<siem::Pending>,
+) -> anyhow::Result<()> {
+    // Start the SIEM sender first so startup audit events are forwarded
+    // as soon as the collector is reachable (they queue until then).
+    let siem_handle = siem_pending.map(siem::start).transpose()?;
+
     // ── TLS setup ───────────────────────────────────────────────────
     let tls_build = setup::build_tls_config(&cli).await?;
     let tls_config = tls_build.tls_config;
@@ -2719,6 +2756,12 @@ async fn run(cli: Cli, audit_anchor_handle: Option<AuditAnchorHandle>) -> anyhow
                 );
             }
         }
+    }
+
+    // Stop the SIEM forwarder last among the audit consumers, so the
+    // shutdown audit records above are flushed to the collector.
+    if let Some(handle) = siem_handle {
+        stop_subsystem("siem", handle).await;
     }
 
     // Flush pending OTel spans before exit.

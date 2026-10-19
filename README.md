@@ -544,6 +544,12 @@ All flags support environment variables (CLI takes precedence):
 | `--otel-service-name` | `OTEL_SERVICE_NAME` | `rustgate` |
 | `--otlp-metrics` | `RUSTGATE_OTLP_METRICS` | `false` |
 | `--otlp-metrics-interval` | `RUSTGATE_OTLP_METRICS_INTERVAL` | `60` (seconds, min 1) |
+| `--siem-endpoint` | `RUSTGATE_SIEM_ENDPOINT` | — (disabled; collector `host:port`) |
+| `--siem-ca` | `RUSTGATE_SIEM_CA` | — (required with `--siem-endpoint`) |
+| `--siem-cert` / `--siem-key` | `RUSTGATE_SIEM_CERT` / `RUSTGATE_SIEM_KEY` | — |
+| `--siem-format` | `RUSTGATE_SIEM_FORMAT` | `cef` (or `json`) |
+| `--siem-queue-size` | `RUSTGATE_SIEM_QUEUE_SIZE` | `10000` |
+| `--siem-include-classified` | `RUSTGATE_SIEM_INCLUDE_CLASSIFIED` | `false` |
 | `--authz-policy-file` | `RUSTGATE_AUTHZ_POLICY_FILE` | — |
 | `--authz-policy-format` | `RUSTGATE_AUTHZ_POLICY_FORMAT` | `native` |
 | `--authz-fail-open` | `RUSTGATE_AUTHZ_FAIL_OPEN` | `false` |

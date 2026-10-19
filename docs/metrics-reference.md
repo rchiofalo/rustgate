@@ -81,6 +81,7 @@ ID explosion without losing the aggregate signal.
 16. [Enrollment & client OCSP](#enrollment--client-ocsp)
 17. [CRL & archive bookkeeping](#crl--archive-bookkeeping)
 18. [Admin drain](#admin-drain)
+19. [SIEM forwarding](#siem-forwarding)
 
 ---
 
@@ -497,6 +498,19 @@ label distinguishes how a drain was triggered (`api`, `signal`, ...).
 
 ---
 
+## SIEM forwarding
+
+The forwarder enabled by `--siem-endpoint`. A dropped event is still in
+the `--audit-log` file but never reached the SIEM.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `rustgate_siem_events_sent_total` | IntCounter | — | Audit events written to the SIEM collector. |
+| `rustgate_siem_events_dropped_total` | IntCounterVec | `reason` | Audit events not delivered: `queue_full` (the queue was full while the collector was slow or unreachable) or `undelivered` (lost when a connection failed, or still queued at shutdown). |
+| `rustgate_siem_connected` | IntGauge | — | 1 while connected to the collector, else 0. |
+
+---
+
 ## Recommended alerts
 
 A starter set. Tune thresholds to the deployment's traffic profile;
@@ -516,6 +530,8 @@ the values below are upper bounds for a typical tactical edge node.
 | Per-tenant throughput saturated | `rate(rustgate_tenant_throughput_rejections_total[5m]) > 0` | warn |
 | Federation replay buffer growth | `delta(rustgate_federation_replay_buffer_bytes[1h]) > 100*1024*1024` | warn |
 | MQTT will storm | `rate(rustgate_mqtt_will_published_total[5m]) > 5` | warn |
+| SIEM dropping audit events | `increase(rustgate_siem_events_dropped_total[15m]) > 0` | page |
+| SIEM disconnected | `rustgate_siem_connected == 0` for 5m | warn |
 
 ---
 
