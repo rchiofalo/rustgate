@@ -43,10 +43,17 @@ Add an opt-in forwarder in `rustgate-server` (`src/siem/`), enabled by
   collector that accepts and hangs up cannot cause a reconnect storm (each
   attempt is itself audited). The forwarder watches the read side so a
   closed connection is noticed before more records are written into it.
-- **Classified deliveries are withheld by default.**
-  `authz.classified_delivery` carries plaintext CNs of classified-artefact
-  recipients by design; forwarding it to a lower-cleared SIEM is a
-  cross-domain leak, so it needs `--siem-include-classified`.
+- **Classification-linked events are protected by default** (#1782), since
+  the SIEM may be cleared below the traffic. `authz.classified_delivery`
+  (plaintext CNs of classified-artefact recipients) is withheld.
+  `classification.denied` and `guard.rejected` for
+  `unauthorized_classification` are the attempted-spill signal a SOC most
+  needs, so they are forwarded, but pseudonymized: CNs become HMAC-SHA256
+  tokens under a random per-process key, the message uid is dropped, and
+  the marking is cut to its classification level, since compartment and
+  control names can be sensitive. The unkeyed `hash_cn` is not used: anyone
+  with a roster can reverse it. `--siem-include-classified` sends all three
+  unchanged.
 - The setup is split because the subscriber is installed before the async
   runtime and crypto provider exist: the layer is built during subscriber
   setup and the sender is started at the top of `run`, and stopped last at

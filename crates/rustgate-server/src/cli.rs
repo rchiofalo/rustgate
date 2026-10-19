@@ -2121,11 +2121,14 @@ pub(crate) struct ObservabilityArgs {
     #[arg(long, default_value_t = 10_000, env = "RUSTGATE_SIEM_QUEUE_SIZE")]
     pub(crate) siem_queue_size: usize,
 
-    /// Also forward `authz.classified_delivery`, which records the
-    /// plaintext CNs of classified-artefact recipients. Off by default:
-    /// set it only when the SIEM is cleared for the traffic's
-    /// classification, since sending it to a lower-cleared SIEM is a
-    /// cross-domain leak.
+    /// Forward classification-linked audit events in full. By default
+    /// `authz.classified_delivery` (plaintext CNs of classified-artefact
+    /// recipients) is withheld, and `classification.denied` and
+    /// `guard.rejected` for `unauthorized_classification` are sent with
+    /// keyed pseudonyms in place of CNs, no message uid, and only the
+    /// classification level of the marking. Set this only when the SIEM is
+    /// cleared for the traffic's classification; sending these to a
+    /// lower-cleared SIEM is a cross-domain leak.
     #[arg(
         long,
         default_value_t = false,

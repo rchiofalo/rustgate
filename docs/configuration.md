@@ -246,7 +246,7 @@ header (facility 13, "log audit"), and a CEF or JSON payload. Off unless
 | `--siem-cert` / `--siem-key` | `RUSTGATE_SIEM_CERT` / `RUSTGATE_SIEM_KEY` | — | Client certificate and key to present (both or neither; key mode 0600) |
 | `--siem-format` | `RUSTGATE_SIEM_FORMAT` | `cef` | `cef` (ArcSight Common Event Format) or `json` |
 | `--siem-queue-size` | `RUSTGATE_SIEM_QUEUE_SIZE` | `10000` | Events held while the collector is slow or unreachable |
-| `--siem-include-classified` | `RUSTGATE_SIEM_INCLUDE_CLASSIFIED` | `false` | Also forward `authz.classified_delivery` |
+| `--siem-include-classified` | `RUSTGATE_SIEM_INCLUDE_CLASSIFIED` | `false` | Forward classification-linked events in full (see below) |
 
 How it behaves:
 
@@ -280,10 +280,22 @@ How it behaves:
   event time); other fields keep their name in camelCase (`peer_id` →
   `peerId`), and a log `message` becomes `msg`. JSON keeps field names as emitted and adds `timestamp`,
   `event_type` and `severity`.
-- **Classified deliveries are withheld by default.** `authz.classified_delivery`
-  records the plaintext CNs of classified-artefact recipients; set
-  `--siem-include-classified` only when the SIEM is cleared for that
-  traffic.
+- **Classification-linked events are protected by default**, because the SIEM
+  may be cleared below the traffic it watches:
+  - `authz.classified_delivery` (plaintext CNs of classified-artefact
+    recipients) is withheld.
+  - `classification.denied` and `guard.rejected` for
+    `unauthorized_classification` are still forwarded, so attempted spills
+    alert, but each CN is replaced by a pseudonym (`p:` plus 16 hex
+    characters of HMAC-SHA256 under a random key drawn at startup), the
+    message `uid` is removed, and the marking is cut to its level
+    (`SECRET//SI//NOFORN` becomes `SECRET`). A pseudonym is stable until the
+    process restarts, so repeat offenders can be counted, but it cannot be
+    reversed by hashing a list of CNs. The `--audit-log` keeps the real
+    values.
+
+  Set `--siem-include-classified` to forward all of these in full, only when
+  the SIEM is cleared for the traffic.
 - **`--air-gap`** refuses an endpoint that is not private, loopback or
   link-local.
 
