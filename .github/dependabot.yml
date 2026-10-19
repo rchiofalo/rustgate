@@ -21,6 +21,13 @@ updates:
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "x509-cert"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # rustix 1.1.5 does not compile on Linux with only the `net` feature
+      # (sockopt.rs uses `crate::timespec`, which `net` alone does not
+      # build), which rustgate-dds dds-real uses. CI does not build that
+      # combination, so its PRs look green. Hold at 1.1.4; 1.1.6+ is fine
+      # to propose.
+      - dependency-name: "rustix"
+        versions: ["1.1.5"]
     groups:
       # opentelemetry, opentelemetry_sdk, opentelemetry-otlp and
       # tracing-opentelemetry must move together: bumping one alone mixes
