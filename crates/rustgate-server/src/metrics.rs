@@ -194,6 +194,15 @@ static ROUTER_INTERCEPTOR_VERDICT_TOTAL: OnceLock<IntCounterVec> = OnceLock::new
 
 static ARCHIVE_BYTES: OnceLock<IntGauge> = OnceLock::new();
 static CRL_AGE_SECONDS: OnceLock<IntGauge> = OnceLock::new();
+static SIEM_EVENTS_SENT: OnceLock<IntCounter> = OnceLock::new();
+static SIEM_EVENTS_DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
+static SIEM_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
+const SIEM_EVENTS_SENT_HELP: &str = "Audit events written to the SIEM collector";
+const SIEM_EVENTS_DROPPED_HELP: &str = "Audit events not delivered to the SIEM collector, by reason \
+     (queue_full: the queue was full while the collector was slow or unreachable; \
+     undelivered: lost when a connection failed, or still queued at shutdown)";
+const SIEM_CONNECTED_HELP: &str =
+    "1 while the SIEM forwarder is connected to its collector, else 0";
 static ENROLLMENT_RATE_LIMITED: OnceLock<IntCounter> = OnceLock::new();
 static ENROLLMENT_RATE_LIMIT_POISON: OnceLock<IntCounter> = OnceLock::new();
 static TENANT_QUOTA_REJECTIONS: OnceLock<IntCounterVec> = OnceLock::new();
@@ -977,6 +986,36 @@ pub fn init() -> prometheus::Result<()> {
     ))?;
     registry.register(Box::new(crl_age_seconds.clone()))?;
     let _ = CRL_AGE_SECONDS.set(crl_age_seconds);
+
+    // SIEM forwarder (`--siem-endpoint`). Dropped events are the signal to
+    // alert on: the hash-chained audit log still has them, the SIEM does
+    // not. The forwarder starts before this runs, so an accessor may have
+    // already filled the cell with its fallback; register whichever
+    // instance the cell holds so the exported series is the live one.
+    let siem_events_sent = IntCounter::with_opts(Opts::new(
+        "rustgate_siem_events_sent_total",
+        SIEM_EVENTS_SENT_HELP,
+    ))?;
+    registry.register(Box::new(
+        SIEM_EVENTS_SENT.get_or_init(|| siem_events_sent).clone(),
+    ))?;
+    let siem_events_dropped = IntCounterVec::new(
+        Opts::new(
+            "rustgate_siem_events_dropped_total",
+            SIEM_EVENTS_DROPPED_HELP,
+        ),
+        &["reason"],
+    )?;
+    registry.register(Box::new(
+        SIEM_EVENTS_DROPPED
+            .get_or_init(|| siem_events_dropped)
+            .clone(),
+    ))?;
+    let siem_connected =
+        IntGauge::with_opts(Opts::new("rustgate_siem_connected", SIEM_CONNECTED_HELP))?;
+    registry.register(Box::new(
+        SIEM_CONNECTED.get_or_init(|| siem_connected).clone(),
+    ))?;
 
     let enrollment_rate_limited = IntCounter::with_opts(Opts::new(
         "rustgate_enrollment_rate_limited_total",
@@ -1957,6 +1996,28 @@ pub fn archive_bytes() -> &'static IntGauge {
 /// CRL parsing and after every SIGHUP-driven CRL re-validation.
 pub fn crl_age_seconds() -> &'static IntGauge {
     CRL_AGE_SECONDS.get_or_init(|| fallback_gauge("rustgate_crl_age_seconds", "fallback"))
+}
+
+/// Audit events written to the SIEM collector.
+pub fn siem_events_sent() -> &'static IntCounter {
+    SIEM_EVENTS_SENT
+        .get_or_init(|| fallback_counter("rustgate_siem_events_sent_total", SIEM_EVENTS_SENT_HELP))
+}
+
+/// Audit events the SIEM forwarder did not deliver, by `reason`.
+pub fn siem_events_dropped() -> &'static IntCounterVec {
+    SIEM_EVENTS_DROPPED.get_or_init(|| {
+        fallback_counter_vec(
+            "rustgate_siem_events_dropped_total",
+            SIEM_EVENTS_DROPPED_HELP,
+            &["reason"],
+        )
+    })
+}
+
+/// Whether the SIEM forwarder is connected (1) or not (0).
+pub fn siem_connected() -> &'static IntGauge {
+    SIEM_CONNECTED.get_or_init(|| fallback_gauge("rustgate_siem_connected", SIEM_CONNECTED_HELP))
 }
 
 // ── Accessor functions ──────────────────────────────────────────────
@@ -3915,6 +3976,24 @@ mod tests {
     }
 
     // ── Readiness check unit tests ─────────────────────────────────
+
+    #[test]
+    fn siem_metrics_touched_before_init_are_the_ones_exported() {
+        // The SIEM forwarder starts before `init()` runs; whatever its
+        // accessors already created must be what `/metrics` serves.
+        siem_connected().set(1);
+        siem_events_sent().inc();
+        let _ = init();
+        let families = prometheus::default_registry().gather();
+        let value = |name: &str| {
+            families.iter().find(|mf| mf.name() == name).map(|mf| {
+                mf.get_metric()[0].get_gauge().get_value()
+                    + mf.get_metric()[0].get_counter().get_value()
+            })
+        };
+        assert_eq!(value("rustgate_siem_connected"), Some(1.0));
+        assert!(value("rustgate_siem_events_sent_total").is_some_and(|v| v >= 1.0));
+    }
 
     #[test]
     fn crl_age_gauge_registered_under_documented_name() {

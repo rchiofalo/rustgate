@@ -232,6 +232,61 @@ Individual backends can be enabled separately with `--features peer-discovery-dn
 
 See [Observability](observability.md) for backend setup (Jaeger, Grafana Tempo).
 
+### SIEM forwarding
+
+Sends every audit event to a SIEM collector (Splunk, ArcSight, QRadar,
+Elastic) over syslog-over-TLS: RFC 5425 octet-counted framing, an RFC 5424
+header (facility 13, "log audit"), and a CEF or JSON payload. Off unless
+`--siem-endpoint` is set; no build feature is needed.
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--siem-endpoint` | `RUSTGATE_SIEM_ENDPOINT` | — | Collector `host:port` (enables forwarding) |
+| `--siem-ca` | `RUSTGATE_SIEM_CA` | — | CA certificates the collector must chain to (required with `--siem-endpoint`; system roots are not used) |
+| `--siem-cert` / `--siem-key` | `RUSTGATE_SIEM_CERT` / `RUSTGATE_SIEM_KEY` | — | Client certificate and key to present (both or neither; key mode 0600) |
+| `--siem-format` | `RUSTGATE_SIEM_FORMAT` | `cef` | `cef` (ArcSight Common Event Format) or `json` |
+| `--siem-queue-size` | `RUSTGATE_SIEM_QUEUE_SIZE` | `10000` | Events held while the collector is slow or unreachable |
+| `--siem-include-classified` | `RUSTGATE_SIEM_INCLUDE_CLASSIFIED` | `false` | Also forward `authz.classified_delivery` |
+
+How it behaves:
+
+- **The audit log stays authoritative.** Forwarding is a copy. If the
+  collector is slow or down, events beyond `--siem-queue-size` are dropped
+  and counted in `rustgate_siem_events_dropped_total`; the router is never
+  slowed. Alert on that counter (see the [metrics reference](https://github.com/rchiofalo/rustgate/blob/main/docs/metrics-reference.md#siem-forwarding)).
+- **Reconnects** back off exponentially (1 s, 2 s, 4 s, ... up to 5 min) after
+  any failure, including a collector that accepts and then hangs up; the
+  backoff resets once a connection has stayed up for 30 s. The forwarder
+  watches the connection for the collector closing it, and retries the
+  frame whose write failed once on the next connection. Frames written just
+  before a collector crash can still be lost. Each connect and disconnect is
+  audited (`siem.connected`, `siem.disconnected`).
+- **At shutdown** queued events are flushed within about 3 s; if the
+  collector is unreachable then, one connection is attempted before giving
+  up.
+- **Severity is set per event type** from a table covering every audit
+  event in the workspace (a test enforces it), not from the `result` field:
+  `audit.chain_discontinuity` (tamper evidence) is 10, `client.connected` is
+  2. Two adjustments apply: a `failure`/`failed`/`panic` result raises an
+  event to at least 6, and `guard.rejected` for `unauthorized_classification`
+  is 8. The syslog severity follows: 9-10 critical, 7-8 error, 5-6 warning,
+  3-4 notice, else informational.
+- **Every `target="audit"` event is forwarded**, including the few without an
+  `event_type` (sent as `audit.untyped`). `RUST_LOG` applies here as it does
+  to `--audit-log`: a filter that drops `audit` at INFO (for example
+  `RUST_LOG=warn`) also stops forwarding, so keep `audit=info` in it.
+- **CEF fields** use the CEF dictionary where one exists (`act`, `outcome`,
+  `reason`, `suser` for a CN, `src`/`spt` for a peer address, `rt` for the
+  event time); other fields keep their name in camelCase (`peer_id` →
+  `peerId`), and a log `message` becomes `msg`. JSON keeps field names as emitted and adds `timestamp`,
+  `event_type` and `severity`.
+- **Classified deliveries are withheld by default.** `authz.classified_delivery`
+  records the plaintext CNs of classified-artefact recipients; set
+  `--siem-include-classified` only when the SIEM is cleared for that
+  traffic.
+- **`--air-gap`** refuses an endpoint that is not private, loopback or
+  link-local.
+
 ## Framing Modes
 
 | Value | Description | Typical Use |

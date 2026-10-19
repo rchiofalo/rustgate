@@ -79,7 +79,7 @@ For trace spans, see [observability.md](observability.md).
 13. [`mqtt` — MQTT broker events](#mqtt--mqtt-broker-events) (1)
 14. [`nats` — NATS bridge](#nats--nats-bridge) (1)
 15. [`udp_multicast` — UDP multicast bridge](#udp_multicast--udp-multicast-bridge) (2)
-16. [`mavlink` — MAVLink framing](#mavlink--mavlink-framing) (4)
+16. [`mavlink` — MAVLink framing](#mavlink--mavlink-framing) (6)
 17. [`guard` — cross-domain boundary](#guard--cross-domain-boundary) (3)
 18. [`store_forward` — offline queue](#store_forward--offline-queue) (4)
 19. [`position_replay` — replay rate limits](#position_replay--replay-rate-limits) (1)
@@ -95,6 +95,7 @@ For trace spans, see [observability.md](observability.md).
 29. [`admin` & `mgmt` — operator control plane](#admin--mgmt--operator-control-plane) (2)
 30. [`server` — process lifecycle](#server--process-lifecycle) (1)
 31. [`air_gap` — air-gap mode rejections](#air_gap--air-gap-mode-rejections) (1)
+32. [`siem` — SIEM forwarder](#siem--siem-forwarder) (2)
 
 ---
 
@@ -313,6 +314,8 @@ identity, autopilot, frame metadata).
 | `mavlink.unsigned_rejected` | `peer`, `reason`, `action`, `result` | Unsigned MAVLink v2 frame rejected by a signature-requiring codec. |
 | `mavlink.signature_rejected` | `peer`, `reason`, `action="mavlink_verify"`, `result="rejected"` | MAVLink v2 frame whose signature failed verification (wrong key, unknown link, malformed, or unsigned where signing is required). |
 | `mavlink.replay_rejected` | `peer`, `link_id`, `timestamp`, `last_accepted`, `reason="replayed_timestamp"`, `action="mavlink_verify"`, `result="rejected"` | Signed frame whose timestamp did not advance past the last accepted one for its `(system_id, component_id, link_id)` stream (replay defence). |
+| `mavlink.v1_admitted` | `cn`, `peer`, `action="mavlink_ingress"`, `result="degraded"` | Unsigned MAVLink v1 frame admitted under the shared fallback CN. Only reachable with `--mavlink-allow-v1`; records the degraded identity posture. |
+| `mavlink.v1_rejected` | `peer`, `reason="v1_not_allowed"`, `action="frame_decode"`, `result="rejected"` | MAVLink v1 frame rejected because v1 is not allowed. Distinguishes a legacy-protocol sender from an unsigned v2 one (`mavlink.unsigned_rejected`). |
 | `mavlink.heartbeat_received` | `system_id`, `component_id`, `autopilot`, `vehicle_type`, `action`, `result` | MAVLink HEARTBEAT decoded — useful for vehicle inventory. |
 
 ## `guard` — cross-domain boundary
@@ -493,6 +496,18 @@ rejected; this event tells the operator why.
 |---|---|---|
 | `air_gap.violation` | `subsystem`, `endpoint`, `reason`, `action`, `result` | Configuration rejected because air-gap mode bans an external endpoint. |
 
+## `siem` — SIEM forwarder
+
+The forwarder enabled by `--siem-endpoint` (see
+[configuration](configuration.md#siem-forwarding)). These events go to the
+`--audit-log` file as usual and are also forwarded once the connection is
+back.
+
+| Event | Fields | Purpose |
+|---|---|---|
+| `siem.connected` | `endpoint`, `action="connect"`, `result="success"` | The forwarder connected to its collector. |
+| `siem.disconnected` | `endpoint`, `error`, `action="connect"`, `result="failure"` | The forwarder lost its collector connection. Events emitted until it reconnects queue up to `--siem-queue-size`; the rest are dropped and counted in `rustgate_siem_events_dropped_total`. |
+
 ---
 
 ## Recommended audit alerts
@@ -524,13 +539,13 @@ python3 - <<'PY'
 import re
 from pathlib import Path
 src = Path("crates/rustgate-core/src/audit.rs").read_text()
-events = sorted({m.group(1) for m in re.finditer(r'audit!\(\s*"([a-z_.]+)"', src)})
+events = sorted({m.group(1) for m in re.finditer(r'audit!\(\s*"([a-z0-9_.]+)"', src)})
 print(len(events))
 for e in events:
     print(f"  {e}")
 PY
 ```
 
-— diff against the row count above (98). When you add a new
+— diff against the row count above (102). When you add a new
 `audit::*` function in the same PR, add a row in the appropriate
 domain section here.
