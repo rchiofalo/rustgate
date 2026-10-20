@@ -125,8 +125,8 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 http-body = "1"
 http-body-util = "0.1"
-base64 = "0.22"
-tokio-tungstenite = "0.29"
+base64 = "0.23"
+tokio-tungstenite = "0.30"
 # `permessage-deflate` (RFC 7692) is implemented at the application layer
 # inside `rustgate-websocket::compression` because tokio-tungstenite 0.29
 # does not yet ship a `deflate` feature on its `tungstenite` dep — the only
