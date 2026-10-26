@@ -99,7 +99,7 @@ ciborium = "0.2"
 # `fips`/`post-quantum` aws-lc-rs surfaces do. rcgen cannot emit ML-DSA
 # certificates, so the issuance module hand-assembles the TBS with
 # x509-cert/der and signs the DER with this crate.
-fips204 = "0.4.6"
+fips204 = "0.5.0"
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 bytes = "1"
 quick-xml = "0.42"
@@ -172,7 +172,7 @@ opentelemetry = { version = "0.33", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "grpc-tonic"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
-parking_lot = "0.12"
+parking_lot = "0.13"
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = "0.6"
 tempfile = "3"
@@ -186,7 +186,7 @@ subtle = "2"
 unicode-normalization = "0.1"
 arc-swap = "1"
 dashmap = "6"
-lru = "0.18.0"
+lru = "0.19.0"
 # R*-tree spatial index for the multi-sensor track correlation engine
 # (`rustgate-correlation`, closes #848). Used to find fused-entity
 # candidates near an incoming sensor report so the gating ladder runs in
