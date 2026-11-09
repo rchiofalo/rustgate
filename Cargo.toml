@@ -99,7 +99,7 @@ ciborium = "0.2"
 # `fips`/`post-quantum` aws-lc-rs surfaces do. rcgen cannot emit ML-DSA
 # certificates, so the issuance module hand-assembles the TBS with
 # x509-cert/der and signs the DER with this crate.
-fips204 = "0.4.6"
+fips204 = "0.5.0"
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 bytes = "1"
 quick-xml = "0.42"
@@ -137,7 +137,7 @@ tokio-tungstenite = "0.30"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 socket2 = "0.6"
 rustix = { version = "1", default-features = false, features = ["process"] }
-async-nats = { version = "0.50", default-features = false, features = ["jetstream", "nkeys", "server_2_10"] }
+async-nats = { version = "0.52", default-features = false, features = ["jetstream", "nkeys", "server_2_10"] }
 prost = "0.14"
 prost-build = "0.14"
 prost-types = "0.14"
@@ -172,7 +172,7 @@ opentelemetry = { version = "0.33", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "grpc-tonic"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
-parking_lot = "0.12"
+parking_lot = "0.13"
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = "0.6"
 tempfile = "3"
@@ -186,12 +186,12 @@ subtle = "2"
 unicode-normalization = "0.1"
 arc-swap = "1"
 dashmap = "6"
-lru = "0.18.0"
+lru = "0.19.0"
 # R*-tree spatial index for the multi-sensor track correlation engine
 # (`rustgate-correlation`, closes #848). Used to find fused-entity
 # candidates near an incoming sensor report so the gating ladder runs in
 # O(log N) per submit instead of scanning the whole fused-entity map.
-rstar = "0.13"
+rstar = "0.14"
 zeroize = { version = "1", features = ["derive"] }
 ocsp-stapler = { version = "0.4", default-features = false, features = ["prometheus", "aws-lc-rs"] }
 # Direct edge on the OCSP ASN.1 crate so the client-OCSP verifier can match
@@ -218,7 +218,7 @@ hex = "0.4"
 ahash = "0.8"
 smol_str = { version = "0.3", features = ["serde"] }
 cedar-policy = "4"
-spiffe = { version = "0.18", default-features = false, features = ["workload-api-x509"] }
+spiffe = { version = "0.19", default-features = false, features = ["workload-api-x509"] }
 async-trait = "0.1.89"
 mdns-sd = { version = "0.21", default-features = false, features = ["async"] }
 etcd-client = { version = "0.21", default-features = false, features = ["tls-aws-lc"] }
@@ -233,13 +233,13 @@ wiremock = "0.6"
 # include `openssl-tls`, which would pull `openssl` into the dep tree and
 # trip the deny.toml ban, so the default set is disabled and
 # `rustls-tls` is opted into explicitly.
-kube = { version = "4.2", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "aws-lc-rs"] }
+kube = { version = "5.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "aws-lc-rs"] }
 # Typed Kubernetes resource bindings. Pinned to the same minor as `kube`'s
 # tested-against version per the `kube` README. The `latest` feature picks
 # the most recent Kubernetes API surface the bindings ship; the operator
 # only uses StatefulSet / Service / ConfigMap / Lease / Event types so any
 # 1.28+ cluster works.
-k8s-openapi = { version = "0.28", features = ["latest"] }
+k8s-openapi = { version = "0.29", features = ["latest"] }
 # Lightweight HTTP router for the operator's `/healthz`, `/readyz`, and
 # `/metrics` endpoints. Default features are disabled so we don't pull in
 # multipart, ws, or other surface area we don't need.
@@ -261,7 +261,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # compatible, has no native-library install step, and is the
 # foundation `ros2-client` builds on (so the same dependency satisfies
 # both raw-DDS and ROS 2 wire compat).
-rustdds = "0.14"
+rustdds = "0.15"
 # ROS 2 client wrapping rustdds. Exposes the ROS 2 graph (nodes,
 # topics, parameters, rosout) and applies the ROS 2 name-mangling
 # convention (`rt/<topic>`) so a rustgate-published message is
