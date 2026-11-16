@@ -15,7 +15,7 @@
 # robot account; substitute the tag and digest from your IB account at
 # the time of the build. The default `rust:1.99-alpine` base below is
 # suitable for non-IB deployments and is what CI publishes today.
-FROM rust:1.99-alpine@sha256:557a94c82b485a14b569120e00867267108c734efe33f10cc31ca0cd5dd1eca9 AS builder
+FROM rust:1.100-alpine@sha256:de1e0058543a81ed7b046629167db587c67a94bdf37cce14eb27f0ec83baaffb AS builder
 
 RUN apk add --no-cache musl-dev protobuf-dev make
 
