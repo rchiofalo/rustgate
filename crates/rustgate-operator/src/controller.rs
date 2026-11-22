@@ -38,7 +38,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{ConfigMap, Service};
@@ -161,7 +160,9 @@ pub async fn reconcile_fn(
     }
 
     let _timer = metrics::reconcile_timer();
-    let now_rfc3339 = Utc::now().to_rfc3339();
+    let now_rfc3339 = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|e| OperatorError::Construct(format!("format reconcile timestamp: {e}")))?;
     let key = ObjectKey::from(cluster.as_ref());
 
     let span = tracing::info_span!(

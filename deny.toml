@@ -158,6 +158,29 @@ ignore = [
     # --all-features -i unsafe-libyaml` returns no entries (kube moves off
     # serde_yaml and rustgate-codec-schema / rustgate-operator migrate).
     "RUSTSEC-2024-0449",
+    # RUSTSEC-2026-0543 — `chrono` is unmaintained; no fixed version exists.
+    # Ref #1804.
+    #
+    # Dependency-graph entry points (`cargo tree --workspace --all-features
+    # --target all -i chrono --depth 1`), all upstream crates we do not own:
+    #   cedar-policy-core (cedar feature, policy evaluation)
+    #   ocsp-stapler, rasn (ocsp feature, OCSP request/response encoding)
+    #   rustdds, ros2-client (rustgate-dds dds-real feature)
+    # rustgate itself no longer depends on chrono: the operator's one call
+    # moved to `time` in #1804. The `[bans]` entry below enforces that, so a
+    # workspace crate or a new dependency cannot add chrono back.
+    #
+    # Risk surface: the advisory is "unmaintained" (informational), not a
+    # vulnerability, and no open advisory affects 0.4.45. The one path that
+    # parses network input is rasn decoding GeneralizedTime fields in OCSP
+    # responses fetched from the configured responder. A flaw found there
+    # later would not get an upstream fix, which is why this ignore has a
+    # removal trigger rather than standing indefinitely.
+    #
+    # Removal trigger: drop this ignore, and the chrono ban's wrapper list,
+    # when `cargo tree --workspace --all-features --target all -i chrono`
+    # returns no entries.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
@@ -345,6 +368,18 @@ deny = [
 
     # native-tls dispatches to platform TLS (SChannel/SecureTransport/OpenSSL)
     { crate = "native-tls", use-instead = "rustls" },
+
+    # chrono is unmaintained (RUSTSEC-2026-0543, ignored above). Only the
+    # upstream crates that still require it may pull it in; rustgate crates
+    # use `time` for timestamps. Remove a wrapper as soon as its crate drops
+    # chrono.
+    { crate = "chrono", use-instead = "time", wrappers = [
+        "cedar-policy-core",
+        "ocsp-stapler",
+        "rasn",
+        "ros2-client",
+        "rustdds",
+    ] },
 ]
 
 [sources]

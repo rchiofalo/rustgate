@@ -249,12 +249,6 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 # at workspace level so any other crate that needs it lands on the same
 # version.
 json-patch = "4"
-# Calendar / wall-clock timestamps for the operator's `lastReconciled`
-# field and `Condition.lastTransitionTime`. The `time` crate is already
-# in the workspace for `formatting` only, but `chrono` matches the RFC
-# 3339 + serde patterns used by `k8s-openapi` and `kube` everywhere
-# else, so for the operator we use `chrono` to avoid impedance mismatch.
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 # Pure-Rust DDS implementation (RTPS wire protocol) used by
 # `rustgate-dds` behind the `dds-real` feature flag. Chosen over the
 # Cyclone DDS FFI binding because rustdds is `#![forbid(unsafe_code)]`
