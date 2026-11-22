@@ -187,6 +187,7 @@ unicode-normalization = "0.1"
 arc-swap = "1"
 dashmap = "6"
 lru = "0.18.0"
+mavlink-tlog = "0.1.3"
 # R*-tree spatial index for the multi-sensor track correlation engine
 # (`rustgate-correlation`, closes #848). Used to find fused-entity
 # candidates near an incoming sensor report so the gating ladder runs in
