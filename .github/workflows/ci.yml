@@ -341,6 +341,13 @@ jobs:
     if: github.event.pull_request.draft == false || github.event_name == 'push'
     needs: [lint, clippy]
     runs-on: ubuntu-latest
+    env:
+      # rust-toolchain.toml pins the newer workspace toolchain and takes
+      # precedence over the rustup default that dtolnay/rust-toolchain
+      # sets, so without this every rustc/cargo call below would run the
+      # workspace toolchain instead of the MSRV. RUSTUP_TOOLCHAIN wins
+      # over the toolchain file.
+      RUSTUP_TOOLCHAIN: "1.99"
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2.23.0
