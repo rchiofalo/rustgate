@@ -157,6 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Build toolchain moved to Rust 1.100 (#1819).** `rust-toolchain.toml`, the CI jobs, the `rust:1.100-alpine` builder images (multi-arch digest) and the Iron Bank `RUST_VERSION` move together, so released binaries and images are built by the compiler CI tests. The minimum supported Rust version stays 1.99 (`rust-version`), and the `msrv` job keeps checking it.
 - **quick-xml 0.42 and argon2 0.6.**
   - quick-xml now types XML names and attribute values as `&str` and validates UTF-8 while reading. The CoT, proto, NFFI, missions, guard and admin parsers are migrated; attribute values are still handled as raw, escaped text.
   - The masking paths keep re-emitted attribute values escaped exactly once.
