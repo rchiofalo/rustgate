@@ -33,197 +33,29 @@
 //! lookup falls back to inserting a default), drive an allocation
 //! per frame and exhaust memory.
 //!
-//! This module is the panic-free counterpart: a static lookup table
-//! built at compile time from the standard MAVLink common-dialect
-//! values, exposed through a single `crc_extra` function that returns
+//! This module is the panic-free counterpart: a static, sorted lookup
+//! table, exposed through a single `crc_extra` function that returns
 //! `Option<u8>`. Callers that get `None` reject the frame with
 //! [`crate::error::MavlinkError::UnknownMessageId`] — no allocation,
 //! no panic, no per-frame slow path.
 //!
-//! # Why a hand-rolled table, not a dialect crate
+//! # Table source
 //!
-//! `rustgate-mavlink` deliberately avoids pulling in a generated
-//! MAVLink dialect crate so that the framing layer stays
-//! protocol-agnostic and the build does not depend on `mavlink-codegen`
-//! at edit time. The table here covers the message IDs the rustgate
-//! workspace actually inspects (HEARTBEAT, common position/attitude
-//! frames, command frames, signing-relevant control messages) and
-//! is exhaustively listed inline so reviewers can see exactly which
-//! catalogue entries the security boundary trusts. Adding a new
-//! message ID is a one-line PR.
-//!
-//! Values come from the upstream
-//! [`message_definitions/v1.0/common.xml`](https://github.com/mavlink/mavlink)
-//! `crc_extra` field, cross-checked against `pymavlink`'s
-//! `message_crcs` constant in `mavutil.py` for the messages listed.
+//! The table is `mavlink_tlog::message_info`: every message in the
+//! upstream [`all.xml`](https://github.com/mavlink/mavlink) dialect
+//! (common, ardupilotmega, development and the vendor sets), generated
+//! from the XML. It has no dependencies, is `#![forbid(unsafe_code)]`,
+//! and does a binary search over a `&'static` slice.
 
 /// Lookup the CRC-EXTRA byte for a given MAVLink `MSG_ID`.
 ///
-/// Returns `Some(crc_extra)` when the ID is in the standard
-/// common-dialect catalogue and `None` when it is not — callers that
-/// must verify the CRC reject the frame on `None` rather than guessing
-/// or panicking.
-///
-/// The lookup is `O(MSG_ID_TABLE.len())` worst case, but the table is
-/// small (well under 100 entries) and the linear scan stays in L1 for
-/// the duration of the frame decode. Switching to a perfect hash is
-/// queued behind the dialect-import work and would not change the
-/// public API.
+/// Returns `Some(crc_extra)` when the ID is in the MAVLink `all.xml`
+/// catalogue and `None` when it is not — callers that must verify the
+/// CRC reject the frame on `None` rather than guessing or panicking.
 #[must_use]
 pub fn crc_extra(msg_id: u32) -> Option<u8> {
-    MSG_ID_TABLE
-        .iter()
-        .copied()
-        .find_map(|(id, extra)| if id == msg_id { Some(extra) } else { None })
+    mavlink_tlog::message_info(msg_id).map(|info| info.crc_extra)
 }
-
-/// Static `(msg_id, crc_extra)` table covering the common-dialect IDs
-/// the rustgate workspace inspects.
-///
-/// Keep entries sorted by `msg_id` ascending so a reviewer adding a new
-/// row can locate the insertion point by binary intuition without
-/// running a sort. The values are the canonical `crc_extra` constants
-/// from `message_definitions/v1.0/common.xml`.
-const MSG_ID_TABLE: &[(u32, u8)] = &[
-    // HEARTBEAT — MSG_ID 0, the canonical presence ping.
-    (0, 50),
-    // SYS_STATUS — MSG_ID 1, vehicle health snapshot.
-    (1, 124),
-    // SYSTEM_TIME — MSG_ID 2, UTC clock distribution.
-    (2, 137),
-    // PING — MSG_ID 4, latency probe.
-    (4, 237),
-    // CHANGE_OPERATOR_CONTROL — MSG_ID 5, GCS authority transfer.
-    (5, 217),
-    // CHANGE_OPERATOR_CONTROL_ACK — MSG_ID 6.
-    (6, 104),
-    // AUTH_KEY — MSG_ID 7, legacy authentication.
-    (7, 119),
-    // SET_MODE — MSG_ID 11, vehicle mode change.
-    (11, 89),
-    // PARAM_REQUEST_READ — MSG_ID 20.
-    (20, 214),
-    // PARAM_REQUEST_LIST — MSG_ID 21.
-    (21, 159),
-    // PARAM_VALUE — MSG_ID 22.
-    (22, 220),
-    // PARAM_SET — MSG_ID 23.
-    (23, 168),
-    // GPS_RAW_INT — MSG_ID 24.
-    (24, 24),
-    // GPS_STATUS — MSG_ID 25.
-    (25, 23),
-    // SCALED_IMU — MSG_ID 26.
-    (26, 170),
-    // RAW_IMU — MSG_ID 27.
-    (27, 144),
-    // RAW_PRESSURE — MSG_ID 28.
-    (28, 67),
-    // SCALED_PRESSURE — MSG_ID 29.
-    (29, 115),
-    // ATTITUDE — MSG_ID 30, vehicle orientation.
-    (30, 39),
-    // ATTITUDE_QUATERNION — MSG_ID 31.
-    (31, 246),
-    // LOCAL_POSITION_NED — MSG_ID 32.
-    (32, 185),
-    // GLOBAL_POSITION_INT — MSG_ID 33, the canonical position frame.
-    (33, 104),
-    // RC_CHANNELS_SCALED — MSG_ID 34.
-    (34, 237),
-    // RC_CHANNELS_RAW — MSG_ID 35.
-    (35, 244),
-    // SERVO_OUTPUT_RAW — MSG_ID 36.
-    (36, 222),
-    // MISSION_REQUEST_PARTIAL_LIST — MSG_ID 37.
-    (37, 212),
-    // MISSION_WRITE_PARTIAL_LIST — MSG_ID 38.
-    (38, 9),
-    // MISSION_ITEM — MSG_ID 39.
-    (39, 254),
-    // MISSION_REQUEST — MSG_ID 40.
-    (40, 230),
-    // MISSION_SET_CURRENT — MSG_ID 41.
-    (41, 28),
-    // MISSION_CURRENT — MSG_ID 42.
-    (42, 28),
-    // MISSION_REQUEST_LIST — MSG_ID 43.
-    (43, 132),
-    // MISSION_COUNT — MSG_ID 44.
-    (44, 221),
-    // MISSION_CLEAR_ALL — MSG_ID 45.
-    (45, 232),
-    // MISSION_ITEM_REACHED — MSG_ID 46.
-    (46, 11),
-    // MISSION_ACK — MSG_ID 47.
-    (47, 153),
-    // SET_GPS_GLOBAL_ORIGIN — MSG_ID 48.
-    (48, 41),
-    // GPS_GLOBAL_ORIGIN — MSG_ID 49.
-    (49, 39),
-    // PARAM_MAP_RC — MSG_ID 50.
-    (50, 78),
-    // MISSION_REQUEST_INT — MSG_ID 51.
-    (51, 196),
-    // SAFETY_SET_ALLOWED_AREA — MSG_ID 54.
-    (54, 15),
-    // SAFETY_ALLOWED_AREA — MSG_ID 55.
-    (55, 3),
-    // ATTITUDE_QUATERNION_COV — MSG_ID 61.
-    (61, 167),
-    // NAV_CONTROLLER_OUTPUT — MSG_ID 62.
-    (62, 183),
-    // GLOBAL_POSITION_INT_COV — MSG_ID 63.
-    (63, 119),
-    // LOCAL_POSITION_NED_COV — MSG_ID 64.
-    (64, 191),
-    // RC_CHANNELS — MSG_ID 65.
-    (65, 118),
-    // REQUEST_DATA_STREAM — MSG_ID 66.
-    (66, 148),
-    // DATA_STREAM — MSG_ID 67.
-    (67, 21),
-    // MANUAL_CONTROL — MSG_ID 69.
-    (69, 243),
-    // RC_CHANNELS_OVERRIDE — MSG_ID 70.
-    (70, 124),
-    // MISSION_ITEM_INT — MSG_ID 73.
-    (73, 38),
-    // VFR_HUD — MSG_ID 74.
-    (74, 20),
-    // COMMAND_INT — MSG_ID 75.
-    (75, 158),
-    // COMMAND_LONG — MSG_ID 76, the canonical command frame.
-    (76, 152),
-    // COMMAND_ACK — MSG_ID 77.
-    (77, 143),
-    // COMMAND_CANCEL — MSG_ID 80.
-    (80, 14),
-    // MANUAL_SETPOINT — MSG_ID 81.
-    (81, 106),
-    // SET_ATTITUDE_TARGET — MSG_ID 82.
-    (82, 49),
-    // ATTITUDE_TARGET — MSG_ID 83.
-    (83, 22),
-    // SET_POSITION_TARGET_LOCAL_NED — MSG_ID 84.
-    (84, 143),
-    // POSITION_TARGET_LOCAL_NED — MSG_ID 85.
-    (85, 140),
-    // SET_POSITION_TARGET_GLOBAL_INT — MSG_ID 86.
-    (86, 5),
-    // POSITION_TARGET_GLOBAL_INT — MSG_ID 87.
-    (87, 150),
-    // STATUSTEXT — MSG_ID 253, the canonical operator log line.
-    (253, 83),
-    // DEBUG — MSG_ID 254.
-    (254, 46),
-    // SETUP_SIGNING — MSG_ID 256, the v2 signing key configuration message.
-    (256, 71),
-    // BUTTON_CHANGE — MSG_ID 257.
-    (257, 131),
-    // PROTOCOL_VERSION — MSG_ID 300.
-    (300, 217),
-];
 
 #[cfg(test)]
 mod tests {
@@ -260,32 +92,22 @@ mod tests {
         // 19 sits between PARAM_REQUEST_READ (20) and SET_MODE (11) —
         // a deliberate gap-walker.
         assert_eq!(crc_extra(19), None);
-        // Just above the highest table entry.
-        assert_eq!(crc_extra(301), None);
+        // Just above the highest table entry (60053).
+        assert_eq!(crc_extra(60_054), None);
     }
 
     #[test]
-    fn table_is_sorted_by_msg_id() {
-        // The doc comment promises ascending order so reviewers can
-        // locate insertion points by intuition. Pin the invariant so
-        // a copy-paste mistake breaks the build.
-        let mut prev: Option<u32> = None;
-        for &(id, _) in MSG_ID_TABLE {
-            if let Some(p) = prev {
-                assert!(id > p, "MSG_ID_TABLE not sorted: {p} >= {id}");
-            }
-            prev = Some(id);
-        }
-    }
-
-    #[test]
-    fn table_has_no_duplicate_msg_ids() {
-        // The lookup short-circuits on first match, so a duplicate row
-        // would silently shadow the second. Pin the invariant.
-        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for &(id, _) in MSG_ID_TABLE {
-            assert!(seen.insert(id), "duplicate MSG_ID in CRC-EXTRA table: {id}");
-        }
+    fn routine_autopilot_traffic_resolves() {
+        // Sent by every ArduPilot / PX4 vehicle; previously rejected
+        // as UnknownMessageId.
+        assert_eq!(crc_extra(109), Some(185)); // RADIO_STATUS
+        assert_eq!(crc_extra(111), Some(34)); // TIMESYNC
+        assert_eq!(crc_extra(147), Some(154)); // BATTERY_STATUS
+        assert_eq!(crc_extra(148), Some(178)); // AUTOPILOT_VERSION
+        assert_eq!(crc_extra(230), Some(163)); // ESTIMATOR_STATUS
+        assert_eq!(crc_extra(241), Some(90)); // VIBRATION
+        assert_eq!(crc_extra(242), Some(104)); // HOME_POSITION
+        assert_eq!(crc_extra(245), Some(130)); // EXTENDED_SYS_STATE
     }
 
     #[test]

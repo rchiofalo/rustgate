@@ -2927,6 +2927,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "mavlink-tlog"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c46169136e460779b8c0532a0dfa898b2175888b49aa4ffe96fca3b0abcf683"
+
+[[package]]
 name = "md5"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4939,6 +4945,7 @@ dependencies = [
  "ciborium",
  "hkdf",
  "lru",
+ "mavlink-tlog",
  "parking_lot",
  "proptest",
  "rustgate-codec-schema",
