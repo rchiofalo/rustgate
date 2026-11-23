@@ -20,7 +20,12 @@ pub struct NatsTlsConfig {
     pub ca_cert: Option<PathBuf>,
 
     /// When true, TLS is required for the NATS connection.
-    /// If set but no certificates are provided, connection will fail.
+    ///
+    /// Must be true whenever any certificate is configured: the NATS
+    /// client treats a configured CA or client certificate as a demand
+    /// for TLS on every server, so `required = false` alongside a
+    /// certificate is rejected by [`validate`](Self::validate) rather
+    /// than left to fail at connect time.
     pub required: bool,
 }
 
@@ -33,7 +38,8 @@ impl NatsTlsConfig {
     /// Validate that the TLS configuration is consistent.
     ///
     /// Returns an error if TLS is required but no certificates are provided,
-    /// or if only one of cert/key is specified without the other.
+    /// if only one of cert/key is specified without the other, or if a
+    /// certificate is configured while TLS is not required.
     pub fn validate(&self) -> Result<(), NatsTlsConfigError> {
         // If cert is provided, key must also be provided (and vice versa)
         if self.client_cert.is_some() != self.client_key.is_some() {
@@ -43,6 +49,15 @@ impl NatsTlsConfig {
         // If TLS is required, at least CA or client certs should be configured
         if self.required && self.ca_cert.is_none() && !self.has_client_auth() {
             return Err(NatsTlsConfigError::RequiredButNoCerts);
+        }
+
+        // Certificates without `required` used to mean "TLS if the server
+        // offers it", which silently fell back to plaintext against a
+        // server (or an on-path attacker) that did not offer TLS. The NATS
+        // client now always demands TLS once a certificate is set, so make
+        // the operator say so explicitly instead of failing at connect.
+        if !self.required && (self.ca_cert.is_some() || self.has_client_auth()) {
+            return Err(NatsTlsConfigError::CertsWithoutRequired);
         }
 
         Ok(())
@@ -61,6 +76,12 @@ pub enum NatsTlsConfigError {
     /// Only one of client cert or key was provided.
     #[error("both RUSTGATE_NATS_TLS_CERT and RUSTGATE_NATS_TLS_KEY must be provided together")]
     IncompleteClientAuth,
+
+    /// A certificate was provided but TLS is not required.
+    #[error(
+        "NATS TLS certificates are set but TLS is not required; set RUSTGATE_NATS_TLS_REQUIRED=true (--nats-tls-required), or remove RUSTGATE_NATS_TLS_CERT, RUSTGATE_NATS_TLS_KEY and RUSTGATE_NATS_TLS_CA"
+    )]
+    CertsWithoutRequired,
 }
 
 /// Configuration for the NATS adapter.
@@ -540,6 +561,44 @@ mod tests {
             required: false,
         };
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_config_ca_without_required_fails() {
+        let config = NatsTlsConfig {
+            ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
+            required: false,
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(NatsTlsConfigError::CertsWithoutRequired)
+        ));
+    }
+
+    #[test]
+    fn tls_config_client_auth_without_required_fails() {
+        let config = NatsTlsConfig {
+            client_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            client_key: Some(PathBuf::from("/tmp/key.pem")),
+            ca_cert: None,
+            required: false,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(NatsTlsConfigError::CertsWithoutRequired)
+        ));
+    }
+
+    #[test]
+    fn tls_config_client_auth_only_required_validates() {
+        let config = NatsTlsConfig {
+            client_cert: Some(PathBuf::from("/tmp/cert.pem")),
+            client_key: Some(PathBuf::from("/tmp/key.pem")),
+            ca_cert: None,
+            required: true,
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

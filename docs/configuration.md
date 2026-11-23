@@ -133,7 +133,7 @@ makes that release a no-op for your deployment.
 | `--nats-tls-cert` | `RUSTGATE_NATS_TLS_CERT` | — | Client certificate for NATS mTLS (PEM) |
 | `--nats-tls-key` | `RUSTGATE_NATS_TLS_KEY` | — | Client private key for NATS mTLS (PEM) |
 | `--nats-tls-ca` | `RUSTGATE_NATS_TLS_CA` | — | CA certificate for NATS server verification (PEM) |
-| `--nats-tls-required` | `RUSTGATE_NATS_TLS_REQUIRED` | `false` | Require TLS for NATS connections |
+| `--nats-tls-required` | `RUSTGATE_NATS_TLS_REQUIRED` | `false` | Require TLS for NATS connections. Must be set whenever any `--nats-tls-*` certificate is set; startup rejects certificates without it |
 
 ### Enrollment (requires `--features enrollment`)
 
