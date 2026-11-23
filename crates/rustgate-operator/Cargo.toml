@@ -25,7 +25,7 @@ workspace = true
 default = []
 # Live cluster controller. Pulls in `kube`, `k8s-openapi`, `tokio` (with
 # the multi-thread runtime), `axum` (for the healthz/metrics surface),
-# `prometheus`, `chrono`, and `json-patch`. Enables the `run` subcommand
+# `prometheus`, `time`, and `json-patch`. Enables the `run` subcommand
 # which:
 #   * watches `RustgateCluster` resources cluster-wide (or in a single
 #     namespace, configurable);
@@ -49,7 +49,7 @@ controller = [
     "dep:tokio",
     "dep:axum",
     "dep:prometheus",
-    "dep:chrono",
+    "dep:time",
     "dep:futures",
     "dep:fastrand",
     "dep:schemars",
@@ -71,7 +71,7 @@ k8s-openapi = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"], optional = true }
 axum = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
-chrono = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 fastrand = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
