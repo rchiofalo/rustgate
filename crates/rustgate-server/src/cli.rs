@@ -389,7 +389,8 @@ pub(crate) struct NatsArgs {
     pub(crate) nats_tls_ca: Option<std::path::PathBuf>,
 
     /// Require TLS for NATS connections. Fails if TLS is required but
-    /// no certificates are provided.
+    /// no certificates are provided, and must be set whenever any
+    /// `--nats-tls-*` certificate is provided.
     #[arg(long, default_value_t = false, env = "RUSTGATE_NATS_TLS_REQUIRED")]
     pub(crate) nats_tls_required: bool,
 
